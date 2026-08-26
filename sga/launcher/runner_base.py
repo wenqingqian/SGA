@@ -1,18 +1,22 @@
+"""Runner: config -> MegatronBackend + SshLauncher.
+
+Surgery note (from flagscale/runner/runner_base.py @ a161153): removed the
+RunnerFactory registry and every non-train task type. SGA supports exactly
+one backend (megatron) and one launcher (ssh), wired directly.
+"""
+
 from abc import ABC
 
 from omegaconf import DictConfig
 
-from flagscale.runner.runner_factory import RunnerFactory
-from flagscale.runner.utils import parse_hostfile
+from sga.launcher.backend_megatron import MegatronBackend
+from sga.launcher.launcher_ssh import SshLauncher
+from sga.launcher.utils import parse_hostfile
 
 # None --> native
 # native --> native_{task_type} in inner Factory registry
 TASK_TO_BACKEND_MAP = {
-    "train": ["megatron", "native"],
-    "inference": ["vllm"],
-    "compress": ["native", None],
-    "serve": ["vllm", "sglang", "llama_cpp", "native", None],
-    "rl": ["verl"],
+    "train": ["megatron"],
 }
 
 
@@ -26,33 +30,13 @@ class Runner(ABC):
         assert self.task_type in TASK_TO_BACKEND_MAP, f"Unsupported task type: {self.task_type}"
 
         backend_attr = getattr(self.config.experiment.task, "backend", None)
-        if self.task_type == "serve":
-            if self.launcher_type == "cloud":
-                backend_attr = "vllm"  # do not support other backend
-            elif backend_attr is None and not self.config.experiment.task.get("entrypoint", None):
-                backend_attr = self.config.serve[0].get("engine", None)
-            backend_attr = backend_attr or "native"
 
-        # backend is required for train / inference / rl
-        if self.task_type in ("train", "inference", "rl"):
-            assert backend_attr is not None, (
-                f"backend_type is required for task_type='{self.task_type}'. "
-                f"Allowed backends: {TASK_TO_BACKEND_MAP[self.task_type]}"
-            )
-            backend_type = backend_attr
-        else:
-            # compress / serve: backend optional
-            backend_type = backend_attr or "native"
-
-        # normalize native → native_{task_type}
-        if backend_type == "native":
-            backend_type = f"native_{self.task_type}"
-
-        if backend_type == "native_serve":
-            if self.config.experiment.runner.get(
-                "deploy", None
-            ) is None or not self.config.experiment.runner.deploy.get("use_fs_serve", False):
-                raise ValueError("config.experiment.deploy.use_fs_serve in YAML should be true")
+        # backend is required for train
+        assert backend_attr is not None, (
+            f"backend_type is required for task_type='{self.task_type}'. "
+            f"Allowed backends: {TASK_TO_BACKEND_MAP[self.task_type]}"
+        )
+        backend_type = backend_attr
 
         self.backend_type = backend_type
 
@@ -63,8 +47,8 @@ class Runner(ABC):
             f"Allowed backends: {allowed_backends}"
         )
 
-        self.backend = RunnerFactory.get_backend(self.backend_type)(self.config)
-        self.launcher = RunnerFactory.get_launcher(self.launcher_type)(self.config, self.backend)
+        self.backend = MegatronBackend(self.config)
+        self.launcher = SshLauncher(self.config, self.backend)
 
     def run(self, *args, **kwargs):
         return self.launcher.run(*args, **kwargs)

@@ -1,53 +1,30 @@
+"""SGA hydra entry: single task type (train), single runner type (ssh).
+
+Surgery note (from flagscale/run.py @ a161153): removed autotuner,
+inference/serve/compress/rl runners, cloud runner, legacy runner map and the
+FLAGSCALE_USE_V1 switch. SGA always dispatches to Runner, which wires
+MegatronBackend + SshLauncher directly (no factory registry).
+"""
+
 import os
 import sys
-import warnings
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
-from flagscale.logger import logger
-from flagscale.runner.autotuner_factory import AutotunerFactory
-from flagscale.runner.runner_base import Runner
-from flagscale.runner.runner_inference import SSHInferenceRunner
-from flagscale.runner.runner_serve import CloudServeRunner, SSHServeRunner
-from flagscale.runner.runner_train import CloudTrainRunner, SSHTrainRunner
-from flagscale.runner.utils import is_master
+from sga.launcher.runner_base import Runner
+from sga.logger import logger
 
 # To accommodate the scenario where the before_start field is used to switch to the actual environment during program execution,
 # we have placed the import statements inside the function body rather than at the beginning of the file.
 
-
-FLAGSCALE_USE_V1 = os.environ.get("FLAGSCALE_USE_V1", "1").lower() in ("1", "true")
-
-VALID_TASKS = {"train", "inference", "compress", "serve", "rl"}
-
-LEGACY_RUNNER_MAP = {
-    "train": SSHTrainRunner,
-    "inference": SSHInferenceRunner,
-    "serve": SSHServeRunner,
-}
+VALID_TASKS = {"train"}
 
 # task_type -> allowed actions
 TASK_ACTIONS = {
-    "train": {"run", "dryrun", "test", "stop", "query", "auto_tune"},
-    "inference": {"run", "dryrun", "test", "stop"},
-    "serve": {"run", "test", "stop", "auto_tune"},
-    "compress": {"run", "dryrun", "stop"},
-    "rl": {"run", "dryrun", "test", "stop"},
+    "train": {"run", "dryrun", "test", "stop", "query"},
 }
-
-
-def check_and_reset_deploy_config(config: DictConfig) -> None:
-    if config.experiment.get("deploy", {}):
-        OmegaConf.set_struct(config.experiment.runner, False)
-        config.experiment.runner.deploy = config.experiment.deploy
-        del config.experiment.deploy
-        warnings.warn(
-            "'config.experiment.deploy' has been moved to 'config.experiment.runner.deploy'. "
-            "Support for the old location will be removed in a future release."
-        )
-        OmegaConf.set_struct(config.experiment.runner, True)
 
 
 def validate_task(task_type: str, action: str) -> None:
@@ -64,65 +41,20 @@ def validate_task(task_type: str, action: str) -> None:
 
 def get_runner(config: DictConfig, task_type: str):
     runner_type = config.experiment.runner.get("type", "ssh")
-
-    if runner_type == "cloud":
-        if task_type == "train":
-            return CloudTrainRunner(config)
-        elif task_type == "serve":
-            if FLAGSCALE_USE_V1:
-                return Runner(config)
-            else:
-                return CloudServeRunner(config)
-        else:
-            raise NotImplementedError(f"Task type '{task_type}' is not supported by cloud runner")
-
-    if FLAGSCALE_USE_V1:
-        return Runner(config)
-
-    logger.warning(
-        "Using legacy runner, which will be removed in future. Please use new runner instead."
-    )
-
-    assert task_type in LEGACY_RUNNER_MAP, (
-        f"Task type '{task_type}' is not supported by legacy runner"
-    )
-    return LEGACY_RUNNER_MAP[task_type](config)
-
-
-def handle_auto_tune(config: DictConfig, task_type: str) -> None:
-    if task_type not in {"serve", "train"}:
-        raise NotImplementedError(f"Auto tune is not implemented for task type '{task_type}'")
-
-    # Only one autotuner process for MPI-based runs
-    if task_type == "train" and not is_master(config):
-        return
-
-    AutoTuner = AutotunerFactory.get_autotuner(task_type)
-    AutoTuner(config).tune()
+    if runner_type != "ssh":
+        raise NotImplementedError(
+            f"Runner type '{runner_type}' is not supported. SGA only supports the ssh runner."
+        )
+    return Runner(config)
 
 
 def execute_action(runner, action: str, task_type: str, config: DictConfig) -> None:
     if action == "run":
-        if task_type == "train":
-            enable_monitoring = config.experiment.runner.get("enable_monitoring", False)
-            enable_gpu_health_check = config.experiment.runner.get("enable_gpu_health_check", False)
-            runner.run(
-                enable_monitoring=enable_monitoring, enable_gpu_health_check=enable_gpu_health_check
-            )
-            if enable_monitoring:
-                logger.info("Monitor service will be started automatically when training begins.")
-        else:
-            runner.run()
+        runner.run()
     elif action == "dryrun":
         runner.run(dryrun=True)
     elif action == "test":
-        # Serve tasks are long-running daemons validated externally, so they
-        # must start in the background even during tests.  Other tasks
-        # (train, inference) run in the foreground so output streams directly.
-        if task_type == "serve":
-            runner.run()
-        else:
-            runner.run(background=False)
+        runner.run(background=False)
     elif action == "stop":
         runner.stop()
     elif action == "query":
@@ -137,7 +69,7 @@ def main(config: DictConfig) -> None:
     # Hydra defaults to hydra.job.chdir=True, which changes cwd to a run-specific
     # output dir (e.g. outputs/2024-01-01/12-00-00/).  This breaks all relative
     # paths in configs (tokenizer files, data paths, hostfiles, entrypoints, etc.).
-    # FlagScale manages output directories explicitly (exp_dir, log_dir, etc.),
+    # SGA manages output directories explicitly (exp_dir, log_dir, etc.),
     # so the cwd change provides no benefit.  Restoring cwd here is equivalent to
     # hydra.job.chdir=False but works for all invocation paths (CLI, direct python,
     # tests) without requiring Hydra config file changes.
@@ -159,16 +91,9 @@ def main(config: DictConfig) -> None:
 
 def _main(config: DictConfig) -> None:
     """Core logic, separated from main() for error wrapping."""
-    check_and_reset_deploy_config(config)
-
     task_type = config.experiment.task.get("type", None)
     action = config.action
     validate_task(task_type, action)
-
-    # auto_tune invokes the runner internally
-    if action == "auto_tune":
-        handle_auto_tune(config, task_type)
-        return
 
     runner = get_runner(config, task_type)
     execute_action(runner, action, task_type, config)
