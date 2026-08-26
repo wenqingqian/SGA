@@ -1,7 +1,6 @@
 import multiprocessing
 import os
 import shlex
-import subprocess
 import time
 from datetime import datetime
 
@@ -138,6 +137,7 @@ def run_node(
     # Get the number of visible devices from the environment variable, e.g. CUDA_VISIBLE_DEVICES, MLU_VISIBLE_DEVICES
     # visible_devices = cur_envs.get("CUDA_VISIBLE_DEVICES", None)
     visible_devices = next((v for k, v in cur_envs.items() if k.endswith("_VISIBLE_DEVICES")), None)
+    num_visible_devices = None
     if visible_devices is not None and isinstance(visible_devices, str):
         visible_devices = visible_devices.split(",")
         num_visible_devices = len(visible_devices)
@@ -430,8 +430,8 @@ class SshLauncher(LauncherBase):
 
         with open(host_query_script_file, "w") as f:
             f.write("#!/bin/bash\n\n")
-            f.write("if [ -f " + host_pid_file + " ]; then\n")
-            f.write("    pid=$(cat " + host_pid_file + ")\n")
+            f.write("if [ -f " + shlex.quote(host_pid_file) + " ]; then\n")
+            f.write("    pid=$(cat " + shlex.quote(host_pid_file) + ")\n")
             f.write("    ps -p $pid -o state --no-headers\n")
             f.write("else\n")
             # TODO: This is a temporary fix. We need to find a better way to query the job.
@@ -460,8 +460,8 @@ class SshLauncher(LauncherBase):
 
         with open(host_query_sub_process_script_file, "w") as f:
             f.write("#!/bin/bash\n\n")
-            f.write("if [ -f " + host_pid_file + " ]; then\n")
-            f.write("    pid=$(cat " + host_pid_file + ")\n")
+            f.write("if [ -f " + shlex.quote(host_pid_file) + " ]; then\n")
+            f.write("    pid=$(cat " + shlex.quote(host_pid_file) + ")\n")
             f.write("    ps -eo pid,ppid | awk -v ppid=$pid '$2 == ppid {print $1}'\n")
             f.write("else\n")
             # TODO: This is a temporary fix. We need to find a better way to query the job.

@@ -13,8 +13,8 @@ from sga.launcher.backend_megatron import MegatronBackend
 from sga.launcher.launcher_ssh import SshLauncher
 from sga.launcher.utils import parse_hostfile
 
-# None --> native
-# native --> native_{task_type} in inner Factory registry
+# task_type -> allowed backends (the single megatron+ssh pair is wired
+# directly below; see the surgery note at the top of this file).
 TASK_TO_BACKEND_MAP = {
     "train": ["megatron"],
 }
@@ -25,11 +25,11 @@ class Runner(ABC):
         self.config = config
         hostfile = self.config.experiment.runner.get("hostfile", None)
         self.resources = parse_hostfile(hostfile) if hostfile else None
-        self.task_type = getattr(self.config.experiment.task, "type", None)
+        self.task_type = self.config.experiment.task.get("type", None)
         self.launcher_type = self.config.experiment.runner.get("type", "ssh")
         assert self.task_type in TASK_TO_BACKEND_MAP, f"Unsupported task type: {self.task_type}"
 
-        backend_attr = getattr(self.config.experiment.task, "backend", None)
+        backend_attr = self.config.experiment.task.get("backend", None)
 
         # backend is required for train
         assert backend_attr is not None, (

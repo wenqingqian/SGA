@@ -11,11 +11,19 @@ Megatron-LM must be provided by the user's ``cmds.before_start`` (normally
 """
 
 import os
+import shlex
 
 from omegaconf import DictConfig, OmegaConf
 
 from sga.launcher.backend_base import BackendBase
-from sga.launcher.utils import flatten_dict_to_args, get_pkg_dir, parse_hostfile, resolve_path, setup_exp_dir, setup_logging_dirs
+from sga.launcher.utils import (
+    flatten_dict_to_args,
+    get_pkg_dir,
+    parse_hostfile,
+    resolve_path,
+    setup_exp_dir,
+    setup_logging_dirs,
+)
 from sga.logger import logger
 
 
@@ -33,7 +41,7 @@ def _get_args_megatron(config: DictConfig):
     new_config_dict.update(config_dict["model"])
     new_config_dict.update(config_dict["data"])
 
-    ignore_keys = ["log_dir", "details_dir", "scripts_dir", "pids_dir"]
+    ignore_keys = ["log_dir", "details_dir", "scripts_dir", "pids_dir", "no_shared_fs"]
     # Flatten the dictionary to a list of arguments
     args = flatten_dict_to_args(new_config_dict, ignore_keys)
 
@@ -44,9 +52,6 @@ def _update_config_train(config: DictConfig):
     exp_dir = setup_exp_dir(config)
 
     OmegaConf.set_struct(config, False)
-
-    if config.experiment.runner.get("no_shared_fs", False):
-        config.train.system.no_shared_fs = True
 
     system = config.train.system
 
@@ -128,7 +133,6 @@ class MegatronBackend(BackendBase):
         cmd,
         background=False,
         pkg_dir=None,
-        enable_monitoring=False,
     ):
         system_config = config.train.system
         logging_config = config.train.system.logging
@@ -160,28 +164,32 @@ class MegatronBackend(BackendBase):
         with open(host_run_script_file, "w") as f:
             f.write("#!/bin/bash\n\n")
             f.write(f"{before_start}\n")
-            f.write(f"mkdir -p {system_config.checkpoint.load}\n")
-            f.write(f"mkdir -p {system_config.checkpoint.save}\n")
-            f.write(f"mkdir -p {system_config.logging.log_dir}\n")
-            f.write(f"mkdir -p {system_config.logging.pids_dir}\n")
-            f.write(f"mkdir -p {system_config.logging.details_dir}\n")
-            f.write(f"mkdir -p {system_config.logging.tensorboard_dir}\n")
-            f.write(f"mkdir -p {system_config.logging.wandb_save_dir}\n")
+            # shlex.quote keeps today's safe path values byte-identical while
+            # making whitespace/metacharacter-bearing paths (or injected
+            # config values) inert.
+            f.write(f"mkdir -p {shlex.quote(system_config.checkpoint.load)}\n")
+            f.write(f"mkdir -p {shlex.quote(system_config.checkpoint.save)}\n")
+            f.write(f"mkdir -p {shlex.quote(system_config.logging.log_dir)}\n")
+            f.write(f"mkdir -p {shlex.quote(system_config.logging.pids_dir)}\n")
+            f.write(f"mkdir -p {shlex.quote(system_config.logging.details_dir)}\n")
+            f.write(f"mkdir -p {shlex.quote(system_config.logging.tensorboard_dir)}\n")
+            f.write(f"mkdir -p {shlex.quote(system_config.logging.wandb_save_dir)}\n")
             f.write("\n")
-            f.write(f"cd {pkg_dir}\n")
+            f.write(f"cd {shlex.quote(pkg_dir)}\n")
             f.write("\n")
-            f.write(f"export PYTHONPATH={pkg_dir}:${{PYTHONPATH}}\n")
+            f.write(f"export PYTHONPATH={shlex.quote(pkg_dir)}:${{PYTHONPATH}}\n")
             f.write("\n")
             f.write(f'cmd="{cmd}"\n')
             f.write("\n")
 
             if background:
                 f.write(
-                    f'nohup bash -c "$cmd; sync" >> {host_output_file} 2>&1 & echo $! > {host_pid_file}\n'
+                    f'nohup bash -c "$cmd; sync" >> {shlex.quote(host_output_file)} 2>&1'
+                    f' & echo $! > {shlex.quote(host_pid_file)}\n'
                 )
             else:
                 f.write("set -o pipefail\n")
-                f.write(f'bash -c "$cmd; sync" 2>&1 | tee -a {host_output_file}\n')
+                f.write(f'bash -c "$cmd; sync" 2>&1 | tee -a {shlex.quote(host_output_file)}\n')
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
@@ -210,8 +218,8 @@ class MegatronBackend(BackendBase):
             after_stop = ""
         with open(host_stop_script_file, "w") as f:
             f.write("#!/bin/bash\n\n")
-            f.write("if [ -f " + host_pid_file + " ]; then\n")
-            f.write("    pid=$(cat " + host_pid_file + ")\n")
+            f.write("if [ -f " + shlex.quote(host_pid_file) + " ]; then\n")
+            f.write("    pid=$(cat " + shlex.quote(host_pid_file) + ")\n")
             f.write("    pkill -P $pid\n")
             f.write("else\n")
             # TODO: This is a temporary fix. We need to find a better way to stop the job.

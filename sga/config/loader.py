@@ -31,10 +31,26 @@ def validate_sga_section(config: DictConfig) -> None:
             "selection/error_feedback disabled and backend: dense)."
         )
     for field in _SGA_SUBFIELDS:
-        if bool(sga.get(field, {}).get("enabled", False)):
+        sub = sga.get(field, None)
+        if sub is None:
+            enabled = False
+        elif OmegaConf.is_dict(sub):
+            enabled = bool(sub.get("enabled", False))
+        else:
+            raise ValueError(
+                f"sga.{field} must be a mapping with an 'enabled' key "
+                f"(got non-mapping value: {sub!r})."
+            )
+        if enabled:
             raise ValueError(_ENABLED_ERROR.format(field=field))
 
-    backend_name = sga.get("backend", {}).get("name", None)
+    backend_cfg = sga.get("backend", None)
+    if backend_cfg is None or not OmegaConf.is_dict(backend_cfg):
+        raise ValueError(
+            "sga.backend is required and must be a mapping with a 'name' key "
+            f"(registry-driven, e.g. 'dense'); got: {backend_cfg!r}."
+        )
+    backend_name = backend_cfg.get("name", None)
     if backend_name is None:
         raise ValueError("sga.backend.name is required (registry-driven, e.g. 'dense').")
     # Late import: the registry is populated by explicit registration, and the

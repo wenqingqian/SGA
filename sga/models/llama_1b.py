@@ -8,7 +8,6 @@ knobs (rotary_base, swiglu, RMSNorm, untie, ...) come from the run yaml.
 """
 
 from megatron.core.enums import ModelType
-from megatron.core.models.gpt import GPTModel
 
 MODEL_NAME = "llama-1b"
 MODEL_TYPE = ModelType.encoder_or_decoder
@@ -24,4 +23,4 @@ def builder(args, pre_process, post_process, vp_stage=None, config=None, pg_coll
     )
 
 
-__all__ = ["MODEL_NAME", "MODEL_TYPE", "builder", "GPTModel"]
+__all__ = ["MODEL_NAME", "MODEL_TYPE", "builder"]
