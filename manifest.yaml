@@ -1,0 +1,16 @@
+# Expected states of sibling repositories used by SGA.
+# setup.sh compares these against the actual checkouts; a mismatch is a WARN,
+# never a block (the Megatron fork legitimately carries local commits).
+
+repos:
+  Megatron-LM:
+    path: ../Megatron-LM
+    branch: sga
+    base_commit: 571370c82   # official core_r0.18.0 tip
+    note: carries the sga plugin interface on top; never carries scheme code
+
+  nccl-sar:
+    path: ../nccl-sar
+    branch: master
+    base_commit: 63cf786     # NCCL 2.30.7 fork; reserved, not built by SGA yet
+    note: sparse allreduce kernel placeholder repo
