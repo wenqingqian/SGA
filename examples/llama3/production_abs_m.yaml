@@ -150,5 +150,9 @@ train:
     tokenizer:
       tokenizer_type: HuggingFaceTokenizer
       tokenizer_model: /workspace/sga_framework/data/llama3_dataset
-      vocab_size: 128256
+      # bridge invariant: old Llama3TokenizerFS derived 64307 (base 64002 +
+      # 305 added) -> padded 64320; new-fork HuggingFaceTokenizer reports
+      # len() = 64002. --vocab-size is unused on this path, so the model vocab
+      # must be pinned explicitly to the checkpoint/dataset value 64320.
+      padded_vocab_size: 64320
       make_vocab_size_divisible_by: 64

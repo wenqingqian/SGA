@@ -2,13 +2,22 @@
 """Tokenizer equivalence assertion (container-only; run after `source env.sh`).
 
 The old baseline used FlagScale's Llama3TokenizerFS shim (HF AutoTokenizer over
-data/llama3_dataset, eod = eos_token_id, vocab = vocab_size + added tokens).
-This asserts megatron 0.18's HuggingFaceTokenizer over the same directory
-yields the same vocabulary footprint, so the pretokenized indexed datasets see
-identical tokenizer semantics.
+data/llama3_dataset, eod = eos_token_id, vocab = vocab_size + added tokens =
+64002 + 305 = 64307, padded to 64320). Megatron 0.18's HuggingFaceTokenizer
+reports vocab = len(tokenizer) = 64002 instead, and --vocab-size is unused on
+that branch: build_tokenizer pads from the tokenizer property alone whenever
+--padded-vocab-size is absent. The bridge therefore pins the model vocab
+explicitly via `padded_vocab_size: 64320` in both run configs (the exact
+value the old runs derived and the base5k_owt checkpoint/embedding and the
+pretokenized indexed datasets were built with).
+
+This asserts (1) eod equality with the old shim derivation and (2) that both
+run configs still pin padded_vocab_size so the embedding never silently
+derives from the diverging tokenizer property.
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,7 +25,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 
 TOKENIZER_DIR = "/workspace/sga_framework/data/llama3_dataset"
-DECLARED_VOCAB = 128256  # explicit --vocab-size in the run config (both old and new)
+PINNED_PADDED_VOCAB = 64320  # old shim 64307 padded by 64 -> ckpt/dataset vocab
+CONFIGS = [
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "examples", "llama3", name)
+    for name in ("train_1b_dense.yaml", "production_abs_m.yaml")
+]
 
 
 def main():
@@ -39,10 +53,9 @@ def main():
     # The old FlagScale shim (Llama3TokenizerFS) derived eod as
     # AutoTokenizer.from_pretrained(dir).eos_token_id over the same directory
     # (md5-identical files); 0.18's HuggingFaceTokenizer derives eod the same
-    # way. The vocab_size *property* formulas differ numerically (len(tok) vs
-    # vocab+added), but both runs declare --vocab-size 128256 explicitly, so
-    # the embedding size never derives from the property; what must hold is
-    # eod equality and that everything fits under the declared vocab.
+    # way. The vocab_size *property* formulas differ numerically (len(tok) =
+    # 64002 vs vocab+added = 64307), so the embedding vocab must come from the
+    # explicit padded_vocab_size pin, never from the property.
     from transformers import AutoTokenizer
 
     hf = AutoTokenizer.from_pretrained(TOKENIZER_DIR, trust_remote_code=True)
@@ -51,10 +64,22 @@ def main():
     print(f"AutoTokenizer vocab/eos:      {hf_vocab} / {hf.eos_token_id}")
 
     assert tok.eod == hf.eos_token_id, "eod derivation diverged from the old shim"
-    assert max(tok.vocab_size, hf_vocab) <= DECLARED_VOCAB, (
-        "tokenizer vocab does not fit under the declared vocab"
+    assert tok.vocab_size <= PINNED_PADDED_VOCAB, (
+        "tokenizer property exceeds the pinned vocab — datasets would overflow"
     )
-    assert tok.eod < DECLARED_VOCAB, f"eod {tok.eod} outside declared vocab {DECLARED_VOCAB}"
+    assert hf_vocab <= PINNED_PADDED_VOCAB, (
+        "old-shim vocab exceeds the pinned vocab — datasets would overflow"
+    )
+    assert tok.eod < PINNED_PADDED_VOCAB, (
+        f"eod {tok.eod} outside pinned vocab {PINNED_PADDED_VOCAB}"
+    )
+    for cfg in CONFIGS:
+        text = open(cfg).read()
+        assert re.search(r"^\s*padded_vocab_size:\s*64320\s*$", text, re.M), (
+            f"{cfg} lost the padded_vocab_size pin — the model vocab would "
+            "silently derive from the tokenizer property (64064) and mismatch "
+            "the 64320 checkpoint/datasets"
+        )
     print("test_tokenizer_equiv: PASS")
 
 
