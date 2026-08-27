@@ -16,7 +16,13 @@ SGA_API_VERSION = 1
 
 
 def _assert_args_compatible() -> None:
-    """v1 config-time assertion set (notes/sga-waist-api-v1.md section 6)."""
+    """v1 config-time assertion set (notes/sga-waist-api-v1.md section 6).
+
+    Backend-specific requirements do NOT live here as name branches — a
+    backend plugin may expose an optional ``validate_runtime(args)`` hook
+    (probed generically after construction in ``build_engine``, the same
+    discipline as the engine's adapt()/wants_force_full() probes).
+    """
     from megatron.training import get_args
 
     args = get_args()
@@ -164,8 +170,21 @@ def build_engine(config: dict, api_version: int):
 
     score = build_score(score_name, dict(config["score"]))
     selection = build_selection(selection_name, dict(config["selection"]), score=score)
-    ef = build_ef(ef_name, dict(config["error_feedback"]))
+    # 'synced' scores are materialized by the EF on full steps; inject WHICH
+    # score to emit so the kernel picks the right mode (validator above
+    # already proved the EF can emit it).
+    emit = score_name if score_decl.scoring_input == "synced" else None
+    ef = build_ef(ef_name, dict(config["error_feedback"]), emit_score=emit)
     backend = build_backend_plugin(backend_name, dict(config["backend"]))
+
+    # Optional backend-owned runtime validation, probed generically (the
+    # same optional-hook discipline as adapt()/wants_force_full()): topology
+    # requirements specific to a concrete backend live IN that backend
+    # plugin — never as name-keyed branches in this shared builder.
+    validate = getattr(backend, "validate_runtime", None)
+    if callable(validate):
+        from megatron.training import get_args
+        validate(get_args())
 
     from sga.engine import SGAEngine
 

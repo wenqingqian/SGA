@@ -16,9 +16,10 @@ Declaration facts used by the validator (see ``validate_combination``):
     fast path (abs_g does; update_ratio does not).
   - Selection.scope: 'elementwise_local' vs 'global_ranked' (topk over the
     whole model needs a ranked view, e.g. the bit-pattern histogram).
-  - ErrorFeedback.emits_score_view: the EF kernel materializes the update
-    into the fp32 main-grad copy on full steps (radius-style); 'synced'
-    scores that need it must be paired with such an EF.
+  - ErrorFeedback.emittable_scores: the score plugins this EF can
+    materialize into the fp32 main-grad copy on full steps (radius-style
+    EF->score handoff); 'synced' scores must be paired with an EF that
+    lists them.
   - ErrorFeedback.requires_full_sync_every_period: the EF's residual
     contract only folds at full syncs, so cycle boundaries must be full.
   - Backend.consumes: 'mask' or 'idx' — the Support object provides both,
@@ -26,6 +27,7 @@ Declaration facts used by the validator (see ``validate_combination``):
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -53,10 +55,15 @@ class EFDecl:
     reset_mode: str = "selective"  # 'selective' | 'full'
     # Needs the engine-allocated uint8 accumulation-count buffers.
     needs_acc_count: bool = False
-    # Materializes the update into main grads on full steps (for 'synced' scores).
-    emits_score_view: bool = False
+    # Score plugins this EF can materialize into main grads on full steps
+    # (the EF->score handoff; 'synced' scores must be paired accordingly).
+    emittable_scores: frozenset = frozenset()
     # Residual contract folds only at full syncs => cycle boundaries must be full.
     requires_full_sync_every_period: bool = False
+
+    @property
+    def emits_score_view(self) -> bool:
+        return bool(self.emittable_scores)
 
 
 @dataclass(frozen=True)
@@ -140,10 +147,11 @@ def validate_combination(score: ScoreDecl, selection: SelectionDecl,
             f"selection '{selection.name}' needs a score with a fused threshold "
             f"path, but score '{score.name}' has none"
         )
-    if score.scoring_input == "synced" and not ef.emits_score_view:
+    if score.scoring_input == "synced" and score.name not in ef.emittable_scores:
         problems.append(
-            f"score '{score.name}' needs synced scoring input (a materialized "
-            f"update) but error_feedback '{ef.name}' does not emit a score view"
+            f"score '{score.name}' needs synced scoring input (a value the EF "
+            f"materializes into main grads on full steps), but error_feedback "
+            f"'{ef.name}' can only emit {sorted(ef.emittable_scores) or 'nothing'}"
         )
     if selection.scope == "global_ranked" and score.scoring_input != "synced":
         problems.append(
@@ -164,9 +172,18 @@ def validate_combination(score: ScoreDecl, selection: SelectionDecl,
 
 def build_score(name, params):
     from sga.plugins.scores.abs_g import AbsGradScore
+    from sga.plugins.scores.abs_g_synced import AbsGSyncedScore
+    from sga.plugins.scores.abs_m import AbsMScore
+    from sga.plugins.scores.coi import CoiScore
     from sga.plugins.scores.update_ratio import UpdateRatioScore
 
-    return {"abs_g": AbsGradScore, "update_ratio": UpdateRatioScore}[name](params)
+    return {
+        "abs_g": AbsGradScore,
+        "abs_g_synced": AbsGSyncedScore,
+        "abs_m": AbsMScore,
+        "coi": CoiScore,
+        "update_ratio": UpdateRatioScore,
+    }[name](params)
 
 
 def build_selection(name, params, score=None):
@@ -179,26 +196,34 @@ def build_selection(name, params, score=None):
     }[name](params, score=score)
 
 
-def build_ef(name, params):
+def build_ef(name, params, emit_score: Optional[str] = None):
     from sga.plugins.error_feedback.masked_adamw import MaskedAdamWEF
     from sga.plugins.error_feedback.radius_opt import RadiusOptEF
 
-    return {"masked_adamw": MaskedAdamWEF, "radius_opt": RadiusOptEF}[name](params)
+    return {
+        "masked_adamw": MaskedAdamWEF,
+        "radius_opt": RadiusOptEF,
+    }[name](params, emit_score=emit_score)
 
 
 def build_backend_plugin(name, params):
     from sga.backends.masked_pipelined import MaskedPipelinedBackend
     from sga.backends.indexed_sparse import IndexedSparseBackend
+    from sga.backends.pipelined_idx_sorted import PipelinedIdxSortedBackend
 
     return {
         "masked_pipelined": MaskedPipelinedBackend,
         "indexed_sparse": IndexedSparseBackend,
+        "pipelined_idx_sorted": PipelinedIdxSortedBackend,
     }[name](params)
 
 
 def register_default_plugins() -> None:
     """Idempotent registration of the built-in plugin declarations."""
     from sga.plugins.scores.abs_g import DECL as abs_g_decl
+    from sga.plugins.scores.abs_g_synced import DECL as abs_g_synced_decl
+    from sga.plugins.scores.abs_m import DECL as abs_m_decl
+    from sga.plugins.scores.coi import DECL as coi_decl
     from sga.plugins.scores.update_ratio import DECL as update_ratio_decl
     from sga.plugins.selection.threshold import DECL as threshold_decl
     from sga.plugins.selection.circular_topk import DECL as topk_decl
@@ -207,6 +232,9 @@ def register_default_plugins() -> None:
 
     for name, decl in (
         ("abs_g", abs_g_decl),
+        ("abs_g_synced", abs_g_synced_decl),
+        ("abs_m", abs_m_decl),
+        ("coi", coi_decl),
         ("update_ratio", update_ratio_decl),
     ):
         if name not in _SCORES:
@@ -226,10 +254,12 @@ def register_default_plugins() -> None:
 
     from sga.backends.masked_pipelined import DECL as mp_decl
     from sga.backends.indexed_sparse import DECL as is_decl
+    from sga.backends.pipelined_idx_sorted import DECL as pis_decl
 
     for name, decl in (
         ("masked_pipelined", mp_decl),
         ("indexed_sparse", is_decl),
+        ("pipelined_idx_sorted", pis_decl),
     ):
         if name not in _BACKEND_PLUGINS:
             register_backend_plugin(name, decl)

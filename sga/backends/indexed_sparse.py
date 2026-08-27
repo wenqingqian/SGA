@@ -24,14 +24,22 @@ DECL = BackendDecl(name="indexed_sparse", consumes="idx")
 class IndexedSparseBackend:
     """Consumes the canonical sorted-idx form of a bucket's support."""
 
+    decl = DECL
+
     def __init__(self, params: dict):
         self._gather_bufs: dict = {}  # id(bucket-state-owner) -> persistent buffer
 
     def _gather_buf(self, key: int, k: int, dtype, device) -> torch.Tensor:
+        # Grow-only, rounded up to 4M elements (16MB fp32): exact-size
+        # reallocation on every selected-count change (including shrinks)
+        # re-triggers the allocator map/unmap storms the persistent-buffer
+        # discipline exists to avoid. Slices below are bounded by k anyway.
         buf = self._gather_bufs.get(key)
-        if buf is None or buf.numel() != k or buf.dtype != dtype or buf.device != device:
-            # Grow-only reallocation: only when the selected count changed.
-            buf = torch.empty(k, dtype=dtype, device=device)
+        cap = -(-(k) // (4 << 20)) * (4 << 20)
+        if (buf is None or buf.dtype != dtype or buf.device != device
+                or buf.numel() < cap):
+            new_cap = cap if buf is None else max(cap, buf.numel())
+            buf = torch.empty(new_cap, dtype=dtype, device=device)
             self._gather_bufs[key] = buf
         return buf
 

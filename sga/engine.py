@@ -27,10 +27,11 @@ the grad norm is computed even when ``clip_grad == 0`` (stock returns 0.0),
 and ``num_zeros`` is None whenever the fork's ``log_num_zeros_in_grad``
 flag is off (stock returns 0).
 
-The score axis is declaration-only for 'synced'-input scores: the engine
-reads the materialized ``main_param.grad`` views directly, so plugins carry
-their scoring-input contract in their declarations, not through data passed
-via EFContext.
+For 'synced'-input scores the engine reads the materialized
+``main_param.grad`` views the EF kernel emits and routes them through the
+score plugin's ``values()`` before selection — identity pass-throughs today,
+but the score object stays on the data path, so a future validation or
+transformation inside a score plugin cannot be silently skipped.
 """
 
 import json
@@ -45,6 +46,7 @@ from sga.support import BucketSupport, Support
 
 class SGAEngineError(RuntimeError):
     """Raised on cross-rank inconsistency or contract violations."""
+
 
 
 class BucketState:
@@ -72,10 +74,15 @@ class BucketState:
 class SelectionContext:
     """What a selection sees at a reselection boundary (CPU-testable shape)."""
 
-    def __init__(self, grad_views, always_sync_masks, comm_group):
+    def __init__(self, grad_views, always_sync_masks, comm_group,
+                 warmup_target=None):
         self.grad_views = grad_views
         self.always_sync_masks = always_sync_masks
         self.comm_group = comm_group
+        # Gated warmup selects implied by the selection's OWN warmup window,
+        # supplied via its optional ``warmup_sync_target(start_iter, period)``
+        # hook (None when the selection declares no window).
+        self.warmup_target = warmup_target
 
 
 class CycleManager:
@@ -136,6 +143,9 @@ class SGAEngine:
         self._param_locations = {}        # id(model_param) -> (bucket_state, start, end)
         self._selection_meta = None       # per-param (bs, start, end) view metadata
         self._active_support = None
+        self._mask_pool = None            # per-bucket [slot_a, slot_b] uint8 pair (lazy)
+        self._mask_turn = 0               # active slot index (flips at activate)
+        self._idx_pools = None            # per-bucket grow-only IndexPool list (lazy)
         self._records = None              # [ParamRecord], built lazily
         self._refresh_step = None         # engine step the records were last refreshed at
         self._main_to_record = {}
@@ -201,6 +211,21 @@ class SGAEngine:
         self._selection_meta = None  # rebuilt after a new chunk attaches
         self.ef.ensure_state(self._bucket_states)
         self._build_always_sync_masks()
+        # The comm groups just became known (DDP bucket construction is a
+        # world-collective, so attach runs symmetrically on every rank):
+        # give the backend its optional eager-setup point BEFORE the training
+        # loop expands the caching allocator. The bucket grad-buffer device
+        # rides along as the ground truth for where collectives will run.
+        # Generic hook probe — backends without one simply skip it.
+        prepare = getattr(self.backend, "prepare", None)
+        if callable(prepare):
+            seen_ids = set()
+            for bs in self._bucket_states:  # deterministic global bucket order
+                dp_group = bs.dp_group
+                if dp_group is None or id(dp_group) in seen_ids:
+                    continue
+                seen_ids.add(id(dp_group))
+                prepare(dp_group, device=bs.grad_data.device)
 
     def _build_always_sync_masks(self):
         patterns = self.selection.params.get("always_sync_layers", []) or []
@@ -336,19 +361,33 @@ class SGAEngine:
                 views = [p.main_param.grad.data.view(-1)
                          for (_, _, _, p) in meta]
                 self._check_norm_spread(views)
+                # Route the materialized tensors through the score plugin's
+                # own contract (identity pass-throughs today; keeps any
+                # score-side validation on the data path).
+                views = self.score.values(views)
             else:
                 views = self._selection_views()[0]
+            # Optional selection-owned warmup policy (generic hook probe —
+            # the v3.1 anchor math lives inside the selection, which alone
+            # interprets its own parameters).
+            warmup_hook = getattr(self.selection, "warmup_sync_target", None)
             sel_ctx = SelectionContext(
                 grad_views=views,
                 always_sync_masks=always_slices,
                 comm_group=self._dp_cp_group(),
+                warmup_target=(warmup_hook(self._cycle.start_iter,
+                                           self._cycle.period)
+                               if callable(warmup_hook) else None),
             )
             masks = self.selection.select(sel_ctx)
             bucket_masks = self._assemble_bucket_masks(masks, meta)
             self._verify_support_consistency(bucket_masks)
             if hasattr(self.selection, "adapt"):
                 self.selection.adapt(masks, always_slices)
-            new_support = Support([BucketSupport(m) for m in bucket_masks])
+            new_support = Support([
+                BucketSupport(m, idx_pool=self._bucket_idx_pool(i))
+                for i, m in enumerate(bucket_masks)
+            ])
         else:
             new_support = None
 
@@ -398,17 +437,37 @@ class SGAEngine:
         return out
 
     def _assemble_bucket_masks(self, masks, meta):
-        """Scatter per-param masks into per-bucket element-level uint8 masks."""
-        bucket_masks = [
-            torch.zeros(bs.grad_data.numel(), dtype=torch.uint8,
-                        device=bs.grad_data.device)
-            for bs in self._bucket_states
-        ]
+        """Scatter per-param masks into per-bucket element-level uint8 masks.
+
+        Double-buffered (ping-pong): the new selection is written into the
+        inactive slot of a per-bucket mask pair, so the OLD support's mask
+        stays intact for the selective reset that runs between assemble and
+        activate — and GB-scale masks are not freshly allocated every cycle
+        (allocator map/unmap storms at reselection cadence; the legacy
+        scheme kept the same two-buffer discipline).
+        """
+        if self._mask_pool is None:
+            self._mask_pool = [
+                [torch.zeros(bs.grad_data.numel(), dtype=torch.uint8,
+                             device=bs.grad_data.device) for _ in range(2)]
+                for bs in self._bucket_states
+            ]
+        bucket_masks = [self._mask_pool[i][1 - self._mask_turn]
+                        for i in range(len(self._bucket_states))]
+        for buf in bucket_masks:
+            buf.zero_()
         for m, (bs, start, end, _) in zip(masks, meta):
             bucket_masks[bs.support_index][start:end] = m
         return bucket_masks
 
     # ------------------------------------------------------------- internals
+
+    def _bucket_idx_pool(self, i: int):
+        """Grow-only idx pool for bucket ``i`` (shared across cycles)."""
+        if self._idx_pools is None:
+            from sga.support import IndexPool
+            self._idx_pools = [IndexPool() for _ in self._bucket_states]
+        return self._idx_pools[i]
 
     def _unwrap_optimizer(self, optimizer):
         """Unwrap ChainedOptimizer-of-1 (get_megatron_optimizer ALWAYS chains,
@@ -543,9 +602,15 @@ class SGAEngine:
                 masked_norm_sq_contribution(grad.float(), mask, total_norm_sq)
 
         stats_group = self._stats_group(mp_opt)
-        if stats_group is not None:
+        # world == 1 (the mp self-group under the pinned tp == cp == pp == 1
+        # world): the allreduce is an identity op, so elide it — megatron's
+        # own per-step collectives on that group initialize its communicator
+        # regardless.
+        if (stats_group is not None
+                and torch.distributed.get_world_size(stats_group) > 1):
             torch.distributed.all_reduce(
-                total_norm_sq, op=torch.distributed.ReduceOp.SUM, group=stats_group
+                total_norm_sq, op=torch.distributed.ReduceOp.SUM,
+                group=stats_group
             )
         self._dp_bitwise_fix(total_norm_sq)
         grad_norm = total_norm_sq.sqrt().item()
@@ -719,8 +784,19 @@ class SGAEngine:
         for bucket_support in support.buckets:
             bucket_support.num_selected()
         support.total_selected
+        # Dual representation, resident per the backend's declared input form
+        # (yaml picks the backend by name, which IS the manual override): an
+        # idx-consuming backend gets its sorted indices compacted and cached
+        # here, outside the collective path, instead of paying the chunked
+        # compaction inside the first sparse sync.
+        if self.backend.decl.consumes == "idx":
+            for bucket_support in support.buckets:
+                bucket_support.idx
         for bs, bucket_support in zip(self._bucket_states, support.buckets):
             bs.active_mask_u8 = bucket_support.mask_u8
+        # The freshly written pool slot becomes the active one; the next
+        # reselection writes into the other slot (see _assemble_bucket_masks).
+        self._mask_turn = 1 - self._mask_turn
 
     # --------------------------------------------------------------- logging
 

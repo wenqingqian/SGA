@@ -28,6 +28,8 @@ DECL = BackendDecl(name="masked_pipelined", consumes="mask")
 class MaskedPipelinedBackend:
     """Consumes the mask form of a bucket's support."""
 
+    decl = DECL
+
     def __init__(self, params: dict):
         self.num_slices = int(params.get("num_slices", 0)) or 2
 

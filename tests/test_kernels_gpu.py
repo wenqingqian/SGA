@@ -149,6 +149,63 @@ def test_scatter_selected_roundtrip():
     assert torch.all(dst.cpu()[rest] == 0)
 
 
+def test_radius_score_modes_purity_and_content():
+    """Triton full-step score emission : with a named score the
+    two outputs swap targets — the score lands in the grad buffer, the signed
+    update in score_out — and moments/params stay bitwise identical to the
+    default run; the emitted score matches its reference from the PRE-commit
+    state (migrated from test_sga_scheme_xp_mask_score.py)."""
+    device = "cuda"
+    n = 999_999
+    lr, b1, b2, eps, wd, step = 5e-5, 0.9, 0.95, 1e-8, 0.1, 1501
+    torch.manual_seed(3)
+    w0 = torch.randn(n) * 0.02
+    g0 = torch.randn(n) * 1e-3
+    m0 = torch.randn(n) * 1e-3
+    v0 = torch.rand(n) * 1e-6
+
+    def run(score_mode=None):
+        w = w0.clone().to(device)
+        g = g0.clone().to(device)
+        m, v = m0.clone().to(device), v0.clone().to(device)
+        side = None if score_mode is None else torch.empty(n, device=device)
+        radius_grad_correct(w, g, m, v, lr, b1, b2, eps, wd, step,
+                            mask=None, write_update=True,
+                            score_out=side, score_mode=score_mode or "coi")
+        return w, g, m, v, side
+
+    w1, g1, m1, v1, _ = run(None)               # default: update in grads
+    bc1, bc2 = 1 - b1 ** step, 1 - b2 ** step
+    m1c = b1 * m0 + (1 - b1) * g0
+    v1c = b2 * v0 + (1 - b2) * g0 * g0
+    u_g = (m1c / bc1) / ((v1c / bc2).sqrt() + eps)
+
+    for mode, ref in (
+        ("coi", ((m1c / bc1) / ((v1c / bc2).sqrt() + eps)
+                 - (b1 * m0 / bc1) / ((b2 * v0 / bc2).sqrt() + eps)).abs()),
+        ("abs_g_synced", g0.abs()),
+        ("abs_m", m0.abs()),
+    ):
+        w2, g2, m2, v2, side = run(mode)
+        assert torch.equal(m1.cpu(), m2.cpu())
+        assert torch.equal(v1.cpu(), v2.cpu())
+        assert torch.equal(w1.cpu(), w2.cpu())   # write_update never touches w
+        torch.testing.assert_close(side.cpu(), g1.cpu(), rtol=1e-5, atol=1e-6)
+        rel = ((g2.cpu().double() - ref.double()).abs().max()
+               / ref.double().max().clamp(min=1e-30)).item()
+        assert rel < 1e-5, (mode, rel)
+
+    # unknown score mode is rejected host-side before any launch
+    try:
+        radius_grad_correct(w0.clone(), g0.clone(), m0.clone(), v0.clone(),
+                            lr, b1, b2, eps, wd, step, mask=None,
+                            write_update=True,
+                            score_out=torch.empty(n), score_mode="bogus")
+        raise AssertionError("bogus score_mode accepted")
+    except ValueError as e:
+        assert "score_mode" in str(e), e
+
+
 if __name__ == "__main__":
     try:
         import triton  # noqa: F401

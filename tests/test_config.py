@@ -75,6 +75,33 @@ def test_fourfield_origin_combination_resolves():
     print("ok: four-field origin combination resolves to the engine config")
 
 
+def test_start_iter_percent_resolves():
+    """cycle.start_iter_percent resolves against train.model.train_iters in
+    the loader, before the canonical --sga-config JSON is built."""
+    cfg, _ = make_base()
+    cfg.train.model.train_iters = 5000
+    cfg.sga.enabled = True
+    cfg.sga.cycle = {"start_iter_percent": 10.0, "period": 4,
+                     "full_sync_interval": 0}
+    cfg.sga.score = {"name": "abs_m"}
+    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 40.0}
+    cfg.sga.error_feedback = {"name": "radius_opt"}
+    cfg.sga.backend = {"name": "indexed_sparse"}
+    engine_cfg = sga_section_to_config(cfg)
+    assert engine_cfg["cycle"]["start_iter"] == 500
+    assert "start_iter_percent" not in engine_cfg["cycle"]
+
+    cfg.sga.cycle = {"start_iter": 4, "start_iter_percent": 10.0, "period": 4}
+    expect_error(lambda: validate_sga_section(cfg), "not both")
+    # an explicit null hits the intended range diagnostic, not float(None)
+    cfg.sga.cycle = {"start_iter_percent": None, "period": 4}
+    expect_error(lambda: validate_sga_section(cfg), "got null")
+    cfg.sga.cycle = {"start_iter_percent": 10.0, "period": 4}
+    cfg.train.model.train_iters = 0
+    expect_error(lambda: validate_sga_section(cfg), "train_iters > 0")
+    print("ok: start_iter_percent resolves in the loader")
+
+
 def test_illegal_combination_rejected():
     cfg, _ = make_base()
     cfg.sga.enabled = True
@@ -197,6 +224,7 @@ if __name__ == "__main__":
     test_all_off_dense_ok()
     test_enabled_field_named_in_error()
     test_fourfield_origin_combination_resolves()
+    test_start_iter_percent_resolves()
     test_illegal_combination_rejected()
     test_sparse_backend_required_when_enabled()
     test_missing_sga_section()

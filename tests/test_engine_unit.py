@@ -59,6 +59,11 @@ def test_cycle_radius_pattern():
         [28, 36, 44, 52, 60]
 
 
+# (the v3.1 warmup-anchor formula moved INTO circular_topk with the
+# selection-owned warmup_sync_target hook; its pinning lives in
+# tests/test_plugins_unit.py::test_warmup_sync_target_anchor)
+
+
 # ------------------------------------------------- payload scaling residual
 
 class _ReplicaWorld:
@@ -105,6 +110,144 @@ def test_payload_scaling_preserves_residual_bitwise():
     assert torch.equal(grad[~active], grad0[~active])
     # selected coords: exactly sum-over-replicas * factor (2-pow exact)
     assert torch.equal(grad[active], grad0[active] * 4 * factor)
+
+
+def test_pipelined_idx_sorted_matches_indexed_sparse():
+    """The S-slice hiprio twin-group backend lands bitwise-identical gradients
+    to the two-slice midpoint backend (same element sets, same collective
+    order within the slice partition, payload scaling on selected only)."""
+    from sga.backends.indexed_sparse import IndexedSparseBackend
+    from sga.backends.pipelined_idx_sorted import PipelinedIdxSortedBackend
+
+    for world, k_shape in ((1, None), (4, None), (4, 7)):  # incl. tiny uneven K
+        torch.manual_seed(21 + world)
+        n = 4096
+        mask = (torch.rand(n) < 0.25).to(torch.uint8)
+        if k_shape is not None:  # force exactly k selected (uneven 3-way split)
+            mask = torch.zeros(n, dtype=torch.uint8)
+            mask[torch.randperm(n)[:k_shape]] = 1
+        support = BucketSupport(mask)
+        factor = 0.125
+
+        g_ref = torch.randn(n)
+        g_new = g_ref.clone()
+        with _ReplicaWorld(world=world):
+            IndexedSparseBackend({}).allreduce_sparse(
+                g_ref, support, None, factor,
+                torch.distributed.ReduceOp.SUM, key=0)
+            PipelinedIdxSortedBackend({}).allreduce_sparse(
+                g_new, support, None, factor,
+                torch.distributed.ReduceOp.SUM, key=0)
+        assert torch.equal(g_new, g_ref), (world, k_shape)
+
+    # grow-only discipline: a smaller second cycle keeps the same capacity
+    be = PipelinedIdxSortedBackend({})
+    assert be.decl.consumes == "idx"  # engine activates by this attribute
+    assert be.decl.name == "pipelined_idx_sorted"
+    from sga.backends.indexed_sparse import IndexedSparseBackend
+    assert IndexedSparseBackend({}).decl.consumes == "idx"
+    with _ReplicaWorld(world=1):
+        be.allreduce_sparse(torch.randn(1000), BucketSupport(
+            torch.ones(1000, dtype=torch.uint8)), None, 1.0,
+            torch.distributed.ReduceOp.SUM, key=3)
+        cap = be._gather_bufs[3].numel()
+        be.allreduce_sparse(torch.randn(1000), BucketSupport(
+            (torch.rand(1000) < 0.01).to(torch.uint8)), None, 1.0,
+            torch.distributed.ReduceOp.SUM, key=3)
+    assert be._gather_bufs[3].numel() == cap
+
+    # eager twin-group plumbing: prepare() is where the ONLY group creation
+    # happens (never lazily inside allreduce_sparse); idempotent; without a
+    # live NCCL world the plain group is kept.
+    be = PipelinedIdxSortedBackend({})
+    assert be._twins == {}
+    sentinel = object()
+    be.prepare(None)                       # missing group: no-op
+    be.prepare(sentinel)                   # no NCCL init here: keep plain
+    be.prepare(sentinel)                   # idempotent
+    assert len(be._twins) == 1 and be._twins[sentinel] is sentinel
+    assert be._group_for(sentinel) is sentinel
+    assert be._group_for(None) is None
+    try:
+        PipelinedIdxSortedBackend({"slices": 0})
+        raise AssertionError("slices=0 accepted")
+    except ValueError:
+        pass
+
+    # backend-owned runtime validation: single pipeline phase + exactly one
+    # DP-CP group covering the world (multi-DP-CP / tensor / context /
+    # expert layouts are refused at config time, not ordered at new_group).
+    ns = SimpleNamespace
+    be.validate_runtime(ns(pipeline_model_parallel_size=1,
+                           tensor_model_parallel_size=1,
+                           context_parallel_size=1,
+                           expert_model_parallel_size=1))
+    for bad in (
+        {"pipeline_model_parallel_size": 2},
+        {"tensor_model_parallel_size": 2},
+        {"context_parallel_size": 2},
+        {"expert_model_parallel_size": 4},
+    ):
+        try:
+            be.validate_runtime(ns(**bad))
+            raise AssertionError(f"bad topology accepted: {bad}")
+        except ValueError:
+            pass
+
+    # (resume fail-closed coverage lives in its own test function below so
+    # a failure names that concern, not this parity mega-test)
+    print("ok: pipelined_idx_sorted == indexed_sparse "
+          "(world 1/4, uneven K, grow-only, eager prepare, validate_runtime)")
+
+
+def test_resume_fail_closed_refusal_and_hermetic_override():
+    """Resume fail-closed conventions: a load dir WITH a checkpoint tracker
+    is refused (twin-PG residency does not fit a resume run's steady
+    state); cold-start conventions (no dir / dir without tracker) pass;
+    the escape-hatch env overrides. The env var is scrubbed before the
+    refuse assertion and restored afterwards, so the refusal case stays
+    hermetic even when it is pre-exported in the runner's shell (its
+    documented use — 80GB hardware — is exactly exporting it before
+    running the suite)."""
+    import tempfile
+
+    import sga.backends.pipelined_idx_sorted as pis
+    from sga.backends.pipelined_idx_sorted import PipelinedIdxSortedBackend
+
+    ns = SimpleNamespace
+    base = dict(pipeline_model_parallel_size=1,
+                tensor_model_parallel_size=1,
+                context_parallel_size=1,
+                expert_model_parallel_size=1)
+    be = PipelinedIdxSortedBackend({})
+    with tempfile.TemporaryDirectory() as td:
+        ckpt = os.path.join(td, "checkpoints")
+        os.makedirs(ckpt)
+        # no dir / dir without tracker: cold start, pass
+        be.validate_runtime(ns(**base, load=os.path.join(td, "missing")))
+        be.validate_runtime(ns(**base, load=ckpt))
+        # tracker present: resume, refuse (message names the alternative
+        # AND the documented escape hatch)
+        open(os.path.join(ckpt, "latest_checkpointed_iteration.txt"), "w").write("60")
+        # hermetic: scrub any pre-exported escape hatch so the refusal
+        # below tests the default behavior; restore whatever was set.
+        prev = os.environ.pop(pis._RESUME_OVERRIDE_ENV, None)
+        try:
+            try:
+                be.validate_runtime(ns(**base, load=ckpt))
+                raise AssertionError("resume accepted")
+            except ValueError as e:
+                assert "indexed_sparse" in str(e)
+                assert pis._RESUME_OVERRIDE_ENV in str(e)
+            os.environ[pis._RESUME_OVERRIDE_ENV] = "1"
+            be.validate_runtime(ns(**base, load=ckpt))  # override passes
+        finally:
+            if prev is None:
+                os.environ.pop(pis._RESUME_OVERRIDE_ENV, None)
+            else:
+                os.environ[pis._RESUME_OVERRIDE_ENV] = prev
+    print("ok: resume fail-closed (cold start passes, tracker refused, "
+          "override honored, env restored)")
 
 
 # ------------------------------------------------ consistency negative tests
@@ -198,9 +341,9 @@ class _FakeBucket:
 
 
 class _FakeGroup:
-    def __init__(self, bucket):
+    def __init__(self, bucket, data_parallel_group=None):
         self.buckets = [bucket]
-        self.data_parallel_group = None
+        self.data_parallel_group = data_parallel_group
         self.reset_calls = 0
 
     def reset(self):
@@ -415,6 +558,108 @@ def test_grad_norm_bypass_forces_next_full():
         assert eng._cycle.force_next is True
         eng.grad_sync(chunk, force_all_reduce=False)  # NOT force_all_reduce
         assert eng._step_full is True  # the bypass forced the dense path
+
+
+# ------------------------------------------------- generic optional hooks
+
+class _HookSelection:
+    """Stub selection exposing BOTH optional hooks the engine probes
+    generically (same getattr discipline as adapt()/wants_force_full())."""
+
+    params = {}
+
+    def __init__(self):
+        self.anchor_calls = []
+        self.ctx = None
+
+    def k_for(self, n_total):
+        return max(1, n_total // 2)
+
+    def warmup_sync_target(self, start_iter, period):
+        self.anchor_calls.append((start_iter, period))
+        return 42
+
+    def select(self, ctx):
+        self.ctx = ctx
+        return [torch.ones(g.numel(), dtype=torch.uint8) for g in ctx.grad_views]
+
+
+class _PrepareBackend(IndexedSparseBackend):
+    def __init__(self):
+        super().__init__({})
+        self.prepared = []
+
+    def prepare(self, comm_group, device=None):
+        self.prepared.append((comm_group, device))
+
+
+def test_generic_optional_hooks_fire():
+    """The engine probes plugins generically: a selection-owned
+    warmup_sync_target(start_iter, period) supplies ctx.warmup_target (the
+    v3.1 anchor policy lives IN the selection), and a backend's optional
+    prepare(comm_group, device) runs once per distinct DP group at attach
+    time — before any training step, with the bucket grad-buffer device."""
+    grp = object()
+    chunk = _FakeChunk()
+    chunk.group.data_parallel_group = grp
+
+    backend = _PrepareBackend()
+    score = build_score("abs_g", {"name": "abs_g"})
+    selection = _HookSelection()
+    ef = build_ef("masked_adamw", {})
+    eng = SGAEngine(
+        {"cycle": {"start_iter": 0, "period": 1, "full_sync_interval": 10}},
+        score, selection, ef, backend)
+    eng._dp_cp_group = lambda: None  # single-process: skip cross-rank layers
+
+    eng.attach(chunk)
+    assert backend.prepared == [(grp, chunk.bucket.grad_data.device)]
+    eng.attach(chunk)                  # duplicate attach is a no-op
+    assert backend.prepared == [(grp, chunk.bucket.grad_data.device)]
+
+    mp = _FakeMPOpt(chunk)
+    with _ReplicaWorld(world=1):
+        _accumulate_into_bucket(chunk)
+        assert eng.grad_sync(chunk, force_all_reduce=False) is True
+        ok, _, _ = eng.optimizer_step(mp, [chunk], 1)
+    assert ok is True
+    # called with (cycle.start_iter, cycle.period); result lands in ctx
+    assert selection.anchor_calls == [(0, 1)]
+    assert selection.ctx.warmup_target == 42
+
+
+def test_synced_score_values_routed_before_selection():
+    """On the synced path the materialized views pass THROUGH the score
+    plugin's values() exactly once per reselection before selection sees
+    them (identity pass-throughs today; the contract must stay honest)."""
+    calls = {"n": 0}
+
+    class _SyncedScore:
+        decl = SimpleNamespace(scoring_input="synced")
+
+        def values(self, views):
+            calls["n"] += 1
+            return views
+
+    score = _SyncedScore()
+    selection = _HookSelection()
+    ef = build_ef("radius_opt", {"residual_mean": False})
+    eng = SGAEngine(
+        {"cycle": {"start_iter": 2, "period": 3, "full_sync_interval": 0}},
+        score, selection, ef, IndexedSparseBackend({}))
+    eng._dp_cp_group = lambda: None
+
+    chunk = _FakeChunk()
+    mp = _FakeMPOpt(chunk)
+    eng.attach(chunk)
+    with _ReplicaWorld(world=1):
+        for it in range(1, 6):  # boundaries at start_iter=2, T=3 -> step 5
+            _accumulate_into_bucket(chunk)
+            assert eng.grad_sync(chunk, force_all_reduce=False) is True
+            ok, _, _ = eng.optimizer_step(mp, [chunk], it)
+            assert ok
+    assert calls["n"] == 1
+    assert selection.ctx.grad_views is not None
 
 
 # ------------------------------------------------- step-counter + resume C1/C2

@@ -15,6 +15,86 @@ from typing import Optional
 
 import torch
 
+# Mask-compaction granularity: mask bytes processed per nonzero chunk. A
+# full-mask nonzero on a 1.2B-element bucket allocates a fresh GB-scale
+# int64 output every cycle; under expandable_segments those alloc/free
+# cycles hit cuMemMap/cuMemSetAccess ioctl storms (the legacy scheme
+# observed multi-second stalls at the second mask rebuild). Chunking keeps
+# the transient int64 outputs small enough for the caching allocator.
+_MASK_COMPACT_CHUNK = 32 << 20
+# Index/gather buffer growth granularity: 4M elements (16MB fp32).
+_GATHER_BUF_CHUNK = 4 << 20
+
+
+class IndexPool:
+    """Grow-only int32 buffer shared across cycles for one bucket's idx.
+
+    Reallocating the sorted-index array every cycle is the same allocator
+    storm the compaction chunking avoids; the capacity only ever grows
+    (rounded up to _GATHER_BUF_CHUNK) and consumers take buf[:k] views.
+
+    Lifecycle constraint: growth REPLACES ``buf``, stranding prior
+    ``buf[:k]`` views over freed storage — safe only because the engine
+    drops a cycle's old Support before compaction can grow the pool, so
+    nothing reads a dropped support's idx afterwards.
+    """
+
+    def __init__(self):
+        self.buf: Optional[torch.Tensor] = None
+
+    def get(self, k: int, device) -> torch.Tensor:
+        if self.buf is None or self.buf.numel() < k or self.buf.device != device:
+            cap = -(-k // _GATHER_BUF_CHUNK) * _GATHER_BUF_CHUNK
+            if self.buf is not None and self.buf.device == device:
+                cap = max(cap, self.buf.numel())  # never shrink
+            self.buf = torch.empty(cap, dtype=torch.int32, device=device)
+        return self.buf
+
+
+def compact_mask_u8(mask_u8: torch.Tensor, pool: Optional[IndexPool] = None) -> torch.Tensor:
+    """Sorted int32 indices of the set positions of ``mask_u8``.
+
+    Bitwise equivalent to ``mask_u8.nonzero(as_tuple=True)[0].to(torch.int32)``
+    (chunks are processed in order, so global ordering is preserved). Without
+    a pool (small/unit-scale inputs) it is the plain one-shot nonzero; with
+    one, counting is chunked (a whole-mask sum(dtype=int64) materializes a
+    full int64 copy — 8 bytes/elem) and the result lives in the persistent
+    grow-only buffer instead of a fresh allocation per cycle.
+
+    Precondition: mask bytes must be exactly 0/1 (asserted against the
+    count/fill agreement below).
+    """
+    n = mask_u8.numel()
+    # int32 canonical indices: refuse oversized masks loudly instead of
+    # wrapping silently. Guarded HERE too (eager activation-time compaction
+    # runs earlier than any backend's own assert, so wrapped indices could
+    # otherwise sit cached through the activate->sync window).
+    assert n < 2 ** 31, f"int32 support indices assume < 2^31 elements, got {n}"
+    if pool is None and n <= _MASK_COMPACT_CHUNK:
+        return mask_u8.nonzero(as_tuple=True)[0].to(torch.int32)
+    k = 0
+    for s in range(0, n, _MASK_COMPACT_CHUNK):
+        k += int(mask_u8[s:s + _MASK_COMPACT_CHUNK].sum().item())
+    if pool is not None:
+        buf = pool.get(k, mask_u8.device)
+    else:
+        buf = torch.empty(k, dtype=torch.int32, device=mask_u8.device)
+    off = 0
+    for s in range(0, n, _MASK_COMPACT_CHUNK):
+        sub = mask_u8[s:s + _MASK_COMPACT_CHUNK].nonzero(as_tuple=True)[0]
+        m = sub.numel()
+        if m:
+            buf[off:off + m].copy_(sub.add_(s))
+            off += m
+    # Count/fill disagreement is the 0/1 precondition failing: the count pass
+    # SUMS bytes, so values > 1 would otherwise hand back uninitialized int32
+    # slots as indices.
+    assert off == k, (
+        f"compact_mask_u8: mask bytes must be exactly 0/1 "
+        f"(counted {k}, filled {off})"
+    )
+    return buf[:k]
+
 
 @dataclass
 class BucketSupport:
@@ -22,6 +102,9 @@ class BucketSupport:
 
     # Element-level uint8 mask at bucket granularity (the selection output).
     mask_u8: torch.Tensor
+    # Persistent grow-only idx pool for this bucket (engine-owned); None in
+    # unit tests / small-scale use falls back to one-shot nonzero.
+    idx_pool: Optional[IndexPool] = field(default=None, repr=False)
     # Number of selected elements (host int; derived once and cached — the
     # mask never changes within a cycle, so per-step rescans are pure waste).
     n_selected: Optional[int] = field(default=None, repr=False)
@@ -53,7 +136,7 @@ class BucketSupport:
     @property
     def idx(self) -> torch.Tensor:
         if self._idx is None:
-            self._idx = self.mask_u8.nonzero(as_tuple=True)[0].to(torch.int32)
+            self._idx = compact_mask_u8(self.mask_u8, self.idx_pool)
         return self._idx
 
     @property

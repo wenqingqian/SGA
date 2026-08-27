@@ -91,9 +91,42 @@ def sga_section_to_config(config: DictConfig):
     engine_config["cycle"] = (
         OmegaConf.to_container(cycle, resolve=True) if cycle is not None else {}
     )
+    _resolve_cycle_start(engine_config["cycle"], config)
 
     _validate_against_registries(engine_config)
     return engine_config
+
+
+def _resolve_cycle_start(cycle: dict, config: DictConfig) -> None:
+    """Resolve ``cycle.start_iter_percent`` (of train.model.train_iters) into
+    the absolute ``start_iter`` the engine speaks — here, BEFORE the section
+    is serialized into the canonical ``--sga-config`` JSON (which only ever
+    carries start_iter). The two forms are mutually exclusive."""
+    if "start_iter_percent" not in cycle:
+        return
+    if cycle.get("start_iter") is not None:
+        raise ValueError(
+            "sga.cycle: set either start_iter or start_iter_percent, not both."
+        )
+    train_iters = OmegaConf.select(config, "train.model.train_iters", default=None)
+    if not train_iters or int(train_iters) <= 0:
+        raise ValueError(
+            "sga.cycle.start_iter_percent requires train.model.train_iters > 0."
+        )
+    pct_raw = cycle.pop("start_iter_percent")
+    # An explicit null must fail with the range diagnostic below, not a
+    # TypeError from float(None) inside the comparison.
+    if pct_raw is None:
+        raise ValueError(
+            "sga.cycle.start_iter_percent must be a number in [0, 100] "
+            "(got null)."
+        )
+    pct = float(pct_raw)
+    if not 0.0 <= pct <= 100.0:
+        raise ValueError(
+            f"sga.cycle.start_iter_percent must be in [0, 100] (got {pct})."
+        )
+    cycle["start_iter"] = max(0, int(round(pct / 100.0 * int(train_iters))))
 
 
 def _validate_against_registries(engine_config: dict) -> None:

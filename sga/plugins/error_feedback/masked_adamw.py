@@ -38,7 +38,7 @@ DECL = EFDecl(
     name="masked_adamw",
     reset_mode="selective",
     needs_acc_count=True,
-    emits_score_view=False,
+    emittable_scores=frozenset(),
     requires_full_sync_every_period=False,
 )
 
@@ -266,10 +266,15 @@ class MaskedAdamWEF:
 
     decl = DECL
 
-    def __init__(self, params: dict):
+    def __init__(self, params: dict, emit_score: Optional[str] = None):
         self.params = params
         self.freeze_inactive = bool(params.get("freeze_inactive", False))
         self.use_acc_count = bool(params.get("grad_acc_count", True))
+        if emit_score is not None:
+            raise ValueError(
+                "masked_adamw emits no score view (its full step is a plain "
+                f"dense AdamW); cannot emit '{emit_score}'"
+            )
 
     def ensure_state(self, bucket_states):
         """Allocate (once, grow-only) the per-bucket uint8 acc-count buffers."""
