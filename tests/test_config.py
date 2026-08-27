@@ -9,7 +9,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omegaconf import OmegaConf
 
-from sga.config import validate_config, validate_sga_section
+from sga.config import (
+    sga_section_to_config,
+    validate_config,
+    validate_sga_section,
+)
 from sga.launcher.backend_megatron import _get_args_megatron
 
 BASE = """
@@ -19,9 +23,7 @@ experiment:
   task: {type: train, backend: megatron, entrypoint: ./sga/train_gpt.py}
   runner: {type: ssh}
 sga:
-  score: {enabled: false}
-  selection: {enabled: false}
-  error_feedback: {enabled: false}
+  enabled: false
   backend: {name: dense}
 train:
   system: {tensor_model_parallel_size: 1}
@@ -55,9 +57,45 @@ def test_all_off_dense_ok():
 
 def test_enabled_field_named_in_error():
     cfg, _ = make_base()
-    cfg.sga.selection.enabled = True
+    cfg.sga.selection = {"name": "threshold"}
     expect_error(lambda: validate_sga_section(cfg), "selection")
     print("ok: enabled field is named in the error")
+
+
+def test_fourfield_origin_combination_resolves():
+    cfg, _ = make_base()
+    cfg.sga.enabled = True
+    cfg.sga.cycle = {"start_iter": 0, "period": 1, "full_sync_interval": 10}
+    cfg.sga.score = {"name": "abs_g"}
+    cfg.sga.selection = {"name": "threshold", "threshold": 1.0e-4}
+    cfg.sga.error_feedback = {"name": "masked_adamw"}
+    cfg.sga.backend = {"name": "masked_pipelined"}
+    engine_cfg = sga_section_to_config(cfg)
+    assert engine_cfg["selection"] == {"name": "threshold", "threshold": 1.0e-4}
+    print("ok: four-field origin combination resolves to the engine config")
+
+
+def test_illegal_combination_rejected():
+    cfg, _ = make_base()
+    cfg.sga.enabled = True
+    cfg.sga.score = {"name": "update_ratio"}
+    cfg.sga.selection = {"name": "threshold"}
+    cfg.sga.error_feedback = {"name": "radius_opt"}
+    cfg.sga.backend = {"name": "indexed_sparse"}
+    expect_error(lambda: validate_sga_section(cfg), "threshold path")
+    print("ok: declaration-illegal combination rejected")
+
+
+def test_sparse_backend_required_when_enabled():
+    cfg, _ = make_base()
+    cfg.sga.enabled = True
+    cfg.sga.cycle = {"start_iter": 0, "period": 1, "full_sync_interval": 10}
+    cfg.sga.score = {"name": "abs_g"}
+    cfg.sga.selection = {"name": "threshold"}
+    cfg.sga.error_feedback = {"name": "masked_adamw"}
+    # backend stays {name: dense} from BASE
+    expect_error(lambda: validate_sga_section(cfg), "dense")
+    print("ok: enabled-with-dense-backend rejected")
 
 
 def test_missing_sga_section():
@@ -70,8 +108,8 @@ def test_missing_sga_section():
 def test_unknown_backend_lists_valid():
     cfg, _ = make_base()
     cfg.sga.backend.name = "quantum"
-    expect_error(lambda: validate_sga_section(cfg), "dense")
-    print("ok: unknown backend rejected with valid set")
+    expect_error(lambda: validate_sga_section(cfg), "backend")
+    print("ok: unknown backend rejected with curated error")
 
 
 def test_non_dict_subfield_rejected_cleanly():
@@ -98,6 +136,43 @@ def test_sga_never_reaches_megatron_cmdline():
     print("ok: sga section never reaches the megatron command line")
 
 
+def test_enabled_injects_canonical_sga_config_pair():
+    """Enabled path: the launcher must append EXACTLY one pair --
+    --sga-config followed by the canonical (sorted-key) resolved JSON --
+    and nothing else from the sga section."""
+    import json
+
+    cfg, tmp = make_base()
+    cfg.sga.enabled = True
+    cfg.sga.cycle = {"start_iter": 0, "period": 2, "full_sync_interval": 0}
+    cfg.sga.score = {"name": "abs_g"}
+    cfg.sga.selection = {"name": "threshold", "threshold": 1.0e-4}
+    cfg.sga.error_feedback = {"name": "masked_adamw", "grad_acc_count": True}
+    cfg.sga.backend = {"name": "masked_pipelined"}
+    expected_engine_cfg = sga_section_to_config(cfg)
+
+    from sga.launcher.backend_megatron import _update_config_train
+
+    try:
+        _update_config_train(cfg)
+        args = _get_args_megatron(cfg)
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    assert args.count("--sga-config") == 1, args
+    i = args.index("--sga-config")
+    payload = args[i + 1]
+    # byte-exact canonical injection
+    assert payload == json.dumps(expected_engine_cfg, sort_keys=True)
+    assert json.loads(payload)["cycle"]["period"] == 2
+    assert json.loads(payload)["error_feedback"]["grad_acc_count"] is True
+    # no other sga-derived tokens may ride along (train.* flatten is separate)
+    assert [a for a in args if a.startswith("abs_g") or a.startswith("masked_")] == []
+    print("ok: enabled path injects exactly ['--sga-config', canonical-json]")
+
+
 def test_flatten_bool_semantics():
     cfg, tmp = make_base()
     cfg.train.system.logging = {}
@@ -121,9 +196,13 @@ def test_flatten_bool_semantics():
 if __name__ == "__main__":
     test_all_off_dense_ok()
     test_enabled_field_named_in_error()
+    test_fourfield_origin_combination_resolves()
+    test_illegal_combination_rejected()
+    test_sparse_backend_required_when_enabled()
     test_missing_sga_section()
     test_unknown_backend_lists_valid()
     test_non_dict_subfield_rejected_cleanly()
     test_sga_never_reaches_megatron_cmdline()
+    test_enabled_injects_canonical_sga_config_pair()
     test_flatten_bool_semantics()
     print("test_config: ALL PASS")

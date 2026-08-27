@@ -45,6 +45,17 @@ def _get_args_megatron(config: DictConfig):
     # Flatten the dictionary to a list of arguments
     args = flatten_dict_to_args(new_config_dict, ignore_keys)
 
+    # SGA rides the narrow-waist config exit as ONE canonical-JSON argument
+    # (never through the flatten; resolved string, not a path — a path would
+    # not be self-contained in checkpoints and could diverge under
+    # no_shared_fs). notes/sga-waist-api-v1.md section 7.
+    from sga.config.loader import sga_section_to_config
+    from sga.runtime import canonical_config_json
+
+    sga_engine_config = sga_section_to_config(config)
+    if sga_engine_config is not None:
+        args += ["--sga-config", canonical_config_json(sga_engine_config)]
+
     return args
 
 
@@ -179,7 +190,10 @@ class MegatronBackend(BackendBase):
             f.write("\n")
             f.write(f"export PYTHONPATH={shlex.quote(pkg_dir)}:${{PYTHONPATH}}\n")
             f.write("\n")
-            f.write(f'cmd="{cmd}"\n')
+            # shlex.quote: the cmd already embeds shlex-quoted words (e.g. the
+            # --sga-config JSON in single quotes); a plain double-quoted
+            # assignment would eat the JSON's inner double quotes.
+            f.write(f"cmd={shlex.quote(cmd)}\n")
             f.write("\n")
 
             if background:

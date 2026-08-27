@@ -1,0 +1,144 @@
+# SGA "radius" named preset : circular-topk scheme as a pure
+# four-field config combination. Everything outside the sga: section mirrors
+# examples/llama3/train_1b_dense.yaml so runs are directly comparable.
+#
+# score=update_ratio + selection=circular_topk (histogram exact topk) +
+# error_feedback=radius_opt (residual) + backend=indexed_sparse.
+# Cycle: full sync + reselect every period-8 boundary after start_iter;
+# residual folds undivided at boundaries (paper-exact).
+
+defaults:
+  - _self_
+
+experiment:
+  exp_name: UNDEFINED
+  exp_dir: UNDEFINED
+  task:
+    type: train
+    backend: megatron
+    entrypoint: ./sga/train_gpt.py
+  runner:
+    type: ssh
+    backend: torchrun
+    nnodes: 1
+    nproc_per_node: 8
+    ssh_port: 2222
+    master_port: 29512
+    no_shared_fs: false
+    rdzv_backend: static
+    hostfile: ./examples/llama3/hostfile.txt
+  cmds:
+    before_start: |
+      source /root/miniconda3/etc/profile.d/conda.sh && conda activate flagscale
+      source /workspace/sga_framework/SGA/env.sh --check
+      export LD_LIBRARY_PATH=/root/miniconda3/envs/flagscale/lib:\${LD_LIBRARY_PATH}
+      export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  envs:
+    SGA_MODEL: llama-1b
+    CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+    CUDA_DEVICE_MAX_CONNECTIONS: 1
+    NVTE_APPLY_QK_LAYER_SCALING: 0
+    NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+    NCCL_DEBUG: WARN
+    NCCL_IB_DISABLE: 0
+    NCCL_IB_GID_INDEX: 3
+    NCCL_NET_GDR_LEVEL: 5
+    NCCL_P2P_DISABLE: 0
+    NCCL_P2P_LEVEL: NVL
+    GLOO_SOCKET_IFNAME: enp226s0
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+action: run
+
+hydra:
+  run:
+    dir: ${experiment.exp_dir}/hydra
+
+sga:
+  enabled: true
+  cycle:
+    start_iter: 20
+    period: 8
+    full_sync_interval: 0
+  score:
+    name: update_ratio
+  selection:
+    name: circular_topk
+    ratio_percent: 10.0
+    exact_kthvalue: false
+  error_feedback:
+    name: radius_opt
+    residual_mean: false
+  backend:
+    name: indexed_sparse
+
+#### model ####
+
+train:
+  system:
+    rerun_mode: disabled
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    disable_bias_linear: True
+    use_flash_attn: True
+    sequence_parallel: True
+    use_distributed_optimizer: False
+    data_parallel_sharding_strategy: no_shard
+    precision:
+      bf16: True
+      attention_softmax_in_fp32: true
+      accumulate_allreduce_grads_in_fp32: true
+    logging:
+      timing_log_level: 2
+      log_interval: 1
+      log_throughput: true
+      log_params_norm: true
+      log_num_zeros_in_grad: true
+    checkpoint:
+      save_interval: 100000
+
+  model:
+    transformer_impl: transformer_engine
+    num_layers: 16
+    hidden_size: 2048
+    ffn_hidden_size: 8192
+    num_attention_heads: 32
+    seq_length: 2048
+    group_query_attention: True
+    num_query_groups: 8
+    max_position_embeddings: 2048
+    norm_epsilon: 1e-5
+    use_rotary_position_embeddings: True
+    swiglu: True
+    normalization: RMSNorm
+    position_embedding_type: rope
+    rotary_base: 500000
+    untie_embeddings_and_output_weights: True
+    init_method_std: 0.02
+    attention_dropout: 0.0
+    hidden_dropout: 0.0
+    clip_grad: 1.0
+    train_iters: 60
+    eval_iters: 0
+    eval_interval: 10000000
+    micro_batch_size: 1
+    global_batch_size: 8
+    seed: 1234
+    optimizer:
+      weight_decay: 1e-2
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      lr_scheduler:
+        lr: 1.0e-5
+        min_lr: 1.0e-6
+        lr_warmup_fraction: 0.1
+        lr_decay_style: cosine
+
+  data:
+    data_path: /workspace/sga_framework/data/openwebtext/openwebtext-meg-llama_text_document
+    split: 1
+    tokenizer:
+      tokenizer_type: HuggingFaceTokenizer
+      tokenizer_model: /workspace/sga_framework/data/llama3_dataset
+      vocab_size: 128256
+      make_vocab_size_divisible_by: 64

@@ -143,7 +143,8 @@ def test_run_script_skeleton():
             line.startswith("export PYTHONPATH=") and line.endswith(":${PYTHONPATH}")
             for line in lines
         )
-        assert 'cmd="echo hi"' in lines
+        # shlex.quote keeps the payload shell-safe (e.g. the --sga-config JSON)
+        assert "cmd='echo hi'" in lines
         nohup_lines = [line for line in lines if line.startswith('nohup bash -c "$cmd; sync"')]
         assert len(nohup_lines) == 1 and ">> " in nohup_lines[0] and "2>&1" in nohup_lines[0]
 
