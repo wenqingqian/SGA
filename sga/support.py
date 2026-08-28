@@ -1,13 +1,16 @@
 # Copyright (c) 2026, SGA framework contributors.
 """The Support object: which gradient coordinates are communicated this cycle.
 
-Representation is settled project lore (2026-08-27): idx and mask are two forms
-of the same support, without preference; the canonical form is the
-position-sorted index array (support comes from synchronized scoring state and
-is stable within a cycle), and the mask form is derived and cached on demand.
-Backends declare which form they consume; consistency checks always operate on
-the canonical sorted idx so there is exactly one conversion relationship
-between what is verified and what is communicated.
+Representation is settled project lore (2026-08-27): idx and mask are two
+forms of the same support; the STORED form is the mask (the selection's
+direct output, written into the engine's ping-pong pool), while the
+position-sorted index array is derived lazily from it by ``compact_mask_u8``
+and pooled on demand. Backends declare which form they consume. The
+consistency machinery (layer-1 counts, layer-2 dual checksums) computes
+directly from the MASK — chunked count/checksum kernels, no index
+materialization — so both what is verified and what is communicated reduce
+to the same underlying mask (and under shadow the idx is never materialized
+at all).
 """
 
 from dataclasses import dataclass, field

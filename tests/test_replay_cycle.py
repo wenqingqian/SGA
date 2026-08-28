@@ -525,7 +525,40 @@ def test_select_topk_flat_contract():
         raise AssertionError("negative scores accepted")
     except ValueError as e:
         assert "non-negative" in str(e), e
+    # NaN/Inf would sit in the histogram's top bit-pattern bins and displace
+    # real coordinates from the topk silently (min() does not catch NaN)
+    for bad in (float("nan"), float("inf")):
+        try:
+            soa.select_topk_flat(torch.tensor([0.5, bad, 0.2]), 2)
+            raise AssertionError(f"{bad} scores accepted")
+        except ValueError as e:
+            assert "finite" in str(e), e
     print("PASS test_select_topk_flat_contract")
+
+
+def test_param_hp_group_index_out_of_range():
+    """A catalog param_group index outside the step meta's param_groups is a
+    trace-integrity violation and must fail with a named error (a raw
+    IndexError from groups[gi] would be cryptic and point nowhere)."""
+    meta = {
+        "adam_beta1": 0.9, "adam_beta2": 0.999, "adam_eps": 1e-8,
+        "weight_decay": 0.0,
+        "param_groups": [
+            {"lr": 1e-3, "weight_decay": 0.0,
+             "adam_beta1": 0.9, "adam_beta2": 0.999, "adam_eps": 1e-8},
+            {"lr": 2e-3, "weight_decay": 0.1,
+             "adam_beta1": 0.85, "adam_beta2": 0.95, "adam_eps": 1e-7},
+        ],
+    }
+    b1, b2, eps, wd, gi = soa._param_hp(meta, {"param_group": 1})
+    assert (b1, b2, eps, wd, gi) == (0.85, 0.95, 1e-7, 0.1, 1)
+    for bad_gi in (-1, 2):
+        try:
+            soa._param_hp(meta, {"param_group": bad_gi})
+            raise AssertionError(f"group index {bad_gi} accepted")
+        except ValueError as e:
+            assert "outside the step meta param_groups" in str(e), e
+    print("PASS test_param_hp_group_index_out_of_range")
 
 
 def test_cli_rejects_invalid_options():
@@ -591,6 +624,7 @@ def main():
     test_determinism()
     test_per_group_hyperparams_resolve()
     test_select_topk_flat_contract()
+    test_param_hp_group_index_out_of_range()
     test_cli_rejects_invalid_options()
     test_print_summary_zero_distortion()
     print("\nall replay-cycle tests passed")

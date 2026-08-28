@@ -55,7 +55,7 @@ from sga.kernels import (
     sga_peek_step,
 )
 from sga.plugins.error_feedback import EFContext, ParamRecord
-from sga.shadow import readonly_score
+from sga.shadow import EMITS_USING_SCRATCH, readonly_score
 from sga.support import BucketSupport, Support
 from sga.trace import TraceCollector
 
@@ -180,7 +180,7 @@ class SGAEngine:
         # Trace collector: None unless sga.trace.dir is set — the dump slot
         # below then costs one None-check per step (zero-overhead-when-off).
         trace_cfg = config.get("trace", None)
-        self._trace = TraceCollector(trace_cfg) if trace_cfg else None
+        self._trace = TraceCollector(trace_cfg) if trace_cfg is not None else None
         # Shadow mode (sga.shadow): replicate the stock step() literally and
         # only READ state at cycle boundaries. shadow_score=false strips even
         # the read-only scoring (the stock-replication probe configuration:
@@ -414,27 +414,7 @@ class SGAEngine:
                     views = self.score.values(views)
             else:
                 views = self._selection_views()[0]
-            # Optional selection-owned warmup policy (generic hook probe —
-            # the v3.1 anchor math lives inside the selection, which alone
-            # interprets its own parameters).
-            warmup_hook = getattr(self.selection, "warmup_sync_target", None)
-            sel_ctx = SelectionContext(
-                grad_views=views,
-                always_sync_masks=always_slices,
-                comm_group=self._dp_cp_group(),
-                warmup_target=(warmup_hook(self._cycle.start_iter,
-                                           self._cycle.period)
-                               if callable(warmup_hook) else None),
-            )
-            masks = self.selection.select(sel_ctx)
-            bucket_masks = self._assemble_bucket_masks(masks, meta)
-            self._verify_support_consistency(bucket_masks)
-            if hasattr(self.selection, "adapt"):
-                self.selection.adapt(masks, always_slices)
-            new_support = Support([
-                BucketSupport(m, idx_pool=self._bucket_idx_pool(i))
-                for i, m in enumerate(bucket_masks)
-            ])
+            new_support = self._run_selection(views, always_slices, meta)
         else:
             new_support = None
 
@@ -541,6 +521,18 @@ class SGAEngine:
         views, always_slices, meta = self._selection_views()
         if self.score.decl.scoring_input == "synced":
             emit = self.score.decl.emit_name or self.score.decl.name
+            # Two largest-param-sized buffers carry the shared formula-chain
+            # temps (bitwise-identical out= routing) — the boundary's
+            # allocator high-water otherwise spikes several param-sized
+            # allocations on the largest param.
+            scratch = None
+            if records and emit in EMITS_USING_SCRATCH:
+                max_n = max(r.main_param.numel() for r in records)
+                ref = records[0].main_param
+                scratch = (
+                    torch.empty(max_n, dtype=ref.dtype, device=ref.device),
+                    torch.empty(max_n, dtype=ref.dtype, device=ref.device),
+                )
             views = []
             for (_, _, _, p) in meta:
                 rec = rec_of.get(id(p))
@@ -550,32 +542,13 @@ class SGAEngine:
                         f"(shape {tuple(p.shape)}); records were refreshed "
                         "from a different optimizer view"
                     )
-                views.append(readonly_score(rec, emit).view(-1))
+                views.append(readonly_score(rec, emit, scratch).view(-1))
             self._check_norm_spread(views)
             if self.score.decl.needs_support:
                 views = self.score.values(views, self._support_slices(meta))
             else:
                 views = self.score.values(views)
-        # Optional selection-owned warmup policy, probed exactly like the
-        # live path (the selection alone interprets its own parameters).
-        warmup_hook = getattr(self.selection, "warmup_sync_target", None)
-        sel_ctx = SelectionContext(
-            grad_views=views,
-            always_sync_masks=always_slices,
-            comm_group=self._dp_cp_group(),
-            warmup_target=(warmup_hook(self._cycle.start_iter,
-                                       self._cycle.period)
-                           if callable(warmup_hook) else None),
-        )
-        masks = self.selection.select(sel_ctx)
-        bucket_masks = self._assemble_bucket_masks(masks, meta)
-        self._verify_support_consistency(bucket_masks)
-        if hasattr(self.selection, "adapt"):
-            self.selection.adapt(masks, always_slices)
-        self._activate_support(Support([
-            BucketSupport(m, idx_pool=self._bucket_idx_pool(i))
-            for i, m in enumerate(bucket_masks)
-        ]))
+        self._activate_support(self._run_selection(views, always_slices, meta))
         if self._count_guard:
             self._check_counts()
 
@@ -595,6 +568,33 @@ class SGAEngine:
                     "must be deterministic (histogram/topk), this forks "
                     "dense trajectories and breaks the shadow invariant"
                 )
+
+    def _run_selection(self, views, always_slices, meta) -> "Support":
+        """Shared selection tail for both reselection call sites: warmup
+        probe → context → select → bucket assembly → consistency verify →
+        adapt → Support construction. The CALLER owns activation timing and
+        everything around it: live activates only after the EF's selective
+        reset has consumed the old support (step 7), shadow activates
+        immediately inside the RNG bracket — those orderings are load-bearing
+        and deliberately stay at the call sites."""
+        warmup_hook = getattr(self.selection, "warmup_sync_target", None)
+        sel_ctx = SelectionContext(
+            grad_views=views,
+            always_sync_masks=always_slices,
+            comm_group=self._dp_cp_group(),
+            warmup_target=(warmup_hook(self._cycle.start_iter,
+                                       self._cycle.period)
+                           if callable(warmup_hook) else None),
+        )
+        masks = self.selection.select(sel_ctx)
+        bucket_masks = self._assemble_bucket_masks(masks, meta)
+        self._verify_support_consistency(bucket_masks)
+        if hasattr(self.selection, "adapt"):
+            self.selection.adapt(masks, always_slices)
+        return Support([
+            BucketSupport(m, idx_pool=self._bucket_idx_pool(i))
+            for i, m in enumerate(bucket_masks)
+        ])
 
     def _selection_views(self):
         """Local per-param grad views (bucket order) + metadata for assembly.
@@ -1001,8 +1001,10 @@ class SGAEngine:
         # (yaml picks the backend by name, which IS the manual override): an
         # idx-consuming backend gets its sorted indices compacted and cached
         # here, outside the collective path, instead of paying the chunked
-        # compaction inside the first sparse sync.
-        if self.backend.decl.consumes == "idx":
+        # compaction inside the first sparse sync. Shadow gates this off:
+        # grad sync never goes sparse there, so no consumer exists and the
+        # compacted pool would be pure resident waste (~idx-sized per bucket).
+        if self.backend.decl.consumes == "idx" and not self._shadow:
             for bucket_support in support.buckets:
                 bucket_support.idx
         for bs, bucket_support in zip(self._bucket_states, support.buckets):

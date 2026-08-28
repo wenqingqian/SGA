@@ -71,12 +71,22 @@ def test_parse_branch_points():
     assert parse_branch_points("") == []
     assert parse_branch_points("50, 10,50") == [10, 50]
     assert parse_branch_points([200, 7]) == [7, 200]
+    assert parse_branch_points([10.0, 2]) == [2, 10]  # integral floats fine
     try:
         parse_branch_points([-3])
     except ValueError as e:
         assert ">= 0" in str(e)
     else:
         raise SystemExit("negative branch point must be rejected")
+    # non-integral specs: int() would silently truncate and land the window
+    # on the wrong step
+    for bad in ([10.5], "10.5", [None]):
+        try:
+            parse_branch_points(bad)
+        except ValueError as e:
+            assert "must be an integer" in str(e), e
+        else:
+            raise SystemExit(f"non-integral branch point accepted: {bad!r}")
     print("PASS test_parse_branch_points")
 
 
@@ -358,6 +368,59 @@ def test_rank_gate():
     print("PASS test_rank_gate")
 
 
+def test_meta_carries_engine_phase():
+    """meta['phase'] self-describes the producing engine mode: live_full /
+    live_sparse on the live path (the bootstrap region runs full — no
+    support exists until the first reselect at step > start_iter — then the
+    post-reselect step runs sparse under the active support), 'shadow' in
+    shadow mode. A mixed trace directory stops being an inference exercise."""
+    torch.manual_seed(4)
+    with tempfile.TemporaryDirectory() as td:
+        chunk = _FakeChunk()
+        mp = _FakeMPOpt(chunk)
+        eng = _build_traced_engine(
+            {"dir": td, "branch_points": [0], "window": 3}, chunk)
+        _drive_steps(eng, chunk, mp, [0, 1, 2])
+        phases = {}
+        for s in range(3):
+            m = torch.load(os.path.join(td, f"step_{s:06d}_g.pt"),
+                           weights_only=False)["meta"]
+            phases[s] = m["phase"]
+        assert phases[0] == "live_full", phases  # bootstrap: no support yet
+        assert phases[1] == "live_full", phases  # step 0 had no reselect
+        assert phases[2] == "live_sparse", phases  # post-reselect support
+    with tempfile.TemporaryDirectory() as td:
+        chunk = _FakeChunk()
+        from sga.plugins import build_ef, build_score, build_selection
+        from test_engine_unit import _ORIGIN
+        from test_shadow_unit import _ShadowCapableMPOpt
+        score = build_score(_ORIGIN["score"], {"name": _ORIGIN["score"]})
+        selection = build_selection(_ORIGIN["selection"],
+                                    dict(_ORIGIN["selection_params"]),
+                                    score=score)
+        ef = build_ef(_ORIGIN["ef"], dict(_ORIGIN["ef_params"]))
+        eng = SGAEngine({"cycle": _ORIGIN["cycle"], "shadow": True,
+                         "trace": {"dir": td, "branch_points": [0],
+                                   "window": 1}},
+                        score, selection, ef, _ORIGIN["backend"])
+        eng._dp_cp_group = lambda: None
+        eng.attach(chunk)
+        mp = _ShadowCapableMPOpt(chunk)
+        with _ReplicaWorld(world=1):
+            off = 0
+            for p in chunk.params:
+                n = p.numel()
+                chunk.bucket.grad_data[off:off + n] += torch.randn(n)
+                off += n
+            assert eng.grad_sync(chunk, force_all_reduce=False) is False
+            ok, _, _ = eng.optimizer_step(mp, [chunk], 0)
+            assert ok
+        m = torch.load(os.path.join(td, "step_000000_g.pt"),
+                       weights_only=False)["meta"]
+        assert m["phase"] == "shadow", m["phase"]
+    print("PASS test_meta_carries_engine_phase")
+
+
 def main():
     test_parse_branch_points()
     test_canonical_name_strips_module_prefixes()
@@ -367,6 +430,7 @@ def main():
     test_absolute_numbering_resume_safe()
     test_bind_param_group_contract()
     test_rank_gate()
+    test_meta_carries_engine_phase()
     print("\nall trace tests passed")
 
 

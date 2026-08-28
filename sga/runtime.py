@@ -123,6 +123,24 @@ def _assert_args_compatible() -> None:
                  "is decoupled AdamW)")
 
 
+def _assert_shadow_emits_supported(config: dict, score_decl, emit) -> None:
+    """Shadow runs over a 'synced' score recompute the emit read-only from
+    pre-commit state (sga.shadow); an emit with no read-only formula must
+    fail HERE (engine construction), never at the first cycle boundary."""
+    # Deliberate fail-early: the gate keys off ``shadow`` alone, so it also
+    # fires for shadow_score=false probe configs — over-strict by design.
+    if not config.get("shadow") or emit is None:
+        return
+    from sga.shadow import SHADOW_SUPPORTED_EMITS
+
+    if emit not in SHADOW_SUPPORTED_EMITS:
+        raise ValueError(
+            f"SGA config: shadow mode has no read-only formula for the "
+            f"synced score '{score_decl.name}' (emits '{emit}'); supported: "
+            f"{sorted(SHADOW_SUPPORTED_EMITS)}"
+        )
+
+
 def build_engine(config: dict, api_version: int):
     """Validate + assemble the engine from the four-field config dict."""
     from sga.plugins import (
@@ -177,6 +195,7 @@ def build_engine(config: dict, api_version: int):
     emit = None
     if score_decl.scoring_input == "synced":
         emit = score_decl.emit_name or score_name
+    _assert_shadow_emits_supported(config, score_decl, emit)
     ef = build_ef(ef_name, dict(config["error_feedback"]), emit_score=emit)
     backend = build_backend_plugin(backend_name, dict(config["backend"]))
 

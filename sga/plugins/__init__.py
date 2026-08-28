@@ -175,6 +175,16 @@ def validate_combination(score: ScoreDecl, selection: SelectionDecl,
             f"selection '{selection.name}' is global-ranked and requires a "
             f"'synced' score input (got '{score.scoring_input}')"
         )
+    if score.needs_support and score.scoring_input != "synced":
+        # The engine routes per-param support slices into values() ONLY on
+        # the synced branch (materialized-update views); a support-declaring
+        # score on the local_or_merged branch would either TypeError at the
+        # first boundary or silently lose its support term.
+        problems.append(
+            f"score '{score.name}' declares needs_support but its "
+            f"scoring_input is '{score.scoring_input}' — support slices are "
+            "only routed on the 'synced' path"
+        )
     if ef.requires_full_sync_every_period:
         period = cycle.get("period", 1)
         if cycle.get("full_sync_interval", 0) not in (0, period):

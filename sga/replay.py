@@ -214,9 +214,18 @@ def _param_hp(meta, catalog_entry):
     groups = meta.get("param_groups") if isinstance(meta, dict) else None
     gi = catalog_entry.get("param_group") if catalog_entry else None
     if groups is not None and gi is not None:
-        g = groups[int(gi)]
+        gi = int(gi)
+        if not 0 <= gi < len(groups):
+            # A raw IndexError here would be cryptic; the catalog/meta pair
+            # disagreeing is a trace-integrity problem and must say so.
+            raise ValueError(
+                f"trace catalog param_group index {gi} outside the step "
+                f"meta param_groups (0..{len(groups) - 1}); catalog and meta "
+                "come from different runs"
+            )
+        g = groups[gi]
         return (float(g["adam_beta1"]), float(g["adam_beta2"]),
-                float(g["adam_eps"]), float(g["weight_decay"]), int(gi))
+                float(g["adam_eps"]), float(g["weight_decay"]), gi)
     return (float(meta["adam_beta1"]), float(meta["adam_beta2"]),
             float(meta["adam_eps"]), float(meta["weight_decay"]), None)
 
@@ -375,6 +384,13 @@ def select_topk_flat(t, k):
         raise ValueError(f"k={k} > N={N}")
     if float(t.min()) < 0.0:
         raise ValueError("select_topk_flat requires non-negative scores")
+    if not bool(torch.isfinite(t).all()):
+        # NaN/Inf sit in the histogram's top bit-pattern bins: they would be
+        # selected FIRST, silently displacing real coordinates from the topk.
+        raise ValueError(
+            "select_topk_flat requires finite scores (NaN/Inf would land in "
+            "the top bins and silently pollute the topk)"
+        )
     thresh = hist_threshold(t, k)
     gt = t > thresh
     n_gt = int(gt.sum().item())

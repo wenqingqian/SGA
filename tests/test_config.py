@@ -183,6 +183,37 @@ def test_illegal_combination_rejected():
     print("ok: declaration-illegal combination rejected")
 
 
+def test_needs_support_local_score_rejected():
+    """A support-declaring score on the local_or_merged branch is illegal:
+    the engine routes per-param support slices into values() ONLY on the
+    synced (materialized-update) path, so such a score would TypeError at
+    the first boundary or silently lose its support term."""
+    from sga.plugins import (
+        BackendDecl,
+        EFDecl,
+        ScoreDecl,
+        SelectionDecl,
+        validate_combination,
+    )
+
+    bad = ScoreDecl(name="hypothetical_sticky",
+                    scoring_input="local_or_merged", needs_support=True)
+    ok_synced = ScoreDecl(name="abs_m_sticky_like",
+                          scoring_input="synced", needs_support=True,
+                          emit_name="abs_m")
+    sel = SelectionDecl(name="threshold")
+    ef = EFDecl(name="ef", emittable_scores=frozenset({"abs_m"}))
+    backend = BackendDecl(name="b")
+    try:
+        validate_combination(bad, sel, ef, backend, {})
+    except ValueError as e:
+        assert "needs_support" in str(e) and "synced" in str(e), e
+    else:
+        raise SystemExit("needs_support + local_or_merged must be rejected")
+    validate_combination(ok_synced, sel, ef, backend, {})
+    print("ok: needs_support on a non-synced score rejected")
+
+
 def test_sparse_backend_required_when_enabled():
     cfg, _ = make_base()
     cfg.sga.enabled = True
@@ -290,12 +321,73 @@ def test_flatten_bool_semantics():
     print("ok: flatten bool semantics preserved (False dropped)")
 
 
+def test_sga_top_level_allowlist():
+    """The sga: section is a closed vocabulary. Unknown top-level keys are
+    rejected mode-INDEPENDENTLY (before the enabled split): a `shadw: true`
+    typo dropped silently would run live sparse where the user intended
+    shadow's bitwise-dense invariant — the most dangerous silent failure on
+    this config face. The legacy dense-yaml form (axis blocks carrying
+    enabled: false instead of name, no top-level enabled key) still passes."""
+    cfg, _ = make_base()
+    cfg.sga.shadw = True
+    expect_error(lambda: sga_section_to_config(cfg), "unknown keys ['shadw']")
+    # unknown key beats the mode-legality diagnostics (membership first)
+    cfg2, _ = make_base()
+    cfg2.sga.selection = {"name": "threshold"}
+    cfg2.sga.slect = {"name": "threshold"}
+    expect_error(lambda: sga_section_to_config(cfg2), "unknown keys ['slect']")
+
+    # every top-level key at once (enabled path) resolves
+    cfg3, _ = make_base()
+    cfg3.sga.enabled = True
+    cfg3.sga.cycle = {"start_iter": 0, "period": 8, "full_sync_interval": 0}
+    cfg3.sga.score = {"name": "abs_m"}
+    cfg3.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0}
+    cfg3.sga.error_feedback = {"name": "radius_opt"}
+    cfg3.sga.backend = {"name": "indexed_sparse"}
+    cfg3.sga.checks = {"count_guard": True}
+    cfg3.sga.trace = {"dir": "/tmp/sga-trace-x"}
+    cfg3.sga.shadow = True
+    cfg3.sga.shadow_score = True
+    engine_cfg = sga_section_to_config(cfg3)
+    for key in ("cycle", "score", "selection", "error_feedback", "backend",
+                "checks", "trace", "shadow", "shadow_score"):
+        assert key in engine_cfg, key
+
+    # legacy dense form (test_launcher_shape BASE shape) still validates
+    cfg4, _ = make_base()
+    del cfg4.sga.enabled
+    for axis in ("score", "selection", "error_feedback"):
+        cfg4.sga[axis] = {"enabled": False}
+    assert sga_section_to_config(cfg4) is None
+    print("ok: sga top-level allowlist (typo / all-known / legacy dense form)")
+
+
+def test_cycle_interior_allowlist():
+    """cycle's interior is a fixed vocabulary: a `peroid` typo would
+    otherwise silently fall back to period=1 — reselection every step
+    instead of the configured cycle, with no diagnostic anywhere."""
+    cfg, _ = make_base()
+    cfg.sga.enabled = True
+    cfg.sga.cycle = {"start_iter": 0, "peroid": 8, "full_sync_interval": 0}
+    cfg.sga.score = {"name": "abs_m"}
+    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0}
+    cfg.sga.error_feedback = {"name": "radius_opt"}
+    cfg.sga.backend = {"name": "indexed_sparse"}
+    expect_error(lambda: sga_section_to_config(cfg), "unknown keys ['peroid']")
+
+    cfg.sga.cycle = 5
+    expect_error(lambda: sga_section_to_config(cfg), "must be a mapping")
+    print("ok: sga.cycle interior allowlist (peroid typo / non-mapping)")
+
+
 if __name__ == "__main__":
     test_all_off_dense_ok()
     test_enabled_field_named_in_error()
     test_fourfield_origin_combination_resolves()
     test_start_iter_percent_resolves()
     test_illegal_combination_rejected()
+    test_needs_support_local_score_rejected()
     test_sparse_backend_required_when_enabled()
     test_missing_sga_section()
     test_unknown_backend_lists_valid()
@@ -305,4 +397,6 @@ if __name__ == "__main__":
     test_flatten_bool_semantics()
     test_checks_section_validation()
     test_trace_section_validation()
+    test_sga_top_level_allowlist()
+    test_cycle_interior_allowlist()
     print("test_config: ALL PASS")

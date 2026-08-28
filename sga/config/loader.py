@@ -26,6 +26,29 @@ from sga.trace import parse_branch_points
 
 _AXES = ("score", "selection", "error_feedback", "backend")
 
+# Top-level sga: keys (single list, mode-independent: a typo like `shadw`
+# must fail loud even in a disabled config, where it would otherwise be
+# silently dropped and the run would proceed as live sparse instead of the
+# intended shadow). Plugin params inside score/selection/error_feedback/
+# backend stay free-form; cycle's own interior is a fixed vocabulary.
+_SGA_KEYS = frozenset(
+    (
+        "enabled",
+        "cycle",
+        "score",
+        "selection",
+        "error_feedback",
+        "backend",
+        "checks",
+        "trace",
+        "shadow",
+        "shadow_score",
+    )
+)
+_CYCLE_KEYS = frozenset(
+    ("start_iter", "start_iter_percent", "period", "full_sync_interval")
+)
+
 
 def sga_section_to_config(config: DictConfig):
     """Normalize config.sga into the engine config dict, or None when disabled.
@@ -38,6 +61,12 @@ def sga_section_to_config(config: DictConfig):
         raise ValueError(
             "Config is missing the 'sga:' section (declare it with enabled: "
             "false and backend: dense for pure dense training)."
+        )
+
+    unknown = sorted(set(sga.keys()) - _SGA_KEYS)
+    if unknown:
+        raise ValueError(
+            f"sga: unknown keys {unknown} (known: {sorted(_SGA_KEYS)})"
         )
 
     enabled = bool(sga.get("enabled", False))
@@ -107,9 +136,21 @@ def sga_section_to_config(config: DictConfig):
         )
 
     cycle = sga.get("cycle", None)
-    engine_config["cycle"] = (
-        OmegaConf.to_container(cycle, resolve=True) if cycle is not None else {}
-    )
+    if cycle is not None:
+        if not OmegaConf.is_dict(cycle):
+            raise ValueError(f"sga.cycle must be a mapping (got: {cycle!r}).")
+        engine_config["cycle"] = OmegaConf.to_container(cycle, resolve=True)
+        unknown = sorted(set(engine_config["cycle"]) - _CYCLE_KEYS)
+        if unknown:
+            # A typo like `peroid` would otherwise silently fall back to the
+            # period default of 1 — reselection every step instead of the
+            # configured cycle, with no diagnostic anywhere.
+            raise ValueError(
+                f"sga.cycle: unknown keys {unknown} "
+                f"(known: {sorted(_CYCLE_KEYS)})"
+            )
+    else:
+        engine_config["cycle"] = {}
     _resolve_cycle_start(engine_config["cycle"], config)
 
     # Engine consistency-machinery toggles (all default on; escape hatches

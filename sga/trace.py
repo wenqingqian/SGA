@@ -56,7 +56,9 @@ import torch
 
 def parse_branch_points(spec) -> List[int]:
     """Normalize a branch-point spec (comma string or int list) into a
-    sorted list of unique non-negative ints. Empty/None -> []."""
+    sorted list of unique non-negative ints. Empty/None -> []. Non-integral
+    floats are rejected: int() would silently truncate 10.5 to 10 and land
+    the window on the wrong step."""
     if spec is None:
         return []
     if isinstance(spec, str):
@@ -65,7 +67,16 @@ def parse_branch_points(spec) -> List[int]:
         toks = list(spec)
     points = set()
     for tok in toks:
-        t = int(tok)
+        if isinstance(tok, float) and not tok.is_integer():
+            raise ValueError(
+                f"trace branch point must be an integer, got {tok!r}"
+            )
+        try:
+            t = int(tok)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"trace branch point must be an integer, got {tok!r}"
+            ) from None
         if t < 0:
             raise ValueError(f"trace branch point must be >= 0, got {t}")
         points.add(t)
@@ -78,6 +89,13 @@ def _canonical_name(name: str) -> str:
     while name.startswith("module."):
         name = name[len("module."):]
     return name
+
+
+def _dump_phase(engine) -> str:
+    """Engine mode at dump time: shadow, or the live step's sync phase."""
+    if getattr(engine, "_shadow", False):
+        return "shadow"
+    return "live_full" if getattr(engine, "_step_full", None) else "live_sparse"
 
 
 def _catalog_mismatch(old, expected: dict):
@@ -168,7 +186,7 @@ class TraceCollector:
 
     # ------------------------------------------------------------------ dump
 
-    def _meta(self, mp_opt, step: int, grad_norm) -> dict:
+    def _meta(self, mp_opt, step: int, grad_norm, phase: Optional[str]) -> dict:
         cfg = mp_opt.config
         groups = []
         for g in mp_opt.optimizer.param_groups:
@@ -182,6 +200,10 @@ class TraceCollector:
             })
         meta = {
             "step": step,
+            # Engine mode at dump time: 'shadow' | 'live_full' | 'live_sparse'.
+            # Replay-grade traces come from shadow/dense runs; the field makes
+            # a mixed directory self-describing instead of inferrable.
+            "phase": phase,
             "lr": [g["lr"] for g in groups],
             "grad_norm": float(grad_norm) if grad_norm is not None else float("nan"),
             "clip_grad": float(getattr(cfg, "clip_grad", 0.0)),
@@ -208,7 +230,7 @@ class TraceCollector:
             self._bind(engine, mp_opt)
 
         os.makedirs(self.dir, exist_ok=True)
-        meta = self._meta(mp_opt, step, grad_norm)
+        meta = self._meta(mp_opt, step, grad_norm, _dump_phase(engine))
 
         if not self._catalog_written:
             cat_path = os.path.join(self.dir, "catalog.pt")

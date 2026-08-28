@@ -272,6 +272,16 @@ def test_readonly_score_matches_ef_torch_reference():
         assert torch.equal(main_p.data, w) and torch.equal(main_p.grad, g)
         assert torch.equal(rec._state["exp_avg"], m0)
         assert torch.equal(rec._state["exp_avg_sq"], v0)
+        # scratch routing: same values, fresh (non-aliasing) results, and a
+        # second call reusing the SAME buffers still matches (per-param
+        # outputs are held simultaneously and must stay distinct)
+        scratch = (torch.empty(2 * n), torch.empty(2 * n))
+        got_s = readonly_score(rec, emit, scratch)
+        assert torch.equal(got_s, g_ref), f"{emit}: scratch path drifted"
+        assert got_s.data_ptr() not in (scratch[0].data_ptr(),
+                                        scratch[1].data_ptr()), emit
+        got_s2 = readonly_score(rec, emit, scratch)
+        assert torch.equal(got_s2, g_ref) and got_s2.data_ptr() != got_s.data_ptr()
     # state-absent record (pre-first-commit): moments read as zeros
     n = 16
     main_p = torch.nn.Parameter(torch.randn(n))
@@ -580,6 +590,205 @@ def test_loader_shadow_validation():
     print("PASS test_loader_shadow_validation")
 
 
+def test_shadow_rng_guard_cuda_half_raises():
+    """The RNG guard's CUDA half: a boundary insertion that consumes a CUDA
+    RNG stream fails the assert even when the CPU stream stays clean (the
+    CPU-only test is structurally blind to this half on CPU-only test envs —
+    exercised via monkeypatched torch.cuda state accessors)."""
+    torch.manual_seed(3)
+    chunk = _FakeChunk()
+    mp = _ShadowCapableMPOpt(chunk)
+    score = build_score("abs_m", {"name": "abs_m"})
+    selection = build_selection("circular_topk",
+                                {"ratio_percent": 30.0}, score=score)
+    ef = build_ef("radius_opt", {})
+    eng = SGAEngine({"cycle": {"start_iter": 0, "period": 1,
+                               "full_sync_interval": 0},
+                     "shadow": True}, score, selection, ef,
+                    _RADIUS["backend"])
+    eng._dp_cp_group = lambda: None
+    eng.attach(chunk)
+
+    calls = {"n": 0}
+    snap = [torch.arange(8, dtype=torch.int64)]
+
+    def states_all():
+        calls["n"] += 1
+        if calls["n"] >= 2:  # the post-insertion read: stream state moved
+            return [snap[0] + 1]
+        return [snap[0].clone()]
+
+    real_avail = torch.cuda.is_available
+    real_states = torch.cuda.get_rng_state_all
+    torch.cuda.is_available = lambda: True
+    torch.cuda.get_rng_state_all = states_all
+    try:
+        gen = torch.Generator().manual_seed(5)
+        with _ReplicaWorld(world=1):
+            _push_grads(chunk, gen)
+            chunk.finish_grad_sync(force_all_reduce=False)
+            try:
+                eng.optimizer_step(mp, [chunk], 1)
+            except RuntimeError as e:
+                assert "CUDA RNG" in str(e), f"wrong error: {e}"
+            else:
+                raise SystemExit("CUDA RNG consumption must fail the assert")
+        assert calls["n"] >= 2, "guard must read CUDA state before and after"
+    finally:
+        torch.cuda.is_available = real_avail
+        torch.cuda.get_rng_state_all = real_states
+    print("PASS test_shadow_rng_guard_cuda_half_raises")
+
+
+def test_shadow_local_score_consumes_raw_bucket_views():
+    """Non-synced scores (scoring_input='local_or_merged') skip readonly_score
+    entirely: the selection consumes the raw bucket gradient views — at the
+    shadow call point those hold the dense-synced, stock-clipped gradient
+    (the honest dense-replay input)."""
+    import sga.engine as engine_mod
+
+    torch.manual_seed(6)
+    chunk = _FakeChunk()
+    mp = _ShadowCapableMPOpt(chunk)
+    # abs_g is local_or_merged; threshold selection operates elementwise
+    eng = _build_shadow_engine(
+        _ORIGIN, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
+        shadow_score=True)
+    eng.attach(chunk)
+
+    def no_readonly(rec, emit_name, scratch=None):
+        raise AssertionError(
+            f"readonly_score must not run for local_or_merged scores "
+            f"(got emit {emit_name!r})"
+        )
+
+    seen_views = []
+    real_select = eng.selection.select
+
+    def select_spy(ctx):
+        seen_views.append(list(ctx.grad_views))
+        return real_select(ctx)
+
+    eng.selection.select = select_spy
+    engine_mod.readonly_score = no_readonly
+    try:
+        gen = torch.Generator().manual_seed(9)
+        with _ReplicaWorld(world=1):
+            _push_grads(chunk, gen)
+            chunk.finish_grad_sync(force_all_reduce=False)
+            ok, _, _ = eng.optimizer_step(mp, [chunk], 1)
+            assert ok
+    finally:
+        from sga.shadow import readonly_score as fresh_readonly
+        engine_mod.readonly_score = fresh_readonly
+        eng.selection.select = real_select
+    assert len(seen_views) == 1, "reselection must run at the step-1 boundary"
+    # raw bucket views: same storage as the engine's own meta-ordered spans
+    # (bucket params_list order, not chunk.params order)
+    _, _, meta = eng._selection_views()
+    assert len(meta) == len(seen_views[0])
+    for (bs, start, end, _p), v in zip(meta, seen_views[0]):
+        assert v.data_ptr() == bs.grad_data[start:end].data_ptr(), \
+            "local score must see the raw bucket grad views"
+    print("PASS test_shadow_local_score_consumes_raw_bucket_views")
+
+
+def test_readonly_score_grad_none_guard():
+    """A record without a gradient at the boundary fails with the named
+    diagnostic instead of an opaque AttributeError deep in the formula."""
+    n = 8
+    main_p = torch.nn.Parameter(torch.randn(n))
+    rec = ParamRecord(
+        model_param=main_p, main_param=main_p,
+        bucket_state=SimpleNamespace(active_mask_u8=None),
+        start=0, end=n, lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8,
+        weight_decay=0.1, step=3,
+    )
+    rec._state = {}
+    try:
+        readonly_score(rec, "abs_m")
+    except ValueError as e:
+        assert "no gradient" in str(e), e
+    else:
+        raise SystemExit("grad-less record must be rejected")
+    print("PASS test_readonly_score_grad_none_guard")
+
+
+def test_shadow_supported_emits_and_build_gate():
+    """SHADOW_SUPPORTED_EMITS is the single source of truth: every advertised
+    emit has a formula (existence pin; value drift is pinned by
+    test_readonly_score_matches_ef_torch_reference), unknown names name
+    the supported set, and the build-time gate rejects a shadow run over an
+    unsupported synced emit at engine construction instead of mid-run."""
+    from sga.plugins import get_ef_decl, get_score_decl, register_default_plugins
+    from sga.runtime import _assert_shadow_emits_supported
+    from sga.shadow import SHADOW_SUPPORTED_EMITS
+
+    torch.manual_seed(2)
+    n = 16
+    main_p = torch.nn.Parameter(torch.randn(n))
+    main_p.grad = torch.randn(n)
+    rec = ParamRecord(
+        model_param=torch.nn.Parameter(torch.randn(n)), main_param=main_p,
+        bucket_state=SimpleNamespace(active_mask_u8=None),
+        start=0, end=n, lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8,
+        weight_decay=0.1, step=5,
+    )
+    rec._state = {"exp_avg": torch.randn(n) * 0.1,
+                  "exp_avg_sq": torch.rand(n) * 0.01}
+    for emit in sorted(SHADOW_SUPPORTED_EMITS):
+        out = readonly_score(rec, emit)
+        assert out.shape == (n,) and out.dtype == torch.float32, emit
+    try:
+        readonly_score(rec, "bogus")
+    except ValueError as e:
+        assert "bogus" in str(e) and "supported" in str(e), e
+    else:
+        raise SystemExit("unknown emit must be rejected")
+
+    register_default_plugins()
+    # emit-set relation pin: the shadow set is independently maintained from
+    # the radius EF's emittable_scores; the two must stay equal.
+    assert get_ef_decl("radius_opt").emittable_scores == SHADOW_SUPPORTED_EMITS
+    decl = get_score_decl("abs_m")
+    _assert_shadow_emits_supported({"shadow": True}, decl, "abs_m")
+    _assert_shadow_emits_supported({}, decl, "whatever")  # live: not gated
+    _assert_shadow_emits_supported({"shadow": False}, decl, "whatever")
+    try:
+        _assert_shadow_emits_supported({"shadow": True}, decl, "bogus")
+    except ValueError as e:
+        assert "shadow mode" in str(e) and "bogus" in str(e), e
+    else:
+        raise SystemExit("shadow build gate must reject unsupported emits")
+    print("PASS test_shadow_supported_emits_and_build_gate")
+
+
+def test_shadow_activates_without_idx_materialization():
+    """VRAM gate: an idx-consuming backend under shadow never compacts the
+    support — grad sync stays stock so no consumer exists, and the compacted
+    pool would be resident waste. Mask-derived counts still resolve (both
+    consistency layers are mask-based)."""
+    torch.manual_seed(11)
+    chunk = _FakeChunk()
+    mp = _ShadowCapableMPOpt(chunk)
+    assert _RADIUS["backend"].decl.consumes == "idx"
+    eng = _build_shadow_engine(
+        _RADIUS, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
+        shadow_score=True)
+    eng.attach(chunk)
+    gen = torch.Generator().manual_seed(5)
+    with _ReplicaWorld(world=1):
+        _push_grads(chunk, gen)
+        ok, _, _ = eng.optimizer_step(mp, [chunk], 1)
+        assert ok
+    assert eng._active_support is not None
+    assert all(b._idx is None for b in eng._active_support.buckets), \
+        "shadow must not materialize idx for an idx-consuming backend"
+    assert 0 < eng._active_support.total_selected \
+        < eng._active_support.total_elements
+    print("PASS test_shadow_activates_without_idx_materialization")
+
+
 def main():
     test_shadow_replicates_stock_call_sequence()
     test_shadow_numerics_equal_stock_loop()
@@ -593,6 +802,11 @@ def main():
     test_shadow_probe_config_never_builds_records_or_state()
     test_shadow_metrics_reselected_tracks_boundary_reselection()
     test_loader_shadow_validation()
+    test_shadow_rng_guard_cuda_half_raises()
+    test_shadow_local_score_consumes_raw_bucket_views()
+    test_readonly_score_grad_none_guard()
+    test_shadow_supported_emits_and_build_gate()
+    test_shadow_activates_without_idx_materialization()
     print("\nall shadow unit tests passed")
 
 
