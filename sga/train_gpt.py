@@ -103,6 +103,11 @@ def _sga_resume_guard(args) -> None:
             return
         with open(tracker) as f:
             iterations = [int(line) for line in f.read().split() if line.isdigit()]
+        if not iterations:
+            # release-style tracker (content "release") or an empty file:
+            # megatron loads the release weights at iteration 0 — there is no
+            # prior SGA state to be continuous with, so nothing to verify.
+            return
         # Rank-shard discovery WITHOUT get_checkpoint_name's defaults: those
         # consult parallel_state, which pretrain() has not initialized yet.
         # Every rank shard of an iteration embeds the same saved args, so

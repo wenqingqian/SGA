@@ -202,8 +202,11 @@ class MegatronBackend(BackendBase):
                     f' & echo $! > {shlex.quote(host_pid_file)}\n'
                 )
             else:
+                # capture the training's own exit status: `bash -c "$cmd;
+                # sync"` reports sync's rc (0) and masks a crash
                 f.write("set -o pipefail\n")
-                f.write(f'bash -c "$cmd; sync" 2>&1 | tee -a {shlex.quote(host_output_file)}\n')
+                f.write(f'bash -c "$cmd" 2>&1 | tee -a {shlex.quote(host_output_file)}\n')
+                f.write("rc=$?\nsync\nexit $rc\n")
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())

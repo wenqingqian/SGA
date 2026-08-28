@@ -221,7 +221,14 @@ def run_ssh_command(
         # Stdout/stderr stream directly to the login node console.
         result = subprocess.run(ssh_cmd, shell=True, check=False, env=ssh_env)
         if result.returncode != 0:
-            sys.exit(result.returncode)
+            # raise, never sys.exit: with a hostfile this runs inside a
+            # multiprocessing pool worker, where SystemExit kills the worker
+            # without delivering the result — the parent's starmap then hangs
+            # until an external timeout. A normal exception is captured by
+            # the pool and re-raised in the parent, exiting run.py nonzero.
+            raise RuntimeError(
+                f"remote script on {host} failed with rc={result.returncode}"
+            )
         return
 
     result = subprocess.run(
@@ -238,7 +245,7 @@ def run_ssh_command(
         print(f"SSH command {ssh_cmd} failed with return code {result.returncode}.")
         print(f"Output: {result.stdout}")
         print(f"Error: {result.stderr}")
-        sys.exit(result.returncode)
+        raise RuntimeError(f"ssh command on {host} failed with rc={result.returncode}")
     if query:
         return result
 
