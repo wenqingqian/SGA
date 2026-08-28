@@ -33,6 +33,14 @@ score plugin's ``values()`` before selection — e.g. the abs_m_sticky
 loyalty bonus multiplies there — and support-declaring scores additionally
 receive the pre-switch support slices. The score object stays on the data
 path, so a score-side transformation cannot be silently skipped.
+
+Shadow mode (sga.shadow) bypasses the whole contract above: the step is a
+literal replication of the stock MixedPrecisionOptimizer.step() (stock
+clip included — the engine's masked clip is NOT bitwise stock), with only
+insertions that are read-only with respect to model/optimizer training
+tensors and RNG streams (trace dump slot, cycle-boundary shadow scoring
+whose RNG-freedom is asserted), and a full end-of-step clear. See
+``_shadow_step``.
 """
 
 import json
@@ -40,8 +48,14 @@ import os
 
 import torch
 
-from sga.kernels import masked_norm_sq_contribution, masked_scale, sga_advance_step
+from sga.kernels import (
+    masked_norm_sq_contribution,
+    masked_scale,
+    sga_advance_step,
+    sga_peek_step,
+)
 from sga.plugins.error_feedback import EFContext, ParamRecord
+from sga.shadow import readonly_score
 from sga.support import BucketSupport, Support
 from sga.trace import TraceCollector
 
@@ -167,6 +181,12 @@ class SGAEngine:
         # below then costs one None-check per step (zero-overhead-when-off).
         trace_cfg = config.get("trace", None)
         self._trace = TraceCollector(trace_cfg) if trace_cfg else None
+        # Shadow mode (sga.shadow): replicate the stock step() literally and
+        # only READ state at cycle boundaries. shadow_score=false strips even
+        # the read-only scoring (the stock-replication probe configuration:
+        # bitwise risk lives in the replication machinery, not the reads).
+        self._shadow = bool(config.get("shadow", False))
+        self._shadow_score = bool(config.get("shadow_score", True))
         self._metrics_file = os.environ.get("SGA_METRICS_FILE")
         self._rank = 0
         if torch.distributed.is_initialized():
@@ -263,6 +283,10 @@ class SGAEngine:
         """Call point 2. True = engine handled every group of this chunk."""
         if id(model_chunk) not in self._chunks:
             return False
+        if self._shadow:
+            # Stock dense sync in the fork's own call context (the literal
+            # replication covers collectives too; no phase flags to stamp).
+            return False
         step = self._iter + 1
         forced = bool(force_all_reduce) or self._cycle.force_next
         if self._cycle.force_next:
@@ -321,6 +345,8 @@ class SGAEngine:
             f"SGA engine step {step} != fork iteration {iteration}; "
             "eval/rerun interleaving broke the step accounting"
         )
+        if self._shadow:
+            return self._shadow_step(mp_opt, model_chunks, iteration, step)
 
         # 1. prepare (copy + unscale + inf check + scaler update). NOTE: the
         # megatron contract returns found_inf (True = BAD), not success.
@@ -436,6 +462,139 @@ class SGAEngine:
         self._step_forced = False
         self._iter = iteration
         return (True, grad_norm, num_zeros)
+
+    # ------------------------------------------------------------- shadow mode
+
+    def _shadow_step(self, mp_opt, model_chunks, iteration, step):
+        """Literal replication of the stock MixedPrecisionOptimizer.step().
+
+        prepare_grads → [found_inf: full clear + stock early return] →
+        STOCK clip_grad_norm → STOCK count_zeros → [trace dump slot] →
+        [cycle-boundary read-only scoring/selection, shadow support] →
+        stock step_with_ready_grads (commit + copy-back) → full clear.
+
+        The engine's masked clip service is deliberately NOT used (it is not
+        bitwise the stock clip); the EF never runs; the end-of-step full
+        clear replaces next iteration's zero_grad_buffer, which the fork's
+        static guard skipped because the engine is active. Trace dumps in
+        shadow see the stock clipped dense gradient — the replay-grade view.
+        """
+        found_inf = mp_opt.prepare_grads()
+        if found_inf:
+            self._full_clear(model_chunks)
+            self._iter = iteration
+            self._step_full = None
+            self._step_forced = False
+            return (False, None, None)
+
+        grad_norm = 0.0
+        if getattr(mp_opt.config, "clip_grad", 0.0) > 0.0:
+            grad_norm = mp_opt.clip_grad_norm(mp_opt.config.clip_grad)
+        num_zeros = 0
+        if getattr(mp_opt.config, "log_num_zeros_in_grad", False):
+            num_zeros = mp_opt.count_zeros()
+
+        reselect = self._cycle.reselect_boundary(step)
+        reselected = reselect and self._shadow_score
+
+        # Same frozen dump slot as the live path: after count_zeros, before
+        # the commit (the EF slot it precedes in live mode does not exist
+        # here — the commit itself is the writer being avoided). Records are
+        # NOT pre-refreshed: the dump refreshes them lazily only when a dump
+        # actually fires, so the probe configuration runs record-free.
+        if self._trace is not None:
+            self._trace.maybe_dump(self, mp_opt, step, grad_norm)
+
+        if reselected:
+            self._shadow_reselect(self._refresh_records(mp_opt))
+
+        success = mp_opt.step_with_ready_grads()
+
+        self._full_clear(model_chunks)
+        self._log_step(step, True, reselected, grad_norm)
+        self._step_full = None
+        self._step_forced = False
+        self._iter = iteration
+        return (bool(success), grad_norm, num_zeros)
+
+    def _shadow_reselect(self, records):
+        """Read-only scoring + selection at a shadow cycle boundary.
+
+        Reuses the live reselection machinery (view routing incl. the sticky
+        pre-switch support slices, selection, bucket assembly, consistency
+        checks, activation) with the score tensors coming from
+        sga.shadow.readonly_score instead of the EF's fused materialization;
+        non-synced scores skip readonly_score and consume the raw
+        ``_selection_views()`` bucket views directly — at this call point
+        those hold the dense-synced, stock-clipped gradient (the honest
+        dense-replay input).
+        The RNG-state assert brackets the whole insertion: the boundary
+        must be consumption-free on every RNG stream (selections are
+        histogram/topk-based by design — a violation means a plugin broke
+        that contract and would silently fork dense trajectories).
+        """
+        rng_before = torch.get_rng_state()
+        cuda_before = (torch.cuda.get_rng_state_all()
+                       if torch.cuda.is_available() else None)
+
+        rec_of = {id(rec.model_param): rec for rec in records}
+        views, always_slices, meta = self._selection_views()
+        if self.score.decl.scoring_input == "synced":
+            emit = self.score.decl.emit_name or self.score.decl.name
+            views = []
+            for (_, _, _, p) in meta:
+                rec = rec_of.get(id(p))
+                if rec is None:
+                    raise TypeError(
+                        "shadow reselection: meta param without a record "
+                        f"(shape {tuple(p.shape)}); records were refreshed "
+                        "from a different optimizer view"
+                    )
+                views.append(readonly_score(rec, emit).view(-1))
+            self._check_norm_spread(views)
+            if self.score.decl.needs_support:
+                views = self.score.values(views, self._support_slices(meta))
+            else:
+                views = self.score.values(views)
+        # Optional selection-owned warmup policy, probed exactly like the
+        # live path (the selection alone interprets its own parameters).
+        warmup_hook = getattr(self.selection, "warmup_sync_target", None)
+        sel_ctx = SelectionContext(
+            grad_views=views,
+            always_sync_masks=always_slices,
+            comm_group=self._dp_cp_group(),
+            warmup_target=(warmup_hook(self._cycle.start_iter,
+                                       self._cycle.period)
+                           if callable(warmup_hook) else None),
+        )
+        masks = self.selection.select(sel_ctx)
+        bucket_masks = self._assemble_bucket_masks(masks, meta)
+        self._verify_support_consistency(bucket_masks)
+        if hasattr(self.selection, "adapt"):
+            self.selection.adapt(masks, always_slices)
+        self._activate_support(Support([
+            BucketSupport(m, idx_pool=self._bucket_idx_pool(i))
+            for i, m in enumerate(bucket_masks)
+        ]))
+        if self._count_guard:
+            self._check_counts()
+
+        if not torch.equal(torch.get_rng_state(), rng_before):
+            raise RuntimeError(
+                "shadow: boundary scoring consumed CPU RNG — selections must "
+                "be deterministic (histogram/topk), this forks dense "
+                "trajectories and breaks the shadow invariant"
+            )
+        if cuda_before is not None:
+            cuda_after = torch.cuda.get_rng_state_all()
+            if len(cuda_after) != len(cuda_before) or any(
+                not torch.equal(a, b) for a, b in zip(cuda_before, cuda_after)
+            ):
+                raise RuntimeError(
+                    "shadow: boundary scoring consumed CUDA RNG — selections "
+                    "must be deterministic (histogram/topk), this forks "
+                    "dense trajectories and breaks the shadow invariant"
+                )
 
     def _selection_views(self):
         """Local per-param grad views (bucket order) + metadata for assembly.
@@ -589,13 +748,26 @@ class SGAEngine:
                         lr=0.0, beta1=0.9, beta2=0.95, eps=1e-8,
                         weight_decay=0.0, step=1,
                     )
-                    rec._state = mp_opt.optimizer.state[main_param]
+                    # Shadow binds non-inserting (rec._state may be None —
+                    # readonly_score/trace read it via ``_state or {}``): the
+                    # stock commit owns state materialization, so the probe
+                    # run leaves the state dict untouched. The live EFs write
+                    # the lazy moments INTO this dict entry, so live keeps
+                    # the inserting bind.
+                    rec._state = (mp_opt.optimizer.state.get(main_param)
+                                  if self._shadow
+                                  else mp_opt.optimizer.state[main_param])
                     self._records.append(rec)
                     self._main_to_record[id(main_param)] = rec
 
         # Refresh hyperparams + shared step counter exactly once per step.
+        # Shadow reads the upcoming commit PEEK-style (no group['step']
+        # write): the stock commit owns its counters — TE/apex FusedAdam
+        # advances group['step'] itself inside step(), and a second engine
+        # advance would double-step every bias correction.
         for group in mp_opt.optimizer.param_groups:
-            step = sga_advance_step(mp_opt, group)
+            step = (sga_peek_step(mp_opt, group) if self._shadow
+                    else sga_advance_step(mp_opt, group))
             for p in group["params"]:
                 rec = self._main_to_record.get(id(p))
                 if rec is None:

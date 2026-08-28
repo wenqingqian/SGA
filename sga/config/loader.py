@@ -68,6 +68,12 @@ def sga_section_to_config(config: DictConfig):
                 "is an engine-side service (dense replay-grade traces come "
                 "from shadow runs) — remove the section."
             )
+        for key in ("shadow", "shadow_score"):
+            if sga.get(key, None) is not None:
+                raise ValueError(
+                    f"sga.{key} is set but sga.enabled is false; shadow mode "
+                    "is an engine mode — remove the field."
+                )
         backend_cfg = sga.get("backend", None)
         name = None
         if backend_cfg is not None and OmegaConf.is_dict(backend_cfg):
@@ -150,6 +156,30 @@ def sga_section_to_config(config: DictConfig):
         if not isinstance(window, int) or isinstance(window, bool) or window < 1:
             raise ValueError(f"sga.trace.window must be an int >= 1 (got {window!r}).")
         t["window"] = window
+
+    # Shadow mode: stock-step literal replication with read-only boundary
+    # scoring (dense numerics invariant). shadow_score=false strips even the
+    # read-only scoring — the stock-replication probe configuration.
+    shadow = sga.get("shadow", None)
+    if shadow is not None:
+        if not isinstance(shadow, bool):
+            raise ValueError(f"sga.shadow must be a boolean (got: {shadow!r}).")
+        # Explicit false means plain live: no shadow key reaches the engine
+        # config (consumers key off presence, absent == false).
+        if shadow:
+            engine_config["shadow"] = shadow
+    shadow_score = sga.get("shadow_score", None)
+    if shadow_score is not None:
+        if engine_config.get("shadow") is not True:
+            raise ValueError(
+                "sga.shadow_score is set but sga.shadow is not true; it only "
+                "modifies shadow runs."
+            )
+        if not isinstance(shadow_score, bool):
+            raise ValueError(
+                f"sga.shadow_score must be a boolean (got: {shadow_score!r})."
+            )
+        engine_config["shadow_score"] = shadow_score
 
     _validate_against_registries(engine_config)
     return engine_config

@@ -12,7 +12,9 @@
 # log-space steps) + error_feedback=radius_opt (residual) +
 # backend=pipelined_idx_sorted (S=3 compact-set pipeline on a twin
 # high-priority NCCL process group). Cycle start_iter=4 / period=4 with
-# adaptive_warmup_syncs=5: the transition is visible within a 60-iter smoke.
+# adaptive_warmup_syncs=5 (historical validation context: the transition was
+# originally confirmed within a 60-iter smoke; the preset now runs
+# train_iters=5000).
 
 defaults:
   - _self_
@@ -128,7 +130,8 @@ train:
     attention_dropout: 0.0
     hidden_dropout: 0.0
     clip_grad: 1.0
-    train_iters: 60
+    train_iters: 5000
+    exit_interval: 200
     eval_iters: 0
     eval_interval: 10000000
     micro_batch_size: 1

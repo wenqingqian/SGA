@@ -139,6 +139,30 @@ def masked_scale(grad: torch.Tensor, mask: torch.Tensor, coeff: float) -> None:
         grad_flat[mask_flat.bool()] *= coeff
 
 
+def sga_peek_step(wrapper, group):
+    """Read-only variant of sga_advance_step: the step the NEXT optimizer
+    commit will use, WITHOUT mutating any optimizer-visible counter.
+
+    Shadow mode contract: the stock commit path owns its own counters —
+    TE/apex FusedAdam advances ``group['step']`` INSIDE ``step()`` (creating
+    it on first use), torch AdamW advances per-param ``state['step']`` — so
+    the engine must not write group['step'] on shadow runs. Calling
+    sga_advance_step there would make FusedAdam's bias corrections run with
+    a double-advanced step (engine +1, stock +1 per iteration). This peek
+    derives the upcoming-commit number from whichever counter style the
+    optimizer maintains.
+    """
+    if 'step' in group:
+        s = group['step']
+        return (int(s.item()) if torch.is_tensor(s) else int(s)) + 1
+    for p in group['params']:
+        p_state = wrapper.optimizer.state.get(p)
+        if p_state is not None and 'step' in p_state:
+            s = p_state['step']
+            return (int(s.item()) if torch.is_tensor(s) else int(s)) + 1
+    return 1  # no counter anywhere: the upcoming commit is the first
+
+
 def sga_advance_step(wrapper, group):
     """Advance the shared Adam step counter by one and return the NEW value
     as a plain python int (for beta**step math).
