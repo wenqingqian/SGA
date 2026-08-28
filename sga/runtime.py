@@ -172,8 +172,11 @@ def build_engine(config: dict, api_version: int):
     selection = build_selection(selection_name, dict(config["selection"]), score=score)
     # 'synced' scores are materialized by the EF on full steps; inject WHICH
     # score to emit so the kernel picks the right mode (validator above
-    # already proved the EF can emit it).
-    emit = score_name if score_decl.scoring_input == "synced" else None
+    # already proved the EF can emit it). Post-processing scores declare the
+    # base score the kernel should materialize via ``emit_name``.
+    emit = None
+    if score_decl.scoring_input == "synced":
+        emit = score_decl.emit_name or score_name
     ef = build_ef(ef_name, dict(config["error_feedback"]), emit_score=emit)
     backend = build_backend_plugin(backend_name, dict(config["backend"]))
 

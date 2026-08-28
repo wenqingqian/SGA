@@ -564,13 +564,20 @@ def test_grad_norm_bypass_forces_next_full():
 
 class _HookSelection:
     """Stub selection exposing BOTH optional hooks the engine probes
-    generically (same getattr discipline as adapt()/wants_force_full())."""
+    generically (same getattr discipline as adapt()/wants_force_full()).
+
+    Masks alternate per call (even indices on the first call, odd on the
+    second, ...): a support activated at one reselection is then
+    distinguishable from what the NEXT call would select — all-ones masks
+    would make the two indistinguishable.
+    """
 
     params = {}
 
     def __init__(self):
         self.anchor_calls = []
         self.ctx = None
+        self._calls = 0
 
     def k_for(self, n_total):
         return max(1, n_total // 2)
@@ -581,7 +588,10 @@ class _HookSelection:
 
     def select(self, ctx):
         self.ctx = ctx
-        return [torch.ones(g.numel(), dtype=torch.uint8) for g in ctx.grad_views]
+        masks = [(torch.arange(g.numel()) % 2 == self._calls % 2).to(torch.uint8)
+                 for g in ctx.grad_views]
+        self._calls += 1
+        return masks
 
 
 class _PrepareBackend(IndexedSparseBackend):
@@ -635,7 +645,7 @@ def test_synced_score_values_routed_before_selection():
     calls = {"n": 0}
 
     class _SyncedScore:
-        decl = SimpleNamespace(scoring_input="synced")
+        decl = SimpleNamespace(scoring_input="synced", needs_support=False)
 
         def values(self, views):
             calls["n"] += 1
@@ -660,6 +670,94 @@ def test_synced_score_values_routed_before_selection():
             assert ok
     assert calls["n"] == 1
     assert selection.ctx.grad_views is not None
+
+
+def test_count_guard_once_per_cycle_and_flag_off():
+    """Layer-1 count guard placement (2026-08-28 ruling): it fires ONCE per
+    support activation — never on sparse grad_sync steps (the counts are the
+    activation-time caches and the support is immutable within a cycle, so
+    per-step checks re-verify identical numbers). checks.count_guard=false
+    (the legacy skip flag's counterpart) disables it entirely."""
+    def _run_and_count(config_extra):
+        score = build_score("update_ratio", {"name": "update_ratio"})
+        selection = build_selection("circular_topk", {"ratio_percent": 30.0},
+                                    score=score)
+        ef = build_ef("radius_opt", {"residual_mean": False})
+        eng = SGAEngine({"cycle": dict(_RADIUS["cycle"]), **config_extra},
+                        score, selection, ef, IndexedSparseBackend({}))
+        eng._dp_cp_group = lambda: None
+        calls = []
+        orig = eng._check_counts
+        def _spy():
+            calls.append(1)
+            orig()
+        eng._check_counts = _spy
+        chunk = _FakeChunk()
+        mp = _FakeMPOpt(chunk)
+        eng.attach(chunk)
+        history = []
+        with _ReplicaWorld(world=1):
+            for step in range(1, 10):  # _RADIUS: reselections at 5 and 8
+                _accumulate_into_bucket(chunk)
+                eng.grad_sync(chunk, force_all_reduce=False)
+                eng.optimizer_step(mp, [chunk], step)
+                history.append(len(calls))
+        return history
+
+    history = _run_and_count({})
+    # guard ON: fires at the two activations (steps 5, 8), never on the
+    # sparse grad_sync steps in between
+    assert history == [0, 0, 0, 0, 1, 1, 1, 2, 2], history
+    history = _run_and_count({"checks": {"count_guard": False}})
+    assert history == [0] * 9, history
+    print("ok: count guard once per cycle (activations only); flag disables")
+
+
+def test_support_declaring_score_gets_pre_switch_support():
+    """ScoreDecl.needs_support routing: at each reselection the score's
+    values() receives the CURRENT (pre-switch) support's per-param mask
+    slices — None at bootstrap (degenerate), last cycle's support after."""
+    class _StickyScore:
+        decl = SimpleNamespace(scoring_input="synced", needs_support=True)
+
+        def __init__(self):
+            self.calls = []
+
+        def values(self, views, support_slices=None):
+            self.calls.append(support_slices)
+            return views
+
+    score = _StickyScore()
+    selection = _HookSelection()  # selects all-ones masks
+    ef = build_ef("radius_opt", {"residual_mean": False})
+    eng = SGAEngine(
+        {"cycle": {"start_iter": 2, "period": 3, "full_sync_interval": 0}},
+        score, selection, ef, IndexedSparseBackend({}))
+    eng._dp_cp_group = lambda: None
+
+    chunk = _FakeChunk()
+    mp = _FakeMPOpt(chunk)
+    eng.attach(chunk)
+    with _ReplicaWorld(world=1):
+        for it in range(1, 9):  # boundaries at start_iter=2, T=3 -> steps 5, 8
+            _accumulate_into_bucket(chunk)
+            assert eng.grad_sync(chunk, force_all_reduce=False) is True
+            ok, _, _ = eng.optimizer_step(mp, [chunk], it)
+            assert ok
+    assert len(score.calls) == 2
+    assert score.calls[0] is None, "bootstrap must pass no support"
+    second = score.calls[1]
+    assert second is not None and len(second) == len(chunk.params)
+    # _HookSelection alternates: step 5 selected the even-index pattern, so
+    # step 8's values() must see exactly THAT support elementwise — an
+    # all-ones (or odd-pattern) slice would mean post-switch routing.
+    even = (torch.arange(chunk.params[0].numel()) % 2 == 0).to(torch.uint8)
+    odd = (torch.arange(chunk.params[0].numel()) % 2 == 1).to(torch.uint8)
+    for s in second:
+        assert torch.equal(s, even), f"step 8 must see the step-5 support: {s}"
+        assert not torch.equal(s, odd)
+    print("ok: needs_support score receives pre-switch support (None at "
+          "bootstrap, last cycle afterwards)")
 
 
 # ------------------------------------------------- step-counter + resume C1/C2

@@ -19,7 +19,12 @@ Declaration facts used by the validator (see ``validate_combination``):
   - ErrorFeedback.emittable_scores: the score plugins this EF can
     materialize into the fp32 main-grad copy on full steps (radius-style
     EF->score handoff); 'synced' scores must be paired with an EF that
-    lists them.
+    lists them. A score whose post-processing sits OUTSIDE the kernel
+    (e.g. abs_m_sticky) names the actually-materialized base score via
+    Score.emit_name, and the membership check runs against that name.
+  - Score.needs_support: the score reads the current (pre-switch) support
+    at reselection; the engine supplies per-param support slices to
+    ``values()`` (None at bootstrap => degenerate to the base score).
   - ErrorFeedback.requires_full_sync_every_period: the EF's residual
     contract only folds at full syncs, so cycle boundaries must be full.
   - Backend.consumes: 'mask' or 'idx' — the Support object provides both,
@@ -37,6 +42,15 @@ class ScoreDecl:
     scoring_input: str = "local_or_merged"  # 'local_or_merged' | 'synced'
     # Fused ``threshold_mask`` fast path available (needed by threshold selection).
     has_threshold_path: bool = False
+    # Score reads the CURRENT (pre-switch) support at reselection time, e.g. a
+    # loyalty bonus over last cycle's coordinates. The engine then passes
+    # per-param support mask slices into ``values()`` (None at bootstrap, where
+    # the score must degenerate to its support-free base form).
+    needs_support: bool = False
+    # Name of the score the EF actually materializes when this differs from
+    # the plugin's own name (post-processing scores like abs_m_sticky, which
+    # the EF emits as plain abs_m). None means "emit under my own name".
+    emit_name: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -147,12 +161,15 @@ def validate_combination(score: ScoreDecl, selection: SelectionDecl,
             f"selection '{selection.name}' needs a score with a fused threshold "
             f"path, but score '{score.name}' has none"
         )
-    if score.scoring_input == "synced" and score.name not in ef.emittable_scores:
-        problems.append(
-            f"score '{score.name}' needs synced scoring input (a value the EF "
-            f"materializes into main grads on full steps), but error_feedback "
-            f"'{ef.name}' can only emit {sorted(ef.emittable_scores) or 'nothing'}"
-        )
+    if score.scoring_input == "synced":
+        emit = score.emit_name or score.name
+        if emit not in ef.emittable_scores:
+            problems.append(
+                f"score '{score.name}' needs synced scoring input (the EF "
+                f"materializes '{emit}' into main grads on full steps), but "
+                f"error_feedback '{ef.name}' can only emit "
+                f"{sorted(ef.emittable_scores) or 'nothing'}"
+            )
     if selection.scope == "global_ranked" and score.scoring_input != "synced":
         problems.append(
             f"selection '{selection.name}' is global-ranked and requires a "
@@ -174,14 +191,20 @@ def build_score(name, params):
     from sga.plugins.scores.abs_g import AbsGradScore
     from sga.plugins.scores.abs_g_synced import AbsGSyncedScore
     from sga.plugins.scores.abs_m import AbsMScore
+    from sga.plugins.scores.abs_m_post import AbsMPostScore
+    from sga.plugins.scores.abs_m_sticky import AbsMStickyScore
     from sga.plugins.scores.coi import CoiScore
+    from sga.plugins.scores.snr_m import SnrMScore
     from sga.plugins.scores.update_ratio import UpdateRatioScore
 
     return {
         "abs_g": AbsGradScore,
         "abs_g_synced": AbsGSyncedScore,
         "abs_m": AbsMScore,
+        "abs_m_post": AbsMPostScore,
+        "abs_m_sticky": AbsMStickyScore,
         "coi": CoiScore,
+        "snr_m": SnrMScore,
         "update_ratio": UpdateRatioScore,
     }[name](params)
 
@@ -223,7 +246,10 @@ def register_default_plugins() -> None:
     from sga.plugins.scores.abs_g import DECL as abs_g_decl
     from sga.plugins.scores.abs_g_synced import DECL as abs_g_synced_decl
     from sga.plugins.scores.abs_m import DECL as abs_m_decl
+    from sga.plugins.scores.abs_m_post import DECL as abs_m_post_decl
+    from sga.plugins.scores.abs_m_sticky import DECL as abs_m_sticky_decl
     from sga.plugins.scores.coi import DECL as coi_decl
+    from sga.plugins.scores.snr_m import DECL as snr_m_decl
     from sga.plugins.scores.update_ratio import DECL as update_ratio_decl
     from sga.plugins.selection.threshold import DECL as threshold_decl
     from sga.plugins.selection.circular_topk import DECL as topk_decl
@@ -234,7 +260,10 @@ def register_default_plugins() -> None:
         ("abs_g", abs_g_decl),
         ("abs_g_synced", abs_g_synced_decl),
         ("abs_m", abs_m_decl),
+        ("abs_m_post", abs_m_post_decl),
+        ("abs_m_sticky", abs_m_sticky_decl),
         ("coi", coi_decl),
+        ("snr_m", snr_m_decl),
         ("update_ratio", update_ratio_decl),
     ):
         if name not in _SCORES:

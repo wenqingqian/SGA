@@ -29,9 +29,10 @@ flag is off (stock returns 0).
 
 For 'synced'-input scores the engine reads the materialized
 ``main_param.grad`` views the EF kernel emits and routes them through the
-score plugin's ``values()`` before selection — identity pass-throughs today,
-but the score object stays on the data path, so a future validation or
-transformation inside a score plugin cannot be silently skipped.
+score plugin's ``values()`` before selection — e.g. the abs_m_sticky
+loyalty bonus multiplies there — and support-declaring scores additionally
+receive the pre-switch support slices. The score object stays on the data
+path, so a score-side transformation cannot be silently skipped.
 """
 
 import json
@@ -42,6 +43,7 @@ import torch
 from sga.kernels import masked_norm_sq_contribution, masked_scale, sga_advance_step
 from sga.plugins.error_feedback import EFContext, ParamRecord
 from sga.support import BucketSupport, Support
+from sga.trace import TraceCollector
 
 
 class SGAEngineError(RuntimeError):
@@ -155,6 +157,16 @@ class SGAEngine:
         self._step_forced = False
         self._mp_opt = None
         self._log_num_zeros = None        # resolved from args at first step
+        # Layer-1 count guard toggle (checks.count_guard, default on). The
+        # guard runs once per cycle at support activation — within a cycle
+        # the support is immutable and its counts are cached, so per-step
+        # re-checks re-verify identical numbers (user ruling 2026-08-28,
+        # aligned with the legacy per-cycle check).
+        self._count_guard = bool(config.get("checks", {}).get("count_guard", True))
+        # Trace collector: None unless sga.trace.dir is set — the dump slot
+        # below then costs one None-check per step (zero-overhead-when-off).
+        trace_cfg = config.get("trace", None)
+        self._trace = TraceCollector(trace_cfg) if trace_cfg else None
         self._metrics_file = os.environ.get("SGA_METRICS_FILE")
         self._rank = 0
         if torch.distributed.is_initialized():
@@ -265,7 +277,6 @@ class SGAEngine:
             model_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
             return True
 
-        self._check_counts()
         avg = getattr(model_chunk.ddp_config, "average_in_collective", False)
         reduce_op = torch.distributed.ReduceOp.AVG if avg else torch.distributed.ReduceOp.SUM
         for bucket_key, bs in self._chunk_buckets(model_chunk):
@@ -330,6 +341,12 @@ class SGAEngine:
         # 3. num_zeros BEFORE the EF (radius overwrites main grads).
         num_zeros = self._count_zeros(mp_opt) if self._log_num_zeros_flag() else None
 
+        # 3b. trace dump slot (frozen slot: AFTER count_zeros, BEFORE the EF
+        #     rewrites main_param.grad — the post-unscale post-clip view the
+        #     offline replay consumes; grad_norm is this step's own clip).
+        if self._trace is not None:
+            self._trace.maybe_dump(self, mp_opt, step, grad_norm)
+
         # 4. EF owns the entire inner step.
         records = self._refresh_records(mp_opt)
         next_full = self._cycle.is_full(step + 1)
@@ -362,9 +379,13 @@ class SGAEngine:
                          for (_, _, _, p) in meta]
                 self._check_norm_spread(views)
                 # Route the materialized tensors through the score plugin's
-                # own contract (identity pass-throughs today; keeps any
-                # score-side validation on the data path).
-                views = self.score.values(views)
+                # own contract (keeps any score-side transformation — e.g. the
+                # sticky loyalty bonus — on the data path; support-declaring
+                # scores additionally receive the pre-switch support slices).
+                if self.score.decl.needs_support:
+                    views = self.score.values(views, self._support_slices(meta))
+                else:
+                    views = self.score.values(views)
             else:
                 views = self._selection_views()[0]
             # Optional selection-owned warmup policy (generic hook probe —
@@ -395,6 +416,12 @@ class SGAEngine:
         self.ef.reset(ef_ctx, was_full=was_full)
         if new_support is not None:
             self._activate_support(new_support)
+            # Layer-1 deadlock guard, once per cycle at activation: the counts
+            # being verified are the activation-time caches, and the support
+            # is immutable until the next reselection — checking here covers
+            # every sparse sync of the coming cycle.
+            if self._count_guard:
+                self._check_counts()
 
         # Grad-norm bypass: force next step full (globally consistent input).
         if hasattr(self.selection, "wants_force_full"):
@@ -435,6 +462,18 @@ class SGAEngine:
             else:
                 out.append(bs.always_sync_mask[start:end])
         return out
+
+    def _support_slices(self, meta):
+        """Per-param uint8 mask slices of the CURRENT (pre-switch) support in
+        meta order — the input of support-declaring scores (sticky loyalty
+        bonus). None at bootstrap (no support yet), where such scores must
+        degenerate to their base form (ScoreDecl.needs_support contract)."""
+        if self._active_support is None:
+            return None
+        return [
+            self._active_support.buckets[bs.support_index].mask_u8[start:end]
+            for (bs, start, end, _) in meta
+        ]
 
     def _assemble_bucket_masks(self, masks, meta):
         """Scatter per-param masks into per-bucket element-level uint8 masks.
@@ -669,9 +708,11 @@ class SGAEngine:
         """Layer 1 (deadlock guard): support counts identical across ranks.
 
         Packed [k0, -k0, k1, -k1, ...] int64, one MAX allreduce; min != max
-        means a diverged support — refuse the mismatched collective. The
-        per-bucket counts come from the cache filled at support activation
-        (the support never changes within a cycle).
+        means a diverged support — refuse the mismatched collective. Runs
+        ONCE PER CYCLE, right after support activation: the per-bucket counts
+        are the caches filled at activation and the support is immutable
+        within the cycle, so the activation-time verdict covers every sparse
+        sync of the cycle (aligned with the legacy per-cycle check).
         """
         group = self._dp_cp_group()
         if group is None or self._active_support is None:

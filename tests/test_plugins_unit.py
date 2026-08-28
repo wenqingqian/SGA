@@ -700,6 +700,121 @@ def test_score_emission_matches_oracles():
     print("ok: score emission matches oracles (coi/abs_g_synced/abs_m)")
 
 
+def test_snr_m_abs_m_post_emission_matches_oracles():
+    """snr_m / abs_m_post emission vs hand oracles on pre-commit state.
+
+    snr_m uses STATE-MATCHED bias corrections (exponent = commits already
+    applied = step - 1) and is exactly 0 at step == 1 (no commit yet);
+    abs_m_post = |beta1*m + (1-beta1)*g| with no correction at all.
+    """
+    from sga.plugins.error_feedback.radius_opt import RadiusOptEF
+
+    torch.manual_seed(4)
+    n, b1, b2, eps, wd, step = 512, 0.9, 0.95, 1e-8, 1e-2, 7
+
+    param0 = torch.randn(n)
+    grad0 = torch.randn(n)
+    m0, v0 = torch.randn(n) * 0.1, torch.rand(n) * 0.1 + 1e-4
+
+    # snr_m with pre-existing moments at step 7 (bc_pre exponent 6)
+    w = param0.clone(); g = grad0.clone()
+    rec = _Rec(w, g)
+    rec._state = {"exp_avg": m0.clone(), "exp_avg_sq": v0.clone()}
+    RadiusOptEF({}, emit_score="snr_m").full_step(_RecCtx([rec]))
+    bc1_pre, bc2_pre = 1 - b1 ** (step - 1), 1 - b2 ** (step - 1)
+    snr_ref = (m0 / bc1_pre).abs() / ((v0 / bc2_pre).sqrt() + eps)
+    torch.testing.assert_close(g.data, snr_ref, rtol=1e-5, atol=1e-7)
+
+    # snr_m at step == 1: no commit applied yet -> score is exactly 0
+    w = param0.clone(); g = grad0.clone()
+    rec = _Rec(w, g)
+    rec.step = 1
+    rec._state = {"exp_avg": torch.zeros(n), "exp_avg_sq": torch.zeros(n)}
+    RadiusOptEF({}, emit_score="snr_m").full_step(_RecCtx([rec]))
+    assert torch.all(g.data == 0), "snr_m at step 1 must be exactly 0"
+
+    # abs_m_post = |m_new| (no bias correction of any kind)
+    w = param0.clone(); g = grad0.clone()
+    rec = _Rec(w, g)
+    rec._state = {"exp_avg": m0.clone(), "exp_avg_sq": v0.clone()}
+    RadiusOptEF({}, emit_score="abs_m_post").full_step(_RecCtx([rec]))
+    post_ref = (b1 * m0 + (1 - b1) * grad0).abs()
+    torch.testing.assert_close(g.data, post_ref, rtol=1e-5, atol=1e-7)
+    # ... while the committed m/v and the applied update stay the standard ones
+    bc1, bc2 = 1 - b1 ** step, 1 - b2 ** step
+    m_new = b1 * m0 + (1 - b1) * grad0
+    v_new = b2 * v0 + (1 - b2) * grad0 * grad0
+    u_ref = wd * param0 + (m_new / bc1) / ((v_new / bc2).sqrt() + eps)
+    torch.testing.assert_close(rec._state["exp_avg"], m_new, rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(w.data, param0 - 1e-3 * u_ref, rtol=1e-5, atol=1e-7)
+    print("ok: snr_m/abs_m_post emission matches oracles (incl. step-1 zero)")
+
+
+def test_abs_m_sticky_loyalty_bonus():
+    """abs_m_sticky = abs_m x (1 + lambda * 1[in pre-switch support]).
+
+    Plugin-level contract: the bonus multiplies support members only, fresh
+    tensors come back (the materialized views alias live main grads), and a
+    None support (bootstrap) degenerates to plain abs_m.
+    """
+    from sga.plugins.scores.abs_m_sticky import AbsMStickyScore
+
+    views = [torch.tensor([1.0, 2.0, 3.0, 4.0]),
+             torch.tensor([5.0, 6.0])]
+    support = [torch.tensor([1, 0, 1, 0], dtype=torch.uint8),
+               torch.tensor([0, 1], dtype=torch.uint8)]
+
+    sticky = AbsMStickyScore({"name": "abs_m_sticky"})
+    assert sticky.sticky_lambda == 0.5  # oracle default
+    out = sticky.values(views, support)
+    torch.testing.assert_close(out[0], torch.tensor([1.5, 2.0, 4.5, 4.0]))
+    torch.testing.assert_close(out[1], torch.tensor([5.0, 9.0]))
+    # inputs never mutated (they alias the live main grads)
+    torch.testing.assert_close(views[0], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    assert out[0].data_ptr() != views[0].data_ptr()
+
+    # bootstrap: no support -> identity (degenerates to abs_m)
+    out = sticky.values(views, None)
+    assert out[0] is views[0]
+
+    # custom lambda
+    sticky = AbsMStickyScore({"name": "abs_m_sticky", "sticky_lambda": 2.0})
+    out = sticky.values(views, support)
+    torch.testing.assert_close(out[0], torch.tensor([3.0, 2.0, 9.0, 4.0]))
+    print("ok: abs_m_sticky loyalty bonus (default/custom lambda, bootstrap)")
+
+
+def test_abs_m_sticky_rejects_invalid_inputs():
+    """Plugin-boundary fail-loud: a non-finite/negative sticky_lambda would
+    poison every boosted score into NaN selection silently; view/slice
+    misalignment cannot trigger with today's engine (aligned slices from the
+    same meta) and must not silently zip-truncate if that ever changes."""
+    from sga.plugins.scores.abs_m_sticky import AbsMStickyScore
+
+    for bad in (float("nan"), float("inf"), -0.1):
+        try:
+            AbsMStickyScore({"name": "abs_m_sticky", "sticky_lambda": bad})
+            raise AssertionError(f"sticky_lambda {bad} accepted")
+        except ValueError as e:
+            assert "sticky_lambda" in str(e), e
+
+    sticky = AbsMStickyScore({"name": "abs_m_sticky"})
+    views = [torch.randn(4), torch.randn(6)]
+    try:
+        sticky.values(views, [torch.ones(4, dtype=torch.uint8)])
+        raise AssertionError("view/slice length mismatch accepted")
+    except ValueError as e:
+        assert "2 views but 1 support slices" in str(e), e
+    try:
+        sticky.values(views, [torch.ones(4, dtype=torch.uint8),
+                              torch.ones(5, dtype=torch.uint8)])
+        raise AssertionError("view/slice numel mismatch accepted")
+    except ValueError as e:
+        assert "slice 1" in str(e) and "5" in str(e) and "6" in str(e), e
+    print("ok: abs_m_sticky rejects bad sticky_lambda and misaligned "
+          "views/slices")
+
+
 def test_emittable_scores_validator_and_build_injection():
     from sga.plugins import (
         build_ef,
@@ -713,21 +828,32 @@ def test_emittable_scores_validator_and_build_injection():
 
     register_default_plugins()
     ef_decl = get_ef_decl("radius_opt")
-    for name in ("update_ratio", "coi", "abs_g_synced", "abs_m"):
+    for name in ("update_ratio", "coi", "abs_g_synced", "abs_m",
+                 "snr_m", "abs_m_post"):
         assert name in ef_decl.emittable_scores
         validate_combination(get_score_decl(name), get_selection_decl("circular_topk"),
                              ef_decl, get_backend_plugin_decl("indexed_sparse"),
                              {"period": 8, "full_sync_interval": 0})
+    # abs_m_sticky emits via emit_name='abs_m': 'abs_m_sticky' itself is NOT
+    # in emittable_scores, so acceptance here proves the validator checks the
+    # declared emit name, not the plugin name.
+    sticky_decl = get_score_decl("abs_m_sticky")
+    assert sticky_decl.emit_name == "abs_m" and sticky_decl.needs_support
+    assert "abs_m_sticky" not in ef_decl.emittable_scores
+    validate_combination(sticky_decl, get_selection_decl("circular_topk"),
+                         ef_decl, get_backend_plugin_decl("indexed_sparse"),
+                         {"period": 8, "full_sync_interval": 0})
     # a synced score on a non-emitting EF is rejected at config time
-    try:
-        validate_combination(get_score_decl("abs_m"),
-                             get_selection_decl("circular_topk"),
-                             get_ef_decl("masked_adamw"),
-                             get_backend_plugin_decl("masked_pipelined"),
-                             {"period": 1})
-        raise AssertionError("abs_m x masked_adamw was not rejected")
-    except ValueError as e:
-        assert "emit" in str(e), e
+    for name in ("abs_m", "abs_m_sticky", "snr_m"):
+        try:
+            validate_combination(get_score_decl(name),
+                                 get_selection_decl("circular_topk"),
+                                 get_ef_decl("masked_adamw"),
+                                 get_backend_plugin_decl("masked_pipelined"),
+                                 {"period": 1})
+            raise AssertionError(f"{name} x masked_adamw was not rejected")
+        except ValueError as e:
+            assert "emit" in str(e), e
     # build injection: the EF instance carries the requested emission mode
     ef = build_ef("radius_opt", {}, emit_score="abs_m")
     assert ef.emit_score == "abs_m"
@@ -776,9 +902,34 @@ def test_support_idx_pool_chunked_equals_nonzero():
     b = compact_mask_u8(smaller, pool)
     assert b.numel() < a.numel()
     assert pool.buf.numel() == cap0  # never shrinks
+    bigger = (torch.rand(70_000_000) < 0.9).to(torch.uint8)
+    c = compact_mask_u8(bigger, pool)
+    assert c.numel() > cap0 and pool.buf.numel() >= c.numel()  # growth replaces the buffer
     bs = BucketSupport((torch.rand(64) < 0.5).to(torch.uint8), idx_pool=None)
     assert torch.equal(bs.idx, bs.mask_u8.nonzero(as_tuple=True)[0].to(torch.int32))
     print("ok: chunked compaction == nonzero; grow-only pool")
+
+
+def test_support_split_and_idx_positional_equivalence():
+    """BucketSupport.split: cached searchsorted midpoint split of the cached
+    flat-nonzero indices (the legacy topk_indices/topk_split pair); the
+    indices must address exactly the mask's set positions."""
+    from sga.support import BucketSupport
+
+    mask = torch.tensor([0, 1, 1, 0, 1, 0], dtype=torch.uint8)  # mid = 3
+    bs = BucketSupport(mask, idx_pool=None)
+    idx = bs.idx
+    assert idx.dtype == torch.int32
+    assert idx.tolist() == [1, 2, 4]
+    grad = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    assert torch.equal(grad[idx.long()], grad[mask.bool()])
+    assert bs.split == 2  # indices 1,2 below mid=3; 4 above
+    assert bs.split == int(torch.searchsorted(idx, 3).item())
+    assert bs.split == int((idx < 3).sum().item())
+    # both derivations are cached: repeated access returns identical objects
+    assert bs.idx.data_ptr() == idx.data_ptr()
+    assert bs.split == bs.split
+    print("ok: BucketSupport idx/split == flatnonzero + midpoint split")
 
 
 if __name__ == "__main__":

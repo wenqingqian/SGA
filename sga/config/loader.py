@@ -22,6 +22,8 @@ backend name must be 'dense'.
 
 from omegaconf import DictConfig, OmegaConf
 
+from sga.trace import parse_branch_points
+
 _AXES = ("score", "selection", "error_feedback", "backend")
 
 
@@ -55,6 +57,17 @@ def sga_section_to_config(config: DictConfig):
                     f"sga.{axis}.name is set but sga.enabled is false; either "
                     "enable SGA or remove the plugin configuration."
                 )
+        if sga.get("checks", None) is not None:
+            raise ValueError(
+                "sga.checks is set but sga.enabled is false; the consistency "
+                "machinery only exists with an engine — remove the section."
+            )
+        if sga.get("trace", None) is not None:
+            raise ValueError(
+                "sga.trace is set but sga.enabled is false; trace collection "
+                "is an engine-side service (dense replay-grade traces come "
+                "from shadow runs) — remove the section."
+            )
         backend_cfg = sga.get("backend", None)
         name = None
         if backend_cfg is not None and OmegaConf.is_dict(backend_cfg):
@@ -92,6 +105,51 @@ def sga_section_to_config(config: DictConfig):
         OmegaConf.to_container(cycle, resolve=True) if cycle is not None else {}
     )
     _resolve_cycle_start(engine_config["cycle"], config)
+
+    # Engine consistency-machinery toggles (all default on; escape hatches
+    # for research runs — e.g. count_guard=false restores the legacy
+    # --x-skip-topk-count-check behavior).
+    checks = sga.get("checks", None)
+    if checks is not None:
+        if not OmegaConf.is_dict(checks):
+            raise ValueError(f"sga.checks must be a mapping (got: {checks!r}).")
+        engine_config["checks"] = OmegaConf.to_container(checks, resolve=True)
+        unknown = sorted(set(engine_config["checks"]) - {"count_guard"})
+        if unknown:
+            raise ValueError(
+                f"sga.checks: unknown keys {unknown} (known: ['count_guard'])"
+            )
+        if not isinstance(engine_config["checks"].get("count_guard", True), bool):
+            raise ValueError("sga.checks.count_guard must be a boolean.")
+
+    # Engine-side trace collector (offline replay data source). Off unless
+    # sga.trace.dir is set; validation/normalization happens HERE so the
+    # collector sees a clean {dir, branch_points, window} dict.
+    trace = sga.get("trace", None)
+    if trace is not None:
+        if not OmegaConf.is_dict(trace):
+            raise ValueError(f"sga.trace must be a mapping (got: {trace!r}).")
+        engine_config["trace"] = OmegaConf.to_container(trace, resolve=True)
+        t = engine_config["trace"]
+        unknown = sorted(set(t) - {"dir", "branch_points", "window"})
+        if unknown:
+            raise ValueError(
+                f"sga.trace: unknown keys {unknown} "
+                "(known: ['branch_points', 'dir', 'window'])"
+            )
+        if not isinstance(t.get("dir"), str) or not t["dir"]:
+            raise ValueError(
+                "sga.trace.dir is required and must be a non-empty string "
+                "(the trace output directory)."
+            )
+        try:
+            t["branch_points"] = parse_branch_points(t.get("branch_points"))
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"sga.trace.branch_points: {e}") from None
+        window = t.get("window", 100)
+        if not isinstance(window, int) or isinstance(window, bool) or window < 1:
+            raise ValueError(f"sga.trace.window must be an int >= 1 (got {window!r}).")
+        t["window"] = window
 
     _validate_against_registries(engine_config)
     return engine_config

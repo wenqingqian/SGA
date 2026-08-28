@@ -86,7 +86,10 @@ def test_radius_triton_matches_fallback():
     g_init = g_d.cpu().clone()
     _radius_grad_correct_torch(
         p_ref, g_init, m_ref, v_ref, lr, b1, b2, eps, wd,
-        1 - b1 ** step, 1 - b2 ** step, mask, False,
+        1 - b1 ** step, 1 - b2 ** step,
+        1 - b1 ** (step - 1) if step > 1 else 0.0,
+        1 - b2 ** (step - 1) if step > 1 else 0.0,
+        mask, False,
     )
     torch.testing.assert_close(p_d.cpu(), p_ref, rtol=1e-5, atol=1e-7)
     torch.testing.assert_close(mm_d.cpu(), m_ref, rtol=1e-5, atol=1e-7)
@@ -104,7 +107,10 @@ def test_radius_triton_matches_fallback():
     g_ref = grads.clone()
     _radius_grad_correct_torch(
         p_ref, g_ref, m_ref, v_ref, lr, b1, b2, eps, wd,
-        1 - b1 ** step, 1 - b2 ** step, None, True,
+        1 - b1 ** step, 1 - b2 ** step,
+        1 - b1 ** (step - 1) if step > 1 else 0.0,
+        1 - b2 ** (step - 1) if step > 1 else 0.0,
+        None, True,
     )
     torch.testing.assert_close(g_d.cpu(), g_ref, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(p_d.cpu(), p_ref, rtol=1e-5, atol=1e-7)
@@ -176,6 +182,7 @@ def test_radius_score_modes_purity_and_content():
 
     w1, g1, m1, v1, _ = run(None)               # default: update in grads
     bc1, bc2 = 1 - b1 ** step, 1 - b2 ** step
+    bc1_pre, bc2_pre = 1 - b1 ** (step - 1), 1 - b2 ** (step - 1)
     m1c = b1 * m0 + (1 - b1) * g0
     v1c = b2 * v0 + (1 - b2) * g0 * g0
     u_g = (m1c / bc1) / ((v1c / bc2).sqrt() + eps)
@@ -185,6 +192,9 @@ def test_radius_score_modes_purity_and_content():
                  - (b1 * m0 / bc1) / ((b2 * v0 / bc2).sqrt() + eps)).abs()),
         ("abs_g_synced", g0.abs()),
         ("abs_m", m0.abs()),
+        # snr_m: state-matched (pre-commit) corrections, exponent step - 1
+        ("snr_m", (m0 / bc1_pre).abs() / ((v0 / bc2_pre).sqrt() + eps)),
+        ("abs_m_post", m1c.abs()),
     ):
         w2, g2, m2, v2, side = run(mode)
         assert torch.equal(m1.cpu(), m2.cpu())
@@ -194,6 +204,16 @@ def test_radius_score_modes_purity_and_content():
         rel = ((g2.cpu().double() - ref.double()).abs().max()
                / ref.double().max().clamp(min=1e-30)).item()
         assert rel < 1e-5, (mode, rel)
+
+    # snr_m at step == 1: no commit applied yet -> score collapses to 0
+    w = w0.clone().to(device)
+    g = g0.clone().to(device)
+    m, v = m0.clone().to(device), v0.clone().to(device)
+    radius_grad_correct(w, g, m, v, lr, b1, b2, eps, wd, 1,
+                        mask=None, write_update=True,
+                        score_out=torch.empty(n, device=device),
+                        score_mode="snr_m")
+    assert torch.all(g == 0).item(), "snr_m at step 1 must be exactly 0"
 
     # unknown score mode is rejected host-side before any launch
     try:

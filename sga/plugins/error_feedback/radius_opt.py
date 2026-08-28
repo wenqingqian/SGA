@@ -45,7 +45,9 @@ DECL = EFDecl(
     name="radius_opt",
     reset_mode="selective",
     needs_acc_count=False,
-    emittable_scores=frozenset({"update_ratio", "coi", "abs_g_synced", "abs_m"}),
+    emittable_scores=frozenset({
+        "update_ratio", "coi", "abs_g_synced", "abs_m", "snr_m", "abs_m_post",
+    }),
     requires_full_sync_every_period=True,
 )
 
@@ -54,7 +56,8 @@ _BLOCK_SIZE = 1024
 # Score emission modes for full steps (SCORE_MODE constexpr). Everything is
 # computed from values only reachable in this kernel pass: coi and abs_m read
 # the PRE-commit moments that the same pass overwrites.
-_SCORE_MODES = {"coi": 1, "abs_g_synced": 2, "abs_m": 3}
+_SCORE_MODES = {"coi": 1, "abs_g_synced": 2, "abs_m": 3, "snr_m": 4,
+                "abs_m_post": 5}
 
 
 if _HAS_TRITON:
@@ -64,6 +67,7 @@ if _HAS_TRITON:
         param_ptr, grad_ptr, m_ptr, v_ptr, mask_ptr, score_ptr,
         lr, beta1, beta2, eps, weight_decay,
         bias_correction1, bias_correction2,
+        bias_correction1_pre, bias_correction2_pre,
         n_elements,
         BLOCK_SIZE: tl.constexpr,
         HAS_MASK: tl.constexpr,
@@ -106,6 +110,22 @@ if _HAS_TRITON:
         elif SCORE_MODE == 3:
             # abs_m: |m| of the PRE-commit momentum.
             score = tl.abs(m)
+        elif SCORE_MODE == 4:
+            # snr_m: |m_hat| / (sqrt(v_hat) + eps) of the PRE-commit moments
+            # with STATE-MATCHED bias corrections (exponent = commits already
+            # applied = step - 1). The host passes 0.0 at step == 1 (no commit
+            # yet) and the score collapses to 0 — the discarded branch's
+            # inf/nan is selected away by tl.where.
+            score = tl.where(
+                bias_correction1_pre > 0,
+                tl.abs(m / bias_correction1_pre)
+                / (tl.sqrt(v / bias_correction2_pre) + eps),
+                0.0,
+            )
+        elif SCORE_MODE == 5:
+            # abs_m_post: |m_new| = |beta1*m + (1-beta1)*g|, the momentum
+            # after a hypothetical commit of this gradient (no correction).
+            score = tl.abs(m_new)
 
         tl.store(m_ptr + offsets, m_new, mask=valid)
         tl.store(v_ptr + offsets, v_new, mask=valid)
@@ -178,14 +198,19 @@ def radius_grad_correct(
     zero gradient.
 
     Full-step score emission (``score_out`` given): the named score (one of
-    coi / abs_g_synced / abs_m, all computed from pre-commit state reachable
-    only inside this pass) is written into ``grad_buffer`` — the reselection
-    reads it from there exactly like the default update score — and the
-    signed update goes to ``score_out`` instead; the caller applies and frees
-    it before the reselection.
+    coi / abs_g_synced / abs_m / snr_m / abs_m_post, all computed from
+    pre-commit state reachable only inside this pass) is written into
+    ``grad_buffer`` — the reselection reads it from there exactly like
+    the default update score — and the signed update goes to ``score_out``
+    instead; the caller applies and frees it before the reselection.
     """
     bias_correction1 = 1.0 - beta1 ** step
     bias_correction2 = 1.0 - beta2 ** step
+    # State-matched (pre-commit) corrections for snr_m: the exponent is the
+    # number of commits already applied, i.e. step - 1; 0.0 at step == 1
+    # collapses the snr_m score to 0 (the offline oracle's definition).
+    bias_correction1_pre = 1.0 - beta1 ** (step - 1) if step > 1 else 0.0
+    bias_correction2_pre = 1.0 - beta2 ** (step - 1) if step > 1 else 0.0
     n_elements = param_buffer.numel()
     if n_elements == 0:
         return
@@ -198,7 +223,9 @@ def radius_grad_correct(
         _radius_grad_correct_torch(
             param_buffer, grad_buffer, exp_avg_buffer, exp_avg_sq_buffer,
             lr, beta1, beta2, eps, weight_decay,
-            bias_correction1, bias_correction2, mask, write_update,
+            bias_correction1, bias_correction2,
+            bias_correction1_pre, bias_correction2_pre,
+            mask, write_update,
             score_out, score_mode if has_score else None,
         )
         return
@@ -212,6 +239,7 @@ def radius_grad_correct(
         score_out if has_score else grad_buffer,
         lr, beta1, beta2, eps, weight_decay,
         bias_correction1, bias_correction2,
+        bias_correction1_pre, bias_correction2_pre,
         n_elements,
         BLOCK_SIZE=_BLOCK_SIZE,
         HAS_MASK=has_mask,
@@ -222,7 +250,9 @@ def radius_grad_correct(
 
 def _radius_grad_correct_torch(
     param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
-    bias_correction1, bias_correction2, mask, write_update,
+    bias_correction1, bias_correction2,
+    bias_correction1_pre, bias_correction2_pre,
+    mask, write_update,
     score_out=None, score_mode=None,
 ) -> None:
     """Pure-torch reference path (CPU unit tests); same math as the kernel."""
@@ -244,6 +274,15 @@ def _radius_grad_correct_torch(
         score = g.abs()
     elif score_mode == "abs_m":
         score = m.abs()
+    elif score_mode == "snr_m":
+        if bias_correction1_pre > 0:
+            score = (m / bias_correction1_pre).abs() / (
+                (v / bias_correction2_pre).sqrt() + eps
+            )
+        else:
+            score = torch.zeros_like(m)
+    elif score_mode == "abs_m_post":
+        score = m_new.abs()
     m.copy_(m_new)
     v.copy_(v_new)
     if write_update:
@@ -332,9 +371,10 @@ class RadiusOptEF:
 
         With the default 'update_ratio' score the signed update lands in the
         main grads (Phase 2 applies from there). With a named score
-        (coi/abs_g_synced/abs_m) the two outputs swap targets: the score
-        takes over the grad buffer and the update goes to per-record side
-        buffers, applied and freed record-by-record BEFORE the engine's
+        (coi/abs_g_synced/abs_m/snr_m/abs_m_post) the two outputs swap
+        targets: the score takes over the grad buffer and the update goes to
+        per-record side buffers, applied and freed record-by-record BEFORE
+        the engine's
         reselection reads the score views — the select-time GPU peak then
         carries no model-sized side-buffer set (the legacy scheme's OOM fix).
         Caveat on the Phase-0 allocation: side buffers for ALL records are

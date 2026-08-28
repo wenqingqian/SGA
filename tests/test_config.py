@@ -75,6 +75,76 @@ def test_fourfield_origin_combination_resolves():
     print("ok: four-field origin combination resolves to the engine config")
 
 
+def test_checks_section_validation():
+    """sga.checks carries the consistency-machinery toggles (count_guard,
+    default on); unknown keys are named in the error, and the section is
+    rejected when the engine is off."""
+    cfg, _ = make_base()
+    cfg.sga.enabled = True
+    cfg.sga.cycle = {"start_iter": 0, "period": 8, "full_sync_interval": 0}
+    cfg.sga.score = {"name": "abs_m"}
+    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0}
+    cfg.sga.error_feedback = {"name": "radius_opt"}
+    cfg.sga.backend = {"name": "indexed_sparse"}
+    engine_cfg = sga_section_to_config(cfg)
+    assert "checks" not in engine_cfg  # absent -> engine defaults apply
+
+    cfg.sga.checks = {"count_guard": False}
+    engine_cfg = sga_section_to_config(cfg)
+    assert engine_cfg["checks"] == {"count_guard": False}
+
+    cfg.sga.checks = {"count_guard": "no"}
+    expect_error(lambda: sga_section_to_config(cfg), "boolean")
+    cfg.sga.checks = {"bogus_toggle": True}
+    expect_error(lambda: sga_section_to_config(cfg), "bogus_toggle")
+
+    cfg2, _ = make_base()
+    cfg2.sga.checks = {"count_guard": False}
+    expect_error(lambda: sga_section_to_config(cfg2), "enabled is false")
+    print("ok: sga.checks validation (default absent / flag / unknown / off)")
+
+
+def test_trace_section_validation():
+    """sga.trace configures the engine-side trace collector: dir required,
+    branch_points normalized from comma string or list, window default 100;
+    unknown keys named in the error; section rejected when the engine is off."""
+    cfg, _ = make_base()
+    cfg.sga.enabled = True
+    cfg.sga.cycle = {"start_iter": 0, "period": 8, "full_sync_interval": 0}
+    cfg.sga.score = {"name": "abs_m"}
+    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0}
+    cfg.sga.error_feedback = {"name": "radius_opt"}
+    cfg.sga.backend = {"name": "indexed_sparse"}
+    engine_cfg = sga_section_to_config(cfg)
+    assert "trace" not in engine_cfg  # absent -> collector off
+
+    cfg.sga.trace = {"dir": "/tmp/sga-trace-x", "branch_points": "50, 10,50"}
+    engine_cfg = sga_section_to_config(cfg)
+    assert engine_cfg["trace"]["dir"] == "/tmp/sga-trace-x"
+    assert engine_cfg["trace"]["branch_points"] == [10, 50]  # sorted, deduped
+    assert engine_cfg["trace"]["window"] == 100  # default
+
+    cfg.sga.trace = {"dir": "/tmp/sga-trace-x", "branch_points": [200, 7],
+                     "window": 5}
+    engine_cfg = sga_section_to_config(cfg)
+    assert engine_cfg["trace"]["branch_points"] == [7, 200]
+    assert engine_cfg["trace"]["window"] == 5
+
+    cfg.sga.trace = {"branch_points": [10]}
+    expect_error(lambda: sga_section_to_config(cfg), "dir")
+    cfg.sga.trace = {"dir": "/tmp/x", "bogus": 1}
+    expect_error(lambda: sga_section_to_config(cfg), "bogus")
+    cfg.sga.trace = {"dir": "/tmp/x", "branch_points": [-3]}
+    expect_error(lambda: sga_section_to_config(cfg), ">= 0")
+    cfg.sga.trace = {"dir": "/tmp/x", "window": 0}
+    expect_error(lambda: sga_section_to_config(cfg), "window")
+
+    cfg2, _ = make_base()
+    cfg2.sga.trace = {"dir": "/tmp/x"}
+    expect_error(lambda: sga_section_to_config(cfg2), "enabled is false")
+    print("ok: sga.trace validation (absent / normalize / unknown / off)")
+
+
 def test_start_iter_percent_resolves():
     """cycle.start_iter_percent resolves against train.model.train_iters in
     the loader, before the canonical --sga-config JSON is built."""
@@ -233,4 +303,6 @@ if __name__ == "__main__":
     test_sga_never_reaches_megatron_cmdline()
     test_enabled_injects_canonical_sga_config_pair()
     test_flatten_bool_semantics()
+    test_checks_section_validation()
+    test_trace_section_validation()
     print("test_config: ALL PASS")

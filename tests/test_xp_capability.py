@@ -290,7 +290,10 @@ def test_coi_score_matches_fp64_oracle():
         side = torch.empty(n)
         _radius_grad_correct_torch(
             w, buf, m.clone(), v.clone(), 0.0, b1, b2, eps, 0.0,
-            1 - b1 ** step, 1 - b2 ** step, None, True,
+            1 - b1 ** step, 1 - b2 ** step,
+            1 - b1 ** (step - 1) if step > 1 else 0.0,
+            1 - b2 ** (step - 1) if step > 1 else 0.0,
+            None, True,
             score_out=side, score_mode="coi",
         )
         ref = _coi_reference(grad, m, v, b1, b2, eps, step)
@@ -303,7 +306,7 @@ def test_coi_score_matches_fp64_oracle():
     buf = grad.clone()
     _radius_grad_correct_torch(
         torch.zeros(1000), buf, torch.zeros(1000), torch.zeros(1000),
-        0.0, b1, b2, eps, 0.0, 1 - b1, 1 - b2, None, True,
+        0.0, b1, b2, eps, 0.0, 1 - b1, 1 - b2, 0.0, 0.0, None, True,
         score_out=torch.empty(1000), score_mode="coi",
     )
     ref = _coi_reference(grad, torch.zeros(1000), torch.zeros(1000),
