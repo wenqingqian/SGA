@@ -8,8 +8,8 @@ error_feedback × backend) is pure configuration, not code.
   runner, train/ssh/megatron only; run/stop/query via `run.py` + hydra).
 - `sga/config/` — single-layer yaml validation; the `sga:` algorithm section
   never reaches the megatron command line.
-- `sga/models/` — model registry (day-one: `llama-1b`); `sga/train_gpt.py` is
-  the torchrun entrypoint reusing megatron's stock pretrain implementations.
+- `sga/train_gpt.py` — the torchrun entrypoint, reusing megatron's stock
+  pretrain implementations and stock GPT build chain verbatim.
 - `sga/plugins/`, `sga/backends/` — reserved for SGA algorithm plugins and
   gradient-sync backends (day-one backend: `dense`).
 - `examples/llama3/train_1b_dense.yaml` — dense llama 1B config.

@@ -34,6 +34,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Importing the training entry also imports megatron.core, which registers
 # the torch safe globals (argparse.Namespace etc.) that weights_only loading
 # of the stub state dicts relies on.
+import pretrain_gpt
+from megatron.core.enums import ModelType
+from model_provider import model_provider as root_model_provider
+
+import sga.train_gpt as train_gpt
 from sga.train_gpt import _sga_resume_guard
 
 CURRENT = {"score": {"name": "abs_g"}, "cycle": {"period": 2}}
@@ -104,6 +109,17 @@ def _with_rank(rank, fn):
             del os.environ["RANK"]
         else:
             os.environ["RANK"] = saved
+
+
+def test_model_build_chain_is_stock():
+    """The model wiring is megatron's stock chain, verbatim: the entry's
+    model_provider/gpt_builder are the upstream repo-root objects and the
+    ModelType is encoder_or_decoder (same as pretrain_gpt.__main__)."""
+    assert train_gpt.model_provider is pretrain_gpt.model_provider
+    assert train_gpt.gpt_builder.__module__ == "gpt_builders"
+    assert train_gpt.model_provider is root_model_provider
+    assert ModelType.encoder_or_decoder is not None
+    print("ok: model build chain is stock (model_provider/gpt_builder)")
 
 
 def test_identical_and_reordered_configs_pass():
@@ -192,6 +208,7 @@ def test_nonzero_rank_never_loads():
 
 
 if __name__ == "__main__":
+    test_model_build_chain_is_stock()
     test_identical_and_reordered_configs_pass()
     test_differing_config_refuses()
     test_absent_saved_config_refuses()
