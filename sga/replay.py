@@ -1,8 +1,8 @@
 # Copyright (c) 2026, SGA framework contributors.
 """SGA offline replay oracle: score evaluation on recorded training traces.
 
-SGA-repository port of the legacy research tool (old workspace
-AGENTSPACE/utils/sga_oracle_analysis.py); consumes pre-commit trace dumps
+SGA-repository port of the legacy research tool; consumes pre-commit trace
+dumps
 produced by the engine-side trace collector (sga.trace config) and,
 offline, computes per-coordinate oracle scores and evaluates their
 predictive power over a replay window. Trace format is byte-compatible with

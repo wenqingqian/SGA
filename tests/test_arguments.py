@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The flat-flag vocabulary tests: single parsing pipeline + inertness.
 
-Pins the user ruling (2026-09-01): the nested ``sga:`` yaml section and the
+Pins the single-pipeline contract: the nested ``sga:`` yaml section and the
 hand-written ``--sga-*`` flags are two spellings of ONE pipeline — the
 launcher translates the section into flags, the training entry registers
 them into megatron's argparse and folds them back into the canonical

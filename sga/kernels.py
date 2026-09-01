@@ -1,8 +1,7 @@
 # Copyright (c) 2026, SGA framework contributors.
 """Scheme-agnostic Triton kernels and dispatchers shared by SGA plugins.
 
-Ported from the historical fork's ``megatron/core/sga/common.py`` (survey:
-AGENTSPACE/iterations/earlier probing/data/survey-oldfl-schemes.md S4). The
+Ported from the historical fork's ``megatron/core/sga/common.py``. The
 Megatron-coupled clip plumbing lives in the engine's clip service instead;
 only pure tensor kernels and the AdamW step-counter helper live here. The
 pure-torch fallbacks are physically isolated in ``sga/kernels_torch.py`` —

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Migrated scheme_xp capability tests (单测迁移).
+"""Migrated scheme_xp capability tests.
 
 Ported from the legacy fork's tests/unit_tests/test_sga_scheme_xp.py and
-test_sga_scheme_xp_mask_score.py (survey S3) onto the plugin API. The
+test_sga_scheme_xp_mask_score.py onto the plugin API. The
 megatron-integration plumbing those files mock (DDP stamps, wrapper state,
 phase dispatch) does not exist here — the engine/EF unit tests own it; what
 survives is the capability surface the migration promised:

@@ -5,10 +5,9 @@ Holds the globally-unique cycle manager, one generic BucketState per gradient
 bucket, the three plugin objects plus the score NAME (scores are registry
 data, not objects), the three-layer cross-rank consistency machinery, the
 shared masked-clip service, and the unified per-step metrics log. Scheme-free
-by construction: every behavioural difference lives in plugin declarations
-(notes/sga-engine-structure.md).
+by construction: every behavioural difference lives in plugin declarations.
 
-optimizer_step ordering contract (frozen, API note section 4):
+optimizer_step ordering contract (frozen):
 
     prepare_grads() -> engine masked clip -> count_zeros (BEFORE the
     optimizer template: its full step overwrites main grads with the
@@ -107,7 +106,7 @@ class CycleManager:
     hits, or when no support exists yet. Reselection happens at cycle
     boundaries ((step - start_iter) % period == 0, step > start_iter) on
     non-forced steps only — forced full steps advance the cycle but never
-    reselect (notes section 9).
+    reselect.
     """
 
     def __init__(self, start_iter: int, period: int, full_sync_interval: int,
@@ -180,8 +179,7 @@ class SGAEngine:
         # Layer-1 count guard toggle (checks.count_guard, default on). The
         # guard runs once per cycle at support activation — within a cycle
         # the support is immutable and its counts are cached, so per-step
-        # re-checks re-verify identical numbers (user ruling 2026-08-28,
-        # aligned with the legacy per-cycle check).
+        # re-checks re-verify identical numbers.
         self._count_guard = bool(config.get("checks", {}).get("count_guard", True))
         # Trace collector: None unless sga.trace.dir is set — the dump slot
         # below then costs one None-check per step (zero-overhead-when-off).
@@ -382,7 +380,7 @@ class SGAEngine:
         mp_opt._copy_main_params_to_model_params()
 
         # 6. Reselection at non-forced cycle boundaries (old support completes
-        #    its residual handling BEFORE the switch — notes section 9).
+        #    its residual handling BEFORE the switch).
         reselect = self._cycle.reselect_boundary(step) and not self._step_forced
         if reselect:
             meta = self._selection_context()
@@ -585,8 +583,7 @@ class SGAEngine:
         inactive slot of a per-bucket mask pair, so the OLD support's mask
         stays intact for the selective reset that runs between assemble and
         activate — and GB-scale masks are not freshly allocated every cycle
-        (allocator map/unmap storms at reselection cadence; the legacy
-        scheme kept the same two-buffer discipline).
+        (allocator map/unmap storms at reselection cadence).
         """
         if self._mask_pool is None:
             self._mask_pool = [
@@ -726,14 +723,14 @@ class SGAEngine:
         return self._records
 
     def _masked_clip_grad_norm(self, mp_opt, was_full):
-        """Single shared masked clip service (grilling correction C2).
+        """Single shared masked clip service.
 
         Managed params contribute the RAW accumulated grad at support-masked
         coords; unmanaged/full-step params contribute in full. One global
         scalar: MP-group SUM, then the unconditional DP-bitwise fix (SUM over
         DP-CP + divide by world) — without it the fused kernel's atomic-add
         ulp jitter diverges clip coefficients, then masks, then deadlocks the
-        sparse allreduce (the root cause of a historical deadlock run).
+        sparse allreduce.
         """
         clip_grad = getattr(mp_opt.config, "clip_grad", 0.0)
         records = self._records or self._refresh_records(mp_opt)
@@ -853,10 +850,10 @@ class SGAEngine:
         Two independent per-bucket quantities — the position sum and a
         staggered position-mixed sum — each allreduced as MIN and MAX; a
         single sum silently collides on different sets, the dual values do
-        not (notes section 7). Both are computed in CHUNK-position blocks
+        not. Both are computed in CHUNK-position blocks
         from the mask directly: materializing the full nonzero() int64 index
         array once cost ~k*8 bytes (6+ GiB when a reselection lands on a high
-        ratio), which OOM'd the first real run.
+        ratio).
         """
         group = self._dp_cp_group()
         if group is None:

@@ -158,8 +158,7 @@ if _HAS_TRITON:
                 # reads it from there exactly like the default update score.
                 tl.store(grad_ptr + offsets, score, mask=valid)
         # Fused apply on every path (sparse: masked-out coords loaded grad=0,
-        # so their update is the pure weight-decay/momentum drift — applied
-        # exactly like the historical kernel did).
+        # so their update is the pure weight-decay/momentum drift).
         param = param - lr * update
         tl.store(param_ptr + offsets, param, mask=valid)
 

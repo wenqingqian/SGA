@@ -1,8 +1,8 @@
 # Copyright (c) 2026, SGA framework contributors.
 """method=exact: cat + torch.kthvalue + mask OR-merge.
 
-The historical control path, promoted to a first-class method (
-ruling): OR-merge makes the mask identical across ranks even under residual
+The historical control path, promoted to a first-class method:
+OR-merge makes the mask identical across ranks even under residual
 numerical divergence — a TOLERATE-AND-CONTINUE consistency posture, one tier
 above the histogram family's bitwise-replication-plus-abort.
 """

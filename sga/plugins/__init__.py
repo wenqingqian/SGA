@@ -1,7 +1,7 @@
 # Copyright (c) 2026, SGA framework contributors.
 """Plugin declarations and registries for the four SGA config axes.
 
-A scheme is a pure configuration combination (field model):
+A scheme is a pure configuration combination:
 ``score / selection / optimizer / backend``, each with its own params.
 Scores are DATA in the score registry (sga/plugins/scores.py: name ->
 emission mode + formula + doc — no classes); selection/optimizer/backend are

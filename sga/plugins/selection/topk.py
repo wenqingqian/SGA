@@ -26,8 +26,8 @@ Strict-ratio global topk over the optimizer-materialized score magnitudes:
 
 Params of one method are foreign keys under another and rejected at build
 time (their knobs have no effect there — a silently-dead knob is worse than
-a loud refusal). Historical note: this subject was registered as
-``circular_topk`` previously.
+a loud refusal). Historical note: this subject was previously registered as
+``circular_topk``.
 
 "Circular" (the support is regenerated once per cycle period T at the
 full-sync boundary and persists unchanged in between; non-topk coordinates

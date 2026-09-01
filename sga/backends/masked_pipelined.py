@@ -2,20 +2,19 @@
 """Mask-form pipelined sparse allreduce backend.
 
 Ported from the historical fork's ``masked_all_reduce_pipelined`` (common.py)
-with one framework-level change frozen by the the design grilling — the
-payload-scaling decision. The dense path pre-scales the WHOLE bucket buffer
+with one framework-level change — the payload-scaling decision. The dense
+path pre-scales the WHOLE bucket buffer
 by ``gradient_scaling_factor`` before its SUM allreduce, which would scale
-the residual on sparse steps once per cycle into oblivion (the exact bug the
-old fork dodged by asserting ``average_in_collective=True``). Here ONLY the
+the residual on sparse steps once per cycle into oblivion. Here ONLY the
 extracted payload is scaled, so communicated coordinates stay mathematically
 equal to their dense-path values while uncommunicated coordinates keep their
 raw accumulation.
 
-Pipelining insight (from nccl-test/test_mask_all_reduce.py): NCCL handles
+Pipelining insight: NCCL handles
 empty tensors gracefully, so no ``.sum().item()`` checks ever force a
 GPU-CPU sync. Slice i's extraction kernel overlaps slice i-1's NCCL op
-(plain ``async_op=True``; the completion contract is call-flow synchronous,
-see notes/sga-engine-structure.md section 6).
+(plain ``async_op=True``; the completion contract is call-flow
+synchronous).
 """
 
 import torch

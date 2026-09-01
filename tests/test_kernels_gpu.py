@@ -117,7 +117,7 @@ def test_scatter_selected_roundtrip():
 
 
 def test_score_modes_purity_and_content():
-    """Triton full-step score emission : every named score lands
+    """Triton full-step score emission: every named score lands
     in the grad buffer with the apply fused in the same pass, and the
     emitted score matches its reference from the PRE-commit state; the
     bare-int kernel modes equal the Score enum members BY NAME (the enum is

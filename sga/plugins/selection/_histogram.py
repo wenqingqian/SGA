@@ -1,8 +1,7 @@
 # Copyright (c) 2026, SGA framework contributors.
 """Bit-pattern histogram top-k select, in three geometry tiers.
 
-Ported verbatim from scheme_xp (survey S3; the approximate tiers' superset
-ruling is measured lore): per-rank histograms of the top N bits of the
+Ported verbatim from scheme_xp: per-rank histograms of the top N bits of the
 |x| fp32 bit patterns are SUM-allreduced over the comm group — with
 replicated inputs the merged histogram is exactly ``world`` times the local
 one and the select math is scale-invariant, so every rank derives the
@@ -11,7 +10,7 @@ selected). Non-negative fp32 values sort identically to their int32 bit
 patterns, so an exact ``torch.kthvalue`` on the crossing bin's candidates
 alone yields the bit-exact same threshold as over all elements.
 
-Tiers (``mode`` — the earlier geometry table):
+Tiers (``mode``):
 
 - ``exact``    (shift 16, 32769 bins, stride 1): crossing-bin candidate
   refine with an exact kthvalue; bit-exact same threshold as the kthvalue
@@ -33,10 +32,8 @@ idealized (exact only under a full-set histogram) and must not be read as a
 hard invariant.
 
 Every pass is chunked at ``_HIST_CHUNK`` elements: the int32 bit-pattern
-view/copy of a full 1.2B-element bucket is GB-scale, and stacked on the
-legacy scheme's (since-deleted) non-update score side buffers and the
-persistent sparse-comm buffers it OOM'd the legacy scheme's second
-full-sync select at 1B scale. The chunk size is a multiple of the sample
+view/copy of a full 1.2B-element bucket is GB-scale on top of the resident
+sparse-comm buffers. The chunk size is a multiple of the sample
 stride, so the chunked histogram/subsample is bitwise identical to the
 unchunked one.
 """

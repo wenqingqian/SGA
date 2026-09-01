@@ -2,11 +2,11 @@
 """Optimizer-axis plugins: the masked optimizer step + buffer reset contract.
 
 An optimizer template owns the ENTIRE inner optimizer step for ALL params
-(the grilling contract: torch's ``optimizer.step()`` cannot step a
-subset of param_groups, and the SGA kernels update m/v at every coordinate
-every step). It also owns the post-update selective buffer reset semantics
+(torch's ``optimizer.step()`` cannot step a subset of param_groups, and the
+SGA kernels update m/v at every coordinate every step). It also owns the
+post-update selective buffer reset semantics
 (declared via ``reset_mode``); the reset has exactly ONE execution site —
-the end of ``engine.optimizer_step`` (notes section 5).
+the end of ``engine.optimizer_step``.
 
 Score materialization is part of the same template: on full-sync steps the
 commit kernel writes the configured score (see the score registry) into the

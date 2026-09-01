@@ -1,7 +1,7 @@
 # Copyright (c) 2026, SGA framework contributors.
 """The Support object: which gradient coordinates are communicated this cycle.
 
-Representation is settled project lore (2026-08-27): idx and mask are two
+The representation is settled: idx and mask are two
 forms of the same support; the STORED form is the mask (the selection's
 direct output, written into the engine's ping-pong pool), while the
 position-sorted index array is derived lazily from it by ``compact_mask_u8``
@@ -21,8 +21,8 @@ import torch
 # Mask-compaction granularity: mask bytes processed per nonzero chunk. A
 # full-mask nonzero on a 1.2B-element bucket allocates a fresh GB-scale
 # int64 output every cycle; under expandable_segments those alloc/free
-# cycles hit cuMemMap/cuMemSetAccess ioctl storms (the legacy scheme
-# observed multi-second stalls at the second mask rebuild). Chunking keeps
+# cycles hit cuMemMap/cuMemSetAccess ioctl storms (multi-second stalls at
+# mask-rebuild cadence). Chunking keeps
 # the transient int64 outputs small enough for the caching allocator.
 _MASK_COMPACT_CHUNK = 32 << 20
 # Index/gather buffer growth granularity: 4M elements (16MB fp32).

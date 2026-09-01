@@ -8,10 +8,9 @@ math is NOT restated here: the score-registry formulas
 directly; only the m/v commit skeleton lives in this file. Numerics: the
 same op sequence as the Triton kernel, tolerance-pinned by
 tests/test_kernels_gpu.py (the kernel's fused-apply FMA makes bitwise
-equality across the two impossible by design); the op sequence IS bitwise
-identical to the pre-refactor inline torch reference — the load-bearing
-claim for the CPU tests, which pin it elementwise (torch.equal) against
-the shadow path in tests/test_shadow_unit.py.
+equality across the two impossible by design); the op sequence itself is
+pinned elementwise (torch.equal) against the shadow path by
+tests/test_shadow_unit.py.
 """
 
 import torch

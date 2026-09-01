@@ -1,5 +1,5 @@
 # Copyright (c) 2026, SGA framework contributors.
-"""method=adaptive: persistent-tau topk controller (port of
+"""method=adaptive: persistent-tau topk controller (ported from
 scheme_xp's v3.1).
 
 A persistent scalar tau replaces the per-boundary histogram select after a

@@ -45,7 +45,7 @@ class _Ctx:
 # ------------------------------------------------------------- score registry
 
 def test_old_selection_name_fails_loud():
-    """circular_topk (renamed to topk earlier) must fail with the
+    """circular_topk (the pre-rename name of topk) must fail with the
     curated unknown-plugin error — not a KeyError from the dispatch dict."""
     from sga.plugins import build_selection
     try:
@@ -275,7 +275,7 @@ def test_warmup_sync_target_anchor():
 
     # null syncs + no engine anchor (warmup_target=None): the gate
     # short-circuits to a single bootstrap, then the persistent tau path
-    # takes over (the old code crashed here with max(None, 1))
+    # takes over (an earlier revision crashed here with max(None, 1))
     torch.manual_seed(4)
     grads = [torch.randn(2048)]
     sel0 = TopkSelection({"method": "adaptive", "ratio_percent": 10.0,
@@ -305,7 +305,7 @@ def test_histogram_world_replica_threshold():
 
 
 def test_hist_tiers_geometry_and_chunking():
-    """Three-tier geometry : chunked passes are bitwise identical
+    """Three-tier geometry: chunked passes are bitwise identical
     to unchunked ones, exact stays bit-exact vs the kthvalue control, and
     the approximate tiers meet the two-sided production closeness criterion
     vs exact (0.5pp balanced / 2pp fast). The tiers carry an over-selection

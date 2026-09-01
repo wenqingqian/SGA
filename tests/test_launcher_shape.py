@@ -243,7 +243,7 @@ def test_audit_parser_matches_training_entry():
 
 def test_entry_args_provider_returns_parser():
     """Megatron's parse_args REBINDS ``parser = extra_args_provider(parser)``:
-    a provider returning None (the first an earlier round wiring — caught only by
+    a provider returning None (an early wiring, caught only by
     the e2e gate, since the closure lived under __main__) killed every rank
     with 'NoneType' object has no attribute 'parse_args'."""
     from sga.train_gpt import _extra_args_provider

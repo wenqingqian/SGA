@@ -1,7 +1,7 @@
 # Copyright (c) 2026, SGA framework contributors.
 """The flat ``--sga-*`` flag vocabulary — the single SGA parsing pipeline.
 
-Every config path meets HERE (user ruling 2026-09-01):
+Every config path meets HERE:
 
     nested yaml ``sga:`` section --(launcher translation)--> flat flags
     hand-written flat flags --------------------------------------> argparse

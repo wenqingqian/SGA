@@ -7,10 +7,10 @@ PERSISTENT grow-only compact buffer, two pipelined async allreduces split at
 the bucket midpoint, Triton ``scatter_selected`` writeback. The two slices
 cover exactly the same element sets as the legacy bool-index pipeline, so
 the NCCL reduction order is unchanged. Persistent buffers are the verified
-engineering constraint (notes/sga-engine-structure.md section 7): reallocating
+engineering constraint: reallocating
 GB-scale gathers every cycle triggers allocator map/unmap storms.
 
-Payload-only scaling as in the mask backend (frozen decision).
+Payload-only scaling as in the mask backend.
 """
 
 import torch

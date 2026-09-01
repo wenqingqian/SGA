@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for the SGAEngine core (CPU, fakes, mocked collectives).
 
-Covers (acceptance + expert Q7 additions):
+Covers:
 - CycleManager phase semantics: the fsi cadence (period 1 + fsi 10, a
   template without the full-sync requirement may run boundary-sparse cycles)
   and the boundary-full pattern (bootstrap region + period-8 boundaries,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fork-side inertness tests: without --sga-config the waist is a no-op.
 
-The megatron fork's contract (notes/sga-waist-api-v1.md): the unified plugin
+The megatron fork's contract: the unified plugin
 interface must be invisible to pure dense runs. Verifies on the real fork
 source (PYTHONPATH includes Megatron-LM):
 

@@ -15,7 +15,7 @@ constexpr ints only, so the kernel spells them as bare ints with name
 comments; tests/test_kernels_gpu.py pins the mapping by name). The emission
 mode is an INTRINSIC property of the score — it says which math gets
 materialized, independent of any host optimizer. This does NOT reverse the
-an earlier ruling that online usability is declared per optimizer template
+rule that online usability is declared per optimizer template
 (``OptimizerDecl.emittable_scores``): a template declares the kernel-branch
 subset it implements, and today's single template implements every non-OFFLINE
 branch, so its emittable set is derived here. When a second template appears,

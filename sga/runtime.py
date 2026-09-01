@@ -16,7 +16,7 @@ SGA_API_VERSION = 1
 
 
 def _assert_args_compatible() -> None:
-    """v1 config-time assertion set (notes/sga-waist-api-v1.md section 6).
+    """v1 config-time assertion set.
 
     Backend-specific requirements do NOT live here as name branches — a
     backend plugin may expose an optional ``validate_runtime(args)`` hook

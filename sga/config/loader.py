@@ -12,14 +12,14 @@ line through the flatten. The launcher translates it into the FLAT flag
 vocabulary (``--sga-*``; sga/config/arguments.py — the single parsing
 pipeline: the flags are registered into megatron's argparse by the training
 entry and re-assembled into the canonical ``args.sga_config`` JSON) —
-notes/sga-waist-api-v1.md section 7 keeps the waist reading only that JSON.
+the waist reads only that JSON.
 
-the four-field model: a scheme is the four-field combination
+Field model: a scheme is the four-field combination
 score/selection/optimizer/backend, each with its own params, plus the engine
 cycle {start_iter, period, full_sync_interval}. Legality is checked from
 plugin DECLARATIONS (sga.plugins.validate_combination) — no hardcoded
 scheme list — and each plugin's parameter vocabulary is declared on its
-decl (unknown keys fail loud). ``enabled: false`` keeps the an earlier round
+decl (unknown keys fail loud). ``enabled: false`` keeps the SGA-off
 semantics: dense training, backend name must be 'dense'.
 """
 
@@ -91,7 +91,7 @@ def engine_config_from_sga_dict(sga: dict, train_iters=None):
     enabled = bool(sga.get("enabled", False))
 
     if not enabled:
-        # dense-off semantics: dense training, nothing else may be configured.
+        # Disabled semantics: dense training, nothing else may be configured.
         for axis in _AXES:
             sub = sga.get(axis, None)
             if sub is None:
@@ -173,8 +173,7 @@ def engine_config_from_sga_dict(sga: dict, train_iters=None):
     _resolve_cycle_start(engine_config["cycle"], train_iters)
 
     # Engine consistency-machinery toggles (all default on; escape hatches
-    # for research runs — e.g. count_guard=false restores the legacy
-    # --x-skip-topk-count-check behavior).
+    # for research runs).
     checks = sga.get("checks", None)
     if checks is not None:
         if not isinstance(checks, dict):

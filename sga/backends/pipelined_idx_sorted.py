@@ -1,7 +1,7 @@
 # Copyright (c) 2026, SGA framework contributors.
 """Pipelined index-form sparse allreduce on a high-priority NCCL stream.
 
-Twin-process-group variant of indexed_sparse : the sparse
+Twin-process-group variant of indexed_sparse: the sparse
 collectives run on a second NCCL process group over the SAME ranks created
 with ``ProcessGroupNCCL.Options(is_high_priority_stream=True)``, so the
 compact payloads do not queue behind work on the training stream's
@@ -28,9 +28,10 @@ builds the comm object; eager ``device_id`` init likewise stops short of
 transport). When that first collective is the first sparse sync deep in a
 run, its internal cudaMalloc competes with the caching allocator's
 reservations: under ``expandable_segments:True``, resume runs (first sparse
-sync at step 68) crashed deterministically with
+sync after checkpoint-load memory expansion) crashed deterministically with
 ``ncclUnhandledCudaError: Failed to CUDA calloc async`` while fresh runs
-(first sparse sync at step 8) passed — and an eager new_group alone did
+(first sparse sync in the opening steps, allocator still clean) passed —
+and an eager new_group alone did
 NOT fix the resume crash. ``prepare()`` therefore finishes with a dummy
 warmup allreduce pair — one op sized at/above the largest production
 slice (covers the Simple-protocol path, all channels), one 1-element op
@@ -43,9 +44,8 @@ Requires pipeline_model_parallel_size == 1 plus a single DP-CP group
 covering the whole world (rejected config-time by this backend's
 ``validate_runtime``), which also refuses resume runs — the twin's
 residency does not fit a resume run's steady state (see
-``validate_runtime``). Payload-only scaling as in the mask backend
-(frozen decision). Persistent grow-only gather buffers
-(notes/sga-engine-structure.md section 7).
+``validate_runtime``). Payload-only scaling as in the mask backend.
+Persistent grow-only gather buffers.
 """
 
 import os
@@ -221,13 +221,13 @@ class PipelinedIdxSortedBackend:
         # Resume (checkpoint tracker present) is refused on memory grounds:
         # the twin communicator costs ~330MB of permanent residency per GPU,
         # and a resume run's checkpoint-load/first-step steady state leaves
-        # less than that — five probes  showed every warmup
-        # ordering dies: the first still-cold communicator at steady-state
+        # less than that — probing every warmup ordering showed they all
+        # die: the first still-cold communicator at steady-state
         # memory crashes with ``ncclUnhandledCudaError: Failed to CUDA calloc
         # async``, and warming everything shifts the failure into the
         # checkpoint load itself (CUDA OOM). Fresh runs are unaffected —
-        # every communicator initializes at steps 1-8 while memory is clean
-        # (60/60 smoke passes). Resume with indexed_sparse instead; set
+        # every communicator initializes at the opening steps while memory
+        # is clean. Resume with indexed_sparse instead; set
         # SGA_ALLOW_RESUME_PIPELINED=1 to override on hardware with headroom.
         load = getattr(args, "load", None)
         tracker = (os.path.join(load, "latest_checkpointed_iteration.txt")
@@ -240,7 +240,7 @@ class PipelinedIdxSortedBackend:
                 f"{load!r} has a checkpoint tracker). Use backend "
                 "indexed_sparse for resume, or set "
                 f"{_RESUME_OVERRIDE_ENV}=1 to override on hardware with "
-                "headroom (known-issue, iteration probes 5-5e).")
+                "headroom.")
 
     def _gather_buf(self, key: int, k: int, dtype, device) -> torch.Tensor:
         # Grow-only, rounded up to 4M elements (16MB fp32): exact-size
