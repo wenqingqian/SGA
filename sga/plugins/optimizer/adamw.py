@@ -43,7 +43,7 @@ from typing import Optional
 
 import torch
 
-from sga.plugins import OptimizerDecl
+from sga.plugins import OptimizerDecl, PluginParam, resolve_plugin_params
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch, selective_reset_torch
 from sga.plugins.scores import Score, emittable_score_names, get_score_spec
 
@@ -63,6 +63,13 @@ DECL = OptimizerDecl(
     # kernel branch (a second template would declare its own branch subset).
     emittable_scores=emittable_score_names(),
     requires_full_sync_every_period=True,
+    params=(
+        PluginParam(
+            "residual_mean", bool, default=False,
+            doc="pre-fold the accumulated residual by the cycle period at "
+                "full-sync boundaries (residual-mean semantics)",
+        ),
+    ),
 )
 
 # The bare-int EMIT_MODE branches _grad_correct_kernel implements below.
@@ -285,8 +292,9 @@ class SgaAdamW:
     decl = DECL
 
     def __init__(self, params: dict, emit_score: Optional[str] = None):
+        params = resolve_plugin_params("optimizer", "adamw", DECL, dict(params))
         self.params = params
-        self.residual_mean = bool(params.get("residual_mean", False))
+        self.residual_mean = bool(params["residual_mean"])
         # Which registry score to materialize on full steps (build-time
         # injection). None/'update' keeps the historical default: the signed
         # AdamW update itself is the topk input. The emission mode int is

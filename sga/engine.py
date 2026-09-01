@@ -80,7 +80,6 @@ class BucketState:
         # Element spans of the params living in this bucket.
         self.param_spans = []                       # [(model_param, start, end)]
         self.param_names = []
-        self.always_sync_mask = None                # uint8 forced-ones mask (lazy)
         # Extra main grads owned by the buffer this bucket lives in.
         self.extra_main_grads = []                  # (assigned at attach)
         self.active_mask_u8 = None                  # active support mask (set by engine)
@@ -89,10 +88,8 @@ class BucketState:
 class SelectionContext:
     """What a selection sees at a reselection boundary (CPU-testable shape)."""
 
-    def __init__(self, grad_views, always_sync_masks, comm_group,
-                 warmup_target=None):
+    def __init__(self, grad_views, comm_group, warmup_target=None):
         self.grad_views = grad_views
-        self.always_sync_masks = always_sync_masks
         self.comm_group = comm_group
         # Gated warmup selects implied by the selection's OWN warmup window,
         # supplied via its optional ``warmup_sync_target(start_iter, period)``
@@ -251,7 +248,6 @@ class SGAEngine:
 
         self._selection_meta = None  # rebuilt after a new chunk attaches
         self.opt.ensure_state(self._bucket_states)
-        self._build_always_sync_masks()
         # The comm groups just became known (DDP bucket construction is a
         # world-collective, so attach runs symmetrically on every rank):
         # give the backend its optional eager-setup point BEFORE the training
@@ -267,24 +263,6 @@ class SGAEngine:
                     continue
                 seen_ids.add(id(dp_group))
                 prepare(dp_group, device=bs.grad_data.device)
-
-    def _build_always_sync_masks(self):
-        patterns = self.selection.params.get("always_sync_layers", []) or []
-        if not patterns:
-            return
-        for bs in self._bucket_states:
-            mask = None
-            for (param, start, end), name in zip(bs.param_spans, bs.param_names):
-                hit = any(pat in name for pat in patterns)
-                if not hit:
-                    continue
-                if mask is None:
-                    mask = torch.zeros(
-                        bs.grad_data.numel(), dtype=torch.uint8,
-                        device=bs.grad_data.device,
-                    )
-                mask[start:end] = 1
-            bs.always_sync_mask = mask
 
     # -------------------------------------------------------------- grad sync
 
@@ -407,14 +385,14 @@ class SGAEngine:
         #    its residual handling BEFORE the switch — notes section 9).
         reselect = self._cycle.reselect_boundary(step) and not self._step_forced
         if reselect:
-            always_slices, meta = self._selection_context()
+            meta = self._selection_context()
             # Materialized-score views, IN META ORDER: records follow the
             # optimizer's param order, bucket spans follow the DDP bucket
             # order — they differ in real megatron.
             views = [p.main_param.grad.data.view(-1)
                      for (_, _, _, p) in meta]
             self._check_norm_spread(views)
-            new_support = self._run_selection(views, always_slices, meta)
+            new_support = self._run_selection(views, meta)
         else:
             new_support = None
 
@@ -516,7 +494,7 @@ class SGAEngine:
 
         rec_of = {id(rec.model_param): rec for rec in records}
         emit = self.score_name
-        always_slices, meta = self._selection_context()
+        meta = self._selection_context()
         # Two largest-param-sized buffers carry the shared formula-chain
         # temps (bitwise-identical out= routing) — the boundary's
         # allocator high-water otherwise spikes several param-sized
@@ -540,7 +518,7 @@ class SGAEngine:
                 )
             views.append(readonly_score(rec, emit, scratch).view(-1))
         self._check_norm_spread(views)
-        self._activate_support(self._run_selection(views, always_slices, meta))
+        self._activate_support(self._run_selection(views, meta))
         if self._count_guard:
             self._check_counts()
 
@@ -561,10 +539,10 @@ class SGAEngine:
                     "dense trajectories and breaks the shadow invariant"
                 )
 
-    def _run_selection(self, views, always_slices, meta) -> "Support":
+    def _run_selection(self, views, meta) -> "Support":
         """Shared selection tail for both reselection call sites: warmup
         probe → context → select → bucket assembly → consistency verify →
-        adapt → Support construction. The CALLER owns activation timing and
+        Support construction. The CALLER owns activation timing and
         everything around it: live activates only after the optimizer's selective
         reset has consumed the old support (step 7), shadow activates
         immediately inside the RNG bracket — those orderings are load-bearing
@@ -572,7 +550,6 @@ class SGAEngine:
         warmup_hook = getattr(self.selection, "warmup_sync_target", None)
         sel_ctx = SelectionContext(
             grad_views=views,
-            always_sync_masks=always_slices,
             comm_group=self._dp_cp_group(),
             warmup_target=(warmup_hook(self._cycle.start_iter,
                                        self._cycle.period)
@@ -581,15 +558,13 @@ class SGAEngine:
         masks = self.selection.select(sel_ctx)
         bucket_masks = self._assemble_bucket_masks(masks, meta)
         self._verify_support_consistency(bucket_masks)
-        if hasattr(self.selection, "adapt"):
-            self.selection.adapt(masks, always_slices)
         return Support([
             BucketSupport(m, idx_pool=self._bucket_idx_pool(i))
             for i, m in enumerate(bucket_masks)
         ])
 
     def _selection_context(self):
-        """Always-sync slices + per-param view metadata for reselection.
+        """Per-param view metadata for reselection.
 
         ``meta`` entries are (bucket_state, start, end, model_param); the
         param rides along so the callers can fetch the matching materialized
@@ -601,17 +576,7 @@ class SGAEngine:
                 for (param, start, end) in bs.param_spans:
                     meta.append((bs, start, end, param))
             self._selection_meta = meta
-        meta = self._selection_meta
-        return self._always_sync_slices(), meta
-
-    def _always_sync_slices(self):
-        out = []
-        for bs, start, end, _ in self._selection_meta:
-            if bs.always_sync_mask is None:
-                out.append(None)
-            else:
-                out.append(bs.always_sync_mask[start:end])
-        return out
+        return self._selection_meta
 
     def _assemble_bucket_masks(self, masks, meta):
         """Scatter per-param masks into per-bucket element-level uint8 masks.

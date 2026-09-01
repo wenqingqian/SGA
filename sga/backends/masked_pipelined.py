@@ -20,9 +20,18 @@ see notes/sga-engine-structure.md section 6).
 
 import torch
 
-from sga.plugins import BackendDecl
+from sga.plugins import BackendDecl, PluginParam, resolve_plugin_params
 
-DECL = BackendDecl(name="masked_pipelined", consumes="mask")
+DECL = BackendDecl(
+    name="masked_pipelined",
+    consumes="mask",
+    params=(
+        PluginParam(
+            "num_slices", int, default=0,
+            doc="mask slices pipelined against NCCL ops (0 = auto, i.e. 2)",
+        ),
+    ),
+)
 
 
 class MaskedPipelinedBackend:
@@ -31,7 +40,9 @@ class MaskedPipelinedBackend:
     decl = DECL
 
     def __init__(self, params: dict):
-        self.num_slices = int(params.get("num_slices", 0)) or 2
+        params = resolve_plugin_params("backend", "masked_pipelined", DECL,
+                                       dict(params))
+        self.num_slices = int(params["num_slices"]) or 2
 
     def allreduce_sparse(self, grad_data: torch.Tensor, support,
                          comm_group, gradient_scaling_factor: float,

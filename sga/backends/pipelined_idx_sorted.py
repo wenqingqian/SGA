@@ -52,9 +52,18 @@ import os
 
 import torch
 
-from sga.plugins import BackendDecl
+from sga.plugins import BackendDecl, PluginParam, resolve_plugin_params
 
-DECL = BackendDecl(name="pipelined_idx_sorted", consumes="idx")
+DECL = BackendDecl(
+    name="pipelined_idx_sorted",
+    consumes="idx",
+    params=(
+        PluginParam(
+            "slices", int, default=3,
+            doc="number of idx slices pipelined against the twin allreduces",
+        ),
+    ),
+)
 
 # Emergency/diagnostic bypass for this backend's twin-PG warmup. Parsed as
 # exactly "1" (the unset default): any OTHER value — "0", "true", "yes"
@@ -84,7 +93,9 @@ class PipelinedIdxSortedBackend:
     decl = DECL
 
     def __init__(self, params: dict):
-        self._slices = int(params.get("slices", 3))
+        params = resolve_plugin_params("backend", "pipelined_idx_sorted",
+                                       DECL, dict(params))
+        self._slices = int(params["slices"])
         if self._slices < 1:
             raise ValueError(f"slices must be >= 1, got {self._slices}")
         self._gather_bufs: dict = {}  # bucket key -> persistent compact buffer

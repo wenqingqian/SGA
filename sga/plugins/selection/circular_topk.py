@@ -35,7 +35,11 @@ the materialized score still sits in the main-grad copy.
 
 import torch
 
-from sga.plugins import SelectionDecl
+from sga.plugins import (
+    PluginParam,
+    SelectionDecl,
+    resolve_plugin_params,
+)
 from sga.plugins.selection import _histogram
 from sga.plugins.selection._histogram import (
     _HIST_BINS,
@@ -49,6 +53,35 @@ from sga.plugins.selection._histogram import (
 DECL = SelectionDecl(
     name="circular_topk",
     output_form="mask",
+    params=(
+        PluginParam(
+            "ratio_percent", float, required=True,
+            doc="topk mask ratio in percent, strictly inside (0, 100)",
+        ),
+        PluginParam(
+            "hist_mode", str, default="exact", choices=tuple(sorted(_HIST_MODES)),
+            doc="histogram geometry tier: exact / balanced / fast",
+        ),
+        PluginParam(
+            "exact_kthvalue", bool, default=False,
+            doc="control path: full-model cat + torch.kthvalue + mask "
+                "OR-merge (A/B comparison)",
+        ),
+        PluginParam(
+            "adaptive", bool, default=False,
+            doc="persistent-tau adaptive threshold (v3.1 controller)",
+        ),
+        PluginParam(
+            "adaptive_warmup_syncs", int, default=5, nullable=True,
+            doc="gated warmup selects before the persistent tau takes over "
+                "(null disables the warmup gate)",
+        ),
+        PluginParam(
+            "adaptive_warmup_mode", str, default="fast",
+            choices=tuple(sorted(_HIST_MODES)),
+            doc="histogram tier used to bootstrap/steer the adaptive tau",
+        ),
+    ),
 )
 
 # Back-compat alias: the histogram path was inlined here before the
@@ -113,24 +146,27 @@ class CircularTopkSelection:
     decl = DECL
 
     def __init__(self, params: dict):
+        raw = dict(params)  # pre-resolution view (explicit keys only)
+        params = resolve_plugin_params("selection", "circular_topk", DECL,
+                                       raw)
         self.params = params
         self.ratio_percent = float(params["ratio_percent"])
         assert 0.0 < self.ratio_percent < 100.0, (
             f"ratio_percent must be in (0, 100), got {self.ratio_percent}"
         )
-        self.hist_mode = params.get("hist_mode", "exact")
+        self.hist_mode = params["hist_mode"]
         if self.hist_mode not in _HIST_MODES:
             raise ValueError(
                 f"circular_topk: unknown hist_mode {self.hist_mode!r} "
                 f"(expected one of {sorted(_HIST_MODES)})"
             )
-        self.exact_kthvalue = bool(params.get("exact_kthvalue", False))
-        self.adaptive = bool(params.get("adaptive", False))
-        warmup_syncs = params.get("adaptive_warmup_syncs", 5)
+        self.exact_kthvalue = bool(params["exact_kthvalue"])
+        self.adaptive = bool(params["adaptive"])
+        warmup_syncs = params["adaptive_warmup_syncs"]
         self.adaptive_warmup_syncs = (
             int(warmup_syncs) if warmup_syncs is not None else None
         )
-        self.adaptive_warmup_mode = params.get("adaptive_warmup_mode", "fast")
+        self.adaptive_warmup_mode = params["adaptive_warmup_mode"]
         if self.adaptive:
             if self.adaptive_warmup_mode not in _HIST_MODES:
                 raise ValueError(
@@ -143,7 +179,7 @@ class CircularTopkSelection:
                     "circular_topk: adaptive and exact_kthvalue are mutually "
                     "exclusive (the control path exists for exact A/B)"
                 )
-            if "hist_mode" in params:
+            if "hist_mode" in raw:
                 raise ValueError(
                     "circular_topk: hist_mode is dead under adaptive=True "
                     "(the bootstrap uses adaptive_warmup_mode and steady "

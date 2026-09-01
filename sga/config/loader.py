@@ -8,16 +8,19 @@ Structure (one file, no defaults/inheritance/merging):
     train: {system, model, data}                       # megatron args
 
 The `sga:` section is validated here and never reaches the megatron command
-line through the flatten (the launcher flattens only train.{system,model,data}
-and instead injects the resolved section as the single opaque ``--sga-config``
-canonical-JSON argument — notes/sga-waist-api-v1.md section 7).
+line through the flatten. The launcher translates it into the FLAT flag
+vocabulary (``--sga-*``; sga/config/arguments.py — the single parsing
+pipeline: the flags are registered into megatron's argparse by the training
+entry and re-assembled into the canonical ``args.sga_config`` JSON) —
+notes/sga-waist-api-v1.md section 7 keeps the waist reading only that JSON.
 
 the four-field model: a scheme is the four-field combination
-score/selection/optimizer/backend, each with its own params, plus the
-engine cycle {start_iter, period, full_sync_interval}. Legality is checked
-from plugin DECLARATIONS (sga.plugins.validate_combination) — no hardcoded
-scheme list. ``enabled: false`` keeps the dense-off semantics: dense training,
-backend name must be 'dense'.
+score/selection/optimizer/backend, each with its own params, plus the engine
+cycle {start_iter, period, full_sync_interval}. Legality is checked from
+plugin DECLARATIONS (sga.plugins.validate_combination) — no hardcoded
+scheme list — and each plugin's parameter vocabulary is declared on its
+decl (unknown keys fail loud). ``enabled: false`` keeps the an earlier round
+semantics: dense training, backend name must be 'dense'.
 """
 
 from omegaconf import DictConfig, OmegaConf
@@ -30,7 +33,8 @@ _AXES = ("score", "selection", "optimizer", "backend")
 # must fail loud even in a disabled config, where it would otherwise be
 # silently dropped and the run would proceed as live sparse instead of the
 # intended shadow). Plugin params inside score/selection/optimizer/backend
-# stay free-form; cycle's own interior is a fixed vocabulary.
+# are validated against the plugins' declared vocabularies; cycle's own
+# interior is a fixed vocabulary.
 _SGA_KEYS = frozenset(
     (
         "enabled",
@@ -62,6 +66,21 @@ def sga_section_to_config(config: DictConfig):
             "Config is missing the 'sga:' section (declare it with enabled: "
             "false and backend: dense for pure dense training)."
         )
+    train_iters = OmegaConf.select(config, "train.model.train_iters",
+                                   default=None)
+    return engine_config_from_sga_dict(OmegaConf.to_container(sga, resolve=True),
+                                       train_iters=train_iters)
+
+
+def engine_config_from_sga_dict(sga: dict, train_iters=None):
+    """The shared validation core, on a plain dict (both input forms meet
+    here): the nested yaml section (via sga_section_to_config) and the flat
+    flags re-nested by the assembler (sga/config/arguments.py). ``train_iters``
+    is the percent-resolution context; the flat-flag path passes None
+    (start_iter_percent has no flag and is rejected there).
+    """
+    if not isinstance(sga, dict):
+        raise ValueError(f"sga section must be a mapping (got: {sga!r}).")
 
     unknown = sorted(set(sga.keys()) - _SGA_KEYS)
     if unknown:
@@ -77,7 +96,7 @@ def sga_section_to_config(config: DictConfig):
             sub = sga.get(axis, None)
             if sub is None:
                 continue
-            if not OmegaConf.is_dict(sub):
+            if not isinstance(sub, dict):
                 raise ValueError(
                     f"sga.{axis} must be a mapping (got: {sub!r})."
                 )
@@ -105,7 +124,7 @@ def sga_section_to_config(config: DictConfig):
                 )
         backend_cfg = sga.get("backend", None)
         name = None
-        if backend_cfg is not None and OmegaConf.is_dict(backend_cfg):
+        if backend_cfg is not None and isinstance(backend_cfg, dict):
             name = backend_cfg.get("name", None)
         if name not in (None, "dense"):
             raise ValueError(
@@ -117,7 +136,7 @@ def sga_section_to_config(config: DictConfig):
     engine_config = {}
     for axis in _AXES:
         sub = sga.get(axis, None)
-        if sub is None or not OmegaConf.is_dict(sub):
+        if sub is None or not isinstance(sub, dict):
             raise ValueError(
                 f"sga.{axis} is required when sga.enabled is true and must be "
                 f"a mapping with a 'name' key (got: {sub!r})."
@@ -125,7 +144,7 @@ def sga_section_to_config(config: DictConfig):
         name = sub.get("name", None)
         if name is None:
             raise ValueError(f"sga.{axis}.name is required (registry-driven).")
-        params = OmegaConf.to_container(sub, resolve=True)
+        params = dict(sub)
         params.pop("name", None)
         engine_config[axis] = {"name": name, **params}
 
@@ -137,9 +156,9 @@ def sga_section_to_config(config: DictConfig):
 
     cycle = sga.get("cycle", None)
     if cycle is not None:
-        if not OmegaConf.is_dict(cycle):
+        if not isinstance(cycle, dict):
             raise ValueError(f"sga.cycle must be a mapping (got: {cycle!r}).")
-        engine_config["cycle"] = OmegaConf.to_container(cycle, resolve=True)
+        engine_config["cycle"] = dict(cycle)
         unknown = sorted(set(engine_config["cycle"]) - _CYCLE_KEYS)
         if unknown:
             # A typo like `peroid` would otherwise silently fall back to the
@@ -151,16 +170,16 @@ def sga_section_to_config(config: DictConfig):
             )
     else:
         engine_config["cycle"] = {}
-    _resolve_cycle_start(engine_config["cycle"], config)
+    _resolve_cycle_start(engine_config["cycle"], train_iters)
 
     # Engine consistency-machinery toggles (all default on; escape hatches
     # for research runs — e.g. count_guard=false restores the legacy
     # --x-skip-topk-count-check behavior).
     checks = sga.get("checks", None)
     if checks is not None:
-        if not OmegaConf.is_dict(checks):
+        if not isinstance(checks, dict):
             raise ValueError(f"sga.checks must be a mapping (got: {checks!r}).")
-        engine_config["checks"] = OmegaConf.to_container(checks, resolve=True)
+        engine_config["checks"] = dict(checks)
         unknown = sorted(set(engine_config["checks"]) - {"count_guard"})
         if unknown:
             raise ValueError(
@@ -174,9 +193,9 @@ def sga_section_to_config(config: DictConfig):
     # collector sees a clean {dir, branch_points, window} dict.
     trace = sga.get("trace", None)
     if trace is not None:
-        if not OmegaConf.is_dict(trace):
+        if not isinstance(trace, dict):
             raise ValueError(f"sga.trace must be a mapping (got: {trace!r}).")
-        engine_config["trace"] = OmegaConf.to_container(trace, resolve=True)
+        engine_config["trace"] = dict(trace)
         t = engine_config["trace"]
         unknown = sorted(set(t) - {"dir", "branch_points", "window"})
         if unknown:
@@ -226,18 +245,17 @@ def sga_section_to_config(config: DictConfig):
     return engine_config
 
 
-def _resolve_cycle_start(cycle: dict, config: DictConfig) -> None:
+def _resolve_cycle_start(cycle: dict, train_iters) -> None:
     """Resolve ``cycle.start_iter_percent`` (of train.model.train_iters) into
     the absolute ``start_iter`` the engine speaks — here, BEFORE the section
-    is serialized into the canonical ``--sga-config`` JSON (which only ever
-    carries start_iter). The two forms are mutually exclusive."""
+    is serialized into the canonical ``args.sga_config`` JSON (which only
+    ever carries start_iter). The two forms are mutually exclusive."""
     if "start_iter_percent" not in cycle:
         return
     if cycle.get("start_iter") is not None:
         raise ValueError(
             "sga.cycle: set either start_iter or start_iter_percent, not both."
         )
-    train_iters = OmegaConf.select(config, "train.model.train_iters", default=None)
     if not train_iters or int(train_iters) <= 0:
         raise ValueError(
             "sga.cycle.start_iter_percent requires train.model.train_iters > 0."
@@ -259,8 +277,11 @@ def _resolve_cycle_start(cycle: dict, config: DictConfig) -> None:
 
 
 def _validate_against_registries(engine_config: dict) -> None:
-    """Registry membership + declaration-based combination check."""
+    """Registry membership + declaration-based combination check + the
+    plugins' declared parameter vocabularies (unknown keys fail loud here —
+    a typo'd param would otherwise be silently swallowed downstream)."""
     from sga.plugins import (
+        check_plugin_params,
         get_backend_plugin_decl,
         get_optimizer_decl,
         get_score_spec,
@@ -278,6 +299,26 @@ def _validate_against_registries(engine_config: dict) -> None:
     if int(cycle.get("period", 1)) < 1:
         raise ValueError("sga.cycle.period must be >= 1")
     validate_combination(score_name, selection, optimizer, backend, cycle)
+
+    # Scores are registry DATA with no tunable params: any key besides the
+    # name is a typo or a misunderstanding of the axis.
+    extra_score_keys = sorted(set(engine_config["score"]) - {"name"})
+    if extra_score_keys:
+        raise ValueError(
+            f"sga.score takes no params beyond name (got: {extra_score_keys})"
+        )
+    for axis, decl in (("selection", selection),
+                       ("optimizer", optimizer),
+                       ("backend", backend)):
+        params = {k: v for k, v in engine_config[axis].items() if k != "name"}
+        check_plugin_params(axis, engine_config[axis]["name"], decl, params)
+        # Canonicalize float params to float regardless of the yaml spelling
+        # (10 vs 10.0): the canonical --sga-config JSON must be
+        # spelling-invariant, or the resume guard would refuse identical
+        # configs over a byte difference.
+        for p in decl.params:
+            if p.type is float and isinstance(params.get(p.name), int):
+                engine_config[axis][p.name] = float(engine_config[axis][p.name])
 
 
 def validate_sga_section(config: DictConfig) -> None:

@@ -36,9 +36,8 @@ torch.manual_seed(0)
 
 
 class _Ctx:
-    def __init__(self, grad_views, always=None, comm_group=None, warmup_target=None):
+    def __init__(self, grad_views, comm_group=None, warmup_target=None):
         self.grad_views = grad_views
-        self.always_sync_masks = always or [None] * len(grad_views)
         self.comm_group = comm_group
         self.warmup_target = warmup_target
 
@@ -346,7 +345,7 @@ def test_hist_tiers_geometry_and_chunking():
 
     # selection plumbing: hist_mode flows through, unknown modes rejected
     sel = CircularTopkSelection({"ratio_percent": 10.0, "hist_mode": "fast"})
-    sel.select(_Ctx(grads, None, comm_group=None))
+    sel.select(_Ctx(grads, comm_group=None))
     bits = torch.tensor(sel.last_threshold, dtype=torch.float32).view(torch.int32).item()
     assert (bits & ((1 << 19) - 1)) == 0
     try:
@@ -382,7 +381,7 @@ def test_circular_topk_adaptive_lifecycle():
     assert sel.adaptive_warmup_mode == "fast"
 
     # 1) bootstrap from the warmup-mode histogram; tau is its bin edge
-    sel.select(_Ctx(grads, None, comm_group=None, warmup_target=3))
+    sel.select(_Ctx(grads, comm_group=None, warmup_target=3))
     bits = torch.tensor(sel.last_threshold, dtype=torch.float32).view(torch.int32).item()
     assert (bits & ((1 << 19) - 1)) == 0
     assert sel._tau == sel.last_threshold
@@ -390,21 +389,21 @@ def test_circular_topk_adaptive_lifecycle():
 
     # 2) a miss extends the warmup (never escalates): still bootstrapping
     sel._warmup_passed = 0
-    sel.select(_Ctx(grads, None, comm_group=None, warmup_target=3))
+    sel.select(_Ctx(grads, comm_group=None, warmup_target=3))
     assert sel._tau == sel.last_threshold
 
     # 3) after the gate: masks == |g| >= tau, built with the OLD tau while
     # the feedback moves the persistent tau for the next cycle
     sel._warmup_passed = 3
     tau = sel._tau
-    masks = sel.select(_Ctx(grads, None, comm_group=None, warmup_target=3))
+    masks = sel.select(_Ctx(grads, comm_group=None, warmup_target=3))
     for g, m in zip(grads, masks):
         assert torch.equal(m, (g.abs() >= tau).to(torch.uint8))
     assert sel.last_threshold == tau
 
     # 4) collapse guard: everything below tau -> re-bootstrap from histogram
     sel._tau = 1e30
-    masks = sel.select(_Ctx(grads, None, comm_group=None, warmup_target=3))
+    masks = sel.select(_Ctx(grads, comm_group=None, warmup_target=3))
     assert sel._tau < 1e30
     assert any(int(torch.count_nonzero(m).item()) for m in masks)
 
@@ -423,7 +422,7 @@ def test_circular_topk_adaptive_lifecycle():
     canned_zero = (0.0, [(grads[0].abs() >= 0.10).to(torch.uint8)])
     with mock.patch.object(ct_mod, "select_masks_histogram",
                            return_value=canned_zero):
-        masks = sel.select(_Ctx(grads, None, comm_group=None, warmup_target=0))
+        masks = sel.select(_Ctx(grads, comm_group=None, warmup_target=0))
     assert sel._tau > 0.0, sel._tau
     assert sel._tau == _bin_edge_float(1, 19), sel._tau  # fast mode floor
     assert all(int(torch.count_nonzero(m).item()) for m in masks)

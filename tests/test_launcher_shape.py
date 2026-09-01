@@ -143,7 +143,7 @@ def test_run_script_skeleton():
             line.startswith("export PYTHONPATH=") and line.endswith(":${PYTHONPATH}")
             for line in lines
         )
-        # shlex.quote keeps the payload shell-safe (e.g. the --sga-config JSON)
+        # shlex.quote keeps the payload shell-safe (quoted --sga-* values)
         assert "cmd='echo hi'" in lines
         nohup_lines = [line for line in lines if line.startswith('nohup bash -c "$cmd; sync"')]
         assert len(nohup_lines) == 1 and ">> " in nohup_lines[0] and "2>&1" in nohup_lines[0]
@@ -241,10 +241,27 @@ def test_audit_parser_matches_training_entry():
         print("ok: audit parser matches training entry (provider ABSENT, identical tables)")
 
 
+def test_entry_args_provider_returns_parser():
+    """Megatron's parse_args REBINDS ``parser = extra_args_provider(parser)``:
+    a provider returning None (the first an earlier round wiring — caught only by
+    the e2e gate, since the closure lived under __main__) killed every rank
+    with 'NoneType' object has no attribute 'parse_args'."""
+    from sga.train_gpt import _extra_args_provider
+
+    parser = audit_megatron_args.build_megatron_parser(False)
+    out = _extra_args_provider(parser)
+    assert out is parser, "extra_args_provider must return the parser"
+    # the SGA flat vocabulary actually registered on it
+    table = audit_megatron_args.dump_table(out)
+    assert "--sga-enabled" in table and "--sga-score-name" in table
+    print("ok: entry extra_args_provider returns the parser with --sga-* flags")
+
+
 if __name__ == "__main__":
     test_golden_shape()
     test_run_script_skeleton()
     test_run_node_without_visible_devices()
     test_no_shared_fs_never_reaches_cmdline()
     test_audit_parser_matches_training_entry()
+    test_entry_args_provider_returns_parser()
     print("test_launcher_shape: ALL PASS")

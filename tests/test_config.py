@@ -226,12 +226,12 @@ def test_sga_never_reaches_megatron_cmdline():
     print("ok: sga section never reaches the megatron command line")
 
 
-def test_enabled_injects_canonical_sga_config_pair():
-    """Enabled path: the launcher must append EXACTLY one pair --
-    --sga-config followed by the canonical (sorted-key) resolved JSON --
-    and nothing else from the sga section."""
-    import json
-
+def test_enabled_emits_flat_flag_sequence():
+    """Enabled path: the sga section reaches the megatron command line as
+    VISIBLE flat --sga-* flags (no opaque --sga-config JSON token), exactly
+    the sequence sga_config_to_flags derives from the resolved engine
+    config — the spelling the training entry re-assembles into the
+    canonical args.sga_config JSON."""
     cfg, tmp = make_base()
     cfg.sga.enabled = True
     cfg.sga.cycle = {"start_iter": 0, "period": 2, "full_sync_interval": 0}
@@ -241,6 +241,7 @@ def test_enabled_injects_canonical_sga_config_pair():
     cfg.sga.backend = {"name": "masked_pipelined"}
     expected_engine_cfg = sga_section_to_config(cfg)
 
+    from sga.config.arguments import sga_config_to_flags
     from sga.launcher.backend_megatron import _update_config_train
 
     try:
@@ -251,16 +252,17 @@ def test_enabled_injects_canonical_sga_config_pair():
 
         shutil.rmtree(tmp, ignore_errors=True)
 
-    assert args.count("--sga-config") == 1, args
-    i = args.index("--sga-config")
-    payload = args[i + 1]
-    # byte-exact canonical injection
-    assert payload == json.dumps(expected_engine_cfg, sort_keys=True)
-    assert json.loads(payload)["cycle"]["period"] == 2
-    assert json.loads(payload)["optimizer"]["residual_mean"] is True
-    # no other sga-derived tokens may ride along (train.* flatten is separate)
-    assert [a for a in args if a.startswith("abs_m") or a.startswith("adamw")] == []
-    print("ok: enabled path injects exactly ['--sga-config', canonical-json]")
+    expected_flags = sga_config_to_flags(expected_engine_cfg)
+    assert args.count("--sga-config") == 0, args
+    # appended verbatim at the tail of the megatron command line
+    assert args[-len(expected_flags):] == expected_flags, args
+    assert not [a for a in args[:-len(expected_flags)] if a.startswith("--sga")], args
+    pairs = dict(zip(expected_flags[::2], expected_flags[1::2]))
+    assert pairs["--sga-enabled"] == "true"
+    assert pairs["--sga-cycle-period"] == "2"
+    assert pairs["--sga-optimizer-residual-mean"] == "true"
+    assert pairs["--sga-selection-ratio-percent"] == "20.0"
+    print("ok: enabled path emits the flat --sga-* flag sequence")
 
 
 def test_flatten_bool_semantics():
@@ -334,6 +336,37 @@ def test_cycle_interior_allowlist():
     print("ok: sga.cycle interior allowlist (peroid typo / non-mapping)")
 
 
+def test_plugin_param_vocabulary():
+    """Each plugin axis has a declared param vocabulary: unknown keys,
+    wrong types, out-of-choices values, and missing required params are
+    named in the error (the loader gate; constructors repeat it)."""
+    cfg, _ = make_base()
+    _enable_standard(cfg)
+
+    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0,
+                         "rtaio": 5}
+    expect_error(lambda: sga_section_to_config(cfg), "unknown params ['rtaio']")
+
+    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": "30"}
+    expect_error(lambda: sga_section_to_config(cfg), "must be float")
+
+    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0,
+                         "hist_mode": "turbo"}
+    expect_error(lambda: sga_section_to_config(cfg), "must be one of")
+
+    cfg.sga.selection = {"name": "circular_topk"}  # ratio_percent required
+    expect_error(lambda: sga_section_to_config(cfg), "required")
+
+    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0}
+    cfg.sga.optimizer = {"name": "adamw", "residual_mean": "yes"}
+    expect_error(lambda: sga_section_to_config(cfg), "must be bool")
+
+    cfg.sga.optimizer = {"name": "adamw"}
+    cfg.sga.backend = {"name": "indexed_sparse", "anything": 1}
+    expect_error(lambda: sga_section_to_config(cfg), "unknown params ['anything']")
+    print("ok: plugin param vocabulary enforced (unknown/type/choices/required)")
+
+
 if __name__ == "__main__":
     test_all_off_dense_ok()
     test_enabled_field_named_in_error()
@@ -345,10 +378,11 @@ if __name__ == "__main__":
     test_unknown_backend_lists_valid()
     test_non_dict_subfield_rejected_cleanly()
     test_sga_never_reaches_megatron_cmdline()
-    test_enabled_injects_canonical_sga_config_pair()
+    test_enabled_emits_flat_flag_sequence()
     test_flatten_bool_semantics()
     test_checks_section_validation()
     test_trace_section_validation()
     test_sga_top_level_allowlist()
     test_cycle_interior_allowlist()
+    test_plugin_param_vocabulary()
     print("test_config: ALL PASS")

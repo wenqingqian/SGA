@@ -16,8 +16,9 @@ Payload-only scaling as in the mask backend (frozen decision).
 import torch
 
 from sga.kernels import scatter_selected
-from sga.plugins import BackendDecl
+from sga.plugins import BackendDecl, resolve_plugin_params
 
+# No tunable params: the persistent-buffer geometry is internal.
 DECL = BackendDecl(name="indexed_sparse", consumes="idx")
 
 
@@ -27,6 +28,8 @@ class IndexedSparseBackend:
     decl = DECL
 
     def __init__(self, params: dict):
+        # Resolve against the (empty) declared vocabulary: any key is a typo.
+        resolve_plugin_params("backend", "indexed_sparse", DECL, dict(params))
         self._gather_bufs: dict = {}  # id(bucket-state-owner) -> persistent buffer
 
     def _gather_buf(self, key: int, k: int, dtype, device) -> torch.Tensor:

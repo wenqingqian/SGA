@@ -140,6 +140,22 @@ def _sga_resume_guard(args) -> None:
         raise SystemExit(1)
 
 
+def _extra_args_provider(parser):
+    """Megatron's extra-args contract: add and RETURN the parser.
+
+    modelopt first (upstream order), then the SGA flat vocabulary — all
+    default-inert: without any --sga-* flag the parser surface is
+    stock-identical. (The return is load-bearing: megatron's parse_args
+    rebinds ``parser = extra_args_provider(parser)``.)
+    """
+    if has_nvidia_modelopt:
+        add_modelopt_args(parser)
+    from sga.config.arguments import add_sga_flat_args
+
+    add_sga_flat_args(parser)
+    return parser
+
+
 if __name__ == "__main__":
     _PROGRAM_START_TIME = getattr(pretrain_gpt, "_PROGRAM_START_TIME", time.time())
     _MAIN_ENTRY_TIME = time.time()
@@ -155,9 +171,14 @@ if __name__ == "__main__":
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
     args = parse_and_validate_args(
-        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        extra_args_provider=_extra_args_provider,
         args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
     )
+    # Fold the flat flags into the canonical args.sga_config BEFORE anyone
+    # reads it (resume guard here; the waist's first attach inside pretrain).
+    from sga.config.arguments import assemble_sga_args
+
+    assemble_sga_args(args)
     _sga_resume_guard(args)
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(

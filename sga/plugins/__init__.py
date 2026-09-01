@@ -9,6 +9,13 @@ class plugins that each declare their attributes. The combination validator
 checks legality from those declarations — there is NO hardcoded list of
 legal combinations and NO scheme names anywhere in the engine.
 
+Every plugin also declares its PARAMETER VOCABULARY (``PluginParam`` entries
+on the decl): the loader rejects unknown keys against it (a typo'd param
+fails at launch instead of being silently swallowed by ``params.get``), and
+the flat-flag vocabulary (sga/config/arguments.py) is generated from the
+same declarations — one source of truth per axis. Constructors read their
+defaults through ``resolve_plugin_params`` instead of restating them.
+
 Declaration facts used by the validator (see ``validate_combination``):
   - Optimizer.emittable_scores: the score names this template's full-step
     kernel can materialize into the fp32 main-grad copy (the optimizer->score
@@ -22,12 +29,14 @@ Declaration facts used by the validator (see ``validate_combination``):
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 from sga.plugins.scores import Score, ScoreSpec, get_score_spec, score_names
 
 __all__ = [
     "Score",
     "ScoreSpec",
+    "PluginParam",
     "get_score_spec",
     "score_names",
     "SelectionDecl",
@@ -40,6 +49,8 @@ __all__ = [
     "get_optimizer_decl",
     "get_backend_plugin_decl",
     "registered_names",
+    "check_plugin_params",
+    "resolve_plugin_params",
     "validate_combination",
     "build_selection",
     "build_optimizer",
@@ -49,9 +60,98 @@ __all__ = [
 
 
 @dataclass(frozen=True)
+class PluginParam:
+    """One plugin-parameter declaration (the axis's config vocabulary).
+
+    ``type`` is the yaml-side scalar type (bool/int/float/str); ``choices``
+    (when non-empty) restricts str params; ``nullable`` admits an explicit
+    null (e.g. warmup windows that can be turned off); required params have
+    no default. The same entries drive the loader's unknown-key/type checks,
+    the constructors' default resolution, and the flat flags.
+    """
+
+    name: str
+    type: object
+    required: bool = False
+    default: Any = None
+    doc: str = ""
+    choices: tuple = ()
+    nullable: bool = False
+
+
+def check_plugin_params(axis: str, plugin_name: str, decl, params: dict) -> None:
+    """Fail loud on unknown keys / missing required / wrong types.
+
+    The single param-validation entry shared by the loader (config time) and
+    ``resolve_plugin_params`` (build time): an unknown key here is a typo in
+    a config that ``params.get`` would otherwise silently swallow.
+    """
+    known = {p.name for p in decl.params}
+    unknown = sorted(set(params) - known)
+    if unknown:
+        raise ValueError(
+            f"sga.{axis} ({plugin_name}): unknown params {unknown} "
+            f"(known: {sorted(known)})"
+        )
+    for p in decl.params:
+        if p.name not in params:
+            if p.required:
+                raise ValueError(
+                    f"sga.{axis} ({plugin_name}): param '{p.name}' is "
+                    "required"
+                )
+            continue
+        _check_value(axis, plugin_name, p, params[p.name])
+
+
+def _check_value(axis: str, plugin_name: str, p: "PluginParam", val) -> None:
+    """Validate one (param, value) pair: nullability, type, choices."""
+    if val is None:
+        if p.nullable:
+            return
+        raise ValueError(
+            f"sga.{axis} ({plugin_name}): param '{p.name}' is not "
+            "nullable (got null)"
+        )
+    if p.type is bool:
+        ok = isinstance(val, bool)
+    elif p.type is int:
+        # bool is an int subclass; yaml true/false must not pass as 1/0
+        ok = isinstance(val, int) and not isinstance(val, bool)
+    elif p.type is float:
+        ok = (isinstance(val, (int, float)) and not isinstance(val, bool))
+    else:
+        ok = isinstance(val, p.type)
+    if not ok:
+        raise ValueError(
+            f"sga.{axis} ({plugin_name}): param '{p.name}' must be "
+            f"{p.type.__name__} (got {val!r})"
+        )
+    if p.choices and val not in p.choices:
+        raise ValueError(
+            f"sga.{axis} ({plugin_name}): param '{p.name}' must be one "
+            f"of {list(p.choices)} (got {val!r})"
+        )
+
+
+def resolve_plugin_params(axis: str, plugin_name: str, decl,
+                          params: dict) -> dict:
+    """Validate and expand a params dict to its full defaulted form.
+
+    The constructors' single read path: defaults come from the DECLARATION,
+    never from a restated ``params.get(name, default)``.
+    """
+    check_plugin_params(axis, plugin_name, decl, params)
+    out = {p.name: p.default for p in decl.params if not p.required}
+    out.update(params)
+    return out
+
+
+@dataclass(frozen=True)
 class SelectionDecl:
     name: str
     output_form: str = "mask"  # 'mask' | 'idx' (Support canonicalizes either way)
+    params: tuple = ()         # (PluginParam, ...)
 
 
 @dataclass(frozen=True)
@@ -64,6 +164,7 @@ class OptimizerDecl:
     emittable_scores: frozenset = frozenset()
     # Residual contract folds only at full syncs => cycle boundaries must be full.
     requires_full_sync_every_period: bool = False
+    params: tuple = ()             # (PluginParam, ...)
 
     @property
     def emits_score_view(self) -> bool:
@@ -74,6 +175,7 @@ class OptimizerDecl:
 class BackendDecl:
     name: str
     consumes: str = "mask"  # 'mask' | 'idx'
+    params: tuple = ()      # (PluginParam, ...)
 
 
 _SELECTIONS: dict = {}
@@ -82,20 +184,25 @@ _BACKEND_PLUGINS: dict = {}
 
 
 def register_selection(name, decl):
-    _register(_SELECTIONS, name, decl)
+    _register("selection", _SELECTIONS, name, decl)
 
 
 def register_optimizer(name, decl):
-    _register(_OPTIMIZERS, name, decl)
+    _register("optimizer", _OPTIMIZERS, name, decl)
 
 
 def register_backend_plugin(name, decl):
-    _register(_BACKEND_PLUGINS, name, decl)
+    _register("backend", _BACKEND_PLUGINS, name, decl)
 
 
-def _register(registry, name, decl):
+def _register(axis, registry, name, decl):
     if name in registry:
         raise ValueError(f"Duplicate plugin registration for '{name}'")
+    # A misdeclared default (wrong type/choices, or None on a non-nullable
+    # param) would otherwise sail through every constructor gate.
+    for p in decl.params:
+        if not p.required:
+            _check_value(axis, name, p, p.default)
     registry[name] = decl
 
 
@@ -162,17 +269,19 @@ def validate_combination(score_name: str, selection: SelectionDecl,
 def build_selection(name, params):
     from sga.plugins.selection.circular_topk import CircularTopkSelection
 
+    register_default_plugins()
     return {
         "circular_topk": CircularTopkSelection,
-    }[name](params)
+    }[name](_resolved("selection", name, params))
 
 
 def build_optimizer(name, params, emit_score: str = None):
     from sga.plugins.optimizer.adamw import SgaAdamW
 
+    register_default_plugins()
     return {
         "adamw": SgaAdamW,
-    }[name](params, emit_score=emit_score)
+    }[name](_resolved("optimizer", name, params), emit_score=emit_score)
 
 
 def build_backend_plugin(name, params):
@@ -180,11 +289,25 @@ def build_backend_plugin(name, params):
     from sga.backends.indexed_sparse import IndexedSparseBackend
     from sga.backends.pipelined_idx_sorted import PipelinedIdxSortedBackend
 
+    register_default_plugins()
     return {
         "masked_pipelined": MaskedPipelinedBackend,
         "indexed_sparse": IndexedSparseBackend,
         "pipelined_idx_sorted": PipelinedIdxSortedBackend,
-    }[name](params)
+    }[name](_resolved("backend", name, params))
+
+
+def _resolved(axis, name, params):
+    """Curated unknown-plugin error + name strip; the CONSTRUCTOR stays the
+    single resolver (defaults expand once, explicit-vs-default stays
+    distinguishable for cross-param legality like circular_topk's dead
+    hist_mode-under-adaptive refusal)."""
+    registry = {"selection": _SELECTIONS, "optimizer": _OPTIMIZERS,
+                "backend": _BACKEND_PLUGINS}[axis]
+    _lookup(registry, name, axis)
+    params = dict(params)
+    params.pop("name", None)
+    return params
 
 
 def register_default_plugins() -> None:

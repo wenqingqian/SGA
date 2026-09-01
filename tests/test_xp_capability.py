@@ -46,7 +46,6 @@ from sga.plugins.selection.circular_topk import CircularTopkSelection, _adapt_th
 class _SelCtx:
     def __init__(self, grad_views, warmup_target=None):
         self.grad_views = grad_views
-        self.always_sync_masks = [None] * len(grad_views)
         self.comm_group = None
         self.warmup_target = warmup_target
 
