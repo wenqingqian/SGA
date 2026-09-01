@@ -173,8 +173,8 @@ def sga_advance_step(wrapper, group):
     relies on. Callers are optimizer-internal; nothing else may invoke it.
 
     TE/Apex FusedAdam maintains group['step'] itself -> shared counter,
-    nothing to seed (its own counters never advance because the EF never
-    calls its step, so this branch serves it too). torch AdamW keeps
+    nothing to seed (its own counters never advance because the optimizer
+    template never calls its step, so this branch serves it too). torch AdamW keeps
     per-param state['step'] instead: seed the group counter from it ONCE
     (uniform across params), then keep incrementing locally. Absent state
     => fresh moments (iter 0 or release-ckpt finetune) => seed 0. Tensor

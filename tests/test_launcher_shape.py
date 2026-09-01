@@ -45,7 +45,7 @@ experiment:
 sga:
   score: {enabled: false}
   selection: {enabled: false}
-  error_feedback: {enabled: false}
+  optimizer: {enabled: false}
   backend: {name: dense}
 train:
   system: {tensor_model_parallel_size: 1}

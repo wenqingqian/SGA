@@ -115,7 +115,8 @@ def _assert_args_compatible() -> None:
     _require(not getattr(args, "check_for_large_grads_in_bucket", False),
              "--check-for-large-grads must be off")
 
-    # The EF's dense-fallback math is decoupled (AdamW-style); FusedAdam must
+    # The optimizer template's dense-fallback math is decoupled (AdamW-style);
+    # FusedAdam must
     # run in adam_w_mode for the two to agree (torch AdamW always does).
     if getattr(args, "optimizer", "adam") == "adam":
         _require(getattr(args, "decoupled_weight_decay", True),
@@ -123,34 +124,15 @@ def _assert_args_compatible() -> None:
                  "is decoupled AdamW)")
 
 
-def _assert_shadow_emits_supported(config: dict, score_decl, emit) -> None:
-    """Shadow runs over a 'synced' score recompute the emit read-only from
-    pre-commit state (sga.shadow); an emit with no read-only formula must
-    fail HERE (engine construction), never at the first cycle boundary."""
-    # Deliberate fail-early: the gate keys off ``shadow`` alone, so it also
-    # fires for shadow_score=false probe configs — over-strict by design.
-    if not config.get("shadow") or emit is None:
-        return
-    from sga.shadow import SHADOW_SUPPORTED_EMITS
-
-    if emit not in SHADOW_SUPPORTED_EMITS:
-        raise ValueError(
-            f"SGA config: shadow mode has no read-only formula for the "
-            f"synced score '{score_decl.name}' (emits '{emit}'); supported: "
-            f"{sorted(SHADOW_SUPPORTED_EMITS)}"
-        )
-
-
 def build_engine(config: dict, api_version: int):
     """Validate + assemble the engine from the four-field config dict."""
     from sga.plugins import (
         build_backend_plugin,
-        build_ef,
-        build_score,
+        build_optimizer,
         build_selection,
         get_backend_plugin_decl,
-        get_ef_decl,
-        get_score_decl,
+        get_optimizer_decl,
+        get_score_spec,
         get_selection_decl,
         register_default_plugins,
         validate_combination,
@@ -165,7 +147,7 @@ def build_engine(config: dict, api_version: int):
     register_default_plugins()
     _assert_args_compatible()
 
-    for axis in ("score", "selection", "error_feedback", "backend"):
+    for axis in ("score", "selection", "optimizer", "backend"):
         if not isinstance(config.get(axis), dict) or "name" not in config[axis]:
             raise ValueError(
                 f"SGA config: axis '{axis}' must be a dict with a 'name' field"
@@ -176,27 +158,23 @@ def build_engine(config: dict, api_version: int):
 
     score_name = config["score"]["name"]
     selection_name = config["selection"]["name"]
-    ef_name = config["error_feedback"]["name"]
+    optimizer_name = config["optimizer"]["name"]
     backend_name = config["backend"]["name"]
 
-    score_decl = get_score_decl(score_name)
+    get_score_spec(score_name)  # unknown score fails with the registered list
     selection_decl = get_selection_decl(selection_name)
-    ef_decl = get_ef_decl(ef_name)
+    optimizer_decl = get_optimizer_decl(optimizer_name)
     backend_decl = get_backend_plugin_decl(backend_name)
 
-    validate_combination(score_decl, selection_decl, ef_decl, backend_decl, cycle)
+    validate_combination(score_name, selection_decl, optimizer_decl,
+                         backend_decl, cycle)
 
-    score = build_score(score_name, dict(config["score"]))
-    selection = build_selection(selection_name, dict(config["selection"]), score=score)
-    # 'synced' scores are materialized by the EF on full steps; inject WHICH
-    # score to emit so the kernel picks the right mode (validator above
-    # already proved the EF can emit it). Post-processing scores declare the
-    # base score the kernel should materialize via ``emit_name``.
-    emit = None
-    if score_decl.scoring_input == "synced":
-        emit = score_decl.emit_name or score_name
-    _assert_shadow_emits_supported(config, score_decl, emit)
-    ef = build_ef(ef_name, dict(config["error_feedback"]), emit_score=emit)
+    selection = build_selection(selection_name, dict(config["selection"]))
+    # Scores are materialized by the optimizer template on full steps; inject
+    # WHICH score to emit so the kernel picks the right mode (the validator
+    # above already proved the template can emit it).
+    opt = build_optimizer(optimizer_name, dict(config["optimizer"]),
+                          emit_score=score_name)
     backend = build_backend_plugin(backend_name, dict(config["backend"]))
 
     # Optional backend-owned runtime validation, probed generically (the
@@ -210,7 +188,7 @@ def build_engine(config: dict, api_version: int):
 
     from sga.engine import SGAEngine
 
-    engine = SGAEngine(config, score, selection, ef, backend)
+    engine = SGAEngine(config, score_name, selection, opt, backend)
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         canonical = json.dumps(config, sort_keys=True)

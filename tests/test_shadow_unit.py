@@ -2,12 +2,12 @@
 """Unit tests for shadow mode (run: python tests/test_shadow_unit.py).
 
 Covers: the literal stock-replication call sequence (spy-verified: stock
-clip, stock commit; the engine masked clip and the EF never run), numerical
-equivalence of the whole replication path vs a plain stock step loop (with
-boundary scoring active every step), the found-inf early-return + full
-clear, the RNG-consumption guard, read-only score formulas vs the EF torch
-reference (elementwise), shadow support lineage (sticky gets the pre-switch
-shadow support), the peek VALUE (upcoming-commit tracking across both
+clip, stock commit; the engine masked clip and the optimizer template never
+run), numerical equivalence of the whole replication path vs a plain stock
+step loop (with boundary scoring active every step), the found-inf
+early-return + full clear, the RNG-consumption guard (CPU and CUDA halves),
+read-only score formulas vs the optimizer kernel's torch reference
+(elementwise), the peek VALUE (upcoming-commit tracking across both
 optimizer counter styles), the probe configuration (record-free machinery,
 no phantom reselect in the metrics), grad_sync delegation, and loader
 validation.
@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import tempfile
+import warnings
 from types import SimpleNamespace
 
 import torch
@@ -26,17 +27,17 @@ from omegaconf import OmegaConf
 
 from sga.config import sga_section_to_config
 from sga.engine import SGAEngine
-from sga.plugins import build_ef, build_score, build_selection
-from sga.plugins.error_feedback import ParamRecord
-from sga.plugins.error_feedback.radius_opt import _radius_grad_correct_torch
+from sga.plugins import build_optimizer, build_selection
+from sga.plugins.optimizer import ParamRecord
+from sga.plugins.optimizer.adamw import _grad_correct_torch
 from sga.shadow import readonly_score
 
 from test_engine_unit import (
+    _ABS_M,
     _FakeChunk,
     _FakeMPOpt,
-    _ORIGIN,
-    _RADIUS,
     _ReplicaWorld,
+    _UPDATE,
 )
 
 
@@ -79,13 +80,12 @@ class _ShadowCapableMPOpt(_FakeMPOpt):
 
 
 def _build_shadow_engine(combo, cycle=None, shadow_score=True):
-    score = build_score(combo["score"], {"name": combo["score"]})
-    selection = build_selection(combo["selection"], dict(combo["selection_params"]),
-                                score=score)
-    ef = build_ef(combo["ef"], dict(combo["ef_params"]))
+    selection = build_selection(combo["selection"], dict(combo["selection_params"]))
+    opt = build_optimizer(combo["opt"], dict(combo["opt_params"]),
+                          emit_score=combo["score"])
     eng = SGAEngine({"cycle": cycle or dict(combo["cycle"]),
                      "shadow": True, "shadow_score": shadow_score},
-                    score, selection, ef, combo["backend"])
+                    combo["score"], selection, opt, combo["backend"])
     eng._dp_cp_group = lambda: None
     return eng
 
@@ -99,18 +99,18 @@ def _push_grads(chunk, gen):
 
 
 def test_shadow_replicates_stock_call_sequence():
-    """Stock clip/commit run in order; the engine masked clip and the EF
-    never fire; buffers are fully cleared at step end."""
+    """Stock clip/commit run in order; the engine masked clip and the
+    optimizer template never fire; buffers are fully cleared at step end."""
     torch.manual_seed(0)
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
-    eng = _build_shadow_engine(_ORIGIN, shadow_score=False)
+    eng = _build_shadow_engine(_UPDATE, shadow_score=False)
     eng.attach(chunk)
 
     for name in ("full_step", "sparse_step", "reset"):
         def refusing(_ctx, _n=name):
-            raise AssertionError(f"EF.{_n} must never run in shadow")
-        setattr(eng.ef, name, refusing)
+            raise AssertionError(f"optimizer template.{_n} must never run in shadow")
+        setattr(eng.opt, name, refusing)
     def no_masked_clip(*a, **k):
         raise AssertionError("engine masked clip must never run in shadow")
     eng._masked_clip_grad_norm = no_masked_clip
@@ -138,7 +138,7 @@ def test_shadow_numerics_equal_stock_loop():
     mp_sh = _ShadowCapableMPOpt(chunk_sh)
     mp_st = _ShadowCapableMPOpt(chunk_st)
     eng = _build_shadow_engine(
-        _RADIUS, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
+        _ABS_M, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
         shadow_score=True)
     eng.attach(chunk_sh)
 
@@ -181,7 +181,7 @@ def test_shadow_found_inf_full_clear_and_skip():
         mp.calls.append("prepare")
         return True  # stock contract: True = found_inf (BAD)
     mp.prepare_grads = found_inf_prepare
-    eng = _build_shadow_engine(_ORIGIN, shadow_score=True)
+    eng = _build_shadow_engine(_UPDATE, shadow_score=True)
     eng.attach(chunk)
     chunk.bucket.grad_data.add_(1.0)
     with _ReplicaWorld(world=1):
@@ -194,51 +194,51 @@ def test_shadow_found_inf_full_clear_and_skip():
 
 
 def test_shadow_rng_guard_raises():
-    """RNG consumption inside the boundary insertion (here: the score
-    plugin's values()) fails the RNG assert — the shadow guard dog."""
+    """RNG consumption inside the boundary insertion (here: the readonly
+    score evaluation) fails the RNG assert — the shadow guard dog."""
+    import sga.engine as engine_mod
+
     torch.manual_seed(3)
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
-    # synced score: values() sits on the shadow data path
-    score = build_score("abs_m", {"name": "abs_m"})
-    selection = build_selection("circular_topk",
-                                {"ratio_percent": 30.0}, score=score)
-    ef = build_ef("radius_opt", {})
+    selection = build_selection("circular_topk", {"ratio_percent": 30.0})
+    opt = build_optimizer("adamw", {}, emit_score="abs_m")
     eng = SGAEngine({"cycle": {"start_iter": 0, "period": 1,
                                "full_sync_interval": 0},
-                     "shadow": True}, score, selection, ef,
-                    _RADIUS["backend"])
+                     "shadow": True}, "abs_m", selection, opt,
+                    _ABS_M["backend"])
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
-    orig_values = score.values
+    orig = engine_mod.readonly_score
 
-    def rng_eating(views, support_slices=None):
+    def rng_eating(rec, emit_name, scratch=None):
         torch.rand(1)  # forbidden consumption on the CPU stream
-        if support_slices is None:
-            return orig_values(views)
-        return orig_values(views, support_slices)
+        return orig(rec, emit_name, scratch)
 
-    eng.score.values = rng_eating
+    engine_mod.readonly_score = rng_eating
     gen = torch.Generator().manual_seed(5)
-    with _ReplicaWorld(world=1):
-        _push_grads(chunk, gen)
-        chunk.finish_grad_sync(force_all_reduce=False)
-        try:
-            eng.optimizer_step(mp, [chunk], 1)  # boundary at step 1
-        except RuntimeError as e:
-            assert "RNG" in str(e), f"wrong error: {e}"
-        else:
-            raise SystemExit("RNG consumption must fail the shadow assert")
+    try:
+        with _ReplicaWorld(world=1):
+            _push_grads(chunk, gen)
+            chunk.finish_grad_sync(force_all_reduce=False)
+            try:
+                eng.optimizer_step(mp, [chunk], 1)  # boundary at step 1
+            except RuntimeError as e:
+                assert "RNG" in str(e), f"wrong error: {e}"
+            else:
+                raise SystemExit("RNG consumption must fail the shadow assert")
+    finally:
+        engine_mod.readonly_score = orig
     print("PASS test_shadow_rng_guard_raises")
 
 
-def test_readonly_score_matches_ef_torch_reference():
-    """readonly_score vs _radius_grad_correct_torch's materialized output,
-    elementwise, for every emit name (the anti-drift pin); inputs stay
-    untouched (read-only)."""
+def test_readonly_score_matches_optimizer_torch_reference():
+    """readonly_score vs _grad_correct_torch's materialized output,
+    elementwise, for every registry emit name (the anti-drift pin; the
+    registry formula is the single source of score math, the kernel its
+    online materialization); inputs stay untouched (read-only)."""
     torch.manual_seed(4)
-    for emit in ("update_ratio", "coi", "abs_g_synced", "abs_m",
-                 "snr_m", "abs_m_post"):
+    for emit in ("update", "coi", "abs_g", "abs_m"):
         n = 256
         w = torch.randn(n)
         g = torch.randn(n)
@@ -246,16 +246,15 @@ def test_readonly_score_matches_ef_torch_reference():
         v0 = torch.rand(n) * 0.01 + 1e-4
         b1, b2, eps, wd, lr = 0.9, 0.95, 1e-8, 0.1, 1e-3
         step = 37
-        # EF reference over clones: named scores land in the grad buffer,
+        # kernel reference over clones: named scores land in the grad buffer,
         # the default signed update lands there when no side buffer is given
         g_ref = g.clone()
-        _radius_grad_correct_torch(
+        _grad_correct_torch(
             w.clone(), g_ref, m0.clone(), v0.clone(), lr, b1, b2, eps, wd,
             1.0 - b1 ** step, 1.0 - b2 ** step,
-            1.0 - b1 ** (step - 1), 1.0 - b2 ** (step - 1),
             None, True,
-            score_out=(torch.empty(n) if emit != "update_ratio" else None),
-            score_mode=(emit if emit != "update_ratio" else None),
+            score_out=(None if emit == "update" else torch.empty(n)),
+            score_mode=(None if emit == "update" else emit),
         )
         # shadow: fresh record over the same pre-commit state
         main_p = torch.nn.Parameter(w.clone())
@@ -268,7 +267,7 @@ def test_readonly_score_matches_ef_torch_reference():
         )
         rec._state = {"exp_avg": m0.clone(), "exp_avg_sq": v0.clone()}
         got = readonly_score(rec, emit)
-        assert torch.equal(got, g_ref), f"{emit}: shadow score != EF reference"
+        assert torch.equal(got, g_ref), f"{emit}: shadow score != kernel reference"
         assert torch.equal(main_p.data, w) and torch.equal(main_p.grad, g)
         assert torch.equal(rec._state["exp_avg"], m0)
         assert torch.equal(rec._state["exp_avg_sq"], v0)
@@ -294,10 +293,9 @@ def test_readonly_score_matches_ef_torch_reference():
     )
     rec._state = {}
     assert torch.equal(readonly_score(rec, "abs_m"), torch.zeros(n))
-    # zero-state edges vs the reference: snr_m at step 1 (the
-    # bias_correction1_pre == 0 collapse-to-zeros branch) and a formula emit
-    # (update_ratio) over zero moments
-    for emit in ("snr_m", "update_ratio"):
+    # zero-state edges vs the reference: the update-direction scores over
+    # zero moments (the pre-first-commit boundary every real run hits)
+    for emit in ("update", "coi"):
         w = torch.randn(n)
         g = torch.randn(n)
         main_p = torch.nn.Parameter(w.clone())
@@ -305,72 +303,59 @@ def test_readonly_score_matches_ef_torch_reference():
         rec = ParamRecord(
             model_param=torch.nn.Parameter(w.clone()), main_param=main_p,
             bucket_state=SimpleNamespace(active_mask_u8=None),
-            start=0, end=n, lr=lr, beta1=b1, beta2=b2, eps=eps,
-            weight_decay=wd, step=1,
+            start=0, end=n, lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8,
+            weight_decay=0.1, step=1,
         )
         rec._state = {}
         g_ref = g.clone()
-        _radius_grad_correct_torch(
-            w.clone(), g_ref, torch.zeros(n), torch.zeros(n), lr, b1, b2,
-            eps, wd, 1.0 - b1 ** 1, 1.0 - b2 ** 1,
-            1.0 - b1 ** 0, 1.0 - b2 ** 0,
+        _grad_correct_torch(
+            w.clone(), g_ref, torch.zeros(n), torch.zeros(n), 1e-3, 0.9, 0.95,
+            1e-8, 0.1, 1.0 - 0.9 ** 1, 1.0 - 0.95 ** 1,
             None, True,
-            score_out=(torch.empty(n) if emit != "update_ratio" else None),
-            score_mode=(emit if emit != "update_ratio" else None),
+            score_out=(None if emit == "update" else torch.empty(n)),
+            score_mode=(None if emit == "update" else emit),
         )
         assert torch.equal(readonly_score(rec, emit), g_ref), \
-            f"{emit} at zero state: shadow score != EF reference"
-    print("PASS test_readonly_score_matches_ef_torch_reference")
+            f"{emit} at zero state: shadow score != kernel reference"
+    print("PASS test_readonly_score_matches_optimizer_torch_reference")
 
 
-def test_shadow_sticky_gets_pre_switch_shadow_support():
-    """At the second boundary the sticky score receives the FIRST boundary's
-    shadow support (lineage via _activate_support), None at the first."""
-    torch.manual_seed(5)
-    chunk = _FakeChunk()
-    mp = _ShadowCapableMPOpt(chunk)
-    score = build_score("abs_m_sticky", {"name": "abs_m_sticky"})
-    selection = build_selection("circular_topk",
-                                {"ratio_percent": 30.0}, score=score)
-    ef = build_ef("radius_opt", {})
-    eng = SGAEngine({"cycle": {"start_iter": 0, "period": 2,
-                               "full_sync_interval": 0},
-                     "shadow": True}, score, selection, ef,
-                    _ORIGIN["backend"])
-    eng._dp_cp_group = lambda: None
-    eng.attach(chunk)
-    seen = []
-    orig_values = score.values
-
-    def spy(views, support_slices=None):
-        seen.append(None if support_slices is None else
-                    [s.clone() for s in support_slices])
-        return orig_values(views, support_slices)
-
-    score.values = spy
-    gen = torch.Generator().manual_seed(6)
-    expected = None
-    with _ReplicaWorld(world=1):
-        for step in range(1, 5):
-            _push_grads(chunk, gen)
-            chunk.finish_grad_sync(force_all_reduce=False)
-            ok, _, _ = eng.optimizer_step(mp, [chunk], step)
-            assert ok
-            if step == 2:
-                # expected side of the lineage: the just-activated step-2
-                # support in meta order (the spy clone covers the received
-                # side only)
-                expected = [s.clone() for s in
-                            eng._support_slices(eng._selection_views()[2])]
-    assert len(seen) == 2  # boundaries at steps 2 and 4
-    assert seen[0] is None  # bootstrap: no shadow support yet
-    assert seen[1] is not None and all(s is not None for s in seen[1])
-    # activation runs after score.values in _shadow_reselect, so the
-    # post-switch support does not exist yet — compare elementwise against
-    # the step-2 support
-    for got, want in zip(seen[1], expected):
-        assert torch.equal(got, want)
-    print("PASS test_shadow_sticky_gets_pre_switch_shadow_support")
+def test_readonly_score_mixed_numel_records_share_one_scratch_pair():
+    """C1 regression: two records of DIFFERENT numel AND rank score through
+    ONE shared scratch pair sized to the max numel — exactly what the engine
+    allocates per shadow boundary (a single flat max_n pair reused for every
+    param in meta order, smaller-before-larger in practice). The formulas'
+    [:n].view_as(w) narrowing must keep the out= chain off the pair's shape:
+    an out= resize (deprecated, emits a UserWarning) would shrink the shared
+    buffers under the first, smaller record and the next, larger record would
+    trip readonly_score's contract assert."""
+    torch.manual_seed(9)
+    max_n = 10 * 20
+    shared = (torch.empty(max_n), torch.empty(max_n))
+    for shape in ((50,), (10, 20)):
+        n = shape[0] * (shape[1] if len(shape) > 1 else 1)
+        w = torch.randn(shape)
+        g = torch.randn(shape)
+        main_p = torch.nn.Parameter(w.clone())
+        main_p.grad = g.clone()
+        rec = ParamRecord(
+            model_param=torch.nn.Parameter(w.clone()), main_param=main_p,
+            bucket_state=SimpleNamespace(active_mask_u8=None),
+            start=0, end=n, lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8,
+            weight_decay=0.1, step=5,
+        )
+        rec._state = {"exp_avg": torch.randn(shape) * 0.1,
+                      "exp_avg_sq": torch.rand(shape) + 1e-4}
+        fresh = readonly_score(rec, "update")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            got = readonly_score(rec, "update", shared)
+        assert torch.equal(got, fresh), shape
+        assert got.data_ptr() not in (shared[0].data_ptr(),
+                                      shared[1].data_ptr()), shape
+        # the pair keeps its full capacity across records (never resized)
+        assert shared[0].numel() == max_n and shared[1].numel() == max_n
+    print("PASS test_readonly_score_mixed_numel_records_share_one_scratch_pair")
 
 
 def test_shadow_peek_matches_stock_fusedadam_step():
@@ -391,7 +376,7 @@ def test_shadow_peek_matches_stock_fusedadam_step():
 
     mp.optimizer.step = fused_style_step
     eng = _build_shadow_engine(
-        _RADIUS, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
+        _ABS_M, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
         shadow_score=True)
     eng.attach(chunk)
     gen = torch.Generator().manual_seed(11)
@@ -417,7 +402,7 @@ def test_shadow_peek_value_tracks_upcoming_commit_torch_adamw():
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
     eng = _build_shadow_engine(
-        _RADIUS, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
+        _ABS_M, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
         shadow_score=True)
     eng.attach(chunk)
     gen = torch.Generator().manual_seed(19)
@@ -436,7 +421,7 @@ def test_shadow_grad_sync_returns_false():
     """Shadow grad_sync delegates to the fork's stock finish_grad_sync and
     stamps no phase flags."""
     chunk = _FakeChunk()
-    eng = _build_shadow_engine(_ORIGIN)
+    eng = _build_shadow_engine(_UPDATE)
     eng.attach(chunk)
     assert eng.grad_sync(chunk, force_all_reduce=False) is False
     print("PASS test_shadow_grad_sync_returns_false")
@@ -456,8 +441,8 @@ def test_shadow_probe_config_never_builds_records_or_state():
             chunk = _FakeChunk()
             mp = _ShadowCapableMPOpt(chunk)
             eng = _build_shadow_engine(
-                _RADIUS, cycle={"start_iter": 0, "period": 2,
-                                "full_sync_interval": 0},
+                _ABS_M, cycle={"start_iter": 0, "period": 2,
+                               "full_sync_interval": 0},
                 shadow_score=False)
             eng.attach(chunk)
             refresh_calls = []
@@ -508,8 +493,8 @@ def test_shadow_metrics_reselected_tracks_boundary_reselection():
             chunk = _FakeChunk()
             mp = _ShadowCapableMPOpt(chunk)
             eng = _build_shadow_engine(
-                _RADIUS, cycle={"start_iter": 0, "period": 2,
-                                "full_sync_interval": 0},
+                _ABS_M, cycle={"start_iter": 0, "period": 2,
+                               "full_sync_interval": 0},
                 shadow_score=True)
             eng.attach(chunk)
             gen = torch.Generator().manual_seed(17)
@@ -525,8 +510,7 @@ def test_shadow_metrics_reselected_tracks_boundary_reselection():
                 os.environ.pop("SGA_METRICS_FILE", None)
             else:
                 os.environ["SGA_METRICS_FILE"] = prev
-    assert [r["reselected"] for r in rows] == \
-        [False, True, False, True, False]
+    assert [r["reselected"] for r in rows] == [False, True, False, True, False]
     print("PASS test_shadow_metrics_reselected_tracks_boundary_reselection")
 
 
@@ -540,7 +524,7 @@ _BASE = {
         "cycle": {"start_iter": 0, "period": 8, "full_sync_interval": 0},
         "score": {"name": "abs_m"},
         "selection": {"name": "circular_topk", "ratio_percent": 30.0},
-        "error_feedback": {"name": "radius_opt"},
+        "optimizer": {"name": "adamw"},
         "backend": {"name": "indexed_sparse"},
     },
     "train": {"system": {"tensor_model_parallel_size": 1},
@@ -583,7 +567,7 @@ def test_loader_shadow_validation():
     cfg.sga.enabled = False
     cfg.sga.score = None
     cfg.sga.selection = None
-    cfg.sga.error_feedback = None
+    cfg.sga.optimizer = None
     cfg.sga.backend = {"name": "dense"}
     cfg.sga.shadow = True
     _expect_error(cfg, "enabled is false")
@@ -595,17 +579,17 @@ def test_shadow_rng_guard_cuda_half_raises():
     RNG stream fails the assert even when the CPU stream stays clean (the
     CPU-only test is structurally blind to this half on CPU-only test envs —
     exercised via monkeypatched torch.cuda state accessors)."""
+    import sga.engine as engine_mod
+
     torch.manual_seed(3)
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
-    score = build_score("abs_m", {"name": "abs_m"})
-    selection = build_selection("circular_topk",
-                                {"ratio_percent": 30.0}, score=score)
-    ef = build_ef("radius_opt", {})
+    selection = build_selection("circular_topk", {"ratio_percent": 30.0})
+    opt = build_optimizer("adamw", {}, emit_score="abs_m")
     eng = SGAEngine({"cycle": {"start_iter": 0, "period": 1,
                                "full_sync_interval": 0},
-                     "shadow": True}, score, selection, ef,
-                    _RADIUS["backend"])
+                     "shadow": True}, "abs_m", selection, opt,
+                    _ABS_M["backend"])
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
 
@@ -622,6 +606,9 @@ def test_shadow_rng_guard_cuda_half_raises():
     real_states = torch.cuda.get_rng_state_all
     torch.cuda.is_available = lambda: True
     torch.cuda.get_rng_state_all = states_all
+    orig = engine_mod.readonly_score
+    engine_mod.readonly_score = (lambda rec, emit, scratch=None:
+                                  orig(rec, emit, scratch))
     try:
         gen = torch.Generator().manual_seed(5)
         with _ReplicaWorld(world=1):
@@ -637,60 +624,8 @@ def test_shadow_rng_guard_cuda_half_raises():
     finally:
         torch.cuda.is_available = real_avail
         torch.cuda.get_rng_state_all = real_states
+        engine_mod.readonly_score = orig
     print("PASS test_shadow_rng_guard_cuda_half_raises")
-
-
-def test_shadow_local_score_consumes_raw_bucket_views():
-    """Non-synced scores (scoring_input='local_or_merged') skip readonly_score
-    entirely: the selection consumes the raw bucket gradient views — at the
-    shadow call point those hold the dense-synced, stock-clipped gradient
-    (the honest dense-replay input)."""
-    import sga.engine as engine_mod
-
-    torch.manual_seed(6)
-    chunk = _FakeChunk()
-    mp = _ShadowCapableMPOpt(chunk)
-    # abs_g is local_or_merged; threshold selection operates elementwise
-    eng = _build_shadow_engine(
-        _ORIGIN, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
-        shadow_score=True)
-    eng.attach(chunk)
-
-    def no_readonly(rec, emit_name, scratch=None):
-        raise AssertionError(
-            f"readonly_score must not run for local_or_merged scores "
-            f"(got emit {emit_name!r})"
-        )
-
-    seen_views = []
-    real_select = eng.selection.select
-
-    def select_spy(ctx):
-        seen_views.append(list(ctx.grad_views))
-        return real_select(ctx)
-
-    eng.selection.select = select_spy
-    engine_mod.readonly_score = no_readonly
-    try:
-        gen = torch.Generator().manual_seed(9)
-        with _ReplicaWorld(world=1):
-            _push_grads(chunk, gen)
-            chunk.finish_grad_sync(force_all_reduce=False)
-            ok, _, _ = eng.optimizer_step(mp, [chunk], 1)
-            assert ok
-    finally:
-        from sga.shadow import readonly_score as fresh_readonly
-        engine_mod.readonly_score = fresh_readonly
-        eng.selection.select = real_select
-    assert len(seen_views) == 1, "reselection must run at the step-1 boundary"
-    # raw bucket views: same storage as the engine's own meta-ordered spans
-    # (bucket params_list order, not chunk.params order)
-    _, _, meta = eng._selection_views()
-    assert len(meta) == len(seen_views[0])
-    for (bs, start, end, _p), v in zip(meta, seen_views[0]):
-        assert v.data_ptr() == bs.grad_data[start:end].data_ptr(), \
-            "local score must see the raw bucket grad views"
-    print("PASS test_shadow_local_score_consumes_raw_bucket_views")
 
 
 def test_readonly_score_grad_none_guard():
@@ -714,15 +649,15 @@ def test_readonly_score_grad_none_guard():
     print("PASS test_readonly_score_grad_none_guard")
 
 
-def test_shadow_supported_emits_and_build_gate():
-    """SHADOW_SUPPORTED_EMITS is the single source of truth: every advertised
-    emit has a formula (existence pin; value drift is pinned by
-    test_readonly_score_matches_ef_torch_reference), unknown names name
-    the supported set, and the build-time gate rejects a shadow run over an
-    unsupported synced emit at engine construction instead of mid-run."""
-    from sga.plugins import get_ef_decl, get_score_decl, register_default_plugins
-    from sga.runtime import _assert_shadow_emits_supported
-    from sga.shadow import SHADOW_SUPPORTED_EMITS
+def test_registry_scores_shadow_evaluable_and_decl_alignment():
+    """The registry is the single emit namespace: every registered score
+    evaluates through readonly_score (existence pin; value drift is pinned by
+    test_readonly_score_matches_optimizer_torch_reference), unknown names
+    fail with the registered list, and the adamw template's emittable set
+    stays a subset of the registry (a decl advertising an unregistered name
+    would pass config validation and blow up mid-run; today every registry
+    entry is online-usable, so the subset is an equality pin)."""
+    from sga.plugins import get_optimizer_decl, register_default_plugins, score_names
 
     torch.manual_seed(2)
     n = 16
@@ -736,31 +671,24 @@ def test_shadow_supported_emits_and_build_gate():
     )
     rec._state = {"exp_avg": torch.randn(n) * 0.1,
                   "exp_avg_sq": torch.rand(n) * 0.01}
-    for emit in sorted(SHADOW_SUPPORTED_EMITS):
+    for emit in score_names():
         out = readonly_score(rec, emit)
         assert out.shape == (n,) and out.dtype == torch.float32, emit
     try:
         readonly_score(rec, "bogus")
     except ValueError as e:
-        assert "bogus" in str(e) and "supported" in str(e), e
+        assert "bogus" in str(e) and "registered" in str(e), e
     else:
         raise SystemExit("unknown emit must be rejected")
 
     register_default_plugins()
-    # emit-set relation pin: the shadow set is independently maintained from
-    # the radius EF's emittable_scores; the two must stay equal.
-    assert get_ef_decl("radius_opt").emittable_scores == SHADOW_SUPPORTED_EMITS
-    decl = get_score_decl("abs_m")
-    _assert_shadow_emits_supported({"shadow": True}, decl, "abs_m")
-    _assert_shadow_emits_supported({}, decl, "whatever")  # live: not gated
-    _assert_shadow_emits_supported({"shadow": False}, decl, "whatever")
-    try:
-        _assert_shadow_emits_supported({"shadow": True}, decl, "bogus")
-    except ValueError as e:
-        assert "shadow mode" in str(e) and "bogus" in str(e), e
-    else:
-        raise SystemExit("shadow build gate must reject unsupported emits")
-    print("PASS test_shadow_supported_emits_and_build_gate")
+    decl = get_optimizer_decl("adamw")
+    assert set(decl.emittable_scores) <= set(score_names()), \
+        "decl advertises unregistered scores"
+    assert decl.emittable_scores == frozenset(score_names()), \
+        ("every registry entry is online-usable today (an offline-only entry "
+         "must consciously relax this pin)")
+    print("PASS test_registry_scores_shadow_evaluable_and_decl_alignment")
 
 
 def test_shadow_activates_without_idx_materialization():
@@ -771,9 +699,12 @@ def test_shadow_activates_without_idx_materialization():
     torch.manual_seed(11)
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
-    assert _RADIUS["backend"].decl.consumes == "idx"
+    assert _ABS_M["backend"].decl.consumes == "idx"
+    # 'update' score: nonzero already at step 1 (abs_m over the zero
+    # pre-first-commit moments would tie at 0 everywhere and select all)
+    combo = dict(_ABS_M, score="update")
     eng = _build_shadow_engine(
-        _RADIUS, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
+        combo, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
         shadow_score=True)
     eng.attach(chunk)
     gen = torch.Generator().manual_seed(5)
@@ -794,8 +725,8 @@ def main():
     test_shadow_numerics_equal_stock_loop()
     test_shadow_found_inf_full_clear_and_skip()
     test_shadow_rng_guard_raises()
-    test_readonly_score_matches_ef_torch_reference()
-    test_shadow_sticky_gets_pre_switch_shadow_support()
+    test_readonly_score_matches_optimizer_torch_reference()
+    test_readonly_score_mixed_numel_records_share_one_scratch_pair()
     test_shadow_peek_matches_stock_fusedadam_step()
     test_shadow_peek_value_tracks_upcoming_commit_torch_adamw()
     test_shadow_grad_sync_returns_false()
@@ -803,9 +734,8 @@ def main():
     test_shadow_metrics_reselected_tracks_boundary_reselection()
     test_loader_shadow_validation()
     test_shadow_rng_guard_cuda_half_raises()
-    test_shadow_local_score_consumes_raw_bucket_views()
     test_readonly_score_grad_none_guard()
-    test_shadow_supported_emits_and_build_gate()
+    test_registry_scores_shadow_evaluable_and_decl_alignment()
     test_shadow_activates_without_idx_materialization()
     print("\nall shadow unit tests passed")
 

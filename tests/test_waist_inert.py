@@ -142,9 +142,9 @@ def test_api_version_mismatch_rejected_at_build():
         from sga.runtime import SGA_API_VERSION, build_engine
 
         config = {
-            "score": {"name": "abs_g"},
-            "selection": {"name": "threshold"},
-            "error_feedback": {"name": "masked_adamw"},
+            "score": {"name": "abs_m"},
+            "selection": {"name": "circular_topk"},
+            "optimizer": {"name": "adamw"},
             "backend": {"name": "masked_pipelined"},
             "cycle": {},
         }

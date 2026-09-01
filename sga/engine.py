@@ -2,15 +2,17 @@
 """The SGAEngine: the single runtime object of the SGA framework.
 
 Holds the globally-unique cycle manager, one generic BucketState per gradient
-bucket, the four plugin objects and their private state, the three-layer
-cross-rank consistency machinery, the shared masked-clip service, and the
-unified per-step metrics log. Scheme-free by construction: every behavioural
-difference lives in plugin declarations (notes/sga-engine-structure.md).
+bucket, the three plugin objects plus the score NAME (scores are registry
+data, not objects), the three-layer cross-rank consistency machinery, the
+shared masked-clip service, and the unified per-step metrics log. Scheme-free
+by construction: every behavioural difference lives in plugin declarations
+(notes/sga-engine-structure.md).
 
 optimizer_step ordering contract (frozen, API note section 4):
 
-    prepare_grads() -> engine masked clip -> count_zeros (BEFORE the EF:
-    radius overwrites main grads with the update) -> EF/score/selection ->
+    prepare_grads() -> engine masked clip -> count_zeros (BEFORE the
+    optimizer template: its full step overwrites main grads with the
+    materialized score) -> optimizer/score/selection ->
     _copy_main_params_to_model_params -> selective reset (old support first,
     then switch) -> return (success, grad_norm, num_zeros)
 
@@ -27,12 +29,11 @@ the grad norm is computed even when ``clip_grad == 0`` (stock returns 0.0),
 and ``num_zeros`` is None whenever the fork's ``log_num_zeros_in_grad``
 flag is off (stock returns 0).
 
-For 'synced'-input scores the engine reads the materialized
-``main_param.grad`` views the EF kernel emits and routes them through the
-score plugin's ``values()`` before selection — e.g. the abs_m_sticky
-loyalty bonus multiplies there — and support-declaring scores additionally
-receive the pre-switch support slices. The score object stays on the data
-path, so a score-side transformation cannot be silently skipped.
+Scores are NAMES in the registry (sga/plugins/scores.py). On a reselection
+boundary the engine reads the materialized ``main_param.grad`` views the
+optimizer template's full-step kernel emits and hands them to the selection
+DIRECTLY — no score object sits on the data path, so there is nothing to
+skip and nothing to keep in sync with the kernel's math.
 
 Shadow mode (sga.shadow) bypasses the whole contract above: the step is a
 literal replication of the stock MixedPrecisionOptimizer.step() (stock
@@ -54,8 +55,9 @@ from sga.kernels import (
     sga_advance_step,
     sga_peek_step,
 )
-from sga.plugins.error_feedback import EFContext, ParamRecord
-from sga.shadow import EMITS_USING_SCRATCH, readonly_score
+from sga.plugins.optimizer import OptContext, ParamRecord
+from sga.plugins.scores import SCRATCH_SCORES
+from sga.shadow import readonly_score
 from sga.support import BucketSupport, Support
 from sga.trace import TraceCollector
 
@@ -81,10 +83,7 @@ class BucketState:
         self.always_sync_mask = None                # uint8 forced-ones mask (lazy)
         # Extra main grads owned by the buffer this bucket lives in.
         self.extra_main_grads = []                  # (assigned at attach)
-        # Plugin-private persistent state (EF-owned):
-        self.grad_acc_count = None                  # uint8 acc counts (origin EF)
         self.active_mask_u8 = None                  # active support mask (set by engine)
-        self.ones_mask_u8 = None                    # all-ones mask cache (origin EF)
 
 
 class SelectionContext:
@@ -106,7 +105,7 @@ class CycleManager:
     iteration number — see SGAEngine.optimizer_step for the consistency assert).
 
     Steps are 1-based. A step is FULL (dense sync) when forced, when still in
-    the bootstrap region (<= start_iter), when the EF's residual contract
+    the bootstrap region (<= start_iter), when the optimizer's residual contract
     requires it at a cycle boundary, when the periodic full_sync_interval
     hits, or when no support exists yet. Reselection happens at cycle
     boundaries ((step - start_iter) % period == 0, step > start_iter) on
@@ -137,21 +136,31 @@ class CycleManager:
 
 
 class SGAEngine:
-    """Engine over the four plugin objects; built by sga.runtime.build_engine."""
+    """Engine over the plugin objects; built by sga.runtime.build_engine."""
 
-    def __init__(self, config: dict, score, selection, ef, backend):
+    def __init__(self, config: dict, score_name: str, selection, opt, backend):
         self.config = config
-        self.score = score
+        self.score_name = score_name
         self.selection = selection
-        self.ef = ef
+        self.opt = opt
         self.backend = backend
+        # Shadow scores with ``score_name`` while the live path consumes the
+        # optimizer's materialized ``emit_score``; build_engine ties them, but
+        # a direct-construction caller desyncing the two must fail loudly here
+        # (shadow would score a different formula than the optimizer
+        # materializes).
+        assert getattr(opt, "emit_score", self.score_name) == self.score_name, (
+            f"engine score_name {self.score_name!r} != optimizer emit_score "
+            f"{getattr(opt, 'emit_score', self.score_name)!r}: the shadow "
+            "score and the optimizer's materialized score must coincide"
+        )
 
         cycle = config.get("cycle", {})
         self._cycle = CycleManager(
             start_iter=int(cycle.get("start_iter", 0)),
             period=int(cycle.get("period", 1)),
             full_sync_interval=int(cycle.get("full_sync_interval", 0)),
-            boundary_implies_full=ef.decl.requires_full_sync_every_period,
+            boundary_implies_full=opt.decl.requires_full_sync_every_period,
         )
         self._chunks = {}                 # id(chunk) -> chunk
         self._bucket_states = []          # global ordered list (Support alignment)
@@ -241,7 +250,7 @@ class SGAEngine:
                 self._bucket_states.append(bs)
 
         self._selection_meta = None  # rebuilt after a new chunk attaches
-        self.ef.ensure_state(self._bucket_states)
+        self.opt.ensure_state(self._bucket_states)
         self._build_always_sync_masks()
         # The comm groups just became known (DDP bucket construction is a
         # world-collective, so attach runs symmetrically on every rank):
@@ -364,19 +373,21 @@ class SGAEngine:
         # 2. masked clip (single shared service; unconditional DP-bitwise fix).
         grad_norm = self._masked_clip_grad_norm(mp_opt, was_full)
 
-        # 3. num_zeros BEFORE the EF (radius overwrites main grads).
+        # 3. num_zeros BEFORE the optimizer template (its full step
+        # overwrites main grads with the materialized score).
         num_zeros = self._count_zeros(mp_opt) if self._log_num_zeros_flag() else None
 
-        # 3b. trace dump slot (frozen slot: AFTER count_zeros, BEFORE the EF
-        #     rewrites main_param.grad — the post-unscale post-clip view the
-        #     offline replay consumes; grad_norm is this step's own clip).
+        # 3b. trace dump slot (frozen slot: AFTER count_zeros, BEFORE the
+        #     optimizer rewrites main_param.grad — the post-unscale post-clip
+        #     view the offline replay consumes; grad_norm is this step's own
+        #     clip).
         if self._trace is not None:
             self._trace.maybe_dump(self, mp_opt, step, grad_norm)
 
-        # 4. EF owns the entire inner step.
+        # 4. The optimizer template owns the entire inner step.
         records = self._refresh_records(mp_opt)
         next_full = self._cycle.is_full(step + 1)
-        ef_ctx = EFContext(
+        opt_ctx = OptContext(
             records=records,
             phase="full" if was_full else "sparse",
             support=self._active_support,
@@ -385,9 +396,9 @@ class SGAEngine:
             next_step_is_full=next_full,
         )
         if was_full:
-            self.ef.full_step(ef_ctx)
+            self.opt.full_step(opt_ctx)
         else:
-            self.ef.sparse_step(ef_ctx)
+            self.opt.sparse_step(opt_ctx)
 
         # 5. copy main -> model.
         mp_opt._copy_main_params_to_model_params()
@@ -396,30 +407,19 @@ class SGAEngine:
         #    its residual handling BEFORE the switch — notes section 9).
         reselect = self._cycle.reselect_boundary(step) and not self._step_forced
         if reselect:
-            _, always_slices, meta = self._selection_views()
-            if self.score.decl.scoring_input == "synced":
-                # Materialized-update views, IN META ORDER: records follow the
-                # optimizer's param order, bucket spans follow the DDP bucket
-                # order — they differ in real megatron.
-                views = [p.main_param.grad.data.view(-1)
-                         for (_, _, _, p) in meta]
-                self._check_norm_spread(views)
-                # Route the materialized tensors through the score plugin's
-                # own contract (keeps any score-side transformation — e.g. the
-                # sticky loyalty bonus — on the data path; support-declaring
-                # scores additionally receive the pre-switch support slices).
-                if self.score.decl.needs_support:
-                    views = self.score.values(views, self._support_slices(meta))
-                else:
-                    views = self.score.values(views)
-            else:
-                views = self._selection_views()[0]
+            always_slices, meta = self._selection_context()
+            # Materialized-score views, IN META ORDER: records follow the
+            # optimizer's param order, bucket spans follow the DDP bucket
+            # order — they differ in real megatron.
+            views = [p.main_param.grad.data.view(-1)
+                     for (_, _, _, p) in meta]
+            self._check_norm_spread(views)
             new_support = self._run_selection(views, always_slices, meta)
         else:
             new_support = None
 
-        # 7. Selective reset (EF-owned semantics, old support), then switch.
-        self.ef.reset(ef_ctx, was_full=was_full)
+        # 7. Selective reset (optimizer-owned semantics, old support), then switch.
+        self.opt.reset(opt_ctx, was_full=was_full)
         if new_support is not None:
             self._activate_support(new_support)
             # Layer-1 deadlock guard, once per cycle at activation: the counts
@@ -454,7 +454,7 @@ class SGAEngine:
         stock step_with_ready_grads (commit + copy-back) → full clear.
 
         The engine's masked clip service is deliberately NOT used (it is not
-        bitwise the stock clip); the EF never runs; the end-of-step full
+        bitwise the stock clip); the optimizer template never runs; the end-of-step full
         clear replaces next iteration's zero_grad_buffer, which the fork's
         static guard skipped because the engine is active. Trace dumps in
         shadow see the stock clipped dense gradient — the replay-grade view.
@@ -478,7 +478,7 @@ class SGAEngine:
         reselected = reselect and self._shadow_score
 
         # Same frozen dump slot as the live path: after count_zeros, before
-        # the commit (the EF slot it precedes in live mode does not exist
+        # the commit (the optimizer slot it precedes in live mode does not exist
         # here — the commit itself is the writer being avoided). Records are
         # NOT pre-refreshed: the dump refreshes them lazily only when a dump
         # actually fires, so the probe configuration runs record-free.
@@ -500,14 +500,11 @@ class SGAEngine:
     def _shadow_reselect(self, records):
         """Read-only scoring + selection at a shadow cycle boundary.
 
-        Reuses the live reselection machinery (view routing incl. the sticky
-        pre-switch support slices, selection, bucket assembly, consistency
-        checks, activation) with the score tensors coming from
-        sga.shadow.readonly_score instead of the EF's fused materialization;
-        non-synced scores skip readonly_score and consume the raw
-        ``_selection_views()`` bucket views directly — at this call point
-        those hold the dense-synced, stock-clipped gradient (the honest
-        dense-replay input).
+        Reuses the live reselection machinery (view routing, selection,
+        bucket assembly, consistency checks, activation) with the score
+        tensors coming from sga.shadow.readonly_score — the registry formula
+        evaluated on the pre-commit state — instead of the optimizer
+        template's fused materialization.
         The RNG-state assert brackets the whole insertion: the boundary
         must be consumption-free on every RNG stream (selections are
         histogram/topk-based by design — a violation means a plugin broke
@@ -518,36 +515,31 @@ class SGAEngine:
                        if torch.cuda.is_available() else None)
 
         rec_of = {id(rec.model_param): rec for rec in records}
-        views, always_slices, meta = self._selection_views()
-        if self.score.decl.scoring_input == "synced":
-            emit = self.score.decl.emit_name or self.score.decl.name
-            # Two largest-param-sized buffers carry the shared formula-chain
-            # temps (bitwise-identical out= routing) — the boundary's
-            # allocator high-water otherwise spikes several param-sized
-            # allocations on the largest param.
-            scratch = None
-            if records and emit in EMITS_USING_SCRATCH:
-                max_n = max(r.main_param.numel() for r in records)
-                ref = records[0].main_param
-                scratch = (
-                    torch.empty(max_n, dtype=ref.dtype, device=ref.device),
-                    torch.empty(max_n, dtype=ref.dtype, device=ref.device),
+        emit = self.score_name
+        always_slices, meta = self._selection_context()
+        # Two largest-param-sized buffers carry the shared formula-chain
+        # temps (bitwise-identical out= routing) — the boundary's
+        # allocator high-water otherwise spikes several param-sized
+        # allocations on the largest param.
+        scratch = None
+        if records and emit in SCRATCH_SCORES:
+            max_n = max(r.main_param.numel() for r in records)
+            ref = records[0].main_param
+            scratch = (
+                torch.empty(max_n, dtype=ref.dtype, device=ref.device),
+                torch.empty(max_n, dtype=ref.dtype, device=ref.device),
+            )
+        views = []
+        for (_, _, _, p) in meta:
+            rec = rec_of.get(id(p))
+            if rec is None:
+                raise TypeError(
+                    "shadow reselection: meta param without a record "
+                    f"(shape {tuple(p.shape)}); records were refreshed "
+                    "from a different optimizer view"
                 )
-            views = []
-            for (_, _, _, p) in meta:
-                rec = rec_of.get(id(p))
-                if rec is None:
-                    raise TypeError(
-                        "shadow reselection: meta param without a record "
-                        f"(shape {tuple(p.shape)}); records were refreshed "
-                        "from a different optimizer view"
-                    )
-                views.append(readonly_score(rec, emit, scratch).view(-1))
-            self._check_norm_spread(views)
-            if self.score.decl.needs_support:
-                views = self.score.values(views, self._support_slices(meta))
-            else:
-                views = self.score.values(views)
+            views.append(readonly_score(rec, emit, scratch).view(-1))
+        self._check_norm_spread(views)
         self._activate_support(self._run_selection(views, always_slices, meta))
         if self._count_guard:
             self._check_counts()
@@ -573,7 +565,7 @@ class SGAEngine:
         """Shared selection tail for both reselection call sites: warmup
         probe → context → select → bucket assembly → consistency verify →
         adapt → Support construction. The CALLER owns activation timing and
-        everything around it: live activates only after the EF's selective
+        everything around it: live activates only after the optimizer's selective
         reset has consumed the old support (step 7), shadow activates
         immediately inside the RNG bracket — those orderings are load-bearing
         and deliberately stay at the call sites."""
@@ -596,12 +588,12 @@ class SGAEngine:
             for i, m in enumerate(bucket_masks)
         ])
 
-    def _selection_views(self):
-        """Local per-param grad views (bucket order) + metadata for assembly.
+    def _selection_context(self):
+        """Always-sync slices + per-param view metadata for reselection.
 
         ``meta`` entries are (bucket_state, start, end, model_param); the
-        param rides along so the 'synced' path can fetch the matching
-        materialized update (main_param.grad) in the same order.
+        param rides along so the callers can fetch the matching materialized
+        score (main_param.grad) in the same order.
         """
         if self._selection_meta is None:
             meta = []
@@ -610,8 +602,7 @@ class SGAEngine:
                     meta.append((bs, start, end, param))
             self._selection_meta = meta
         meta = self._selection_meta
-        views = [bs.grad_data[start:end] for bs, start, end, _ in meta]
-        return views, self._always_sync_slices(), meta
+        return self._always_sync_slices(), meta
 
     def _always_sync_slices(self):
         out = []
@@ -621,18 +612,6 @@ class SGAEngine:
             else:
                 out.append(bs.always_sync_mask[start:end])
         return out
-
-    def _support_slices(self, meta):
-        """Per-param uint8 mask slices of the CURRENT (pre-switch) support in
-        meta order — the input of support-declaring scores (sticky loyalty
-        bonus). None at bootstrap (no support yet), where such scores must
-        degenerate to their base form (ScoreDecl.needs_support contract)."""
-        if self._active_support is None:
-            return None
-        return [
-            self._active_support.buckets[bs.support_index].mask_u8[start:end]
-            for (bs, start, end, _) in meta
-        ]
 
     def _assemble_bucket_masks(self, masks, meta):
         """Scatter per-param masks into per-bucket element-level uint8 masks.
@@ -698,7 +677,7 @@ class SGAEngine:
         """Lazy ParamRecord build + once-per-step hyperparam refresh.
 
         Every caller lives inside a single optimizer_step (the clip service,
-        the zero count, and the EF handoff below), so the SHARED Adam step
+        the zero count, and the optimizer handoff below), so the SHARED Adam step
         counter must advance at most once per engine step: repeated visits
         within the same step are stamped out via ``_refresh_step``. Dense
         AdamW uses exactly ``iteration`` as its step; the SGA kernels read
@@ -722,7 +701,7 @@ class SGAEngine:
                             raise TypeError(
                                 "SGA v1 found a native-fp32 param that "
                                 "requires grad; such params get no optimizer "
-                                f"step under the EF-owned step (shape "
+                                f"step under the optimizer-owned step (shape "
                                 f"{tuple(p.shape)}). v1 supports bf16 params "
                                 "with fp32 twins only"
                             )
@@ -734,7 +713,7 @@ class SGAEngine:
                     loc = self._param_locations.get(id(model_param))
                     bs, start, end = loc if loc else (None, 0, 0)
                     if bs is None:
-                        # Without a bucket span the EF's residual contract
+                        # Without a bucket span the optimizer's residual contract
                         # silently skips this param forever.
                         raise TypeError(
                             "SGA records: model param without an attached "
@@ -789,7 +768,7 @@ class SGAEngine:
         scalar: MP-group SUM, then the unconditional DP-bitwise fix (SUM over
         DP-CP + divide by world) — without it the fused kernel's atomic-add
         ulp jitter diverges clip coefficients, then masks, then deadlocks the
-        sparse allreduce (the historical radius-owt-50k root cause).
+        sparse allreduce (the root cause of a historical deadlock run).
         """
         clip_grad = getattr(mp_opt.config, "clip_grad", 0.0)
         records = self._records or self._refresh_records(mp_opt)
@@ -976,8 +955,6 @@ class SGAEngine:
             bs.grad_data.zero_()
             for grad in bs.extra_main_grads:
                 grad.zero_()
-            if bs.grad_acc_count is not None:
-                bs.grad_acc_count.fill_(1)
         self._reset_host_state(model_chunks)
 
     def _reset_host_state(self, model_chunks):
@@ -1020,8 +997,6 @@ class SGAEngine:
         if self._active_support is not None and self._active_support.total_elements:
             ratio = self._active_support.total_selected / self._active_support.total_elements
         extra = ""
-        if hasattr(self.selection, "threshold"):
-            extra = f" thresh={self.selection.threshold:.3e}"
         if hasattr(self.selection, "last_threshold") and self.selection.last_threshold:
             extra = f" sel_thresh={self.selection.last_threshold:.3e}"
         line = (
@@ -1038,7 +1013,6 @@ class SGAEngine:
                         "ratio": ratio,
                         "grad_norm": grad_norm,
                         "reselected": reselected,
-                        "threshold": getattr(self.selection, "threshold", None),
                     }) + "\n")
 
     # ------------------------------------------------------------- group lookups
@@ -1078,7 +1052,7 @@ class SGAEngine:
         return self._tp_group()
 
     def _log_num_zeros_flag(self) -> bool:
-        """The fork's log_num_zeros_in_grad flag (the pre-EF zero count is a
+        """The fork's log_num_zeros_in_grad flag (the pre-optimizer zero count is a
         frozen ordering-contract measurement point). False ONLY in supported
         non-running states — no distributed init (unit/CPU envs have no
         global args to consult) or megatron genuinely absent. Inside a live

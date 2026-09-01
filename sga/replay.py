@@ -9,18 +9,16 @@ predictive power over a replay window. Trace format is byte-compatible with
 the legacy collector (catalog.pt / step_NNNNNN_state.pt / step_NNNNNN_g.pt),
 so this tool replays legacy traces and the legacy tool replays new ones.
 
-Scores (fp64 arithmetic, fp32 storage):
+Scores come from the framework's score REGISTRY (sga/plugins/scores.py) —
+the same names and formulas the online engine and shadow mode use; this tool
+consumes the registry directly and defines no score set of its own:
     abs_g        = |g|                       (observed, post-clip gradient)
     abs_m        = |m|                       (pre-commit first moment)
     update       = |wd*w + U(g)|             (online full-sync selection score,
                                               upcoming-commit bias corrections)
-    full_update  = |U(g)|                    (wd-free continuity reference)
     coi          = |U(g) - U(0)|             (counterfactual optimizer impact)
-    snr_m        = |m_hat|/(sqrt(v_hat)+eps) (pre-commit, STATE-MATCHED bias
-                                              corrections = exponent commits-1)
-    abs_m_post   = |b1*m + (1-b1)*g|         (post-commit raw momentum)
-    abs_m_sticky = abs_m * (1 + lambda * 1[in previous cycle support])
-    radius       = |wd*w + snr|              (pre-commit; zerofill-era winner)
+(fp64 arithmetic, fp32 storage; the materialized form may be signed — the
+ranking selects store magnitudes.)
 
 Replay modes:
 - ``zerofill``: frozen support, zero-filled q each step (original offline
@@ -60,7 +58,7 @@ PYTHONPATH):
 
     python -m sga.replay --trace-dir <dir> --branch-point 40 \
         --replay-mode cycle --cycle-len 20 --ratios 10,20 --horizons 1,10 \
-        --score-names abs_m,abs_m_sticky,snr_m --out report.json
+        --score-names abs_m,update --out report.json
 
     # replay-machinery validation against real state dumps:
     python -m sga.replay --trace-dir <dir> --self-check 40 60
@@ -77,24 +75,10 @@ import time
 import torch
 
 
-SCORE_NAMES = ["abs_g", "abs_m", "radius", "full_update", "coi"]
-# Cycle (residual, multi-refresh) replay mode scores. ``update`` is the
-# online-exact full-sync selection score |wd*w + U(g)| (the materialized
-# grad-correct update, decoupled weight decay included, bias corrections of
-# the upcoming commit); ``full_update`` keeps the offline wd-free |U(g)| as
-# a continuity reference. ``radius`` has no online selector counterpart and
-# is opt-in only (SCORE_NAMES_CYCLE_EXTRA).
-SCORE_NAMES_CYCLE = ["abs_g", "abs_m", "update", "full_update", "coi"]
-# Research-candidate scores, cycle mode opt-in via --score-names (not in the
-# default set so existing tables stay reproducible):
-#   snr_m        = |m_hat| / (sqrt(v_hat) + eps), PRE-commit moments with
-#                  state-matched bias corrections (the radius score minus wd)
-#   abs_m_post   = |b1*m + (1-b1)*g|, post-commit raw momentum
-#   abs_m_sticky = abs_m * (1 + sticky_lambda * 1[in previous cycle support]);
-#                  at the branch-point first selection there is no previous
-#                  support, so it degenerates to abs_m
-#   radius       = |wd*w + m_hat/(sqrt(v_hat)+eps)|, pre-commit
-SCORE_NAMES_CYCLE_EXTRA = ["snr_m", "abs_m_post", "abs_m_sticky", "radius"]
+# The score set IS the framework registry (single namespace, formulas
+# included); replay defines no score names of its own.
+from sga.plugins.scores import SCORES, get_score_spec
+
 _G_STEP_RE = re.compile(r"step_(\d+)_g\.pt$")
 _STAT_STEP_RE = re.compile(r"step_(\d+)_state\.pt$")
 
@@ -250,13 +234,14 @@ def compute_scores_flat(w_parts, m_parts, v_parts, g_parts, offsets, N, meta,
     ``update_includes_wd=True`` (cycle mode) switches ``update`` to the
     online-exact full-sync selection score |wd*w + U(g)| (the materialized
     grad-correct update of the upcoming commit); the default reproduces the
-    original five offline scores.
+    original offline scores.
 
     ``hp_parts`` (optional) maps param name -> (beta1, beta2, eps, wd) for
     per-group hyperparameters (new traces); absent, the global meta scalars
     apply to every param (legacy behavior).
     """
-    score_names = score_names or SCORE_NAMES
+    score_names = score_names or list(SCORES)
+    specs = {s: get_score_spec(s) for s in score_names}
     gb1, gb2 = float(meta["adam_beta1"]), float(meta["adam_beta2"])
     geps, gwd = float(meta["adam_eps"]), float(meta["weight_decay"])
     t0 = int(meta["step"])
@@ -270,10 +255,8 @@ def compute_scores_flat(w_parts, m_parts, v_parts, g_parts, offsets, N, meta,
             b1, b2, eps, wd = hp_parts[name]
         else:
             b1, b2, eps, wd = gb1, gb2, geps, gwd
-        # ``state_absent`` implies t0 == 0 and m == v == 0; bias-correction
-        # exponents at the branch point are t0.
-        bc1 = 1.0 - b1 ** t0
-        bc2 = 1.0 - b2 ** t0
+        # ``state_absent`` implies t0 == 0 and m == v == 0; the formulas take
+        # the bias corrections of the UPCOMING commit (exponent t0 + 1).
         bc1p = 1.0 - b1 ** (t0 + 1)
         bc2p = 1.0 - b2 ** (t0 + 1)
         w = w_.reshape(-1)
@@ -287,40 +270,12 @@ def compute_scores_flat(w_parts, m_parts, v_parts, g_parts, offsets, N, meta,
             m64 = m[a:b].to(dtype=torch.float64, device=dev)
             v64 = v[a:b].to(dtype=torch.float64, device=dev)
             g64 = g[a:b].to(dtype=torch.float64, device=dev)
-            if bc1 > 0.0:
-                mterm = m64 / bc1
-            else:
-                mterm = torch.zeros_like(m64)          # t0 == 0: m is zero
-            if bc2 > 0.0:
-                vterm = v64 / bc2
-            else:
-                vterm = torch.zeros_like(v64)
-            radius = (wd * w64 + mterm / (torch.sqrt(vterm) + eps)).abs()
-            m_g = (b1 * m64 + (1.0 - b1) * g64) / bc1p
-            v_g = (b2 * v64 + (1.0 - b2) * g64 * g64) / bc2p
-            u_g = m_g / (torch.sqrt(v_g) + eps)
-            m_0 = (b1 * m64) / bc1p
-            v_0 = (b2 * v64) / bc2p
-            u_0 = m_0 / (torch.sqrt(v_0) + eps)
-            coi = (u_g - u_0).abs()
-            chunk_out = {
-                "abs_g": g64.abs(),
-                "abs_m": m64.abs(),
-                "radius": radius,
-                "full_update": u_g.abs(),
-                "coi": coi,
-                # research candidates (opt-in; identical sel0 semantics to
-                # their _cycle_score_chunk counterparts at si=0)
-                "snr_m": (mterm / (torch.sqrt(vterm) + eps)).abs(),
-                "abs_m_post": (b1 * m64 + (1.0 - b1) * g64).abs(),
-                "abs_m_sticky": m64.abs(),
-            }
-            if update_includes_wd:
-                chunk_out["update"] = (wd * w64 + u_g).abs()
-            else:
-                chunk_out["update"] = u_g.abs()
             for s in score_names:
-                out[s][o + a: o + b] = chunk_out[s]
+                # the materialized form may be signed (update) — rank by magnitude
+                sc = specs[s].formula(w64, m64, v64, g64, b1, b2, eps, wd,
+                                      bc1p, bc2p,
+                                      update_includes_wd=update_includes_wd)
+                out[s][o + a: o + b] = sc.abs()
     return out
 
 
@@ -854,52 +809,6 @@ def sparse_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons
 # cyclic semantics
 # ----------------------------------------------------------------------------
 
-def _cycle_score_chunk(score_name, w, m, v, g, wd, b1, b2, bc1c, bc2c, eps):
-    """One chunk of a cycle-mode boundary score, computed from the PRE-commit
-    moments (m, v), the pre-commit weights (w) and the folded post-clip
-    gradient ``g`` consumed by the boundary commit whose bias corrections are
-    (bc1c, bc2c). All inputs same-shaped tensors on the same device; the
-    arithmetic runs in their (replay) dtype. Mirrors the online definitions:
-    ``update`` = materialized grad-correct update |wd*w + U(g)|,
-    ``coi`` = |U(g) - U(0)| (wd cancels), ``full_update`` = |U(g)| (wd-free),
-    ``abs_g`` = |g|, ``abs_m`` = |m|. Research candidates:
-    ``snr_m`` = |m_hat|/(sqrt(v_hat)+eps) and ``radius`` = |wd*w + snr| with
-    state-matched (pre-commit) bias corrections; ``abs_m_post`` =
-    |b1*m + (1-b1)*g|; ``abs_m_sticky`` = |m| (the sticky boost lives at the
-    re-selection site, it needs the previous cycle's support).
-    """
-    if score_name == "abs_g":
-        return g.abs()
-    if score_name == "abs_m" or score_name == "abs_m_sticky":
-        return m.abs()
-    if score_name == "abs_m_post":
-        return (b1 * m + (1.0 - b1) * g).abs()
-    if score_name == "snr_m" or score_name == "radius":
-        # state-matched (pre-commit) bias corrections derived from the
-        # upcoming commit's: bc(C-1) = 1 - (1 - bc(C)) / beta
-        bc1p = 1.0 - (1.0 - bc1c) / b1
-        bc2p = 1.0 - (1.0 - bc2c) / b2
-        if bc1p <= 0.0 or bc2p <= 0.0:
-            # count-1 == 0: zero moments, matching compute_scores_flat t0=0
-            return torch.zeros_like(m)
-        snr = (m / bc1p) / (torch.sqrt(v / bc2p) + eps)
-        if score_name == "snr_m":
-            return snr.abs()
-        return (wd * w + snr).abs()
-    m_g = (b1 * m + (1.0 - b1) * g) / bc1c
-    v_g = (b2 * v + (1.0 - b2) * g * g) / bc2c
-    u_g = m_g / (torch.sqrt(v_g) + eps)
-    if score_name == "full_update":
-        return u_g.abs()
-    if score_name == "update":
-        return (wd * w + u_g).abs()
-    # coi
-    m_0 = (b1 * m) / bc1c
-    v_0 = (b2 * v) / bc2c
-    u_0 = m_0 / (torch.sqrt(v_0) + eps)
-    return (u_g - u_0).abs()
-
-
 def _fresh_state(t, dev):
     """Copy a cpu reference tensor onto dev; never alias the original (the
     branch-state w0/m0/v0 are shared across replay arms)."""
@@ -911,8 +820,7 @@ def _fresh_state(t, dev):
 
 def sparse_replay_cycle(params, g_files, window_steps, base_meta, t0,
                         eff_horizons, score_name, k, cycle_len, sel0, snap_d,
-                        replay_dtype, chunk_mb, device, sel_trace=None,
-                        sticky_lambda=0.5):
+                        replay_dtype, chunk_mb, device, sel_trace=None):
     """Sparse replay with residual accumulation and cycle-boundary mask
     re-selection — the offline twin of the online cyclic semantics:
 
@@ -981,6 +889,7 @@ def sparse_replay_cycle(params, g_files, window_steps, base_meta, t0,
         # then re-select. Skipped at si=0 (sel0 already encodes it) and when
         # no masked step remains in the window.
         if boundary and si > 0 and si + 1 < W:
+            spec = get_score_spec(score_name)
             score_flat = torch.empty(N, dtype=torch.float32)
             for prm in params:
                 name, o, n = prm["name"], prm["off"], prm["n"]
@@ -993,15 +902,12 @@ def sparse_replay_cycle(params, g_files, window_steps, base_meta, t0,
                 for a in range(0, n, chunk_n):
                     b = min(n, a + chunk_n)
                     q = ((g[a:b].to(dev) / coef_dense) + prm["res"][a:b]) * coef
-                    sc = _cycle_score_chunk(
-                        score_name, prm["ws"][a:b], prm["ms"][a:b],
-                        prm["vs"][a:b], q, wd, b1, b2, bc1c, bc2c, eps)
-                    if score_name == "abs_m_sticky":
-                        # boost coordinates that were in the previous cycle's
-                        # support (``sel`` still holds it at this point)
-                        prev = sel[o + a: o + b].to(dev).to(sc.dtype)
-                        sc = sc * (1.0 + sticky_lambda * prev)
-                    score_flat[o + a: o + b] = sc.float().cpu()
+                    # the materialized form may be signed (update) — the
+                    # topk select ranks by magnitude
+                    sc = spec.formula(prm["ws"][a:b], prm["ms"][a:b],
+                                      prm["vs"][a:b], q, b1, b2, eps, wd,
+                                      bc1c, bc2c, update_includes_wd=True)
+                    score_flat[o + a: o + b] = sc.abs().float().cpu()
             sel, _thresh = select_topk_flat(score_flat, k)
             del score_flat
             if sel_trace is not None:
@@ -1134,18 +1040,16 @@ def process_branch(t0, ctx, args):
 
     # ---- scores ---------------------------------------------------------
     cycle_mode = args.replay_mode == "cycle"
-    allowed = (SCORE_NAMES_CYCLE + SCORE_NAMES_CYCLE_EXTRA) if cycle_mode \
-        else SCORE_NAMES
+    allowed = list(SCORES)
     if args.score_names:
         unknown = [s for s in args.score_names if s not in allowed]
         if unknown:
             raise ValueError(
-                f"--score-names {unknown} not valid in {args.replay_mode} mode "
+                f"--score-names {unknown} not a registered score "
                 f"(allowed: {allowed})")
         score_names = [s for s in allowed if s in args.score_names]
     else:
-        score_names = [s for s in allowed if s in
-                       (SCORE_NAMES_CYCLE if cycle_mode else SCORE_NAMES)]
+        score_names = allowed
     score_flats = compute_scores_flat(
         w_parts, m_parts, v_parts, g_parts, offsets, N, meta,
         args.chunk_mb, args.device, score_names=score_names,
@@ -1201,7 +1105,7 @@ def process_branch(t0, ctx, args):
                 num_at = sparse_replay_cycle(
                     params, g_files, window_steps, meta, t0, eff_horizons,
                     sname, k, args.cycle_len, sel, snap_d, replay_dtype,
-                    args.chunk_mb, args.device, sticky_lambda=args.sticky_lambda,
+                    args.chunk_mb, args.device,
                 )
             elif use_dev:
                 num_at = sparse_replay_dev(
@@ -1487,13 +1391,8 @@ def main(argv=None):
                          "a full-sync step)")
     ap.add_argument("--score-names", default=None,
                     help="comma list restricting the score set (validated "
-                         "against the replay mode's allowed names; cycle mode "
-                         "also accepts the research candidates snr_m, "
-                         "abs_m_post, abs_m_sticky, radius). Default: the "
-                         "mode's standard set")
-    ap.add_argument("--sticky-lambda", type=float, default=0.5,
-                    help="support-loyalty boost for abs_m_sticky: score *= "
-                         "(1 + lambda * 1[in previous cycle support])")
+                         "against the framework score registry). Default: all "
+                         "registered scores")
     ap.add_argument("--window", type=int, default=100,
                     help="trace window length (matches the collector's "
                          "sga.trace.window)")
@@ -1525,11 +1424,6 @@ def main(argv=None):
                      if t]):
         raise ValueError(
             f"--branch-point {args.branch_point!r} names no branch step")
-    if not (math.isfinite(args.sticky_lambda) and args.sticky_lambda >= 0.0):
-        raise ValueError(
-            f"--sticky-lambda must be finite and >= 0, got "
-            f"{args.sticky_lambda!r}")
-
     torch.manual_seed(args.seed)
     if args.device != "cpu":
         if not args.device.startswith("cuda"):
@@ -1610,7 +1504,6 @@ def main(argv=None):
             "replay_mode": args.replay_mode,
             "cycle_len": args.cycle_len,
             "score_names": args.score_names,
-            "sticky_lambda": args.sticky_lambda,
             "window": args.window,
             "seed": args.seed,
         },

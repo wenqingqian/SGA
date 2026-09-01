@@ -2,75 +2,64 @@
 """Plugin declarations and registries for the four SGA config axes.
 
 A scheme is a pure configuration combination (field model):
-``score / selection / error_feedback / backend``, each with its own params.
-Every plugin declares its attributes; the combination validator checks
-legality from those declarations — there is NO hardcoded list of legal
-combinations and NO scheme names anywhere in the engine.
+``score / selection / optimizer / backend``, each with its own params.
+Scores are DATA in the score registry (sga/plugins/scores.py: name -> formula
++ doc — no classes); selection/optimizer/backend are class plugins that each
+declare their attributes. The combination validator checks legality from
+those declarations — there is NO hardcoded list of legal combinations and NO
+scheme names anywhere in the engine.
 
 Declaration facts used by the validator (see ``validate_combination``):
-  - Score.scoring_input: 'local_or_merged' (score from local accumulated
-    grads, mask OR-merged across DP — selection may run every step) or
-    'synced' (score needs the fully-synced gradient state of a full-sync
-    step, e.g. an update materialized by the EF kernel).
-  - Score.has_threshold_path: the score offers a fused ``threshold_mask``
-    fast path (abs_g does; update_ratio does not).
-  - Selection.scope: 'elementwise_local' vs 'global_ranked' (topk over the
-    whole model needs a ranked view, e.g. the bit-pattern histogram).
-  - ErrorFeedback.emittable_scores: the score plugins this EF can
-    materialize into the fp32 main-grad copy on full steps (radius-style
-    EF->score handoff); 'synced' scores must be paired with an EF that
-    lists them. A score whose post-processing sits OUTSIDE the kernel
-    (e.g. abs_m_sticky) names the actually-materialized base score via
-    Score.emit_name, and the membership check runs against that name.
-  - Score.needs_support: the score reads the current (pre-switch) support
-    at reselection; the engine supplies per-param support slices to
-    ``values()`` (None at bootstrap => degenerate to the base score).
-  - ErrorFeedback.requires_full_sync_every_period: the EF's residual
-    contract only folds at full syncs, so cycle boundaries must be full.
+  - Optimizer.emittable_scores: the score names this template's full-step
+    kernel can materialize into the fp32 main-grad copy (the optimizer->score
+    handoff). The configured score MUST be a member — this is the single
+    cross-axis legality rule; registry entries outside every template's
+    emittable set are offline-only (replay-evaluable, config-rejected).
+  - Optimizer.requires_full_sync_every_period: the residual contract only
+    folds at full syncs, so cycle boundaries must be full.
   - Backend.consumes: 'mask' or 'idx' — the Support object provides both,
     so this routes the backend rather than restricting combinations.
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
+from sga.plugins.scores import ScoreSpec, get_score_spec, score_names
 
-@dataclass(frozen=True)
-class ScoreDecl:
-    name: str
-    # What gradient state the score needs.
-    scoring_input: str = "local_or_merged"  # 'local_or_merged' | 'synced'
-    # Fused ``threshold_mask`` fast path available (needed by threshold selection).
-    has_threshold_path: bool = False
-    # Score reads the CURRENT (pre-switch) support at reselection time, e.g. a
-    # loyalty bonus over last cycle's coordinates. The engine then passes
-    # per-param support mask slices into ``values()`` (None at bootstrap, where
-    # the score must degenerate to its support-free base form).
-    needs_support: bool = False
-    # Name of the score the EF actually materializes when this differs from
-    # the plugin's own name (post-processing scores like abs_m_sticky, which
-    # the EF emits as plain abs_m). None means "emit under my own name".
-    emit_name: Optional[str] = None
+__all__ = [
+    "ScoreSpec",
+    "get_score_spec",
+    "score_names",
+    "SelectionDecl",
+    "OptimizerDecl",
+    "BackendDecl",
+    "register_selection",
+    "register_optimizer",
+    "register_backend_plugin",
+    "get_selection_decl",
+    "get_optimizer_decl",
+    "get_backend_plugin_decl",
+    "registered_names",
+    "validate_combination",
+    "build_selection",
+    "build_optimizer",
+    "build_backend_plugin",
+    "register_default_plugins",
+]
 
 
 @dataclass(frozen=True)
 class SelectionDecl:
     name: str
     output_form: str = "mask"  # 'mask' | 'idx' (Support canonicalizes either way)
-    scope: str = "elementwise_local"  # 'elementwise_local' | 'global_ranked'
-    # Requires the paired score to expose a fused threshold fast path.
-    needs_threshold_path: bool = False
 
 
 @dataclass(frozen=True)
-class EFDecl:
+class OptimizerDecl:
     name: str
-    # Post-update buffer reset semantics the EF owns.
+    # Post-update buffer reset semantics the optimizer template owns.
     reset_mode: str = "selective"  # 'selective' | 'full'
-    # Needs the engine-allocated uint8 accumulation-count buffers.
-    needs_acc_count: bool = False
-    # Score plugins this EF can materialize into main grads on full steps
-    # (the EF->score handoff; 'synced' scores must be paired accordingly).
+    # Score names this template can materialize into main grads on full steps
+    # (the optimizer->score handoff); the configured score must be a member.
     emittable_scores: frozenset = frozenset()
     # Residual contract folds only at full syncs => cycle boundaries must be full.
     requires_full_sync_every_period: bool = False
@@ -86,22 +75,17 @@ class BackendDecl:
     consumes: str = "mask"  # 'mask' | 'idx'
 
 
-_SCORES: dict = {}
 _SELECTIONS: dict = {}
-_EFS: dict = {}
+_OPTIMIZERS: dict = {}
 _BACKEND_PLUGINS: dict = {}
-
-
-def register_score(name, decl):
-    _register(_SCORES, name, decl)
 
 
 def register_selection(name, decl):
     _register(_SELECTIONS, name, decl)
 
 
-def register_ef(name, decl):
-    _register(_EFS, name, decl)
+def register_optimizer(name, decl):
+    _register(_OPTIMIZERS, name, decl)
 
 
 def register_backend_plugin(name, decl):
@@ -114,16 +98,12 @@ def _register(registry, name, decl):
     registry[name] = decl
 
 
-def get_score_decl(name):
-    return _lookup(_SCORES, name, "score")
-
-
 def get_selection_decl(name):
     return _lookup(_SELECTIONS, name, "selection")
 
 
-def get_ef_decl(name):
-    return _lookup(_EFS, name, "error_feedback")
+def get_optimizer_decl(name):
+    return _lookup(_OPTIMIZERS, name, "optimizer")
 
 
 def get_backend_plugin_decl(name):
@@ -141,55 +121,36 @@ def _lookup(registry, name, axis):
 
 def registered_names() -> dict:
     return {
-        "score": sorted(_SCORES),
+        "score": score_names(),
         "selection": sorted(_SELECTIONS),
-        "error_feedback": sorted(_EFS),
+        "optimizer": sorted(_OPTIMIZERS),
         "backend": sorted(_BACKEND_PLUGINS),
     }
 
 
-def validate_combination(score: ScoreDecl, selection: SelectionDecl,
-                         ef: EFDecl, backend, cycle: dict) -> None:
+def validate_combination(score_name: str, selection: SelectionDecl,
+                         optimizer: OptimizerDecl, backend, cycle: dict) -> None:
     """Declaration-based combination validation (config time, no scheme names).
 
     ``backend`` is a BackendDecl; ``cycle`` is the engine cycle config dict
-    (start_iter / period / full_sync_interval).
+    (start_iter / period / full_sync_interval). ``selection`` and ``backend``
+    are accepted for interface completeness only — the cross-axis legality
+    rules live on the optimizer decl (checked below).
     """
     problems = []
-    if selection.needs_threshold_path and not score.has_threshold_path:
+    get_score_spec(score_name)  # unknown name fails with the registered list
+    if score_name not in optimizer.emittable_scores:
         problems.append(
-            f"selection '{selection.name}' needs a score with a fused threshold "
-            f"path, but score '{score.name}' has none"
+            f"optimizer '{optimizer.name}' cannot materialize score "
+            f"'{score_name}' into main grads on full steps (emittable: "
+            f"{sorted(optimizer.emittable_scores) or 'nothing'}) — the score "
+            "is offline-only under this optimizer"
         )
-    if score.scoring_input == "synced":
-        emit = score.emit_name or score.name
-        if emit not in ef.emittable_scores:
-            problems.append(
-                f"score '{score.name}' needs synced scoring input (the EF "
-                f"materializes '{emit}' into main grads on full steps), but "
-                f"error_feedback '{ef.name}' can only emit "
-                f"{sorted(ef.emittable_scores) or 'nothing'}"
-            )
-    if selection.scope == "global_ranked" and score.scoring_input != "synced":
-        problems.append(
-            f"selection '{selection.name}' is global-ranked and requires a "
-            f"'synced' score input (got '{score.scoring_input}')"
-        )
-    if score.needs_support and score.scoring_input != "synced":
-        # The engine routes per-param support slices into values() ONLY on
-        # the synced branch (materialized-update views); a support-declaring
-        # score on the local_or_merged branch would either TypeError at the
-        # first boundary or silently lose its support term.
-        problems.append(
-            f"score '{score.name}' declares needs_support but its "
-            f"scoring_input is '{score.scoring_input}' — support slices are "
-            "only routed on the 'synced' path"
-        )
-    if ef.requires_full_sync_every_period:
+    if optimizer.requires_full_sync_every_period:
         period = cycle.get("period", 1)
         if cycle.get("full_sync_interval", 0) not in (0, period):
             problems.append(
-                f"error_feedback '{ef.name}' folds residuals only at full "
+                f"optimizer '{optimizer.name}' folds residuals only at full "
                 f"syncs: full_sync_interval must be 0 or equal to the cycle "
                 f"period ({period})"
             )
@@ -197,45 +158,19 @@ def validate_combination(score: ScoreDecl, selection: SelectionDecl,
         raise ValueError("Illegal SGA plugin combination: " + "; ".join(problems))
 
 
-def build_score(name, params):
-    from sga.plugins.scores.abs_g import AbsGradScore
-    from sga.plugins.scores.abs_g_synced import AbsGSyncedScore
-    from sga.plugins.scores.abs_m import AbsMScore
-    from sga.plugins.scores.abs_m_post import AbsMPostScore
-    from sga.plugins.scores.abs_m_sticky import AbsMStickyScore
-    from sga.plugins.scores.coi import CoiScore
-    from sga.plugins.scores.snr_m import SnrMScore
-    from sga.plugins.scores.update_ratio import UpdateRatioScore
-
-    return {
-        "abs_g": AbsGradScore,
-        "abs_g_synced": AbsGSyncedScore,
-        "abs_m": AbsMScore,
-        "abs_m_post": AbsMPostScore,
-        "abs_m_sticky": AbsMStickyScore,
-        "coi": CoiScore,
-        "snr_m": SnrMScore,
-        "update_ratio": UpdateRatioScore,
-    }[name](params)
-
-
-def build_selection(name, params, score=None):
-    from sga.plugins.selection.threshold import ThresholdSelection
+def build_selection(name, params):
     from sga.plugins.selection.circular_topk import CircularTopkSelection
 
     return {
-        "threshold": ThresholdSelection,
         "circular_topk": CircularTopkSelection,
-    }[name](params, score=score)
+    }[name](params)
 
 
-def build_ef(name, params, emit_score: Optional[str] = None):
-    from sga.plugins.error_feedback.masked_adamw import MaskedAdamWEF
-    from sga.plugins.error_feedback.radius_opt import RadiusOptEF
+def build_optimizer(name, params, emit_score: str = None):
+    from sga.plugins.optimizer.adamw import SgaAdamW
 
     return {
-        "masked_adamw": MaskedAdamWEF,
-        "radius_opt": RadiusOptEF,
+        "adamw": SgaAdamW,
     }[name](params, emit_score=emit_score)
 
 
@@ -253,43 +188,19 @@ def build_backend_plugin(name, params):
 
 def register_default_plugins() -> None:
     """Idempotent registration of the built-in plugin declarations."""
-    from sga.plugins.scores.abs_g import DECL as abs_g_decl
-    from sga.plugins.scores.abs_g_synced import DECL as abs_g_synced_decl
-    from sga.plugins.scores.abs_m import DECL as abs_m_decl
-    from sga.plugins.scores.abs_m_post import DECL as abs_m_post_decl
-    from sga.plugins.scores.abs_m_sticky import DECL as abs_m_sticky_decl
-    from sga.plugins.scores.coi import DECL as coi_decl
-    from sga.plugins.scores.snr_m import DECL as snr_m_decl
-    from sga.plugins.scores.update_ratio import DECL as update_ratio_decl
-    from sga.plugins.selection.threshold import DECL as threshold_decl
     from sga.plugins.selection.circular_topk import DECL as topk_decl
-    from sga.plugins.error_feedback.masked_adamw import DECL as masked_adamw_decl
-    from sga.plugins.error_feedback.radius_opt import DECL as radius_opt_decl
+    from sga.plugins.optimizer.adamw import DECL as adamw_decl
 
     for name, decl in (
-        ("abs_g", abs_g_decl),
-        ("abs_g_synced", abs_g_synced_decl),
-        ("abs_m", abs_m_decl),
-        ("abs_m_post", abs_m_post_decl),
-        ("abs_m_sticky", abs_m_sticky_decl),
-        ("coi", coi_decl),
-        ("snr_m", snr_m_decl),
-        ("update_ratio", update_ratio_decl),
-    ):
-        if name not in _SCORES:
-            register_score(name, decl)
-    for name, decl in (
-        ("threshold", threshold_decl),
         ("circular_topk", topk_decl),
     ):
         if name not in _SELECTIONS:
             register_selection(name, decl)
     for name, decl in (
-        ("masked_adamw", masked_adamw_decl),
-        ("radius_opt", radius_opt_decl),
+        ("adamw", adamw_decl),
     ):
-        if name not in _EFS:
-            register_ef(name, decl)
+        if name not in _OPTIMIZERS:
+            register_optimizer(name, decl)
 
     from sga.backends.masked_pipelined import DECL as mp_decl
     from sga.backends.indexed_sparse import DECL as is_decl

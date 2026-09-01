@@ -2,9 +2,10 @@
 """Unit tests for the SGAEngine core (CPU, fakes, mocked collectives).
 
 Covers (acceptance + expert Q7 additions):
-- CycleManager phase semantics for the origin pattern (period 1 + fsi 10) and
-  the radius pattern (bootstrap region + period-8 boundaries, boundaries
-  imply full);
+- CycleManager phase semantics: the fsi cadence (period 1 + fsi 10, a
+  template without the full-sync requirement may run boundary-sparse cycles)
+  and the boundary-full pattern (bootstrap region + period-8 boundaries,
+  boundaries imply full — today's adamw contract);
 - support lifecycle: bootstrap guard, force steps never reselect, the
   grad-norm bypass forces the next step full;
 - payload-scaling residual preservation (the regression test for the bug the
@@ -13,9 +14,9 @@ Covers (acceptance + expert Q7 additions):
   sync and selected ones get exactly sum*scale;
 - negative tests for the three consistency layers (count mismatch refuses,
   dual-checksum divergence refuses, norm-spread violation raises pre-score);
-- a fake end-to-end optimizer_step flow (origin and radius plugin combos)
-  exercising the frozen ordering contract: prepare -> clip -> EF -> selection
-  -> old-support reset -> switch.
+- a fake end-to-end optimizer_step flow (the default 'update' and the named
+  'abs_m' combos) exercising the frozen ordering contract: prepare -> clip ->
+  optimizer template -> selection -> old-support reset -> switch.
 
 Run: python tests/test_engine_unit.py  (or pytest tests/test_engine_unit.py)
 """
@@ -31,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sga.backends.indexed_sparse import IndexedSparseBackend
 from sga.backends.masked_pipelined import MaskedPipelinedBackend
 from sga.engine import BucketState, CycleManager, SGAEngine, SGAEngineError
-from sga.plugins import build_ef, build_score, build_selection
+from sga.plugins import build_optimizer, build_selection
 from sga.support import BucketSupport, Support
 
 torch.manual_seed(0)
@@ -39,17 +40,18 @@ torch.manual_seed(0)
 
 # ------------------------------------------------------------------- cycle
 
-def test_cycle_origin_pattern():
+def test_cycle_fsi_pattern():
     cm = CycleManager(start_iter=0, period=1, full_sync_interval=10,
                       boundary_implies_full=False)
     phases = ["full" if cm.is_full(s) else "sparse" for s in range(1, 16)]
     # Pure cycle semantics (the engine ORs in the bootstrap no-support guard):
-    # origin EF does not imply full at boundaries; fsi=10 -> step 10 full.
+    # a template without the full-sync requirement may run boundary-sparse
+    # cycles; fsi=10 -> step 10 full.
     assert phases == ["sparse"] * 9 + ["full"] + ["sparse"] * 5, phases
     assert all(cm.reselect_boundary(s) for s in range(1, 16))  # T=1
 
 
-def test_cycle_radius_pattern():
+def test_cycle_boundary_full_pattern():
     cm = CycleManager(start_iter=20, period=8, full_sync_interval=0,
                       boundary_implies_full=True)
     fulls = [s for s in range(1, 61) if cm.is_full(s)]
@@ -332,7 +334,7 @@ class _FakeBucket:
     def __init__(self, params, spans, numel, bucket_id=0):
         # Deliberately REVERSED vs the optimizer's param order: real megatron
         # buckets reorder params, and the engine must not assume the two
-        # orders coincide (found by the first real radius run).
+        # orders coincide (found by the first real run).
         self.params_list = list(reversed(params))
         self.param_to_index = {p: spans[p] for p in self.params_list}
         self.grad_data = torch.zeros(numel)
@@ -404,34 +406,38 @@ class _FakeMPOpt:
                 p.copy_(mp)
 
 
-_ORIGIN = {
-    "score": "abs_g",
-    "selection": "threshold",
-    "selection_params": {"threshold": 0.5, "target_ratio_low": 0.2,
-                         "target_ratio_high": 0.9},
-    "ef": "masked_adamw",
-    "ef_params": {"grad_acc_count": True, "freeze_inactive": False},
-    "cycle": {"start_iter": 0, "period": 1, "full_sync_interval": 10},
+# The default-score combo: 'update' materializes straight into the main grads
+# (no side buffers) over a mask-consuming backend.
+_UPDATE = {
+    "score": "update",
+    "selection": "circular_topk",
+    "selection_params": {"ratio_percent": 30.0},
+    "opt": "adamw",
+    "opt_params": {"residual_mean": False},
+    "cycle": {"start_iter": 0, "period": 3, "full_sync_interval": 0},
     "backend": MaskedPipelinedBackend({"num_slices": 2}),
 }
 
-_RADIUS = {
-    "score": "update_ratio",
+# The named-score combo: abs_m swaps the full-step output targets (score into
+# the grad buffer, signed update into per-record side buffers) over an
+# idx-consuming backend.
+_ABS_M = {
+    "score": "abs_m",
     "selection": "circular_topk",
     "selection_params": {"ratio_percent": 30.0},
-    "ef": "radius_opt",
-    "ef_params": {"residual_mean": False},
+    "opt": "adamw",
+    "opt_params": {"residual_mean": False},
     "cycle": {"start_iter": 2, "period": 3, "full_sync_interval": 0},
     "backend": IndexedSparseBackend({}),
 }
 
 
 def _build_engine(combo):
-    score = build_score(combo["score"], {"name": combo["score"]})
-    selection = build_selection(combo["selection"], dict(combo["selection_params"]),
-                                score=score)
-    ef = build_ef(combo["ef"], dict(combo["ef_params"]))
-    eng = SGAEngine({"cycle": combo["cycle"]}, score, selection, ef, combo["backend"])
+    selection = build_selection(combo["selection"], dict(combo["selection_params"]))
+    opt = build_optimizer(combo["opt"], dict(combo["opt_params"]),
+                          emit_score=combo["score"])
+    eng = SGAEngine({"cycle": combo["cycle"]}, combo["score"], selection, opt,
+                    combo["backend"])
     eng._dp_cp_group = lambda: None  # single-process: skip cross-rank layers
     return eng
 
@@ -445,11 +451,7 @@ def _run_flow(combo, steps):
     with _ReplicaWorld(world=1):  # identity collectives for the backends
         for step in range(1, steps + 1):
             # emulate backward accumulation into the bucket buffer
-            off = 0
-            for p in chunk.params:
-                n = p.numel()
-                chunk.bucket.grad_data[off:off + n] += torch.randn(n)
-                off += n
+            _accumulate_into_bucket(chunk)
             assert eng.grad_sync(chunk, force_all_reduce=False) is True
             was_full = eng._step_full
             ok, grad_norm, nz = eng.optimizer_step(mp, [chunk], step)
@@ -458,13 +460,15 @@ def _run_flow(combo, steps):
     return eng, chunk, mp, log
 
 
-def test_origin_flow_phases_and_support():
-    eng, chunk, mp, log = _run_flow(_ORIGIN, steps=12)
-    # Step 1 full (bootstrap no-support guard) selects support S1 at its end;
-    # steps 2-9 sparse; step 10 full via full_sync_interval; 11-12 sparse.
+def test_update_flow_phases_and_support():
+    eng, chunk, mp, log = _run_flow(_UPDATE, steps=12)
+    # start=0, T=3, boundaries imply full (the adamw residual contract).
+    # Steps 1-2 are full via the no-support guard (no boundary yet); step 3
+    # is the first boundary (full + reselect); 4-5 sparse; 6/9/12 boundaries.
     fulls = [s for s, was_full, _ in log if was_full]
-    assert fulls == [1, 10], fulls
-    assert all(has for _, _, has in log)  # support exists from step 1's end on
+    assert fulls == [1, 2, 3, 6, 9, 12], fulls
+    assert all(has for s, _, has in log if s >= 3), log  # support from step 3 on
+    assert not any(has for s, _, has in log if s < 3), log
     # selective reset left a genuinely partial mask
     mask = eng._bucket_states[0].active_mask_u8
     assert 0 < int(mask.sum()) < mask.numel()
@@ -472,11 +476,11 @@ def test_origin_flow_phases_and_support():
     assert chunk.group.reset_calls == 12
     # full steps DELEGATE to the real dense path (bitwise-parity decision):
     # exactly one finish_grad_sync call per full step, none per sparse step.
-    assert chunk.finish_grad_sync_calls == 2
+    assert chunk.finish_grad_sync_calls == 6
 
 
-def test_radius_flow_boundaries_and_materialization():
-    eng, chunk, mp, log = _run_flow(_RADIUS, steps=9)
+def test_abs_m_flow_boundaries_and_materialization():
+    eng, chunk, mp, log = _run_flow(_ABS_M, steps=9)
     # start=2, T=3, boundaries imply full. Steps 1-2 are the start_iter
     # bootstrap; steps 3-4 have no support yet (first boundary is at 5), so
     # the engine's no-support guard keeps them dense; 5 and 8 are boundaries
@@ -494,64 +498,186 @@ def test_radius_flow_boundaries_and_materialization():
     assert 0 < ratio < 1.0
 
 
+def test_reselect_boundary_orders_reset_before_activation():
+    """Instrumented pin of the load-bearing support-switch ordering at a
+    successful reselection boundary: optimizer full step -> model copy ->
+    selection -> reset (consuming the OLD support's masks) -> activate(new
+    support) -> host reset. The stub selection's consecutive masks are
+    DISJOINT, so 'reset saw the old mask' is falsifiable: a refactor that
+    activated the new support before reset would hand the optimizer the new
+    mask and silently skip the old support's residual handling."""
+    class _DisjointSelection:
+        """Selection no. n masks every n-th-position parity: consecutive
+        selections produce disjoint per-param masks."""
+
+        params = {}
+
+        def __init__(self, events):
+            self._events = events
+            self._calls = 0
+
+        def select(self, ctx):
+            masks = [(torch.arange(g.numel()) % 2 == self._calls % 2)
+                     .to(torch.uint8) for g in ctx.grad_views]
+            self._events.append(("select", [m.clone() for m in masks]))
+            self._calls += 1
+            return masks
+
+    chunk = _FakeChunk()
+    mp = _FakeMPOpt(chunk)
+    opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
+                          emit_score=_UPDATE["score"])
+    events = []
+    eng = SGAEngine({"cycle": dict(_UPDATE["cycle"])}, _UPDATE["score"],
+                    _DisjointSelection(events), opt, _UPDATE["backend"])
+    eng._dp_cp_group = lambda: None
+    eng.attach(chunk)
+
+    real_full = opt.full_step
+    opt.full_step = lambda ctx: (events.append(("full_step", None)),
+                                 real_full(ctx))[1]
+    real_reset = opt.reset
+    opt.reset = lambda ctx, was_full: (
+        events.append(("reset", [bs.active_mask_u8.clone()
+                                 if bs.active_mask_u8 is not None else None
+                                 for bs in ctx.bucket_states])),
+        real_reset(ctx, was_full=was_full))[1]
+    real_copy = mp._copy_main_params_to_model_params
+    mp._copy_main_params_to_model_params = lambda: (
+        events.append(("copy", None)), real_copy())[1]
+    real_activate = eng._activate_support
+    eng._activate_support = lambda s: (events.append(("activate", None)),
+                                       real_activate(s))[1]
+    real_group_reset = chunk.group.reset
+    chunk.group.reset = lambda: (events.append(("host_reset", None)),
+                                 real_group_reset())[1]
+
+    def run(step):
+        _accumulate_into_bucket(chunk)
+        eng.grad_sync(chunk, force_all_reduce=False)
+        eng.optimizer_step(mp, [chunk], step)
+
+    with _ReplicaWorld(world=1):
+        for step in range(1, 6):  # _UPDATE cycle: reselections at 3 and 6
+            run(step)
+        old_masks = [bs.active_mask_u8.clone()
+                     for bs in eng._bucket_states]  # the step-3 support
+        assert all(m is not None for m in old_masks)
+        run(6)  # second reselection boundary
+
+    # boundary 1 (step 3): same cadence, and reset ran with NO support yet
+    # (nothing to consume) before the first activation
+    sel_idx = [i for i, e in enumerate(events) if e[0] == "select"]
+    assert len(sel_idx) == 2
+    i1, i2 = sel_idx
+    assert [e[0] for e in events[i1 - 2:i1 + 4]] == \
+        ["full_step", "copy", "select", "reset", "activate", "host_reset"]
+    assert all(m is None for m in events[i1 + 1][1])
+
+    # boundary 2 (step 6): the optimizer's reset consumed the OLD masks and
+    # ran BEFORE the new support was activated
+    assert [e[0] for e in events[i2 - 2:i2 + 4]] == \
+        ["full_step", "copy", "select", "reset", "activate", "host_reset"]
+    reset_masks = events[i2 + 1][1]
+    assert len(reset_masks) == len(old_masks)
+    for seen, old in zip(reset_masks, old_masks):
+        assert torch.equal(seen, old)
+
+    # the precondition that makes the pin falsifiable: the two supports are
+    # genuinely disjoint, so 'reset saw the old mask' cannot pass by accident
+    new_masks = [bs.active_mask_u8.clone() for bs in eng._bucket_states]
+    for old, new in zip(old_masks, new_masks):
+        assert int((old & new).sum()) == 0
+        assert not torch.equal(old, new)
+
+
 def test_forced_step_never_reselects():
     chunk = _FakeChunk()
     mp = _FakeMPOpt(chunk)
-    eng = _build_engine(_ORIGIN)
+    eng = _build_engine(_UPDATE)
     eng.attach(chunk)
     with _ReplicaWorld(world=1):
-        # step 1: bootstrap full, boundary (T=1) -> reselect S1
-        eng.grad_sync(chunk, force_all_reduce=False)
-        eng.optimizer_step(mp, [chunk], 1)
+        # steps 1-2 bootstrap dense; step 3 is a boundary -> reselect S1;
+        # steps 4-5 ride S1 sparse
+        for step in range(1, 6):
+            _accumulate_into_bucket(chunk)
+            eng.grad_sync(chunk, force_all_reduce=False)
+            eng.optimizer_step(mp, [chunk], step)
         S1 = eng._active_support
-        # step 2 forced (wgrad-saving style): dense, cycle advances, NO switch
+        assert S1 is not None
+        # step 6 IS a boundary (would reselect), but arrives FORCED
+        # (wgrad-saving style): dense, cycle advances, NO switch
+        _accumulate_into_bucket(chunk)
         eng.grad_sync(chunk, force_all_reduce=True)
-        eng.optimizer_step(mp, [chunk], 2)
+        eng.optimizer_step(mp, [chunk], 6)
         assert eng._active_support is S1
 
 
 def test_failed_step_fully_clears_and_repeats_accounting():
     chunk = _FakeChunk()
     mp = _FakeMPOpt(chunk)
-    eng = _build_engine(_ORIGIN)
+    eng = _build_engine(_UPDATE)
     eng.attach(chunk)
     with _ReplicaWorld(world=1):
-        # step 1: bootstrap full, reselect -> support S1
-        eng.grad_sync(chunk, force_all_reduce=False)
-        eng.optimizer_step(mp, [chunk], 1)
+        # steps 1-5 run (S1 selected at the step-3 boundary)
+        for step in range(1, 6):
+            _accumulate_into_bucket(chunk)
+            eng.grad_sync(chunk, force_all_reduce=False)
+            eng.optimizer_step(mp, [chunk], step)
         S1 = eng._active_support
         assert S1 is not None
-        # step 2 reports found_inf (prepare_grads True = BAD in megatron):
-        # failed step -> (False, None, None), buffers fully cleared, support
-        # untouched; _iter still tracks the fork iteration (assert contract).
-        chunk.bucket.grad_data += torch.randn_like(chunk.bucket.grad_data)
+        # step 6 IS a boundary (would reselect) but reports found_inf
+        # (prepare_grads True = BAD in megatron): failed step ->
+        # (False, None, None), buffers fully cleared, support untouched;
+        # _iter still tracks the fork iteration (assert contract).
+        _accumulate_into_bucket(chunk)
         real_prepare = mp.prepare_grads
         mp.prepare_grads = lambda: True
         try:
-            ok, gn, nz = eng.optimizer_step(mp, [chunk], 2)
+            ok, gn, nz = eng.optimizer_step(mp, [chunk], 6)
         finally:
             mp.prepare_grads = real_prepare
         assert (ok, gn, nz) == (False, None, None)
         assert torch.equal(chunk.bucket.grad_data, torch.zeros_like(chunk.bucket.grad_data))
         assert eng._active_support is S1
-        # the failed step consumed iteration 2 without reselecting (T=1 would
-        # otherwise reselect): engine._iter advanced, support persisted.
-        # step 3 (same cycle position as a fresh step 3) still works:
-        chunk.bucket.grad_data += torch.randn_like(chunk.bucket.grad_data)
+        # the failed step consumed iteration 6 without reselecting (it was a
+        # boundary and would otherwise have switched); step 7 rides S1 fine:
+        _accumulate_into_bucket(chunk)
         eng.grad_sync(chunk, force_all_reduce=False)
-        ok3, gn3, _ = eng.optimizer_step(mp, [chunk], 3)
-        assert ok3 is True and gn3 is not None
+        ok7, gn7, _ = eng.optimizer_step(mp, [chunk], 7)
+        assert ok7 is True and gn7 is not None
+        assert eng._active_support is S1
 
 
 def test_grad_norm_bypass_forces_next_full():
+    class _BypassSelection:
+        """Stub exposing the optional wants_force_full hook the engine probes
+        generically (circular_topk does not implement it; the routing itself
+        is the unit under test)."""
+
+        params = {}
+
+        def __init__(self):
+            self.seen = []
+
+        def select(self, ctx):
+            return [(torch.ones(g.numel(), dtype=torch.uint8))
+                    for g in ctx.grad_views]
+
+        def wants_force_full(self, grad_norm):
+            self.seen.append(grad_norm)
+            return grad_norm > 0.001
+
     chunk = _FakeChunk()
     mp = _FakeMPOpt(chunk)
-    combo = dict(_ORIGIN, selection_params=dict(
-        _ORIGIN["selection_params"], grad_norm_bypass=0.001))
-    eng = _build_engine(combo)
+    opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
+                          emit_score=_UPDATE["score"])
+    eng = SGAEngine({"cycle": dict(_UPDATE["cycle"])}, _UPDATE["score"],
+                    _BypassSelection(), opt, _UPDATE["backend"])
+    eng._dp_cp_group = lambda: None
     eng.attach(chunk)
     with _ReplicaWorld(world=1):
-        chunk.bucket.grad_data += torch.randn_like(chunk.bucket.grad_data)
+        _accumulate_into_bucket(chunk)
         eng.grad_sync(chunk, force_all_reduce=False)
         ok, grad_norm, _ = eng.optimizer_step(mp, [chunk], 1)
         assert grad_norm > 0.001  # random grads make the norm large
@@ -614,12 +740,11 @@ def test_generic_optional_hooks_fire():
     chunk.group.data_parallel_group = grp
 
     backend = _PrepareBackend()
-    score = build_score("abs_g", {"name": "abs_g"})
     selection = _HookSelection()
-    ef = build_ef("masked_adamw", {})
+    opt = build_optimizer("adamw", {}, emit_score="abs_g")
     eng = SGAEngine(
-        {"cycle": {"start_iter": 0, "period": 1, "full_sync_interval": 10}},
-        score, selection, ef, backend)
+        {"cycle": {"start_iter": 0, "period": 1, "full_sync_interval": 0}},
+        "abs_g", selection, opt, backend)
     eng._dp_cp_group = lambda: None  # single-process: skip cross-rank layers
 
     eng.attach(chunk)
@@ -635,40 +760,6 @@ def test_generic_optional_hooks_fire():
     assert ok is True
     # called with (cycle.start_iter, cycle.period); result lands in ctx
     assert selection.anchor_calls == [(0, 1)]
-    assert selection.ctx.warmup_target == 42
-
-
-def test_synced_score_values_routed_before_selection():
-    """On the synced path the materialized views pass THROUGH the score
-    plugin's values() exactly once per reselection before selection sees
-    them (identity pass-throughs today; the contract must stay honest)."""
-    calls = {"n": 0}
-
-    class _SyncedScore:
-        decl = SimpleNamespace(scoring_input="synced", needs_support=False)
-
-        def values(self, views):
-            calls["n"] += 1
-            return views
-
-    score = _SyncedScore()
-    selection = _HookSelection()
-    ef = build_ef("radius_opt", {"residual_mean": False})
-    eng = SGAEngine(
-        {"cycle": {"start_iter": 2, "period": 3, "full_sync_interval": 0}},
-        score, selection, ef, IndexedSparseBackend({}))
-    eng._dp_cp_group = lambda: None
-
-    chunk = _FakeChunk()
-    mp = _FakeMPOpt(chunk)
-    eng.attach(chunk)
-    with _ReplicaWorld(world=1):
-        for it in range(1, 6):  # boundaries at start_iter=2, T=3 -> step 5
-            _accumulate_into_bucket(chunk)
-            assert eng.grad_sync(chunk, force_all_reduce=False) is True
-            ok, _, _ = eng.optimizer_step(mp, [chunk], it)
-            assert ok
-    assert calls["n"] == 1
     assert selection.ctx.grad_views is not None
 
 
@@ -679,12 +770,11 @@ def test_count_guard_once_per_cycle_and_flag_off():
     per-step checks re-verify identical numbers). checks.count_guard=false
     (the legacy skip flag's counterpart) disables it entirely."""
     def _run_and_count(config_extra):
-        score = build_score("update_ratio", {"name": "update_ratio"})
-        selection = build_selection("circular_topk", {"ratio_percent": 30.0},
-                                    score=score)
-        ef = build_ef("radius_opt", {"residual_mean": False})
-        eng = SGAEngine({"cycle": dict(_RADIUS["cycle"]), **config_extra},
-                        score, selection, ef, IndexedSparseBackend({}))
+        selection = build_selection("circular_topk", {"ratio_percent": 30.0})
+        opt = build_optimizer("adamw", {"residual_mean": False},
+                              emit_score="update")
+        eng = SGAEngine({"cycle": dict(_ABS_M["cycle"]), **config_extra},
+                        "update", selection, opt, IndexedSparseBackend({}))
         eng._dp_cp_group = lambda: None
         calls = []
         orig = eng._check_counts
@@ -697,7 +787,7 @@ def test_count_guard_once_per_cycle_and_flag_off():
         eng.attach(chunk)
         history = []
         with _ReplicaWorld(world=1):
-            for step in range(1, 10):  # _RADIUS: reselections at 5 and 8
+            for step in range(1, 10):  # _ABS_M cycle: reselections at 5 and 8
                 _accumulate_into_bucket(chunk)
                 eng.grad_sync(chunk, force_all_reduce=False)
                 eng.optimizer_step(mp, [chunk], step)
@@ -711,53 +801,6 @@ def test_count_guard_once_per_cycle_and_flag_off():
     history = _run_and_count({"checks": {"count_guard": False}})
     assert history == [0] * 9, history
     print("ok: count guard once per cycle (activations only); flag disables")
-
-
-def test_support_declaring_score_gets_pre_switch_support():
-    """ScoreDecl.needs_support routing: at each reselection the score's
-    values() receives the CURRENT (pre-switch) support's per-param mask
-    slices — None at bootstrap (degenerate), last cycle's support after."""
-    class _StickyScore:
-        decl = SimpleNamespace(scoring_input="synced", needs_support=True)
-
-        def __init__(self):
-            self.calls = []
-
-        def values(self, views, support_slices=None):
-            self.calls.append(support_slices)
-            return views
-
-    score = _StickyScore()
-    selection = _HookSelection()  # selects all-ones masks
-    ef = build_ef("radius_opt", {"residual_mean": False})
-    eng = SGAEngine(
-        {"cycle": {"start_iter": 2, "period": 3, "full_sync_interval": 0}},
-        score, selection, ef, IndexedSparseBackend({}))
-    eng._dp_cp_group = lambda: None
-
-    chunk = _FakeChunk()
-    mp = _FakeMPOpt(chunk)
-    eng.attach(chunk)
-    with _ReplicaWorld(world=1):
-        for it in range(1, 9):  # boundaries at start_iter=2, T=3 -> steps 5, 8
-            _accumulate_into_bucket(chunk)
-            assert eng.grad_sync(chunk, force_all_reduce=False) is True
-            ok, _, _ = eng.optimizer_step(mp, [chunk], it)
-            assert ok
-    assert len(score.calls) == 2
-    assert score.calls[0] is None, "bootstrap must pass no support"
-    second = score.calls[1]
-    assert second is not None and len(second) == len(chunk.params)
-    # _HookSelection alternates: step 5 selected the even-index pattern, so
-    # step 8's values() must see exactly THAT support elementwise — an
-    # all-ones (or odd-pattern) slice would mean post-switch routing.
-    even = (torch.arange(chunk.params[0].numel()) % 2 == 0).to(torch.uint8)
-    odd = (torch.arange(chunk.params[0].numel()) % 2 == 1).to(torch.uint8)
-    for s in second:
-        assert torch.equal(s, even), f"step 8 must see the step-5 support: {s}"
-        assert not torch.equal(s, odd)
-    print("ok: needs_support score receives pre-switch support (None at "
-          "bootstrap, last cycle afterwards)")
 
 
 # ------------------------------------------------- step-counter + resume C1/C2
@@ -778,7 +821,7 @@ def test_rec_step_tracks_iteration_both_seed_branches():
     # Branch A: FusedAdam-style — the resumed checkpoint's group counter.
     chunk_a = _FakeChunk()
     mp_a = _FakeMPOpt(chunk_a)
-    eng_a = _build_engine(_ORIGIN)
+    eng_a = _build_engine(_UPDATE)
     eng_a.attach(chunk_a)
     mp_a.optimizer.param_groups[0]["step"] = 41
     with _ReplicaWorld(world=1):
@@ -792,7 +835,7 @@ def test_rec_step_tracks_iteration_both_seed_branches():
     # Branch B: torch AdamW — no group['step']; seeded from per-param state.
     chunk_b = _FakeChunk()
     mp_b = _FakeMPOpt(chunk_b)
-    eng_b = _build_engine(_ORIGIN)
+    eng_b = _build_engine(_UPDATE)
     eng_b.attach(chunk_b)
     with _ReplicaWorld(world=1):
         for it in range(1, 5):
@@ -809,7 +852,7 @@ def test_resume_first_optimizer_step_seeds_iteration():
     the moments/step surviving the optimizer state_dict round trip."""
     chunk = _FakeChunk()
     mp = _FakeMPOpt(chunk)
-    eng = _build_engine(_ORIGIN)
+    eng = _build_engine(_UPDATE)
     eng.attach(chunk)
     K = 7  # fork's absolute iteration at resume
     state = {}
@@ -838,15 +881,15 @@ def test_resume_first_optimizer_step_seeds_iteration():
     assert {r.step for r in eng._records} == {K + 1}
 
 
-# ------------------------------------------------- num-zeros BEFORE-EF ordering
+# ------------------------------------------------- num-zeros BEFORE-optimizer ordering
 
-def test_num_zeros_logged_before_radius_overwrite():
-    """With the num-zeros flag forced on, a radius full step must report the
-    zero count of the PRE-EF gradient (radius then overwrites main grads
-    with the materialized update)."""
+def test_num_zeros_logged_before_optimizer_overwrite():
+    """With the num-zeros flag forced on, a named-score full step must report
+    the zero count of the PRE-optimizer gradient (the full step then
+    overwrites main grads with the materialized score)."""
     chunk = _FakeChunk()
     mp = _FakeMPOpt(chunk)
-    eng = _build_engine(_RADIUS)
+    eng = _build_engine(_ABS_M)
     eng.attach(chunk)
     eng._log_num_zeros = True  # fake the args-derived flag (unit env)
     with _ReplicaWorld(world=1):

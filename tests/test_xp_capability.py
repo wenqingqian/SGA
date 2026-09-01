@@ -30,9 +30,9 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import sga.plugins.selection.circular_topk as ct
-from sga.plugins.error_feedback.radius_opt import (
-    _radius_grad_correct_torch,
-    radius_grad_correct,
+from sga.plugins.optimizer.adamw import (
+    _grad_correct_torch,
+    adamw_grad_correct,
 )
 from sga.plugins.selection._histogram import (
     _HIST_BINS,
@@ -288,11 +288,9 @@ def test_coi_score_matches_fp64_oracle():
         w = torch.randn(n, generator=g) * 0.02
         buf = grad.clone()  # becomes the coi score under write_update
         side = torch.empty(n)
-        _radius_grad_correct_torch(
+        _grad_correct_torch(
             w, buf, m.clone(), v.clone(), 0.0, b1, b2, eps, 0.0,
             1 - b1 ** step, 1 - b2 ** step,
-            1 - b1 ** (step - 1) if step > 1 else 0.0,
-            1 - b2 ** (step - 1) if step > 1 else 0.0,
             None, True,
             score_out=side, score_mode="coi",
         )
@@ -304,9 +302,9 @@ def test_coi_score_matches_fp64_oracle():
     # zero-state edge (m = v = 0): U(0) = 0, score = |U(g)|
     grad = torch.randn(1000, generator=g) * 1e-3
     buf = grad.clone()
-    _radius_grad_correct_torch(
+    _grad_correct_torch(
         torch.zeros(1000), buf, torch.zeros(1000), torch.zeros(1000),
-        0.0, b1, b2, eps, 0.0, 1 - b1, 1 - b2, 0.0, 0.0, None, True,
+        0.0, b1, b2, eps, 0.0, 1 - b1, 1 - b2, None, True,
         score_out=torch.empty(1000), score_mode="coi",
     )
     ref = _coi_reference(grad, torch.zeros(1000), torch.zeros(1000),
@@ -314,7 +312,7 @@ def test_coi_score_matches_fp64_oracle():
     assert torch.allclose(buf.double(), ref, rtol=1e-5, atol=1e-12)
 
     # empty input: noop via the public wrapper
-    radius_grad_correct(torch.empty(0), torch.empty(0), torch.empty(0),
+    adamw_grad_correct(torch.empty(0), torch.empty(0), torch.empty(0),
                         torch.empty(0), 1e-3, b1, b2, eps, 0.0, 1,
                         score_out=torch.empty(0), score_mode="coi")
     print("ok: coi score == fp64 oracle (steps 1/2/17/1501, zero-state, empty)")

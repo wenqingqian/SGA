@@ -1,8 +1,8 @@
 # Copyright (c) 2026, SGA framework contributors.
-"""Radius optimizer error feedback (historical radius scheme).
+"""The SGA AdamW optimizer template (kernels ported from the historical
+radius scheme).
 
-Kernels ported verbatim from scheme_radius/kernels.py (survey S3). The AdamW
-update is split so the weight-update direction can be materialized:
+The AdamW update is split so the weight-update direction can be materialized:
 
     update = weight_decay * w + (m / bias1) / (sqrt(v / bias2) + eps)
 
@@ -10,15 +10,22 @@ update is split so the weight-update direction can be materialized:
   grad buffer is untouched so the residual at non-topk positions keeps
   accumulating. m/v update at EVERY coordinate (masked-out coords
   contribute a zero gradient; momentum keeps decaying).
-- Full steps (WRITE_UPDATE=True): the signed update is written into the
-  fp32 main grads. That buffer ALIASES the DDP bucket's fp32 grad storage
-  (megatron: main_param.grad = model_param.main_grad.float() is an identity
-  view for fp32 buckets), so the write lands in the bucket where the
-  residual lives. Safety is purely ORDER-based, and the invariant holds:
-  on a full step the residual was just fully communicated; the EF reads
-  the views BEFORE the caller's selective reset zeroes them; only after
-  that does the selection read the still-materialized updates (EF->score
-  handoff).
+- Full steps (WRITE_UPDATE=True): the score named by the config is written
+  into the fp32 main grads (the reselection reads it from there). With the
+  default 'update' score the SIGNED update takes the grad buffer directly;
+  with a named score (abs_g/abs_m/coi) the two outputs swap targets — the
+  score takes over the grad buffer and the signed update goes to per-record
+  side buffers, applied and freed record-by-record BEFORE the reselection
+  reads the score views. The grad buffer ALIASES the DDP bucket's fp32 grad
+  storage (megatron: main_param.grad = model_param.main_grad.float() is an
+  identity view for fp32 buckets), so the write lands in the bucket where
+  the residual lives. Safety is purely ORDER-based, and the invariant holds:
+  on a full step the residual was just fully communicated; the engine reads
+  the score views BEFORE the caller's selective reset zeroes them; only after that
+  does the selection read the still-materialized score (the optimizer->score
+  handoff). Score math is defined by the score registry (sga/plugins/scores.py);
+  the kernel branches here are its online materialization, pinned against the
+  torch reference within GPU tolerance by tests/test_kernels_gpu.py.
 
 Reset contract (selective with residual fold): sparse steps zero only the
 communicated (topk) positions; when the NEXT step is a full sync and
@@ -31,7 +38,7 @@ from typing import Optional
 
 import torch
 
-from sga.plugins import EFDecl
+from sga.plugins import OptimizerDecl
 
 try:
     import triton
@@ -41,40 +48,38 @@ try:
 except ImportError:  # pragma: no cover
     _HAS_TRITON = False
 
-DECL = EFDecl(
-    name="radius_opt",
+
+DECL = OptimizerDecl(
+    name="adamw",
     reset_mode="selective",
-    needs_acc_count=False,
-    emittable_scores=frozenset({
-        "update_ratio", "coi", "abs_g_synced", "abs_m", "snr_m", "abs_m_post",
-    }),
+    emittable_scores=frozenset({"update", "abs_g", "abs_m", "coi"}),
     requires_full_sync_every_period=True,
 )
 
 _BLOCK_SIZE = 1024
 
 # Score emission modes for full steps (SCORE_MODE constexpr). Everything is
-# computed from values only reachable in this kernel pass: coi and abs_m read
-# the PRE-commit moments that the same pass overwrites.
-_SCORE_MODES = {"coi": 1, "abs_g_synced": 2, "abs_m": 3, "snr_m": 4,
-                "abs_m_post": 5}
+# computed from values only reachable in this kernel pass: abs_m reads the
+# PRE-commit momentum that the same pass overwrites; coi reads both the
+# pre-commit and the folded moments. Mode 0 (the 'update' score) is the
+# historical default: the signed update itself is the materialized score.
+_SCORE_MODES = {"abs_g": 1, "abs_m": 2, "coi": 3}
 
 
 if _HAS_TRITON:
 
     @triton.jit
-    def _radius_grad_correct_kernel(
+    def _grad_correct_kernel(
         param_ptr, grad_ptr, m_ptr, v_ptr, mask_ptr, score_ptr,
         lr, beta1, beta2, eps, weight_decay,
         bias_correction1, bias_correction2,
-        bias_correction1_pre, bias_correction2_pre,
         n_elements,
         BLOCK_SIZE: tl.constexpr,
         HAS_MASK: tl.constexpr,
         WRITE_UPDATE: tl.constexpr,
         SCORE_MODE: tl.constexpr,
     ):
-        """AdamW m/v update + weight-update, fused-apply or materialize-update."""
+        """AdamW m/v update + weight-update, fused-apply or materialize-score."""
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         valid = offsets < n_elements
@@ -98,34 +103,18 @@ if _HAS_TRITON:
         update = weight_decay * param + m_hat / (tl.sqrt(v_hat) + eps)
 
         if SCORE_MODE == 1:
+            # abs_g: |g| of the gradient being committed this step.
+            score = tl.abs(grad)
+        elif SCORE_MODE == 2:
+            # abs_m: |m| of the PRE-commit momentum.
+            score = tl.abs(m)
+        elif SCORE_MODE == 3:
             # coi: |U(g) - U(0)| with the PRE-commit moments; the weight-decay
             # term cancels in the difference. m/v are read, not yet mutated.
             u_0 = (beta1 * m / bias_correction1) / (
                 tl.sqrt(beta2 * v / bias_correction2) + eps
             )
             score = tl.abs(m_hat / (tl.sqrt(v_hat) + eps) - u_0)
-        elif SCORE_MODE == 2:
-            # abs_g_synced: |g| of the gradient being committed this step.
-            score = tl.abs(grad)
-        elif SCORE_MODE == 3:
-            # abs_m: |m| of the PRE-commit momentum.
-            score = tl.abs(m)
-        elif SCORE_MODE == 4:
-            # snr_m: |m_hat| / (sqrt(v_hat) + eps) of the PRE-commit moments
-            # with STATE-MATCHED bias corrections (exponent = commits already
-            # applied = step - 1). The host passes 0.0 at step == 1 (no commit
-            # yet) and the score collapses to 0 — the discarded branch's
-            # inf/nan is selected away by tl.where.
-            score = tl.where(
-                bias_correction1_pre > 0,
-                tl.abs(m / bias_correction1_pre)
-                / (tl.sqrt(v / bias_correction2_pre) + eps),
-                0.0,
-            )
-        elif SCORE_MODE == 5:
-            # abs_m_post: |m_new| = |beta1*m + (1-beta1)*g|, the momentum
-            # after a hypothetical commit of this gradient (no correction).
-            score = tl.abs(m_new)
 
         tl.store(m_ptr + offsets, m_new, mask=valid)
         tl.store(v_ptr + offsets, v_new, mask=valid)
@@ -148,7 +137,7 @@ if _HAS_TRITON:
             tl.store(param_ptr + offsets, param, mask=valid)
 
     @triton.jit
-    def _radius_reset_kernel(
+    def _selective_reset_kernel(
         grad_ptr, mask_ptr,
         inv_interval,
         n_elements,
@@ -158,8 +147,9 @@ if _HAS_TRITON:
         """Selective residual reset, fused into a single pass:
         - mask-active (topk, communicated) positions: store 0;
         - inactive positions with FOLD=True: store grad * inv_interval —
-          bitwise identical to torch's ``/= interval`` (CUDA scalar division
-          multiplies by the fp32 reciprocal computed on the host)."""
+          exact vs torch's ``/= interval`` on the CPU/torch path; on GPU the
+          kernel multiplies by the host-computed fp32 reciprocal, matching
+          CUDA scalar division (no GPU fused-reset A/B test exists)."""
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         valid = offsets < n_elements
@@ -174,7 +164,7 @@ if _HAS_TRITON:
             tl.store(grad_ptr + offsets, g * inv_interval, mask=inactive)
 
 
-def radius_grad_correct(
+def adamw_grad_correct(
     param_buffer: torch.Tensor,
     grad_buffer: torch.Tensor,
     exp_avg_buffer: torch.Tensor,
@@ -188,43 +178,38 @@ def radius_grad_correct(
     mask: torch.Tensor = None,
     write_update: bool = False,
     score_out: torch.Tensor = None,
-    score_mode: str = "coi",
+    score_mode: str = None,
 ) -> None:
     """Run the grad-correct step on contiguous same-size buffers.
 
-    Updates m/v in place. ``write_update=True`` writes the signed update into
-    ``grad_buffer``; otherwise applies ``w -= lr * update`` and leaves the
-    grad buffer untouched. With ``mask``, positions outside it contribute a
-    zero gradient.
+    Updates m/v in place. ``write_update=True`` writes the materialized score
+    into ``grad_buffer``; otherwise applies ``w -= lr * update`` and leaves
+    the grad buffer untouched. With ``mask``, positions outside it contribute
+    a zero gradient.
 
     Full-step score emission (``score_out`` given): the named score (one of
-    coi / abs_g_synced / abs_m / snr_m / abs_m_post, all computed from
-    pre-commit state reachable only inside this pass) is written into
-    ``grad_buffer`` — the reselection reads it from there exactly like
-    the default update score — and the signed update goes to ``score_out``
-    instead; the caller applies and frees it before the reselection.
+    abs_g / abs_m / coi, all computed from pre-commit state reachable only
+    inside this pass) is written into ``grad_buffer`` — the reselection reads
+    it from there exactly like the default update score — and the signed
+    update goes to ``score_out`` instead; the caller applies and frees it
+    before the reselection. An unknown ``score_mode`` alongside ``score_out``
+    is rejected before any work.
     """
     bias_correction1 = 1.0 - beta1 ** step
     bias_correction2 = 1.0 - beta2 ** step
-    # State-matched (pre-commit) corrections for snr_m: the exponent is the
-    # number of commits already applied, i.e. step - 1; 0.0 at step == 1
-    # collapses the snr_m score to 0 (the offline oracle's definition).
-    bias_correction1_pre = 1.0 - beta1 ** (step - 1) if step > 1 else 0.0
-    bias_correction2_pre = 1.0 - beta2 ** (step - 1) if step > 1 else 0.0
-    n_elements = param_buffer.numel()
-    if n_elements == 0:
-        return
-
     has_score = score_out is not None
     if has_score and score_mode not in _SCORE_MODES:
         raise ValueError(f"unknown score_mode: {score_mode!r}")
 
+    n_elements = param_buffer.numel()
+    if n_elements == 0:
+        return
+
     if not (_HAS_TRITON and param_buffer.is_cuda):
-        _radius_grad_correct_torch(
+        _grad_correct_torch(
             param_buffer, grad_buffer, exp_avg_buffer, exp_avg_sq_buffer,
             lr, beta1, beta2, eps, weight_decay,
             bias_correction1, bias_correction2,
-            bias_correction1_pre, bias_correction2_pre,
             mask, write_update,
             score_out, score_mode if has_score else None,
         )
@@ -233,13 +218,12 @@ def radius_grad_correct(
     has_mask = mask is not None
     mask_u8 = mask.to(torch.uint8) if (has_mask and mask.dtype != torch.uint8) else mask
     grid = ((n_elements + _BLOCK_SIZE - 1) // _BLOCK_SIZE,)
-    _radius_grad_correct_kernel[grid](
+    _grad_correct_kernel[grid](
         param_buffer, grad_buffer, exp_avg_buffer, exp_avg_sq_buffer,
         mask_u8 if has_mask else grad_buffer,
         score_out if has_score else grad_buffer,
         lr, beta1, beta2, eps, weight_decay,
         bias_correction1, bias_correction2,
-        bias_correction1_pre, bias_correction2_pre,
         n_elements,
         BLOCK_SIZE=_BLOCK_SIZE,
         HAS_MASK=has_mask,
@@ -248,10 +232,9 @@ def radius_grad_correct(
     )
 
 
-def _radius_grad_correct_torch(
+def _grad_correct_torch(
     param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
     bias_correction1, bias_correction2,
-    bias_correction1_pre, bias_correction2_pre,
     mask, write_update,
     score_out=None, score_mode=None,
 ) -> None:
@@ -265,24 +248,15 @@ def _radius_grad_correct_torch(
     m_hat = m_new / bias_correction1
     v_hat = v_new / bias_correction2
     update = weight_decay * param + m_hat / (v_hat.sqrt() + eps)
-    if score_mode == "coi":
+    if score_mode == "abs_g":
+        score = g.abs()
+    elif score_mode == "abs_m":
+        score = m.abs()
+    elif score_mode == "coi":
         u_0 = (beta1 * m / bias_correction1) / (
             (beta2 * v / bias_correction2).sqrt() + eps
         )
         score = (m_hat / (v_hat.sqrt() + eps) - u_0).abs()
-    elif score_mode == "abs_g_synced":
-        score = g.abs()
-    elif score_mode == "abs_m":
-        score = m.abs()
-    elif score_mode == "snr_m":
-        if bias_correction1_pre > 0:
-            score = (m / bias_correction1_pre).abs() / (
-                (v / bias_correction2_pre).sqrt() + eps
-            )
-        else:
-            score = torch.zeros_like(m)
-    elif score_mode == "abs_m_post":
-        score = m_new.abs()
     m.copy_(m_new)
     v.copy_(v_new)
     if write_update:
@@ -295,8 +269,8 @@ def _radius_grad_correct_torch(
         param.sub_(lr * update)
 
 
-def radius_reset(grad_buffer: torch.Tensor, mask: torch.Tensor,
-                 interval: float, fold: bool) -> None:
+def selective_reset(grad_buffer: torch.Tensor, mask: torch.Tensor,
+                    interval: float, fold: bool) -> None:
     """Fused selective reset: zero communicated positions, optionally fold
     (divide by interval) the residual at inactive positions."""
     n_elements = grad_buffer.numel()
@@ -307,7 +281,7 @@ def radius_reset(grad_buffer: torch.Tensor, mask: torch.Tensor,
         # fp32 reciprocal, computed exactly as torch's CUDA scalar division.
         inv_interval = float((torch.ones(1, dtype=torch.float32) / interval).item())
         grid = ((n_elements + _BLOCK_SIZE - 1) // _BLOCK_SIZE,)
-        _radius_reset_kernel[grid](
+        _selective_reset_kernel[grid](
             grad_buffer, mask_u8, inv_interval, n_elements,
             BLOCK_SIZE=_BLOCK_SIZE, FOLD=fold,
         )
@@ -321,21 +295,21 @@ def radius_reset(grad_buffer: torch.Tensor, mask: torch.Tensor,
         grad_buffer.div_(interval)
 
 
-class RadiusOptEF:
-    """Error-feedback plugin: radius grad-correct + residual reset."""
+class SgaAdamW:
+    """The SGA AdamW optimizer template: grad-correct + residual reset."""
 
     decl = DECL
 
     def __init__(self, params: dict, emit_score: Optional[str] = None):
         self.params = params
         self.residual_mean = bool(params.get("residual_mean", False))
-        # Which score to materialize on full steps (build-time injection;
-        # None/'update_ratio' keeps the historical default: the AdamW update
-        # itself is the topk input).
-        self.emit_score = emit_score or "update_ratio"
+        # Which registry score to materialize on full steps (build-time
+        # injection). None/'update' keeps the historical default: the signed
+        # AdamW update itself is the topk input.
+        self.emit_score = emit_score or "update"
         if self.emit_score not in DECL.emittable_scores:
             raise ValueError(
-                f"radius_opt cannot emit score '{self.emit_score}' "
+                f"adamw cannot emit score '{self.emit_score}' "
                 f"(emittable: {sorted(DECL.emittable_scores)})"
             )
 
@@ -348,7 +322,7 @@ class RadiusOptEF:
             if len(state) == 0:
                 state["exp_avg"] = torch.zeros_like(rec.main_param.data)
                 state["exp_avg_sq"] = torch.zeros_like(rec.main_param.data)
-            radius_grad_correct(
+            adamw_grad_correct(
                 param_buffer=rec.main_param.data.view(-1),
                 grad_buffer=rec.grad.data.view(-1),
                 exp_avg_buffer=state["exp_avg"].view(-1),
@@ -369,25 +343,25 @@ class RadiusOptEF:
     def full_step(self, ctx):
         """Full-sync step: materialize the configured score and apply the update.
 
-        With the default 'update_ratio' score the signed update lands in the
-        main grads (Phase 2 applies from there). With a named score
-        (coi/abs_g_synced/abs_m/snr_m/abs_m_post) the two outputs swap
-        targets: the score takes over the grad buffer and the update goes to
-        per-record side buffers, applied and freed record-by-record BEFORE
-        the engine's
-        reselection reads the score views — the select-time GPU peak then
-        carries no model-sized side-buffer set (the legacy scheme's OOM fix).
-        Caveat on the Phase-0 allocation: side buffers for ALL records are
-        allocated up front, so a named-score full step transiently carries
-        +1 model-sized fp32 buffer set versus the default path — size GPU
+        With the default 'update' score the signed update lands in the main
+        grads (Phase 2 applies from there). With a named score
+        (abs_g/abs_m/coi) the two outputs swap targets: the score takes over
+        the grad buffer and the update goes to per-record side buffers,
+        applied and freed record-by-record BEFORE the engine's reselection
+        reads the score views — the select-time GPU peak then carries no
+        model-sized side-buffer set (the legacy scheme's OOM fix). Caveat on
+        the Phase-0 allocation: side buffers for ALL records are allocated
+        up front, so a named-score full step transiently carries +1
+        model-sized fp32 buffer set versus the default path — size GPU
         headroom accordingly at 1B+ scale.
         """
         # Phase 0: side buffers for the signed update (named scores only).
         # Keyed by id(): ParamRecord is a dataclass — unhashable by value.
+        # Flat: the grad-correct buffers are the params' view(-1) spans.
         score_bufs = None
-        if self.emit_score != "update_ratio":
+        if self.emit_score != "update":
             score_bufs = {
-                id(rec): torch.empty_like(rec.main_param.data)
+                id(rec): torch.empty_like(rec.main_param.data.view(-1))
                 for rec in ctx.records
             }
         # Phase 1: grad-correct; the configured score materializes into main grads.
@@ -421,6 +395,6 @@ class RadiusOptEF:
             if was_full or mask is None:
                 grad_data.zero_()
             else:
-                radius_reset(grad_data, mask, float(ctx.cycle_period), fold_all)
+                selective_reset(grad_data, mask, float(ctx.cycle_period), fold_all)
             for grad in bs.extra_main_grads:
                 grad.zero_()

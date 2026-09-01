@@ -21,10 +21,10 @@ Tests (ported from the legacy oracle suite, importing sga.replay):
    residual/fold math match a from-spec reference; mask re-selection fires
    at the expected boundaries.
 4. Boundary re-selection actually changes the support when momentum flips.
-5. Score formulas: the cycle scores match direct fp64 formulas.
-6. abs_m_sticky loyalty-boost semantics.
-7. Determinism: two identical runs produce bitwise-equal distortion numbers.
-8. Per-group hyperparameter resolution (new-trace additive extension with
+5. Branch-point score formulas (registry, fp64) match direct fp64 references
+   for every registered score, including the zero-moment t0=0 edge.
+6. Determinism: two identical runs produce bitwise-equal distortion numbers.
+7. Per-group hyperparameter resolution (new-trace additive extension with
    legacy global fallback).
 """
 import io
@@ -66,23 +66,11 @@ def _ref_score(name, w, m, v, g, count, b1=B1, b2=B2):
     bc1, bc2 = _bc(count, b1, b2)
     if name == "abs_g":
         return g.abs()
-    if name in ("abs_m", "abs_m_sticky"):
+    if name == "abs_m":
         return m.abs()
-    if name == "abs_m_post":
-        return (b1 * m + (1.0 - b1) * g).abs()
-    if name in ("snr_m", "radius"):
-        # state-matched (pre-commit) corrections: the moments have seen
-        # count-1 commits
-        bc1p, bc2p = _bc(count - 1, b1, b2)
-        if bc1p <= 0.0 or bc2p <= 0.0:
-            return torch.zeros_like(m)
-        snr = (m / bc1p) / (torch.sqrt(v / bc2p) + EPS)
-        return snr.abs() if name == "snr_m" else (WD * w + snr).abs()
     mg = (b1 * m + (1.0 - b1) * g) / bc1
     vg = (b2 * v + (1.0 - b2) * g * g) / bc2
     ug = mg / (torch.sqrt(vg) + EPS)
-    if name == "full_update":
-        return ug.abs()
     if name == "update":
         return (WD * w + ug).abs()
     u0 = (b1 * m / bc1) / (torch.sqrt(b2 * v / bc2) + EPS)
@@ -96,15 +84,11 @@ def _topk_mask(sc, k):
     return mask
 
 
-def reference_cycle(w0, m0, v0, pre_grads, lrs, clip, t0, score_name, k, T,
-                    sticky_lambda=0.5):
+def reference_cycle(w0, m0, v0, pre_grads, lrs, clip, t0, score_name, k, T):
     """From-spec reference: returns (dense_w_at_each_step, sparse_w_at_each_step).
 
     ``pre_grads`` are the PRE-clip gradients (the logged trace gradient is
     pre * coef_dense; coef_dense is what the dense run applied).
-    For abs_m_sticky the re-selection score gets the support-loyalty boost
-    (1 + sticky_lambda * prev_sel); the first selection has no previous
-    support and degenerates to plain abs_m.
     """
     # dense trajectory
     md, vd, wdt = m0.clone(), v0.clone(), w0.clone()
@@ -134,8 +118,6 @@ def reference_cycle(w0, m0, v0, pre_grads, lrs, clip, t0, score_name, k, T,
             q = q_pre * coef
             if si > 0 and si + 1 < len(pre_grads):
                 sc = _ref_score(score_name, ws, ms, vs, q, count)
-                if score_name == "abs_m_sticky":
-                    sc = sc * (1.0 + sticky_lambda * sel.to(sc.dtype))
                 sel = _topk_mask(sc, k)
             res = torch.zeros_like(res)
         else:
@@ -189,7 +171,7 @@ def _make_trace(tmpdir, pre_grads, lrs, clip, t0, n):
 
 
 def _run_module(tmpdir, name, w0, m0, v0, t0, W, score_name, ratio_pct, T,
-                replay_dtype=torch.float64, sel_trace=None, sticky_lambda=0.5):
+                replay_dtype=torch.float64, sel_trace=None):
     """Run the module's dense + cycle sparse replays; return num_at {h: num}."""
     catalog, names, offsets, N, state_files, g_files = soa.discover_trace(tmpdir)
     meta, params, w_parts, m_parts, v_parts, g_parts = soa.build_branch_state(
@@ -197,7 +179,7 @@ def _run_module(tmpdir, name, w0, m0, v0, t0, W, score_name, ratio_pct, T,
     score_flats = soa.compute_scores_flat(
         w_parts, m_parts, v_parts, g_parts, offsets, N, meta,
         chunk_mb=1, device="cpu",
-        score_names=soa.SCORE_NAMES_CYCLE + soa.SCORE_NAMES_CYCLE_EXTRA,
+        score_names=list(soa.SCORES),
         update_includes_wd=True)
     k = max(1, int(round(ratio_pct / 100.0 * N)))
     sel0, _ = soa.select_topk_flat(score_flats[score_name], k)
@@ -212,18 +194,15 @@ def _run_module(tmpdir, name, w0, m0, v0, t0, W, score_name, ratio_pct, T,
         params, g_files, window_steps, meta, t0, eff, replay_dtype, 1, "cpu")
     num_at = soa.sparse_replay_cycle(
         params, g_files, window_steps, meta, t0, eff, score_name, k, T, sel0,
-        snap_d, replay_dtype, 1, "cpu", sel_trace=sel_trace,
-        sticky_lambda=sticky_lambda)
+        snap_d, replay_dtype, 1, "cpu", sel_trace=sel_trace)
     return num_at
 
 
-def _ref_num_at(w0, m0, v0, pre_grads, lrs, clip, t0, score_name, ratio_pct, T,
-                sticky_lambda=0.5):
+def _ref_num_at(w0, m0, v0, pre_grads, lrs, clip, t0, score_name, ratio_pct, T):
     k = max(1, int(round(ratio_pct / 100.0 * w0.numel())))
     dense_ws, sparse_ws = reference_cycle(
         w0.double(), m0.double(), v0.double(),
-        [g.double() for g in pre_grads], lrs, clip, t0, score_name, k, T,
-        sticky_lambda=sticky_lambda)
+        [g.double() for g in pre_grads], lrs, clip, t0, score_name, k, T)
     return {h: float((sparse_ws[h - 1] - dense_ws[h - 1]).norm())
             for h in range(1, len(pre_grads) + 1)}
 
@@ -258,7 +237,7 @@ def test_no_fold_within_window():
     lrs = [4e-5] * W
     with tempfile.TemporaryDirectory() as td:
         name, w0, m0, v0 = _make_trace(td, pre, lrs, 0.0, t0, n)
-        for score in soa.SCORE_NAMES_CYCLE + soa.SCORE_NAMES_CYCLE_EXTRA:
+        for score in soa.SCORES:
             num_at = _run_module(td, name, w0, m0, v0, t0, W, score, 25.0,
                                  T=W + 1)
             ref = _ref_num_at(w0, m0, v0, pre, lrs, 0.0, t0, score, 25.0,
@@ -279,7 +258,7 @@ def test_multicycle_with_clipping():
     clip = 0.3
     with tempfile.TemporaryDirectory() as td:
         name, w0, m0, v0 = _make_trace(td, pre, lrs, clip, t0, n)
-        for score in soa.SCORE_NAMES_CYCLE + soa.SCORE_NAMES_CYCLE_EXTRA:
+        for score in soa.SCORES:
             trace = []
             num_at = _run_module(td, name, w0, m0, v0, t0, W, score, 50.0, 2,
                                  sel_trace=trace)
@@ -315,83 +294,46 @@ def test_boundary_reselect_changes_mask():
     print("PASS test_boundary_reselect_changes_mask")
 
 
-def test_cycle_score_formulas():
-    """_cycle_score_chunk vs direct fp64 formulas on a random state."""
+def test_branch_score_formulas():
+    """compute_scores_flat (the registry formulas, fp64 math / fp32 storage)
+    vs direct fp64 references for every registered score, including the
+    zero-moment t0=0 edge. The cycle-boundary re-selection path consumes the
+    same registry formulas (its per-param call site), pinned elementwise by
+    tests/test_plugins_unit.py::test_score_formulas_match_fp64_oracles."""
     torch.manual_seed(4)
     n = 64
-    w = torch.randn(n, dtype=torch.float64)
-    m = torch.randn(n, dtype=torch.float64) * 0.1
-    v = torch.rand(n, dtype=torch.float64) * 0.01 + 1e-4
-    g = torch.randn(n, dtype=torch.float64) * 0.01
-    count = 1234
-    bc1, bc2 = _bc(count)
-    for name in soa.SCORE_NAMES_CYCLE + soa.SCORE_NAMES_CYCLE_EXTRA:
-        got = soa._cycle_score_chunk(name, w, m, v, g, WD, B1, B2, bc1, bc2,
-                                     EPS)
-        want = _ref_score(name, w, m, v, g, count)
-        assert torch.equal(got, want), f"{name}: chunk formula mismatch"
-    # edge: count=1 (state has zero commits) -> snr_m/radius are zeros,
-    # matching compute_scores_flat's t0=0 zero-moments convention
-    bc1_1, bc2_1 = _bc(1)
-    for name in ("snr_m", "radius"):
-        got = soa._cycle_score_chunk(name, w, m, v, g, WD, B1, B2,
-                                     bc1_1, bc2_1, EPS)
-        assert torch.equal(got, torch.zeros_like(m)), f"{name} count=1 edge"
-    # mid-range counts: the derived pre-commit corrections carry ~1 ulp vs
-    # the direct form (bitwise equality is NOT achievable there; at 1234
-    # both corrections saturate to exactly 1.0, so the loop above cannot
-    # distinguish derivations at all) — pin the derivation by tolerance
-    for count in (50, 500):
-        bc1, bc2 = _bc(count)
-        for name in ("snr_m", "radius"):
-            got = soa._cycle_score_chunk(name, w, m, v, g, WD, B1, B2,
-                                         bc1, bc2, EPS)
-            want = _ref_score(name, w, m, v, g, count)
-            torch.testing.assert_close(got, want, rtol=1e-12, atol=0.0)
-    # real-Adam regime: 0.999**1000 ~ 0.37 does not saturate, so the derived
-    # formula carries its ulp against the direct 1 - beta**(count-1)
-    bc1, bc2 = _bc(1000, B1, 0.999)
-    for name in ("snr_m", "radius"):
-        got = soa._cycle_score_chunk(name, w, m, v, g, WD, B1, 0.999,
-                                     bc1, bc2, EPS)
-        want = _ref_score(name, w, m, v, g, 1000, b2=0.999)
-        torch.testing.assert_close(got, want, rtol=1e-12, atol=0.0)
-    print("PASS test_cycle_score_formulas")
+    w = torch.randn(n, dtype=torch.float32)
+    m = torch.randn(n, dtype=torch.float32) * 0.1
+    v = torch.rand(n, dtype=torch.float32) * 0.01 + 1e-4
+    g = torch.randn(n, dtype=torch.float32) * 0.01
+    count = 1234  # upcoming commit; the branch state dump carries step=t0
 
+    def _flats(step):
+        meta = {**BASE_META, "step": step}
+        return soa.compute_scores_flat(
+            [("p", w)], {"p": m}, {"p": v}, {"p": g}, {"p": 0}, n, meta,
+            chunk_mb=1, device="cpu", update_includes_wd=True)
 
-def test_sticky_semantics():
-    """abs_m_sticky: sel0 degenerates to abs_m (no previous support); the
-    loyalty boost keeps a just-overtaken incumbent in the support."""
-    torch.manual_seed(6)
-    t0, W, n = 1600, 5, 4
-    # m0: coord0 barely leads coord1; g pushes coord1 hard so its momentum
-    # overtakes coord0's by the si=2 boundary -- plain abs_m rotates to
-    # coord1, sticky (x1.5 incumbent boost) keeps coord0.
-    pre = [torch.tensor([0.005, 0.5, 0.005, 0.005]) for _ in range(W)]
-    lrs = [5e-5] * W
-    with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0 = _make_trace(td, pre, lrs, 0.0, t0, n)
-        # m0 engineered post-trace-creation (harness randomizes it)
-        m0_eng = torch.tensor([1.0, 0.96, 0.3, 0.2])
-        st = torch.load(os.path.join(td, f"step_{t0:06d}_state.pt"),
-                        weights_only=False)
-        st["payload"]["m"][name] = m0_eng
-        torch.save(st, os.path.join(td, f"step_{t0:06d}_state.pt"))
-        tr_abs_m, tr_sticky = [], []
-        _run_module(td, name, w0, m0, v0, t0, W, "abs_m", 25.0, 2,
-                    sel_trace=tr_abs_m)
-        _run_module(td, name, w0, m0, v0, t0, W, "abs_m_sticky", 25.0, 2,
-                    sel_trace=tr_sticky)
-    # sel0 identical (sticky has no history at the branch point)
-    assert torch.equal(tr_abs_m[0][1], tr_sticky[0][1]), "sel0 must match"
-    assert tr_abs_m[0][1][0] and not tr_abs_m[0][1][1:].any(), (
-        f"sel0 should pick coord0: {tr_abs_m[0][1]}")
-    # at si=2: abs_m rotates to coord1, sticky keeps coord0
-    assert tr_abs_m[1][1][1] and not tr_abs_m[1][1][0], (
-        f"abs_m@si2 should rotate to coord1: {tr_abs_m[1][1]}")
-    assert tr_sticky[1][1][0] and not tr_sticky[1][1][1], (
-        f"sticky@si2 should keep coord0: {tr_sticky[1][1]}")
-    print("PASS test_sticky_semantics")
+    flats = _flats(count - 1)
+    for name in soa.SCORES:
+        got = flats[name]
+        want = _ref_score(name, w.double(), m.double(), v.double(),
+                          g.double(), count)
+        # fp32 storage rounding only: max abs error within 1e-6 of the peak
+        err = (got.double() - want).abs().max()
+        scale = want.abs().max().clamp(min=1e-30)
+        assert err / scale < 1e-6, f"{name}: {float(err / scale):.3e}"
+
+    # zero-state edge (t0=0, state_absent: zero moments, upcoming commit 1)
+    m, v = torch.zeros_like(m), torch.zeros_like(v)
+    flats0 = _flats(0)
+    for name in soa.SCORES:
+        want = _ref_score(name, w.double(), torch.zeros(n, dtype=torch.float64),
+                          torch.zeros(n, dtype=torch.float64), g.double(), 1)
+        err = (flats0[name].double() - want).abs().max()
+        scale = want.abs().max().clamp(min=1e-30)
+        assert err / scale < 1e-6, f"{name} zero-state: {float(err / scale):.3e}"
+    print("PASS test_branch_score_formulas")
 
 
 def test_determinism():
@@ -573,7 +515,6 @@ def test_cli_rejects_invalid_options():
         (["--horizons", "0"], "--horizons"),
         (["--ratios", "nan"], "--ratios"),
         (["--branch-point", ","], "--branch-point"),
-        (["--sticky-lambda", "-0.1"], "--sticky-lambda"),
     ]
     for extra, opt in cases:
         try:
@@ -582,13 +523,6 @@ def test_cli_rejects_invalid_options():
             assert opt in str(e), (opt, str(e))
         else:
             raise AssertionError(f"{opt}: invalid value accepted")
-    # sticky-lambda NaN is rejected by the same finiteness arm
-    try:
-        soa.main(base + ["--sticky-lambda", "nan"])
-    except ValueError as e:
-        assert "--sticky-lambda" in str(e), e
-    else:
-        raise AssertionError("--sticky-lambda nan accepted")
     print("PASS test_cli_rejects_invalid_options")
 
 
@@ -619,8 +553,7 @@ def main():
     test_no_fold_within_window()
     test_multicycle_with_clipping()
     test_boundary_reselect_changes_mask()
-    test_cycle_score_formulas()
-    test_sticky_semantics()
+    test_branch_score_formulas()
     test_determinism()
     test_per_group_hyperparams_resolve()
     test_select_topk_flat_contract()

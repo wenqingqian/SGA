@@ -1,7 +1,7 @@
 # Copyright (c) 2026, SGA framework contributors.
-"""Circular topk selection (historical radius scheme).
+"""Circular topk selection.
 
-Strict-ratio global topk over the EF-materialized score magnitudes:
+Strict-ratio global topk over the optimizer-materialized score magnitudes:
 ``k = max(1, round(n_total * ratio%))``. Default selector is the bit-pattern
 histogram in one of three geometry tiers (``hist_mode``; see
 ``sga/plugins/selection/_histogram.py`` — exact / balanced / fast):
@@ -27,8 +27,9 @@ under it — their knobs have no effect there.
 
 "circular": the support is regenerated once per cycle period T at the
 full-sync boundary and persisted unchanged in between; non-topk coordinates
-accumulate as residual (the EF's reset contract folds it at the next
-boundary). Selection ALWAYS runs after the EF applied the update and while
+accumulate as residual (the optimizer's reset contract folds it at the next
+boundary). Selection ALWAYS runs after the optimizer template applied the
+update and while
 the materialized score still sits in the main-grad copy.
 """
 
@@ -48,7 +49,6 @@ from sga.plugins.selection._histogram import (
 DECL = SelectionDecl(
     name="circular_topk",
     output_form="mask",
-    scope="global_ranked",
 )
 
 # Back-compat alias: the histogram path was inlined here before the
@@ -112,9 +112,8 @@ class CircularTopkSelection:
 
     decl = DECL
 
-    def __init__(self, params: dict, score=None):
+    def __init__(self, params: dict):
         self.params = params
-        self.score = score
         self.ratio_percent = float(params["ratio_percent"])
         assert 0.0 < self.ratio_percent < 100.0, (
             f"ratio_percent must be in (0, 100), got {self.ratio_percent}"
@@ -196,8 +195,8 @@ class CircularTopkSelection:
     def select(self, ctx):
         """Return per-bucket element-level uint8 masks from the global topk.
 
-        ``ctx.grad_views`` are the EF-materialized score views (the 'synced'
-        scoring input; selection runs only at full-sync cycle boundaries).
+        ``ctx.grad_views`` are the optimizer-materialized score views;
+        selection runs only at full-sync cycle boundaries.
         """
         k = self.k_for(sum(g.numel() for g in ctx.grad_views))
         if self.adaptive:

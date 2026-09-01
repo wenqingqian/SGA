@@ -49,6 +49,17 @@ def expect_error(fn, needle):
     raise SystemExit(f"expected error containing '{needle}'")
 
 
+def _enable_standard(cfg):
+    """The canonical enabled combo: abs_m + circular_topk + adamw."""
+    cfg.sga.enabled = True
+    cfg.sga.cycle = {"start_iter": 0, "period": 8, "full_sync_interval": 0}
+    cfg.sga.score = {"name": "abs_m"}
+    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0}
+    cfg.sga.optimizer = {"name": "adamw"}
+    cfg.sga.backend = {"name": "indexed_sparse"}
+    return cfg
+
+
 def test_all_off_dense_ok():
     cfg, _ = make_base()
     validate_config(cfg)
@@ -57,22 +68,19 @@ def test_all_off_dense_ok():
 
 def test_enabled_field_named_in_error():
     cfg, _ = make_base()
-    cfg.sga.selection = {"name": "threshold"}
+    cfg.sga.selection = {"name": "circular_topk"}
     expect_error(lambda: validate_sga_section(cfg), "selection")
     print("ok: enabled field is named in the error")
 
 
-def test_fourfield_origin_combination_resolves():
+def test_fourfield_combination_resolves():
     cfg, _ = make_base()
-    cfg.sga.enabled = True
-    cfg.sga.cycle = {"start_iter": 0, "period": 1, "full_sync_interval": 10}
-    cfg.sga.score = {"name": "abs_g"}
-    cfg.sga.selection = {"name": "threshold", "threshold": 1.0e-4}
-    cfg.sga.error_feedback = {"name": "masked_adamw"}
-    cfg.sga.backend = {"name": "masked_pipelined"}
+    _enable_standard(cfg)
     engine_cfg = sga_section_to_config(cfg)
-    assert engine_cfg["selection"] == {"name": "threshold", "threshold": 1.0e-4}
-    print("ok: four-field origin combination resolves to the engine config")
+    assert engine_cfg["selection"] == {"name": "circular_topk",
+                                       "ratio_percent": 30.0}
+    assert engine_cfg["optimizer"] == {"name": "adamw"}
+    print("ok: four-field combination resolves to the engine config")
 
 
 def test_checks_section_validation():
@@ -80,12 +88,7 @@ def test_checks_section_validation():
     default on); unknown keys are named in the error, and the section is
     rejected when the engine is off."""
     cfg, _ = make_base()
-    cfg.sga.enabled = True
-    cfg.sga.cycle = {"start_iter": 0, "period": 8, "full_sync_interval": 0}
-    cfg.sga.score = {"name": "abs_m"}
-    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0}
-    cfg.sga.error_feedback = {"name": "radius_opt"}
-    cfg.sga.backend = {"name": "indexed_sparse"}
+    _enable_standard(cfg)
     engine_cfg = sga_section_to_config(cfg)
     assert "checks" not in engine_cfg  # absent -> engine defaults apply
 
@@ -109,12 +112,7 @@ def test_trace_section_validation():
     branch_points normalized from comma string or list, window default 100;
     unknown keys named in the error; section rejected when the engine is off."""
     cfg, _ = make_base()
-    cfg.sga.enabled = True
-    cfg.sga.cycle = {"start_iter": 0, "period": 8, "full_sync_interval": 0}
-    cfg.sga.score = {"name": "abs_m"}
-    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0}
-    cfg.sga.error_feedback = {"name": "radius_opt"}
-    cfg.sga.backend = {"name": "indexed_sparse"}
+    _enable_standard(cfg)
     engine_cfg = sga_section_to_config(cfg)
     assert "trace" not in engine_cfg  # absent -> collector off
 
@@ -150,13 +148,9 @@ def test_start_iter_percent_resolves():
     the loader, before the canonical --sga-config JSON is built."""
     cfg, _ = make_base()
     cfg.train.model.train_iters = 5000
-    cfg.sga.enabled = True
+    _enable_standard(cfg)
     cfg.sga.cycle = {"start_iter_percent": 10.0, "period": 4,
                      "full_sync_interval": 0}
-    cfg.sga.score = {"name": "abs_m"}
-    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 40.0}
-    cfg.sga.error_feedback = {"name": "radius_opt"}
-    cfg.sga.backend = {"name": "indexed_sparse"}
     engine_cfg = sga_section_to_config(cfg)
     assert engine_cfg["cycle"]["start_iter"] == 500
     assert "start_iter_percent" not in engine_cfg["cycle"]
@@ -173,55 +167,23 @@ def test_start_iter_percent_resolves():
 
 
 def test_illegal_combination_rejected():
+    # unknown score name is rejected with the registered list
     cfg, _ = make_base()
-    cfg.sga.enabled = True
-    cfg.sga.score = {"name": "update_ratio"}
-    cfg.sga.selection = {"name": "threshold"}
-    cfg.sga.error_feedback = {"name": "radius_opt"}
-    cfg.sga.backend = {"name": "indexed_sparse"}
-    expect_error(lambda: validate_sga_section(cfg), "threshold path")
-    print("ok: declaration-illegal combination rejected")
-
-
-def test_needs_support_local_score_rejected():
-    """A support-declaring score on the local_or_merged branch is illegal:
-    the engine routes per-param support slices into values() ONLY on the
-    synced (materialized-update) path, so such a score would TypeError at
-    the first boundary or silently lose its support term."""
-    from sga.plugins import (
-        BackendDecl,
-        EFDecl,
-        ScoreDecl,
-        SelectionDecl,
-        validate_combination,
-    )
-
-    bad = ScoreDecl(name="hypothetical_sticky",
-                    scoring_input="local_or_merged", needs_support=True)
-    ok_synced = ScoreDecl(name="abs_m_sticky_like",
-                          scoring_input="synced", needs_support=True,
-                          emit_name="abs_m")
-    sel = SelectionDecl(name="threshold")
-    ef = EFDecl(name="ef", emittable_scores=frozenset({"abs_m"}))
-    backend = BackendDecl(name="b")
-    try:
-        validate_combination(bad, sel, ef, backend, {})
-    except ValueError as e:
-        assert "needs_support" in str(e) and "synced" in str(e), e
-    else:
-        raise SystemExit("needs_support + local_or_merged must be rejected")
-    validate_combination(ok_synced, sel, ef, backend, {})
-    print("ok: needs_support on a non-synced score rejected")
+    _enable_standard(cfg)
+    cfg.sga.score = {"name": "update_ratio"}  # the pre-rename name must fail
+    expect_error(lambda: validate_sga_section(cfg), "Unknown SGA score")
+    # the optimizer's residual contract pins full_sync_interval to 0 or period
+    cfg.sga.score = {"name": "abs_m"}
+    cfg.sga.cycle = {"start_iter": 0, "period": 8, "full_sync_interval": 4}
+    expect_error(lambda: validate_sga_section(cfg), "full_sync")
+    print("ok: illegal combinations rejected (unknown score / cycle mismatch)")
 
 
 def test_sparse_backend_required_when_enabled():
     cfg, _ = make_base()
-    cfg.sga.enabled = True
-    cfg.sga.cycle = {"start_iter": 0, "period": 1, "full_sync_interval": 10}
-    cfg.sga.score = {"name": "abs_g"}
-    cfg.sga.selection = {"name": "threshold"}
-    cfg.sga.error_feedback = {"name": "masked_adamw"}
+    _enable_standard(cfg)
     # backend stays {name: dense} from BASE
+    cfg.sga.backend = {"name": "dense"}
     expect_error(lambda: validate_sga_section(cfg), "dense")
     print("ok: enabled-with-dense-backend rejected")
 
@@ -273,9 +235,9 @@ def test_enabled_injects_canonical_sga_config_pair():
     cfg, tmp = make_base()
     cfg.sga.enabled = True
     cfg.sga.cycle = {"start_iter": 0, "period": 2, "full_sync_interval": 0}
-    cfg.sga.score = {"name": "abs_g"}
-    cfg.sga.selection = {"name": "threshold", "threshold": 1.0e-4}
-    cfg.sga.error_feedback = {"name": "masked_adamw", "grad_acc_count": True}
+    cfg.sga.score = {"name": "abs_m"}
+    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 20.0}
+    cfg.sga.optimizer = {"name": "adamw", "residual_mean": True}
     cfg.sga.backend = {"name": "masked_pipelined"}
     expected_engine_cfg = sga_section_to_config(cfg)
 
@@ -295,9 +257,9 @@ def test_enabled_injects_canonical_sga_config_pair():
     # byte-exact canonical injection
     assert payload == json.dumps(expected_engine_cfg, sort_keys=True)
     assert json.loads(payload)["cycle"]["period"] == 2
-    assert json.loads(payload)["error_feedback"]["grad_acc_count"] is True
+    assert json.loads(payload)["optimizer"]["residual_mean"] is True
     # no other sga-derived tokens may ride along (train.* flatten is separate)
-    assert [a for a in args if a.startswith("abs_g") or a.startswith("masked_")] == []
+    assert [a for a in args if a.startswith("abs_m") or a.startswith("adamw")] == []
     print("ok: enabled path injects exactly ['--sga-config', canonical-json]")
 
 
@@ -333,31 +295,26 @@ def test_sga_top_level_allowlist():
     expect_error(lambda: sga_section_to_config(cfg), "unknown keys ['shadw']")
     # unknown key beats the mode-legality diagnostics (membership first)
     cfg2, _ = make_base()
-    cfg2.sga.selection = {"name": "threshold"}
-    cfg2.sga.slect = {"name": "threshold"}
+    cfg2.sga.selection = {"name": "circular_topk"}
+    cfg2.sga.slect = {"name": "circular_topk"}
     expect_error(lambda: sga_section_to_config(cfg2), "unknown keys ['slect']")
 
     # every top-level key at once (enabled path) resolves
     cfg3, _ = make_base()
-    cfg3.sga.enabled = True
-    cfg3.sga.cycle = {"start_iter": 0, "period": 8, "full_sync_interval": 0}
-    cfg3.sga.score = {"name": "abs_m"}
-    cfg3.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0}
-    cfg3.sga.error_feedback = {"name": "radius_opt"}
-    cfg3.sga.backend = {"name": "indexed_sparse"}
+    _enable_standard(cfg3)
     cfg3.sga.checks = {"count_guard": True}
     cfg3.sga.trace = {"dir": "/tmp/sga-trace-x"}
     cfg3.sga.shadow = True
     cfg3.sga.shadow_score = True
     engine_cfg = sga_section_to_config(cfg3)
-    for key in ("cycle", "score", "selection", "error_feedback", "backend",
+    for key in ("cycle", "score", "selection", "optimizer", "backend",
                 "checks", "trace", "shadow", "shadow_score"):
         assert key in engine_cfg, key
 
     # legacy dense form (test_launcher_shape BASE shape) still validates
     cfg4, _ = make_base()
     del cfg4.sga.enabled
-    for axis in ("score", "selection", "error_feedback"):
+    for axis in ("score", "selection", "optimizer"):
         cfg4.sga[axis] = {"enabled": False}
     assert sga_section_to_config(cfg4) is None
     print("ok: sga top-level allowlist (typo / all-known / legacy dense form)")
@@ -368,12 +325,8 @@ def test_cycle_interior_allowlist():
     otherwise silently fall back to period=1 — reselection every step
     instead of the configured cycle, with no diagnostic anywhere."""
     cfg, _ = make_base()
-    cfg.sga.enabled = True
+    _enable_standard(cfg)
     cfg.sga.cycle = {"start_iter": 0, "peroid": 8, "full_sync_interval": 0}
-    cfg.sga.score = {"name": "abs_m"}
-    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0}
-    cfg.sga.error_feedback = {"name": "radius_opt"}
-    cfg.sga.backend = {"name": "indexed_sparse"}
     expect_error(lambda: sga_section_to_config(cfg), "unknown keys ['peroid']")
 
     cfg.sga.cycle = 5
@@ -384,10 +337,9 @@ def test_cycle_interior_allowlist():
 if __name__ == "__main__":
     test_all_off_dense_ok()
     test_enabled_field_named_in_error()
-    test_fourfield_origin_combination_resolves()
+    test_fourfield_combination_resolves()
     test_start_iter_percent_resolves()
     test_illegal_combination_rejected()
-    test_needs_support_local_score_rejected()
     test_sparse_backend_required_when_enabled()
     test_missing_sga_section()
     test_unknown_backend_lists_valid()

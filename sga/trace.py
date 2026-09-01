@@ -34,7 +34,8 @@ skipped step leaves a GAP in the g-file sequence; the replay's contiguous
 window discovery stops there instead of silently renumbering.
 
 Dump slot (frozen ordering contract): in ``SGAEngine.optimizer_step``
-AFTER step 3 (count_zeros) and BEFORE step 4 (the EF owns the inner step
+AFTER step 3 (count_zeros) and BEFORE step 4 (the optimizer template owns
+the inner step
 and rewrites main_param.grad). At that point prepare_grads + the masked
 clip have run, so main_param.grad is the post-unscale post-clip gradient —
 exactly the legacy hook's view at the top of step_with_ready_grads. On

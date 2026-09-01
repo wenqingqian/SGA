@@ -4,7 +4,7 @@ Structure (one file, no defaults/inheritance/merging):
 
     experiment: {exp_name, exp_dir, task, runner, cmds, envs}
     action: run|dryrun|test|stop|query
-    sga: {enabled, cycle, score, selection, error_feedback, backend}
+    sga: {enabled, cycle, score, selection, optimizer, backend}
     train: {system, model, data}                       # megatron args
 
 The `sga:` section is validated here and never reaches the megatron command
@@ -13,7 +13,7 @@ and instead injects the resolved section as the single opaque ``--sga-config``
 canonical-JSON argument — notes/sga-waist-api-v1.md section 7).
 
 the four-field model: a scheme is the four-field combination
-score/selection/error_feedback/backend, each with its own params, plus the
+score/selection/optimizer/backend, each with its own params, plus the
 engine cycle {start_iter, period, full_sync_interval}. Legality is checked
 from plugin DECLARATIONS (sga.plugins.validate_combination) — no hardcoded
 scheme list. ``enabled: false`` keeps the dense-off semantics: dense training,
@@ -24,20 +24,20 @@ from omegaconf import DictConfig, OmegaConf
 
 from sga.trace import parse_branch_points
 
-_AXES = ("score", "selection", "error_feedback", "backend")
+_AXES = ("score", "selection", "optimizer", "backend")
 
 # Top-level sga: keys (single list, mode-independent: a typo like `shadw`
 # must fail loud even in a disabled config, where it would otherwise be
 # silently dropped and the run would proceed as live sparse instead of the
-# intended shadow). Plugin params inside score/selection/error_feedback/
-# backend stay free-form; cycle's own interior is a fixed vocabulary.
+# intended shadow). Plugin params inside score/selection/optimizer/backend
+# stay free-form; cycle's own interior is a fixed vocabulary.
 _SGA_KEYS = frozenset(
     (
         "enabled",
         "cycle",
         "score",
         "selection",
-        "error_feedback",
+        "optimizer",
         "backend",
         "checks",
         "trace",
@@ -262,22 +262,22 @@ def _validate_against_registries(engine_config: dict) -> None:
     """Registry membership + declaration-based combination check."""
     from sga.plugins import (
         get_backend_plugin_decl,
-        get_ef_decl,
-        get_score_decl,
+        get_optimizer_decl,
+        get_score_spec,
         get_selection_decl,
         register_default_plugins,
         validate_combination,
     )
 
     register_default_plugins()
-    score = get_score_decl(engine_config["score"]["name"])
+    score_name = engine_config["score"]["name"]
     selection = get_selection_decl(engine_config["selection"]["name"])
-    ef = get_ef_decl(engine_config["error_feedback"]["name"])
+    optimizer = get_optimizer_decl(engine_config["optimizer"]["name"])
     backend = get_backend_plugin_decl(engine_config["backend"]["name"])
     cycle = engine_config.get("cycle", {})
     if int(cycle.get("period", 1)) < 1:
         raise ValueError("sga.cycle.period must be >= 1")
-    validate_combination(score, selection, ef, backend, cycle)
+    validate_combination(score_name, selection, optimizer, backend, cycle)
 
 
 def validate_sga_section(config: DictConfig) -> None:

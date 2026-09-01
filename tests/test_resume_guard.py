@@ -117,7 +117,7 @@ def test_identical_and_reordered_configs_pass():
 
 def test_differing_config_refuses():
     tmp = tempfile.mkdtemp(prefix="sga-resume-diff-")
-    other = json.dumps({"score": {"name": "update_ratio"},
+    other = json.dumps({"score": {"name": "update"},
                         "cycle": {"period": 2}}, sort_keys=True)
     make_ckpt(tmp, saved_value=other)
     expect_exit(lambda: _with_rank(

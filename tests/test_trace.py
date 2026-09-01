@@ -17,24 +17,25 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sga.engine import SGAEngine
-from sga.plugins import build_ef, build_score, build_selection
+from sga.plugins import build_optimizer, build_selection
 from sga.trace import TraceCollector, _canonical_name, parse_branch_points
 
 from test_engine_unit import (
     _FakeChunk,
     _FakeMPOpt,
-    _ORIGIN,
     _ReplicaWorld,
+    _UPDATE,
 )
 
 
-def _build_traced_engine(trace_cfg, chunk):
-    score = build_score(_ORIGIN["score"], {"name": _ORIGIN["score"]})
-    selection = build_selection(_ORIGIN["selection"], dict(_ORIGIN["selection_params"]),
-                                score=score)
-    ef = build_ef(_ORIGIN["ef"], dict(_ORIGIN["ef_params"]))
-    eng = SGAEngine({"cycle": _ORIGIN["cycle"], "trace": trace_cfg},
-                    score, selection, ef, _ORIGIN["backend"])
+def _build_traced_engine(trace_cfg, chunk, cycle=None):
+    selection = build_selection(_UPDATE["selection"],
+                                dict(_UPDATE["selection_params"]))
+    opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
+                          emit_score=_UPDATE["score"])
+    eng = SGAEngine({"cycle": cycle or dict(_UPDATE["cycle"]),
+                     "trace": trace_cfg},
+                    _UPDATE["score"], selection, opt, _UPDATE["backend"])
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
     return eng
@@ -101,12 +102,12 @@ def test_zero_overhead_when_off_structural():
     """No sga.trace config -> the engine holds _trace = None (the per-step
     slot cost is a single None-check)."""
     chunk = _FakeChunk()
-    score = build_score(_ORIGIN["score"], {"name": _ORIGIN["score"]})
-    selection = build_selection(_ORIGIN["selection"], dict(_ORIGIN["selection_params"]),
-                                score=score)
-    ef = build_ef(_ORIGIN["ef"], dict(_ORIGIN["ef_params"]))
-    eng = SGAEngine({"cycle": _ORIGIN["cycle"]}, score, selection, ef,
-                    _ORIGIN["backend"])
+    selection = build_selection(_UPDATE["selection"],
+                                dict(_UPDATE["selection_params"]))
+    opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
+                          emit_score=_UPDATE["score"])
+    eng = SGAEngine({"cycle": dict(_UPDATE["cycle"])}, _UPDATE["score"],
+                    selection, opt, _UPDATE["backend"])
     assert eng._trace is None
     eng2 = _build_traced_engine(
         {"dir": "/tmp/sga-trace-never", "branch_points": [], "window": 100}, chunk)
@@ -114,9 +115,10 @@ def test_zero_overhead_when_off_structural():
     print("PASS test_zero_overhead_when_off_structural")
 
 
-def test_dump_slot_before_ef_and_post_clip():
+def test_dump_slot_before_optimizer_and_post_clip():
     """The dump fires inside optimizer_step AFTER the masked clip (payload is
-    the clipped gradient) and BEFORE the EF's inner step (call-order spy)."""
+    the clipped gradient) and BEFORE the optimizer template's inner step
+    (call-order spy)."""
     torch.manual_seed(0)
     with tempfile.TemporaryDirectory() as td:
         chunk = _prefixed_chunk()
@@ -124,24 +126,24 @@ def test_dump_slot_before_ef_and_post_clip():
         eng = _build_traced_engine(
             {"dir": td, "branch_points": [0], "window": 1}, chunk)
 
-        calls = {"ef": 0, "dump": None}
-        orig_full = eng.ef.full_step
-        orig_sparse = eng.ef.sparse_step
+        calls = {"opt": 0, "dump": None}
+        orig_full = eng.opt.full_step
+        orig_sparse = eng.opt.sparse_step
 
         def counting_full(ctx):
-            calls["ef"] += 1
+            calls["opt"] += 1
             return orig_full(ctx)
 
         def counting_sparse(ctx):
-            calls["ef"] += 1
+            calls["opt"] += 1
             return orig_sparse(ctx)
 
-        eng.ef.full_step = counting_full
-        eng.ef.sparse_step = counting_sparse
+        eng.opt.full_step = counting_full
+        eng.opt.sparse_step = counting_sparse
         orig_dump = eng._trace.maybe_dump
 
         def spy(engine, mp_opt, step, grad_norm):
-            calls["dump"] = (step, calls["ef"], grad_norm)
+            calls["dump"] = (step, calls["opt"], grad_norm)
             return orig_dump(engine, mp_opt, step, grad_norm)
 
         eng._trace.maybe_dump = spy
@@ -166,9 +168,9 @@ def test_dump_slot_before_ef_and_post_clip():
             ok, grad_norm, _ = eng.optimizer_step(mp, [chunk], 0)
             assert ok
 
-        # slot ordering: dump ran at step 0 with zero EF calls so far
+        # slot ordering: dump ran at step 0 with zero optimizer calls so far
         assert calls["dump"] is not None and calls["dump"][:2] == (0, 0)
-        assert calls["ef"] == 1  # exactly one inner step happened after
+        assert calls["opt"] == 1  # exactly one inner step happened after
         # the spy saw the engine's own clip result
         assert calls["dump"][2] == grad_norm
 
@@ -187,7 +189,7 @@ def test_dump_slot_before_ef_and_post_clip():
             want = g * coeff
             got = dumped["payload"][f"p{i}"]
             assert torch.equal(got, want), f"p{i}: dump is not the clipped grad"
-    print("PASS test_dump_slot_before_ef_and_post_clip")
+    print("PASS test_dump_slot_before_optimizer_and_post_clip")
 
 
 def test_dump_contents_window_and_state():
@@ -372,37 +374,39 @@ def test_meta_carries_engine_phase():
     """meta['phase'] self-describes the producing engine mode: live_full /
     live_sparse on the live path (the bootstrap region runs full — no
     support exists until the first reselect at step > start_iter — then the
-    post-reselect step runs sparse under the active support), 'shadow' in
-    shadow mode. A mixed trace directory stops being an inference exercise."""
+    post-reselect mid-cycle step runs sparse under the active support),
+    'shadow' in shadow mode. A mixed trace directory stops being an
+    inference exercise."""
     torch.manual_seed(4)
     with tempfile.TemporaryDirectory() as td:
         chunk = _FakeChunk()
         mp = _FakeMPOpt(chunk)
+        # period 2: reselect at every even boundary (steps 2, 4); odd steps
+        # after the first reselect are sparse
         eng = _build_traced_engine(
-            {"dir": td, "branch_points": [0], "window": 3}, chunk)
-        _drive_steps(eng, chunk, mp, [0, 1, 2])
+            {"dir": td, "branch_points": [0], "window": 4}, chunk,
+            cycle={"start_iter": 0, "period": 2, "full_sync_interval": 0})
+        _drive_steps(eng, chunk, mp, [0, 1, 2, 3])
         phases = {}
-        for s in range(3):
+        for s in range(4):
             m = torch.load(os.path.join(td, f"step_{s:06d}_g.pt"),
                            weights_only=False)["meta"]
             phases[s] = m["phase"]
         assert phases[0] == "live_full", phases  # bootstrap: no support yet
-        assert phases[1] == "live_full", phases  # step 0 had no reselect
-        assert phases[2] == "live_sparse", phases  # post-reselect support
+        assert phases[1] == "live_full", phases  # still no support (no boundary)
+        assert phases[2] == "live_full", phases  # boundary: full + reselect
+        assert phases[3] == "live_sparse", phases  # post-reselect support
     with tempfile.TemporaryDirectory() as td:
         chunk = _FakeChunk()
-        from sga.plugins import build_ef, build_score, build_selection
-        from test_engine_unit import _ORIGIN
         from test_shadow_unit import _ShadowCapableMPOpt
-        score = build_score(_ORIGIN["score"], {"name": _ORIGIN["score"]})
-        selection = build_selection(_ORIGIN["selection"],
-                                    dict(_ORIGIN["selection_params"]),
-                                    score=score)
-        ef = build_ef(_ORIGIN["ef"], dict(_ORIGIN["ef_params"]))
-        eng = SGAEngine({"cycle": _ORIGIN["cycle"], "shadow": True,
+        selection = build_selection(_UPDATE["selection"],
+                                    dict(_UPDATE["selection_params"]))
+        opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
+                              emit_score=_UPDATE["score"])
+        eng = SGAEngine({"cycle": dict(_UPDATE["cycle"]), "shadow": True,
                          "trace": {"dir": td, "branch_points": [0],
                                    "window": 1}},
-                        score, selection, ef, _ORIGIN["backend"])
+                        _UPDATE["score"], selection, opt, _UPDATE["backend"])
         eng._dp_cp_group = lambda: None
         eng.attach(chunk)
         mp = _ShadowCapableMPOpt(chunk)
@@ -425,7 +429,7 @@ def main():
     test_parse_branch_points()
     test_canonical_name_strips_module_prefixes()
     test_zero_overhead_when_off_structural()
-    test_dump_slot_before_ef_and_post_clip()
+    test_dump_slot_before_optimizer_and_post_clip()
     test_dump_contents_window_and_state()
     test_absolute_numbering_resume_safe()
     test_bind_param_group_contract()

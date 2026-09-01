@@ -58,7 +58,7 @@ sga:
     enabled: false
   selection:
     enabled: false
-  error_feedback:
+  optimizer:
     enabled: false
   backend:
     name: dense

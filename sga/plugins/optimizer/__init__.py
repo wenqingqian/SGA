@@ -1,23 +1,28 @@
 # Copyright (c) 2026, SGA framework contributors.
-"""Error-feedback-axis plugins: the masked optimizer step + buffer reset contract.
+"""Optimizer-axis plugins: the masked optimizer step + buffer reset contract.
 
-An EF plugin owns the ENTIRE inner optimizer step for ALL params (the
-the design grilling contract: torch's ``optimizer.step()`` cannot step a
-subset of param_groups, and radius-style EFs update m/v at every coordinate
-every step). Params without an active mask take the inline dense AdamW
-fallback. The EF also owns the post-update selective buffer reset semantics
+An optimizer template owns the ENTIRE inner optimizer step for ALL params
+(the grilling contract: torch's ``optimizer.step()`` cannot step a
+subset of param_groups, and the SGA kernels update m/v at every coordinate
+every step). It also owns the post-update selective buffer reset semantics
 (declared via ``reset_mode``); the reset has exactly ONE execution site —
 the end of ``engine.optimizer_step`` (notes section 5).
+
+Score materialization is part of the same template: on full-sync steps the
+commit kernel writes the configured score (see the score registry) into the
+fp32 main-grad copy, where the engine's reselection reads it (the
+optimizer->score handoff). Which scores a template can emit is declared on
+its ``OptimizerDecl.emittable_scores``.
 """
 
 from dataclasses import dataclass, field
 @dataclass
 class ParamRecord:
-    """One (model param, fp32 main param) pair with everything the EF needs."""
+    """One (model param, fp32 main param) pair with everything the optimizer needs."""
 
     model_param: object      # bf16 param living in the DDP bucket
     main_param: object       # fp32 twin actually being optimized
-    bucket_state: object     # engine BucketState (mask_u8, acc_count, spans)
+    bucket_state: object     # engine BucketState (mask_u8, spans)
     start: int               # element span of this param within the bucket
     end: int
     lr: float
@@ -30,8 +35,8 @@ class ParamRecord:
     @property
     def grad(self):
         """Main grad: post-prepare_grads this is the (clipped) synced gradient
-        view; on full steps with an emitting EF it becomes the materialized
-        update after ``full_step``."""
+        view; on full steps with a named score it becomes the materialized
+        score after ``full_step``."""
         return self.main_param.grad
 
     @property
@@ -50,18 +55,12 @@ class ParamRecord:
             return None
         return self.bucket_state.active_mask_u8[self.start:self.end]
 
-    def acc_count(self):
-        """Acc-count buffer slice for this param (or None)."""
-        if self.bucket_state is None or self.bucket_state.grad_acc_count is None:
-            return None
-        return self.bucket_state.grad_acc_count[self.start:self.end]
-
 
 @dataclass
-class EFContext:
-    """Everything the EF sees for one optimizer step.
+class OptContext:
+    """Everything the optimizer sees for one optimizer step.
 
-    No score-handoff payload: 'synced'-input scores read the materialized
+    No score-handoff payload: the reselection reads the materialized
     ``main_param.grad`` views that the engine re-derives itself (see the
     engine module docstring on the declaration-only score axis).
     """
@@ -72,4 +71,3 @@ class EFContext:
     bucket_states: list = None          # engine BucketStates (for reset)
     cycle_period: int = 1               # T (residual fold divisor)
     next_step_is_full: bool = False     # for residual fold decisions
-

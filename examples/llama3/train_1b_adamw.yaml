@@ -2,8 +2,8 @@
 # four-field config combination. Everything outside the sga: section mirrors
 # examples/llama3/train_1b_dense.yaml so runs are directly comparable.
 #
-# score=update_ratio + selection=circular_topk (histogram exact topk) +
-# error_feedback=radius_opt (residual) + backend=indexed_sparse.
+# score=update + selection=circular_topk (histogram exact topk) +
+# optimizer=adamw (residual) + backend=indexed_sparse.
 # Cycle: full sync + reselect every period-8 boundary after start_iter;
 # residual folds undivided at boundaries (paper-exact).
 
@@ -61,13 +61,13 @@ sga:
     period: 8
     full_sync_interval: 0
   score:
-    name: update_ratio
+    name: update
   selection:
     name: circular_topk
     ratio_percent: 10.0
     exact_kthvalue: false
-  error_feedback:
-    name: radius_opt
+  optimizer:
+    name: adamw
     residual_mean: false
   backend:
     name: indexed_sparse

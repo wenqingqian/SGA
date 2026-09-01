@@ -1,34 +1,28 @@
 #!/usr/bin/env python3
-"""Unit tests for the SGA plugin layer (scores / selections / EFs), CPU-only.
+"""Unit tests for the SGA plugin layer (score registry / selections / optimizer), CPU-only.
 
-Covers (acceptance + expert Q7 additions):
-- abs_g compute_mask (element + block) vs a plain-torch reference;
-- masked AdamW torch fallback vs an fp64 oracle (standard + acc-aware +
-  freeze_inactive), and full-mask equivalence to dense AdamW;
-- acc-count update semantics incl. the uint8 saturation at the ceiling;
+Covers:
+- score registry formulas vs straightforward fp64 oracles (all four scores,
+  scratch-routed == freshly-allocated, wd-free update variant);
+- selective reset fold semantics (undivided / /T / full clear);
 - circular topk: histogram threshold == exact torch.kthvalue threshold,
-  mask equality, k rounding bound;
-- threshold selection: OR-merge with a mocked collective, always-sync
-  forcing, adaptive controller band logic and caps;
-- radius reset fold semantics (undivided / /T / full clear).
+  mask equality, k rounding bound, three-tier geometry + chunking;
+- adaptive controller band logic, clamps and lifecycle;
+- declaration-based combination validation + build injection + decl coverage.
 
 Run: python tests/test_plugins_unit.py  (or pytest tests/test_plugins_unit.py)
 """
 
 import os
 import sys
+import warnings
 
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sga.plugins.error_feedback.masked_adamw import (
-    MaskedAdamWEF,
-    _masked_adamw_step_torch,
-    update_grad_acc_count,
-)
-from sga.plugins.error_feedback.radius_opt import radius_reset
-from sga.plugins.scores.abs_g import compute_mask
+from sga.plugins.optimizer.adamw import SgaAdamW, selective_reset
+from sga.plugins.scores import SCRATCH_SCORES, get_score_spec, score_names
 from sga.plugins.selection.circular_topk import (
     CircularTopkSelection,
     _HIST_BINS,
@@ -37,7 +31,6 @@ from sga.plugins.selection.circular_topk import (
     _select_masks_exact_kthvalue,
     _select_masks_histogram,
 )
-from sga.plugins.selection.threshold import ThresholdSelection
 
 torch.manual_seed(0)
 
@@ -50,145 +43,180 @@ class _Ctx:
         self.warmup_target = warmup_target
 
 
-# ---------------------------------------------------------------- abs_g masks
+# ------------------------------------------------------------- score registry
 
-def test_compute_mask_elementwise():
-    g = torch.tensor([-0.5, 0.05, 2.0, -0.00001, 0.0])
-    m = compute_mask(g, 0.1)
-    ref = (g.abs() >= 0.1).to(torch.uint8)
-    assert torch.equal(m, ref), (m, ref)
-
-
-def test_compute_mask_blockwise():
-    g = torch.arange(16, dtype=torch.float32).reshape(4, 4) * 0.01 - 0.02
-    m = compute_mask(g.reshape(-1), 0.03, block_size=4)
-    ref = (g.abs().amax(dim=1) >= 0.03).to(torch.uint8)
-    assert torch.equal(m, ref), (m, ref)
+def test_registry_contents():
+    assert score_names() == ["abs_g", "abs_m", "coi", "update"]
+    for name in score_names():
+        spec = get_score_spec(name)
+        assert callable(spec.formula) and spec.doc
+    try:
+        get_score_spec("nope")
+        raise AssertionError("unknown score accepted")
+    except ValueError as e:
+        assert "nope" in str(e) and "abs_g" in str(e), e
 
 
-def test_compute_mask_empty():
-    m = compute_mask(torch.empty(0), 0.1)
-    assert m.numel() == 0
+def _formula_oracles(w, m, v, g, b1, b2, eps, wd, bc1, bc2):
+    """Straightforward fp64 oracles, written independently of the formulas."""
+    w64, m64, v64, g64 = (t.double() for t in (w, m, v, g))
+    m_new = b1 * m64 + (1 - b1) * g64
+    v_new = b2 * v64 + (1 - b2) * g64 * g64
+    m_hat = m_new / bc1
+    v_hat = v_new / bc2
+    u_g = m_hat / (v_hat.sqrt() + eps)
+    u_0 = (b1 * m64 / bc1) / ((b2 * v64 / bc2).sqrt() + eps)
+    return {
+        "abs_g": g64.abs(),
+        "abs_m": m64.abs(),
+        "update": wd * w64 + u_g,
+        "coi": (u_g - u_0).abs(),
+    }
 
 
-# ------------------------------------------------------------- masked adamw
-
-def _oracle_adamw(param, grad, m, v, step, lr, b1, b2, eps, wd, active, count, freeze):
-    p, g, mm, vv = (t.double().clone() for t in (param, grad, m, v))
-    cnt = count.double().clamp(min=1)
-    gg = torch.where(active, g / cnt, torch.zeros_like(g))
-    b1p = torch.exp(cnt * torch.log(torch.tensor(b1, dtype=torch.float64)))
-    b2p = torch.exp(cnt * torch.log(torch.tensor(b2, dtype=torch.float64)))
-    m_new = b1 * mm + (1 - b1p) * gg
-    v_new = b2 * vv + (1 - b2p) * gg * gg
+def test_score_formulas_match_fp64_oracles():
+    torch.manual_seed(3)
+    n, b1, b2, eps, wd, step = 513, 0.9, 0.95, 1e-8, 1e-2, 7
     bc1, bc2 = 1 - b1 ** step, 1 - b2 ** step
-    upd = torch.where(active, lr * cnt, lr * (1 + 0 * cnt)) * (m_new / bc1) / (
-        (v_new / bc2).sqrt() + eps
-    )
-    p = p - lr * wd * p
-    if freeze:
-        m_new = torch.where(active, m_new, mm)
-        v_new = torch.where(active, v_new, vv)
-        upd = torch.where(active, upd, torch.zeros_like(upd))
-    p = p - upd
-    return p, m_new, v_new
+    w = torch.randn(n)
+    m = torch.randn(n) * 0.1
+    v = torch.rand(n) * 0.1 + 1e-4
+    g = torch.randn(n)
+    oracles = _formula_oracles(w, m, v, g, b1, b2, eps, wd, bc1, bc2)
+    for name in score_names():
+        spec = get_score_spec(name)
+        # no training input is mutated by any formula (shadow's contract):
+        # the snapshots are taken BEFORE the call — comparing against
+        # post-call clones would compare the formula against itself and
+        # could never fail
+        w0, m0, v0, g0 = w.clone(), m.clone(), v.clone(), g.clone()
+        out = spec.formula(w, m, v, g, b1, b2, eps, wd, bc1, bc2,
+                           update_includes_wd=True)
+        torch.testing.assert_close(out.double(), oracles[name],
+                                   rtol=1e-5, atol=1e-7)
+        assert torch.equal(w, w0) and torch.equal(m, m0)
+        assert torch.equal(v, v0) and torch.equal(g, g0)
+    print("ok: score formulas match fp64 oracles")
 
 
-def test_masked_adamw_matches_oracle():
-    n = 512
-    param0 = torch.randn(n)
-    grad = torch.randn(n)
-    m0, v0 = torch.randn(n) * 0.1, torch.rand(n) * 0.1
-    step, lr, b1, b2, eps, wd = 7, 1e-3, 0.9, 0.95, 1e-8, 1e-2
-
-    for active_ratio, count_on, freeze in [
-        (0.3, False, False), (0.3, True, False), (0.3, True, True), (1.0, True, False),
-    ]:
-        active = torch.rand(n) < active_ratio
-        count = torch.randint(1, 9, (n,)).to(torch.uint8) if count_on else None
-        p = param0.clone(); m = m0.clone(); v = v0.clone()
-        _masked_adamw_step_torch(
-            p, grad, m, v, active, lr, b1, b2, eps, wd,
-            1 - b1 ** step, 1 - b2 ** step, freeze, count,
+def test_score_formula_scratch_routing_bitwise():
+    """scratch-routed evaluation is bitwise identical to the freshly-allocated
+    one (the out= chains must be op-for-op the same elementwise sequence),
+    outputs never alias the scratch pair, the unused-scratch scores (outside
+    SCRATCH_SCORES) ignore the pair entirely, and records of DIFFERENT numel
+    AND rank share ONE pair sized to the max (the [:n].view_as(w) narrowing
+    keeps out= ops off the shared buffers' shape — a resize would shrink the
+    pair under the next, larger record). The whole scratch-routed evaluation
+    runs under warnings-as-errors: an out= resize emits a UserWarning and
+    must fail here, not silently rely on deprecated behavior."""
+    torch.manual_seed(4)
+    n = 1024
+    w = torch.randn(n)
+    m = torch.randn(n) * 0.1
+    v = torch.rand(n) + 1e-3
+    g = torch.randn(n)
+    b1, b2, eps, wd, step = 0.9, 0.95, 1e-8, 1e-2, 9
+    bc1, bc2 = 1 - b1 ** step, 1 - b2 ** step
+    for name in score_names():
+        spec = get_score_spec(name)
+        fresh = spec.formula(w, m, v, g, b1, b2, eps, wd, bc1, bc2,
+                             update_includes_wd=True)
+        scratch = (
+            torch.full((n + 7,), float("nan")),  # >= numel, ragged on purpose
+            torch.full((n + 7,), float("nan")),
         )
-        po, mo, vo = _oracle_adamw(
-            param0, grad, m0, v0, step, lr, b1, b2, eps, wd,
-            active, count if count is not None else torch.ones(n), freeze,
-        )
-        torch.testing.assert_close(p, po.float(), rtol=1e-5, atol=1e-7)
-        torch.testing.assert_close(m, mo.float(), rtol=1e-5, atol=1e-7)
-        torch.testing.assert_close(v, vo.float(), rtol=1e-4, atol=1e-7)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            with_scratch = spec.formula(w, m, v, g, b1, b2, eps, wd, bc1, bc2,
+                                        update_includes_wd=True,
+                                        scratch=scratch)
+        assert torch.equal(fresh, with_scratch), name
+        assert with_scratch.data_ptr() != scratch[0].data_ptr()
+        assert with_scratch.data_ptr() != scratch[1].data_ptr()
+    assert SCRATCH_SCORES == frozenset(("update", "coi"))
+
+    # the wd-free variant must ALSO return a fresh tensor with a caller
+    # scratch (never alias the pair — per-param outputs are held
+    # simultaneously) and stay bitwise equal to its fresh evaluation
+    spec = get_score_spec("update")
+    fresh_nowd = spec.formula(w, m, v, g, b1, b2, eps, wd, bc1, bc2,
+                              update_includes_wd=False)
+    scratch = (torch.full((n + 7,), float("nan")),
+               torch.full((n + 7,), float("nan")))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        scratch_nowd = spec.formula(w, m, v, g, b1, b2, eps, wd, bc1, bc2,
+                                    update_includes_wd=False, scratch=scratch)
+    assert torch.equal(fresh_nowd, scratch_nowd)
+    assert scratch_nowd.data_ptr() not in (scratch[0].data_ptr(),
+                                           scratch[1].data_ptr())
+
+    # mixed-numel AND mixed-rank records over ONE shared pair sized to the
+    # max numel (exactly the engine's per-boundary flat max_n pair), smaller
+    # record first: the narrowing must keep both evaluations warning-free
+    # (an out= resize would shrink the SHARED pair under the first record)
+    # and leave the pair at full capacity for the larger record
+    shared = (torch.full((200,), float("nan")), torch.full((200,), float("nan")))
+    for shape in ((50,), (10, 20)):
+        w2 = torch.randn(shape)
+        m2 = torch.randn(shape) * 0.1
+        v2 = torch.rand(shape) + 1e-3
+        g2 = torch.randn(shape)
+        fresh2 = spec.formula(w2, m2, v2, g2, b1, b2, eps, wd, bc1, bc2,
+                              update_includes_wd=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            routed2 = spec.formula(w2, m2, v2, g2, b1, b2, eps, wd, bc1, bc2,
+                                   update_includes_wd=True, scratch=shared)
+        assert torch.equal(fresh2, routed2), shape
+        assert routed2.data_ptr() not in (shared[0].data_ptr(),
+                                          shared[1].data_ptr()), shape
+        assert shared[0].numel() == 200 and shared[1].numel() == 200, \
+            "scratch pair was resized in place"
+    print("ok: score formula scratch routing is bitwise identical")
 
 
-def test_full_mask_equals_dense_adamw():
-    """All-ones mask + unit acc counts must equal standard AdamW."""
+def test_update_formula_wd_free_variant():
+    """update_includes_wd=False returns the wd-free U(g) (the offline
+    zerofill-mode convention); True returns the online-exact signed form."""
+    torch.manual_seed(5)
     n = 256
-    param0 = torch.randn(n)
-    grad = torch.randn(n)
-    m0, v0 = torch.randn(n) * 0.1, torch.rand(n) * 0.1
-    step, lr, b1, b2, eps, wd = 5, 1e-3, 0.9, 0.95, 1e-8, 1e-2
-    ones = torch.ones(n, dtype=torch.bool)
-
-    p = param0.clone(); m = m0.clone(); v = v0.clone()
-    _masked_adamw_step_torch(
-        p, grad, m, v, ones, lr, b1, b2, eps, wd,
-        1 - b1 ** step, 1 - b2 ** step, False, torch.ones(n, dtype=torch.uint8),
-    )
-    # dense reference (decoupled AdamW)
-    pd = param0.clone(); md = m0.clone(); vd = v0.clone()
-    md.mul_(b1).add_(grad, alpha=1 - b1)
-    vd.mul_(b2).addcmul_(grad, grad, value=1 - b2)
-    denom = (vd / (1 - b2 ** step)).sqrt().add_(eps)
-    pd.add_(pd, alpha=-lr * wd)
-    pd.addcdiv_(md, denom, value=-lr / (1 - b1 ** step))
-    torch.testing.assert_close(p, pd, rtol=1e-5, atol=1e-7)
-
-
-# ------------------------------------------------------------------ acc count
-
-def test_acc_count_update_saturates():
-    count = torch.tensor([1, 5, 255, 10], dtype=torch.uint8)
-    active = torch.tensor([1, 0, 0, 1], dtype=torch.uint8)
-    update_grad_acc_count(count, active)
-    assert count.tolist() == [1, 6, 255, 1]  # ceiling SATURATES instead of wrapping
+    w = torch.randn(n)
+    m = torch.randn(n) * 0.1
+    v = torch.rand(n) + 1e-3
+    g = torch.randn(n)
+    b1, b2, eps, wd, step = 0.9, 0.95, 1e-8, 1e-2, 4
+    bc1, bc2 = 1 - b1 ** step, 1 - b2 ** step
+    spec = get_score_spec("update")
+    with_wd = spec.formula(w, m, v, g, b1, b2, eps, wd, bc1, bc2,
+                           update_includes_wd=True)
+    without_wd = spec.formula(w, m, v, g, b1, b2, eps, wd, bc1, bc2,
+                              update_includes_wd=False)
+    # (a + b) - b != a exactly in fp32: the identity holds only to fp32
+    # rounding of the LARGER operands, so the error is checked against the
+    # operand scale, not the (cancelling) difference scale
+    diff = (with_wd - without_wd).double() - wd * w.double()
+    scale = max(float((wd * w.double()).abs().max()),
+                float(without_wd.double().abs().max()))
+    assert float(diff.abs().max()) <= 1e-6 * scale
 
 
-def test_acc_count_saturation_no_wrap_over_long_streak():
-    """A coordinate unselected for hundreds of steps must saturate at 255,
-    never wrap back to small counts."""
-    count = torch.full((4,), 250, dtype=torch.uint8)
-    inactive = torch.zeros(4, dtype=torch.uint8)
-    for _ in range(300):
-        update_grad_acc_count(count, inactive)
-    assert count.tolist() == [255] * 4
+# ------------------------------------------------------------ selective reset
 
-
-def test_saturated_residual_is_averaged_not_reweighted():
-    """Compose saturation WITH a stale residual: a coordinate holding a
-    255-step accumulated gradient enters its next update divided by 255
-    (bounded moment), NOT divided by ~1 as a wrapped/clamped count would."""
-    n = 64
-    stale_grad = torch.full((n,), 255.0)          # the long-accumulated residual
-    param = torch.zeros(n)
-    m0 = torch.zeros(n)
-    v0 = torch.zeros(n)
-    saturated = torch.full((n,), 255, dtype=torch.uint8)
-
-    step, lr, b1, b2, eps, wd = 256, 1e-3, 0.9, 0.95, 1e-8, 0.0
-    p = param.clone(); m = m0.clone(); v = v0.clone()
-    _masked_adamw_step_torch(
-        p, stale_grad, m, v, torch.ones(n, dtype=torch.bool), lr, b1, b2,
-        eps, wd, 1 - b1 ** step, 1 - b2 ** step, False, saturated,
-    )
-    # explicit reference: g/count with 1-beta**count weights, count == 255
-    cnt = torch.full((n,), 255, dtype=torch.float64)
-    ref_m = b1 * 0.0 + (1 - torch.exp(cnt * float(torch.log(torch.tensor(b1))))) * (
-        stale_grad.double() / cnt
-    )
-    torch.testing.assert_close(m, ref_m.float(), rtol=1e-5, atol=1e-7)
-    # bound: no coordinate's moment may approach the raw residual scale
-    # (the wrap bug made count read 0 -> clamped 1 -> m jump to ~(g))
-    assert m.abs().max().item() < 2.0
+def test_selective_reset_fold_semantics():
+    for fold, interval in [(False, 8), (True, 8)]:
+        grad = torch.randn(64)
+        mask = (torch.rand(64) < 0.25).to(torch.uint8)
+        ref = grad.clone()
+        selective_reset(grad, mask, float(interval), fold)
+        active = mask > 0
+        assert torch.all(grad[active] == 0)
+        if fold:
+            torch.testing.assert_close(
+                grad[~active], ref[~active] / interval, rtol=0, atol=0,
+            )
+        else:
+            assert torch.equal(grad[~active], ref[~active])
 
 
 # --------------------------------------------------------------- circular topk
@@ -417,206 +445,10 @@ def test_circular_topk_adaptive_lifecycle():
           "(bootstrap/warmup/tau/collapse/tau-zero latch)")
 
 
-# ------------------------------------------------------ threshold + adaptivity
-
-def test_threshold_select_or_merge_and_always_sync(monkeypatch=None):
-    class _Score:
-        has_threshold_path = True
-
-        def threshold_mask(self, views, threshold, block_size):
-            return [compute_mask(g, threshold) for g in views]
-
-    views = [torch.tensor([0.5, 0.01, 0.2]), torch.tensor([0.3, 0.001])]
-    always = [torch.tensor([0, 1, 0], dtype=torch.uint8), None]
-
-    sel = ThresholdSelection({"threshold": 0.1}, score=_Score())
-    masks = sel.select(_Ctx(views, always, comm_group=None))
-    # 0.5>=0.1 -> 1; 0.01 -> always-sync forced to 1; 0.2 -> 1; 0.3 -> 1; 0.001 -> 0
-    assert masks[0].tolist() == [1, 1, 1]
-    assert masks[1].tolist() == [1, 0]
-
-
-def test_or_merge_survives_world_256():
-    """The mask OR-merge must be a MAX, not a SUM.
-
-    At DP world 256 a uint8 SUM of all-ones wraps to 0: universally-selected
-    coordinates silently drop, identically on every rank — invisible to
-    every consistency layer. MAX of 0/1 is exactly OR and cannot wrap at any
-    world size; staying on uint8 also keeps the collective inside NCCL's
-    supported dtype/op set (int16 is rejected by NCCL outright).
-    """
-    import contextlib
-    from types import SimpleNamespace
-
-    import torch.distributed as dist
-
-    class _Score:
-        has_threshold_path = True
-
-        def threshold_mask(self, views, threshold, block_size):
-            return [compute_mask(g, threshold) for g in views]
-
-    views = [torch.tensor([0.5, 0.01, 0.2, 4.0, 0.001])]
-    sel = ThresholdSelection({"threshold": 0.1}, score=_Score())
-
-    saved_ar, saved_init = dist.all_reduce, dist.is_initialized
-
-    @contextlib.contextmanager
-    def _world256():
-        def fake_allreduce(t, op=None, group=None, async_op=False):
-            if op is dist.ReduceOp.SUM:
-                t.mul_(256)  # equal replicas: SUM == 256 * local (uint8 wraps)
-            # MAX over equal replicas: t already holds the result
-            return SimpleNamespace(wait=lambda: None)
-
-        dist.all_reduce = fake_allreduce
-        try:
-            yield
-        finally:
-            dist.all_reduce = saved_ar
-
-    try:
-        dist.is_initialized = lambda: True
-        with _world256():
-            masks = sel.select(_Ctx(views, [None], comm_group=object()))
-        # a SUM implementation would wrap the ones to 256 % 256 == 0
-        assert masks[0].tolist() == [1, 0, 1, 1, 0]
-    finally:
-        dist.is_initialized = saved_init
-
-
-def test_threshold_adapt_band_and_cap():
-    sel = ThresholdSelection({
-        "threshold": 1e-4, "target_ratio_low": 0.2, "target_ratio_high": 0.3,
-        "threshold_max": 1e-3, "adapt_factor": 0.1,
-    })
-    # ratio 0.9 >> target: threshold increases, capped by threshold_max
-    n = 1000
-    masks = [torch.ones(n, dtype=torch.uint8)]
-    always = [None]
-    for _ in range(200):
-        sel.adapt(masks, always)
-    assert sel.threshold == 1e-3
-    # ratio 0.01 << target: threshold decreases, floored at 0.9x per step
-    sel2 = ThresholdSelection({"threshold": 1e-4, "target_ratio_low": 0.2,
-                               "target_ratio_high": 0.3})
-    masks = [(torch.rand(n) < 0.01).to(torch.uint8)]
-    t0 = sel2.threshold
-    sel2.adapt(masks, [None])
-    assert sel2.threshold < t0 and sel2.threshold >= 0.9 * t0
-
-
-def test_threshold_warmup_anneal_bounds():
-    sel = ThresholdSelection({
-        "threshold": 1e-4, "target_ratio_low": 0.2, "target_ratio_high": 0.3,
-        "warmup_iters": 10, "warmup_start_ratio": 1.0,
-    })
-    # Deterministic ratio 0.99. At adapt_iter 1 the annealed band is
-    # [0.92, 0.93] (progress 0.1 from start 1.0) -> mid 0.925 -> factor
-    # 1 + (0.99 - 0.925) * 0.1 == 1.0065. Asserting the EXACT factor makes
-    # this fail on any warmup-term regression (a non-warmup controller
-    # yields 1.074 against the final band).
-    masks = [torch.tensor([1] * 990 + [0] * 10, dtype=torch.uint8)]
-    t0 = sel.threshold
-    sel.adapt(masks, [None])
-    torch.testing.assert_close(sel.threshold, t0 * 1.0065, rtol=1e-9, atol=0.0)
-    # control: without warmup the SAME ratio moves the threshold by a clearly
-    # different factor — proves the annealed band was actually consulted.
-    plain = ThresholdSelection({
-        "threshold": 1e-4, "target_ratio_low": 0.2, "target_ratio_high": 0.3,
-    })
-    plain.adapt([masks[0].clone()], [None])
-    torch.testing.assert_close(plain.threshold, t0 * 1.074, rtol=1e-9, atol=0.0)
-
-
-def test_threshold_adapt_single_transfer_and_forced_cache():
-    """The controller aggregates selected counts device-side into ONE host
-    transfer and caches static always-sync counts across reselections."""
-    sel = ThresholdSelection({
-        "threshold": 1e-4, "target_ratio_low": 0.2, "target_ratio_high": 0.3,
-    })
-    n = 512
-    forced = torch.zeros(n, dtype=torch.uint8)
-    forced[:7] = 1
-    masks = [(torch.rand(n) < 0.5).to(torch.uint8)]
-    transfers = {"n": 0}
-    real_item = torch.Tensor.item
-
-    def counting_item(self, *a):
-        transfers["n"] += 1
-        return real_item(self, *a)
-
-    torch.Tensor.item = counting_item
-    try:
-        sel.adapt([masks[0].clone()], [forced])
-        first = transfers["n"]
-        assert first >= 1
-        sel.adapt([masks[0].clone()], [forced])
-        second = transfers["n"] - first
-        # cached forced count + single accumulator: steady state keeps the
-        # per-call transfer count at exactly 1 regardless of param count.
-        assert second == 1, second
-    finally:
-        torch.Tensor.item = real_item
-
-
-# ------------------------------------------------------------- radius reset
-
-def test_radius_reset_fold_semantics():
-    for fold, interval in [(False, 8), (True, 8)]:
-        grad = torch.randn(64)
-        mask = (torch.rand(64) < 0.25).to(torch.uint8)
-        ref = grad.clone()
-        radius_reset(grad, mask, float(interval), fold)
-        active = mask > 0
-        assert torch.all(grad[active] == 0)
-        if fold:
-            torch.testing.assert_close(
-                grad[~active], ref[~active] / interval, rtol=0, atol=0,
-            )
-        else:
-            assert torch.equal(grad[~active], ref[~active])
-
-
-# --------------------------------------------------------------- EF reset (origin)
-
-def test_origin_ef_selective_reset_and_counts():
-    ef = MaskedAdamWEF({"grad_acc_count": True, "freeze_inactive": False})
-
-    class _BS:
-        def __init__(self, n):
-            self.grad_data = torch.randn(n)
-            self.active_mask_u8 = (torch.rand(n) < 0.3).to(torch.uint8)
-            self.grad_acc_count = torch.full((n,), 3, dtype=torch.uint8)
-            self.ones_mask_u8 = None
-            self.extra_main_grads = [torch.randn(4)]
-
-    bs = _BS(128)
-    residual_ref = bs.grad_data.clone()
-
-    class _C:
-        support = None
-        bucket_states = [bs]
-        records = []
-
-    ef.reset(_C, was_full=False)
-    active = bs.active_mask_u8 > 0
-    assert torch.all(bs.grad_data[active] == 0)
-    assert torch.equal(bs.grad_data[~active], residual_ref[~active])
-    # communicated -> 1, uncommunicated -> +1 (from 3)
-    assert bs.grad_acc_count[active].min().item() == 1
-    assert bs.grad_acc_count[~active].min().item() == 4
-    assert torch.all(bs.extra_main_grads[0] == 0)
-
-    ef.reset(_C, was_full=True)
-    assert torch.all(bs.grad_data == 0)
-    assert torch.all(bs.grad_acc_count == 1)
-
-
-# ------------------------------------------------- score emission 
+# ------------------------------------------------- score emission (full step)
 
 class _Rec:
-    """Minimal ParamRecord stand-in for RadiusOptEF.full_step.
+    """Minimal ParamRecord stand-in for SgaAdamW.full_step.
 
     __hash__ = None mirrors the engine's @dataclass ParamRecord (value-eq
     classes are unhashable): any dict keyed by the record itself — like the
@@ -640,25 +472,13 @@ class _RecCtx:
         self.records = records
 
 
-def _coi_oracle(param, g, m, v, b1, b2, bc1, bc2, eps, wd):
-    m_new = b1 * m + (1 - b1) * g
-    v_new = b2 * v + (1 - b2) * g * g
-    m_hat = m_new / bc1
-    v_hat = v_new / bc2
-    u_g = m_hat / (v_hat.sqrt() + eps)
-    u_0 = (b1 * m / bc1) / ((b2 * v / bc2).sqrt() + eps)
-    return m_new, v_new, wd * param + u_g, (u_g - u_0).abs()
-
-
 def test_score_emission_matches_oracles():
     """Each emitted score, its buffer swap, and the applied update match a
     hand oracle on pre/post-commit state (fallback path, CPU)."""
-    from sga.plugins.error_feedback.radius_opt import RadiusOptEF
-
     torch.manual_seed(3)
     n, b1, b2, step = 512, 0.9, 0.95, 7
     bc1, bc2 = 1 - b1 ** step, 1 - b2 ** step
-    for mode in ("coi", "abs_g_synced", "abs_m"):
+    for mode in ("coi", "abs_g", "abs_m"):
         param0 = torch.randn(n)
         grad0 = torch.randn(n)
         m0, v0 = torch.randn(n) * 0.1, torch.rand(n) * 0.1
@@ -666,8 +486,8 @@ def test_score_emission_matches_oracles():
         w = param0.clone().requires_grad_(False)
         g = grad0.clone().requires_grad_(False)
         rec = _Rec(w, g)
-        ef = RadiusOptEF({"residual_mean": False}, emit_score=mode)
-        ef.full_step(_RecCtx([rec]))
+        opt = SgaAdamW({"residual_mean": False}, emit_score=mode)
+        opt.full_step(_RecCtx([rec]))
 
         # m0/v0 start at zero here (state is lazily created)
         m_ref = b1 * torch.zeros(n) + (1 - b1) * grad0
@@ -676,7 +496,7 @@ def test_score_emission_matches_oracles():
         if mode == "coi":
             u0_ref = torch.zeros(n)
             score_ref = ((m_ref / bc1) / ((v_ref / bc2).sqrt() + 1e-8) - u0_ref).abs()
-        elif mode == "abs_g_synced":
+        elif mode == "abs_g":
             score_ref = grad0.abs()
         else:
             score_ref = torch.zeros(n)  # |m| with m pre-commit zero
@@ -685,207 +505,115 @@ def test_score_emission_matches_oracles():
                                    rtol=1e-5, atol=1e-7)
 
     # with pre-existing moments, coi is non-trivial: |U(g) - U(0)|
+    param0 = torch.randn(n)
+    grad0 = torch.randn(n)
+    m0, v0 = torch.randn(n) * 0.1, torch.rand(n) * 0.1
     w = param0.clone().requires_grad_(False)
     g = grad0.clone().requires_grad_(False)
     rec = _Rec(w, g)
     rec._state = {"exp_avg": m0.clone(), "exp_avg_sq": v0.clone()}
-    ef = RadiusOptEF({}, emit_score="coi")
-    ef.full_step(_RecCtx([rec]))
-    m_new, v_new, upd, coi = _coi_oracle(param0, grad0, m0, v0,
-                                         b1, b2, bc1, bc2, 1e-8, 1e-2)
-    torch.testing.assert_close(g.data, coi, rtol=1e-5, atol=1e-7)
-    torch.testing.assert_close(w.data, param0 - 1e-3 * upd, rtol=1e-5, atol=1e-7)
-    torch.testing.assert_close(rec._state["exp_avg"], m_new, rtol=1e-5, atol=1e-7)
-    torch.testing.assert_close(rec._state["exp_avg_sq"], v_new, rtol=1e-4, atol=1e-7)
-    print("ok: score emission matches oracles (coi/abs_g_synced/abs_m)")
-
-
-def test_snr_m_abs_m_post_emission_matches_oracles():
-    """snr_m / abs_m_post emission vs hand oracles on pre-commit state.
-
-    snr_m uses STATE-MATCHED bias corrections (exponent = commits already
-    applied = step - 1) and is exactly 0 at step == 1 (no commit yet);
-    abs_m_post = |beta1*m + (1-beta1)*g| with no correction at all.
-    """
-    from sga.plugins.error_feedback.radius_opt import RadiusOptEF
-
-    torch.manual_seed(4)
-    n, b1, b2, eps, wd, step = 512, 0.9, 0.95, 1e-8, 1e-2, 7
-
-    param0 = torch.randn(n)
-    grad0 = torch.randn(n)
-    m0, v0 = torch.randn(n) * 0.1, torch.rand(n) * 0.1 + 1e-4
-
-    # snr_m with pre-existing moments at step 7 (bc_pre exponent 6)
-    w = param0.clone(); g = grad0.clone()
-    rec = _Rec(w, g)
-    rec._state = {"exp_avg": m0.clone(), "exp_avg_sq": v0.clone()}
-    RadiusOptEF({}, emit_score="snr_m").full_step(_RecCtx([rec]))
-    bc1_pre, bc2_pre = 1 - b1 ** (step - 1), 1 - b2 ** (step - 1)
-    snr_ref = (m0 / bc1_pre).abs() / ((v0 / bc2_pre).sqrt() + eps)
-    torch.testing.assert_close(g.data, snr_ref, rtol=1e-5, atol=1e-7)
-
-    # snr_m at step == 1: no commit applied yet -> score is exactly 0
-    w = param0.clone(); g = grad0.clone()
-    rec = _Rec(w, g)
-    rec.step = 1
-    rec._state = {"exp_avg": torch.zeros(n), "exp_avg_sq": torch.zeros(n)}
-    RadiusOptEF({}, emit_score="snr_m").full_step(_RecCtx([rec]))
-    assert torch.all(g.data == 0), "snr_m at step 1 must be exactly 0"
-
-    # abs_m_post = |m_new| (no bias correction of any kind)
-    w = param0.clone(); g = grad0.clone()
-    rec = _Rec(w, g)
-    rec._state = {"exp_avg": m0.clone(), "exp_avg_sq": v0.clone()}
-    RadiusOptEF({}, emit_score="abs_m_post").full_step(_RecCtx([rec]))
-    post_ref = (b1 * m0 + (1 - b1) * grad0).abs()
-    torch.testing.assert_close(g.data, post_ref, rtol=1e-5, atol=1e-7)
-    # ... while the committed m/v and the applied update stay the standard ones
-    bc1, bc2 = 1 - b1 ** step, 1 - b2 ** step
+    opt = SgaAdamW({}, emit_score="coi")
+    opt.full_step(_RecCtx([rec]))
+    oracles = _formula_oracles(param0, m0, v0, grad0, b1, b2, 1e-8, 1e-2,
+                               bc1, bc2)
     m_new = b1 * m0 + (1 - b1) * grad0
     v_new = b2 * v0 + (1 - b2) * grad0 * grad0
-    u_ref = wd * param0 + (m_new / bc1) / ((v_new / bc2).sqrt() + eps)
+    torch.testing.assert_close(g.data, oracles["coi"].float(),
+                               rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(w.data, param0 - 1e-3 * oracles["update"].float(),
+                               rtol=1e-5, atol=1e-7)
     torch.testing.assert_close(rec._state["exp_avg"], m_new, rtol=1e-5, atol=1e-7)
-    torch.testing.assert_close(w.data, param0 - 1e-3 * u_ref, rtol=1e-5, atol=1e-7)
-    print("ok: snr_m/abs_m_post emission matches oracles (incl. step-1 zero)")
+    torch.testing.assert_close(rec._state["exp_avg_sq"], v_new, rtol=1e-4, atol=1e-7)
+    print("ok: score emission matches oracles (coi/abs_g/abs_m)")
 
 
-def test_abs_m_sticky_loyalty_bonus():
-    """abs_m_sticky = abs_m x (1 + lambda * 1[in pre-switch support]).
+# ----------------------------------------------------- combination validation
 
-    Plugin-level contract: the bonus multiplies support members only, fresh
-    tensors come back (the materialized views alias live main grads), and a
-    None support (bootstrap) degenerates to plain abs_m.
-    """
-    from sga.plugins.scores.abs_m_sticky import AbsMStickyScore
-
-    views = [torch.tensor([1.0, 2.0, 3.0, 4.0]),
-             torch.tensor([5.0, 6.0])]
-    support = [torch.tensor([1, 0, 1, 0], dtype=torch.uint8),
-               torch.tensor([0, 1], dtype=torch.uint8)]
-
-    sticky = AbsMStickyScore({"name": "abs_m_sticky"})
-    assert sticky.sticky_lambda == 0.5  # oracle default
-    out = sticky.values(views, support)
-    torch.testing.assert_close(out[0], torch.tensor([1.5, 2.0, 4.5, 4.0]))
-    torch.testing.assert_close(out[1], torch.tensor([5.0, 9.0]))
-    # inputs never mutated (they alias the live main grads)
-    torch.testing.assert_close(views[0], torch.tensor([1.0, 2.0, 3.0, 4.0]))
-    assert out[0].data_ptr() != views[0].data_ptr()
-
-    # bootstrap: no support -> identity (degenerates to abs_m)
-    out = sticky.values(views, None)
-    assert out[0] is views[0]
-
-    # custom lambda
-    sticky = AbsMStickyScore({"name": "abs_m_sticky", "sticky_lambda": 2.0})
-    out = sticky.values(views, support)
-    torch.testing.assert_close(out[0], torch.tensor([3.0, 2.0, 9.0, 4.0]))
-    print("ok: abs_m_sticky loyalty bonus (default/custom lambda, bootstrap)")
-
-
-def test_abs_m_sticky_rejects_invalid_inputs():
-    """Plugin-boundary fail-loud: a non-finite/negative sticky_lambda would
-    poison every boosted score into NaN selection silently; view/slice
-    misalignment cannot trigger with today's engine (aligned slices from the
-    same meta) and must not silently zip-truncate if that ever changes."""
-    from sga.plugins.scores.abs_m_sticky import AbsMStickyScore
-
-    for bad in (float("nan"), float("inf"), -0.1):
-        try:
-            AbsMStickyScore({"name": "abs_m_sticky", "sticky_lambda": bad})
-            raise AssertionError(f"sticky_lambda {bad} accepted")
-        except ValueError as e:
-            assert "sticky_lambda" in str(e), e
-
-    sticky = AbsMStickyScore({"name": "abs_m_sticky"})
-    views = [torch.randn(4), torch.randn(6)]
-    try:
-        sticky.values(views, [torch.ones(4, dtype=torch.uint8)])
-        raise AssertionError("view/slice length mismatch accepted")
-    except ValueError as e:
-        assert "2 views but 1 support slices" in str(e), e
-    try:
-        sticky.values(views, [torch.ones(4, dtype=torch.uint8),
-                              torch.ones(5, dtype=torch.uint8)])
-        raise AssertionError("view/slice numel mismatch accepted")
-    except ValueError as e:
-        assert "slice 1" in str(e) and "5" in str(e) and "6" in str(e), e
-    print("ok: abs_m_sticky rejects bad sticky_lambda and misaligned "
-          "views/slices")
-
-
-def test_emittable_scores_validator_and_build_injection():
+def test_combination_validator_and_build_injection():
     from sga.plugins import (
-        build_ef,
+        OptimizerDecl,
+        build_backend_plugin,
+        build_optimizer,
+        build_selection,
         get_backend_plugin_decl,
-        get_ef_decl,
-        get_score_decl,
+        get_optimizer_decl,
         get_selection_decl,
+        registered_names,
         register_default_plugins,
         validate_combination,
     )
 
     register_default_plugins()
-    ef_decl = get_ef_decl("radius_opt")
-    for name in ("update_ratio", "coi", "abs_g_synced", "abs_m",
-                 "snr_m", "abs_m_post"):
-        assert name in ef_decl.emittable_scores
-        validate_combination(get_score_decl(name), get_selection_decl("circular_topk"),
-                             ef_decl, get_backend_plugin_decl("indexed_sparse"),
-                             {"period": 8, "full_sync_interval": 0})
-    # abs_m_sticky emits via emit_name='abs_m': 'abs_m_sticky' itself is NOT
-    # in emittable_scores, so acceptance here proves the validator checks the
-    # declared emit name, not the plugin name.
-    sticky_decl = get_score_decl("abs_m_sticky")
-    assert sticky_decl.emit_name == "abs_m" and sticky_decl.needs_support
-    assert "abs_m_sticky" not in ef_decl.emittable_scores
-    validate_combination(sticky_decl, get_selection_decl("circular_topk"),
-                         ef_decl, get_backend_plugin_decl("indexed_sparse"),
-                         {"period": 8, "full_sync_interval": 0})
-    # a synced score on a non-emitting EF is rejected at config time
-    for name in ("abs_m", "abs_m_sticky", "snr_m"):
-        try:
-            validate_combination(get_score_decl(name),
-                                 get_selection_decl("circular_topk"),
-                                 get_ef_decl("masked_adamw"),
-                                 get_backend_plugin_decl("masked_pipelined"),
-                                 {"period": 1})
-            raise AssertionError(f"{name} x masked_adamw was not rejected")
-        except ValueError as e:
-            assert "emit" in str(e), e
-    # build injection: the EF instance carries the requested emission mode
-    ef = build_ef("radius_opt", {}, emit_score="abs_m")
-    assert ef.emit_score == "abs_m"
+    opt_decl = get_optimizer_decl("adamw")
+    cycle = {"period": 8, "full_sync_interval": 0}
+    for name in ("update", "coi", "abs_g", "abs_m"):
+        assert name in opt_decl.emittable_scores
+        validate_combination(name, get_selection_decl("circular_topk"),
+                             opt_decl, get_backend_plugin_decl("indexed_sparse"),
+                             cycle)
+    # an unknown score name is rejected with the registered list
     try:
-        build_ef("masked_adamw", {"grad_acc_count": True}, emit_score="coi")
-        raise AssertionError("masked_adamw accepted an emit_score")
+        validate_combination("nope", get_selection_decl("circular_topk"),
+                             opt_decl, get_backend_plugin_decl("indexed_sparse"),
+                             cycle)
+        raise AssertionError("unknown score accepted")
+    except ValueError as e:
+        assert "nope" in str(e) and "abs_g" in str(e), e
+    # a registry score outside the optimizer's emittable set is
+    # offline-only: configs must reject it (simulated via a decl whose
+    # emittable set lacks the name — exactly the future offline-candidate
+    # promotion gate)
+    non_emitting = OptimizerDecl(name="stub", emittable_scores=frozenset())
+    try:
+        validate_combination("abs_m", get_selection_decl("circular_topk"),
+                             non_emitting,
+                             get_backend_plugin_decl("indexed_sparse"), cycle)
+        raise AssertionError("offline-only score accepted")
+    except ValueError as e:
+        assert "emittable" in str(e), e
+    # the residual contract pins full_sync_interval to 0 or the period
+    for bad in ({"period": 8, "full_sync_interval": 4},
+                {"period": 8, "full_sync_interval": 16}):
+        try:
+            validate_combination("abs_m", get_selection_decl("circular_topk"),
+                                 opt_decl,
+                                 get_backend_plugin_decl("indexed_sparse"), bad)
+            raise AssertionError(f"full_sync_interval {bad} accepted")
+        except ValueError as e:
+            assert "full_sync" in str(e), e
+    validate_combination("abs_m", get_selection_decl("circular_topk"),
+                         opt_decl, get_backend_plugin_decl("indexed_sparse"),
+                         {"period": 8, "full_sync_interval": 8})
+
+    # build injection: the optimizer instance carries the requested emission
+    opt = build_optimizer("adamw", {}, emit_score="abs_m")
+    assert opt.emit_score == "abs_m"
+    default_opt = build_optimizer("adamw", {})
+    assert default_opt.emit_score == "update"
+    try:
+        build_optimizer("adamw", {}, emit_score="nope")
+        raise AssertionError("unemittable score accepted at build time")
     except ValueError:
         pass
 
     # every BUILT plugin object exposes its declaration (the engine reads
     # e.g. backend.decl.consumes at the first reselection — a class missing
     # its decl must fail here, not on the cluster)
-    from sga.plugins import (
-        build_backend_plugin,
-        build_score,
-        build_selection,
-        registered_names,
-    )
-
     names = registered_names()
+    assert names["score"] == score_names()
+    assert names["optimizer"] == ["adamw"]
+    assert names["selection"] == ["circular_topk"]
     for n in names["backend"]:
         be = build_backend_plugin(n, {})
         assert be.decl.consumes in ("mask", "idx"), n
-    for n in names["error_feedback"]:
-        assert hasattr(build_ef(n, {}), "decl"), n
+    for n in names["optimizer"]:
+        assert hasattr(build_optimizer(n, {}), "decl"), n
     for n in names["selection"]:
-        params = ({"ratio_percent": 40.0} if "topk" in n else {"threshold": 1e-4})
-        assert hasattr(build_selection(n, params), "decl"), n
-    for n in names["score"]:
-        assert hasattr(build_score(n, {}), "decl"), n
-    print("ok: emittable_scores validator + build injection + decl coverage")
+        assert hasattr(build_selection(n, {"ratio_percent": 40.0}), "decl"), n
+    print("ok: combination validator + build injection + decl coverage")
 
+
+# ------------------------------------------------------------------- support
 
 def test_support_idx_pool_chunked_equals_nonzero():
     from sga.support import BucketSupport, IndexPool, compact_mask_u8
