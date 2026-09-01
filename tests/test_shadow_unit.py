@@ -208,7 +208,7 @@ def test_shadow_rng_guard_raises():
     torch.manual_seed(3)
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
-    selection = build_selection("circular_topk", {"ratio_percent": 30.0})
+    selection = build_selection("topk", {"method": "histogram", "ratio_percent": 30.0})
     opt = build_optimizer("adamw", {}, emit_score="abs_m")
     eng = SGAEngine({"cycle": {"start_iter": 0, "period": 1,
                                "full_sync_interval": 0},
@@ -528,7 +528,7 @@ _BASE = {
         "enabled": True,
         "cycle": {"start_iter": 0, "period": 8, "full_sync_interval": 0},
         "score": {"name": "abs_m"},
-        "selection": {"name": "circular_topk", "ratio_percent": 30.0},
+        "selection": {"name": "topk", "method": "histogram", "ratio_percent": 30.0},
         "optimizer": {"name": "adamw"},
         "backend": {"name": "indexed_sparse"},
     },
@@ -589,7 +589,7 @@ def test_shadow_rng_guard_cuda_half_raises():
     torch.manual_seed(3)
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
-    selection = build_selection("circular_topk", {"ratio_percent": 30.0})
+    selection = build_selection("topk", {"method": "histogram", "ratio_percent": 30.0})
     opt = build_optimizer("adamw", {}, emit_score="abs_m")
     eng = SGAEngine({"cycle": {"start_iter": 0, "period": 1,
                                "full_sync_interval": 0},

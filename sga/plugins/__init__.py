@@ -152,6 +152,9 @@ class SelectionDecl:
     name: str
     output_form: str = "mask"  # 'mask' | 'idx' (Support canonicalizes either way)
     params: tuple = ()         # (PluginParam, ...)
+    # Optional callable(params)->dict: vocabulary-aware default expansion for
+    # inspection CLIs (e.g. topk's per-method view). None = plain resolve.
+    effective: object = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +168,8 @@ class OptimizerDecl:
     # Residual contract folds only at full syncs => cycle boundaries must be full.
     requires_full_sync_every_period: bool = False
     params: tuple = ()             # (PluginParam, ...)
+    # Same inspection hook as SelectionDecl.effective (unused today).
+    effective: object = None
 
     @property
     def emits_score_view(self) -> bool:
@@ -176,6 +181,8 @@ class BackendDecl:
     name: str
     consumes: str = "mask"  # 'mask' | 'idx'
     params: tuple = ()      # (PluginParam, ...)
+    # Same inspection hook as SelectionDecl.effective (unused today).
+    effective: object = None
 
 
 _SELECTIONS: dict = {}
@@ -267,21 +274,19 @@ def validate_combination(score_name: str, selection: SelectionDecl,
 
 
 def build_selection(name, params):
-    from sga.plugins.selection.circular_topk import CircularTopkSelection
+    from sga.plugins.selection.topk import TopkSelection
 
     register_default_plugins()
-    return {
-        "circular_topk": CircularTopkSelection,
-    }[name](_resolved("selection", name, params))
+    params = _resolved("selection", name, params)  # curated unknown-name error
+    return {"topk": TopkSelection}[name](params)
 
 
 def build_optimizer(name, params, emit_score: str = None):
     from sga.plugins.optimizer.adamw import SgaAdamW
 
     register_default_plugins()
-    return {
-        "adamw": SgaAdamW,
-    }[name](_resolved("optimizer", name, params), emit_score=emit_score)
+    params = _resolved("optimizer", name, params)  # curated unknown-name error
+    return {"adamw": SgaAdamW}[name](params, emit_score=emit_score)
 
 
 def build_backend_plugin(name, params):
@@ -290,18 +295,19 @@ def build_backend_plugin(name, params):
     from sga.backends.pipelined_idx_sorted import PipelinedIdxSortedBackend
 
     register_default_plugins()
+    params = _resolved("backend", name, params)  # curated unknown-name error
     return {
         "masked_pipelined": MaskedPipelinedBackend,
         "indexed_sparse": IndexedSparseBackend,
         "pipelined_idx_sorted": PipelinedIdxSortedBackend,
-    }[name](_resolved("backend", name, params))
+    }[name](params)
 
 
 def _resolved(axis, name, params):
     """Curated unknown-plugin error + name strip; the CONSTRUCTOR stays the
     single resolver (defaults expand once, explicit-vs-default stays
-    distinguishable for cross-param legality like circular_topk's dead
-    hist_mode-under-adaptive refusal)."""
+    distinguishable for cross-param legality like topk's per-method
+    foreign-key refusal)."""
     registry = {"selection": _SELECTIONS, "optimizer": _OPTIMIZERS,
                 "backend": _BACKEND_PLUGINS}[axis]
     _lookup(registry, name, axis)
@@ -312,11 +318,11 @@ def _resolved(axis, name, params):
 
 def register_default_plugins() -> None:
     """Idempotent registration of the built-in plugin declarations."""
-    from sga.plugins.selection.circular_topk import DECL as topk_decl
+    from sga.plugins.selection.topk import DECL as topk_decl
     from sga.plugins.optimizer.adamw import DECL as adamw_decl
 
     for name, decl in (
-        ("circular_topk", topk_decl),
+        ("topk", topk_decl),
     ):
         if name not in _SELECTIONS:
             register_selection(name, decl)

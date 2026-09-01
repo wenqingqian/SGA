@@ -94,11 +94,14 @@ def _expanded(path: str) -> dict:
               "backend": get_backend_plugin_decl}
     for axis in ("selection", "optimizer", "backend"):
         name = engine_config[axis]["name"]
+        decl = getter[axis](name)
         params = {k: v for k, v in engine_config[axis].items() if k != "name"}
-        engine_config[axis] = {
-            "name": name,
-            **resolve_plugin_params(axis, name, getter[axis](name), params),
-        }
+        resolved = resolve_plugin_params(axis, name, decl, params)
+        if decl.effective is not None:
+            # vocabulary-aware view (e.g. topk expands only the configured
+            # method's params — the union defaults would not reconstruct)
+            resolved = decl.effective(resolved)
+        engine_config[axis] = {"name": name, **resolved}
     engine_config.setdefault("cycle", {})
     for key, default in (("start_iter", 0), ("period", 1),
                          ("full_sync_interval", 0)):

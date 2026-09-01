@@ -145,7 +145,7 @@ def select_masks_histogram(grads, k, comm_group, mode="exact"):
     try:
         shift, nbins, stride = _HIST_MODES[mode]
     except KeyError:
-        raise ValueError(f"unknown hist_mode: {mode!r}") from None
+        raise ValueError(f"unknown histogram_mode: {mode!r}") from None
 
     hist = _build_histogram(grads, shift, nbins, stride)
     if comm_group is not None and torch.distributed.is_initialized():
@@ -181,3 +181,23 @@ def select_masks_histogram(grads, k, comm_group, mode="exact"):
             m[s:s + _HIST_CHUNK] = _abs_bit_top(gc, shift) >= b
         masks.append(m)
     return _bin_edge_float(b, shift), masks
+
+
+class HistogramSelect:
+    """method=histogram impl: ``select(grads, k, comm_group, warmup_target)``.
+
+    ``warmup_target`` is adaptive-only and ignored here. Threshold semantics
+    by tier: exact kth value (``exact``) or the crossing bin's lower edge
+    (``balanced``/``fast``; also the adaptive tau's bootstrap input).
+    """
+
+    def __init__(self, mode: str = "exact"):
+        if mode not in _HIST_MODES:
+            raise ValueError(
+                f"unknown histogram_mode: {mode!r} "
+                f"(expected one of {sorted(_HIST_MODES)})"
+            )
+        self.mode = mode
+
+    def select(self, grads, k, comm_group, warmup_target=None):
+        return select_masks_histogram(grads, k, comm_group, mode=self.mode)

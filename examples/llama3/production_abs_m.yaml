@@ -7,7 +7,7 @@
 # directly comparable.
 #
 # score=abs_m (|pre-commit first moment|, EF-kernel-emitted at full syncs) +
-# selection=circular_topk adaptive (v3.1: fast-histogram warmup gated on the
+# selection=topk method=adaptive (v3.1: fast-histogram warmup gated on the
 # measured ratio, then a persistent threshold with the ±1pp dead band and
 # log-space steps) + optimizer=adamw (residual) +
 # backend=pipelined_idx_sorted (S=3 compact-set pipeline on a twin
@@ -72,11 +72,9 @@ sga:
   score:
     name: abs_m
   selection:
-    name: circular_topk
+    name: topk
+    method: adaptive
     ratio_percent: 40.0
-    # hist_mode is DEAD under adaptive (explicitly rejected at build time);
-    # non-adaptive presets force it via hydra '+sga.selection.hist_mode=...'.
-    adaptive: true
     adaptive_warmup_syncs: 5
   optimizer:
     name: adamw

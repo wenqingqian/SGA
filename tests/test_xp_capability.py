@@ -29,7 +29,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import sga.plugins.selection.circular_topk as ct
+import sga.plugins.selection._adaptive as adapt_mod
 from sga.plugins.optimizer.adamw import adamw_grad_correct
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch
 from sga.plugins.scores import Score
@@ -40,7 +40,8 @@ from sga.plugins.selection._histogram import (
     _histogram_select_threshold,
     select_masks_histogram,
 )
-from sga.plugins.selection.circular_topk import CircularTopkSelection, _adapt_threshold
+from sga.plugins.selection._adaptive import _adapt_threshold
+from sga.plugins.selection.topk import TopkSelection
 
 
 class _SelCtx:
@@ -115,7 +116,7 @@ def test_top16_monotone_and_sign_stripped():
 
 # ------------------------------------------------- approximate tiers (tier 2)
 
-def test_hist_mode_production_closeness():
+def test_histogram_mode_production_closeness():
     """balanced within 0.5pp / fast within 2pp of the exact selected count on
     a 1M production-shaped gradient (periodic large outliers); every selected
     element passes the returned bin edge; all-equal degenerate selects all."""
@@ -152,10 +153,10 @@ def test_hist_mode_production_closeness():
 
     try:
         select_masks_histogram(grads, 100, None, mode="bogus")
-        raise AssertionError("bogus hist mode accepted")
+        raise AssertionError("bogus histogram_mode accepted")
     except ValueError:
         pass
-    print("ok: hist mode production closeness (0.5pp/2pp) + degenerate")
+    print("ok: histogram mode production closeness (0.5pp/2pp) + degenerate")
 
 
 # -------------------------------------------------------- adaptive threshold
@@ -197,29 +198,30 @@ def test_adaptive_warmup_gate_and_consecutive_reset():
     bad = torch.zeros(1000, dtype=torch.uint8)
     bad[:800] = 1   # 80% >> target -> gate fails
 
-    sel = CircularTopkSelection({"ratio_percent": 40.0, "adaptive": True})
+    sel = TopkSelection({"method": "adaptive", "ratio_percent": 40.0})
     seq = [(0.6, [good]), (0.6, [good]), (0.6, [bad]), (0.6, [good])]
-    with mock.patch.object(ct, "select_masks_histogram", side_effect=seq):
-        sel.select(_SelCtx(grads, warmup_target=3))
-        assert sel._warmup_passed == 1
-        sel.select(_SelCtx(grads, warmup_target=3))
-        assert sel._warmup_passed == 2
-        sel.select(_SelCtx(grads, warmup_target=3))
-        assert sel._warmup_passed == 0  # reset, not 3
-        sel.select(_SelCtx(grads, warmup_target=3))
-        assert sel._warmup_passed == 1
-
-    sel2 = CircularTopkSelection({"ratio_percent": 40.0, "adaptive": True})
     with mock.patch.object(
-        ct, "select_masks_histogram", return_value=(0.6, [good])
+        adapt_mod, "select_masks_histogram", side_effect=seq):
+        sel.select(_SelCtx(grads, warmup_target=3))
+        assert sel.warmup_passed == 1
+        sel.select(_SelCtx(grads, warmup_target=3))
+        assert sel.warmup_passed == 2
+        sel.select(_SelCtx(grads, warmup_target=3))
+        assert sel.warmup_passed == 0  # reset, not 3
+        sel.select(_SelCtx(grads, warmup_target=3))
+        assert sel.warmup_passed == 1
+
+    sel2 = TopkSelection({"method": "adaptive", "ratio_percent": 40.0})
+    with mock.patch.object(
+        adapt_mod, "select_masks_histogram", return_value=(0.6, [good])
     ) as hist:
         sel2.select(_SelCtx(grads, warmup_target=0))
         assert hist.call_count == 1
         assert hist.call_args.kwargs.get("mode") == "fast"
-        assert sel2._warmup_passed == 1
+        assert sel2.warmup_passed == 1
         sel2.select(_SelCtx(grads, warmup_target=0))  # tau path from here
         assert hist.call_count == 1
-        assert sel2._tau == 0.6  # 40% measured, in band, frozen
+        assert sel2.tau == 0.6  # 40% measured, in band, frozen
     print("ok: adaptive warmup gate (consecutive reset, zero short-circuit)")
 
 
@@ -229,33 +231,33 @@ def test_adaptive_tau_feedback_and_collapse_mode():
     guard re-bootstraps in the CONFIGURED warmup mode."""
     grads = [torch.linspace(-1, 1, 1000)]
 
-    sel = CircularTopkSelection({"ratio_percent": 40.0, "adaptive": True})
-    sel._tau = 0.5           # 50% selected -> over target
-    sel._warmup_passed = 5   # past the default warmup
+    sel = TopkSelection({"method": "adaptive", "ratio_percent": 40.0})
+    sel._impl.tau = 0.5           # 50% selected -> over target
+    sel._impl.warmup_passed = 5   # past the default warmup
     masks = sel.select(_SelCtx(grads))
     assert sel.last_threshold == 0.5  # masks built with the OLD tau
     assert torch.equal(masks[0], (grads[0].abs() >= 0.5).to(torch.uint8))
-    assert math.isclose(sel._tau, 0.5 * 1.25 ** 0.5, rel_tol=1e-12)
+    assert math.isclose(sel.tau, 0.5 * 1.25 ** 0.5, rel_tol=1e-12)
 
-    sel2 = CircularTopkSelection({"ratio_percent": 40.0, "adaptive": True})
-    sel2._tau = 0.6           # 40% selected, in band
-    sel2._warmup_passed = 5
+    sel2 = TopkSelection({"method": "adaptive", "ratio_percent": 40.0})
+    sel2._impl.tau = 0.6           # 40% selected, in band
+    sel2._impl.warmup_passed = 5
     sel2.select(_SelCtx(grads))
-    assert sel2._tau == 0.6
+    assert sel2.tau == 0.6
 
     # collapse: nothing passes tau -> re-bootstrap in the warmup mode
     canned = (0.6, [(grads[0].abs() >= 0.6).to(torch.uint8)])
-    sel3 = CircularTopkSelection({"ratio_percent": 40.0, "adaptive": True,
+    sel3 = TopkSelection({"method": "adaptive", "ratio_percent": 40.0,
                                   "adaptive_warmup_mode": "exact"})
-    sel3._tau = 1e9
-    sel3._warmup_passed = 5
+    sel3._impl.tau = 1e9
+    sel3._impl.warmup_passed = 5
     with mock.patch.object(
-        ct, "select_masks_histogram", return_value=canned
+        adapt_mod, "select_masks_histogram", return_value=canned
     ) as hist:
         masks = sel3.select(_SelCtx(grads))
     hist.assert_called_once()
     assert hist.call_args.kwargs.get("mode") == "exact"
-    assert sel3._tau == 0.6
+    assert sel3.tau == 0.6
     assert int(masks[0].sum().item()) == 400
     print("ok: adaptive tau feedback exact factor + collapse mode")
 

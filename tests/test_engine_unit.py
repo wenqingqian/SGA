@@ -61,7 +61,7 @@ def test_cycle_boundary_full_pattern():
         [28, 36, 44, 52, 60]
 
 
-# (the v3.1 warmup-anchor formula moved INTO circular_topk with the
+# (the v3.1 warmup-anchor formula moved INTO the selection impl with the
 # selection-owned warmup_sync_target hook; its pinning lives in
 # tests/test_plugins_unit.py::test_warmup_sync_target_anchor)
 
@@ -410,8 +410,8 @@ class _FakeMPOpt:
 # over a mask-consuming backend.
 _UPDATE = {
     "score": "update",
-    "selection": "circular_topk",
-    "selection_params": {"ratio_percent": 30.0},
+    "selection": "topk",
+    "selection_params": {"method": "histogram", "ratio_percent": 30.0},
     "opt": "adamw",
     "opt_params": {"residual_mean": False},
     "cycle": {"start_iter": 0, "period": 3, "full_sync_interval": 0},
@@ -422,8 +422,8 @@ _UPDATE = {
 # apply fused in the same pass, over an idx-consuming backend.
 _ABS_M = {
     "score": "abs_m",
-    "selection": "circular_topk",
-    "selection_params": {"ratio_percent": 30.0},
+    "selection": "topk",
+    "selection_params": {"method": "histogram", "ratio_percent": 30.0},
     "opt": "adamw",
     "opt_params": {"residual_mean": False},
     "cycle": {"start_iter": 2, "period": 3, "full_sync_interval": 0},
@@ -651,7 +651,7 @@ def test_failed_step_fully_clears_and_repeats_accounting():
 def test_grad_norm_bypass_forces_next_full():
     class _BypassSelection:
         """Stub exposing the optional wants_force_full hook the engine probes
-        generically (circular_topk does not implement it; the routing itself
+        generically (plain topk does not implement it; the routing itself
         is the unit under test)."""
 
         params = {}
@@ -769,7 +769,7 @@ def test_count_guard_once_per_cycle_and_flag_off():
     per-step checks re-verify identical numbers). checks.count_guard=false
     (the legacy skip flag's counterpart) disables it entirely."""
     def _run_and_count(config_extra):
-        selection = build_selection("circular_topk", {"ratio_percent": 30.0})
+        selection = build_selection("topk", {"method": "histogram", "ratio_percent": 30.0})
         opt = build_optimizer("adamw", {"residual_mean": False},
                               emit_score="update")
         eng = SGAEngine({"cycle": dict(_ABS_M["cycle"]), **config_extra},

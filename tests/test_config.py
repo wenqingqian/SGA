@@ -50,11 +50,11 @@ def expect_error(fn, needle):
 
 
 def _enable_standard(cfg):
-    """The canonical enabled combo: abs_m + circular_topk + adamw."""
+    """The canonical enabled combo: abs_m + topk(histogram) + adamw."""
     cfg.sga.enabled = True
     cfg.sga.cycle = {"start_iter": 0, "period": 8, "full_sync_interval": 0}
     cfg.sga.score = {"name": "abs_m"}
-    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0}
+    cfg.sga.selection = {"name": "topk", "method": "histogram", "ratio_percent": 30.0}
     cfg.sga.optimizer = {"name": "adamw"}
     cfg.sga.backend = {"name": "indexed_sparse"}
     return cfg
@@ -68,7 +68,7 @@ def test_all_off_dense_ok():
 
 def test_enabled_field_named_in_error():
     cfg, _ = make_base()
-    cfg.sga.selection = {"name": "circular_topk"}
+    cfg.sga.selection = {"name": "topk", "method": "histogram"}
     expect_error(lambda: validate_sga_section(cfg), "selection")
     print("ok: enabled field is named in the error")
 
@@ -77,7 +77,7 @@ def test_fourfield_combination_resolves():
     cfg, _ = make_base()
     _enable_standard(cfg)
     engine_cfg = sga_section_to_config(cfg)
-    assert engine_cfg["selection"] == {"name": "circular_topk",
+    assert engine_cfg["selection"] == {"name": "topk", "method": "histogram",
                                        "ratio_percent": 30.0}
     assert engine_cfg["optimizer"] == {"name": "adamw"}
     print("ok: four-field combination resolves to the engine config")
@@ -236,7 +236,7 @@ def test_enabled_emits_flat_flag_sequence():
     cfg.sga.enabled = True
     cfg.sga.cycle = {"start_iter": 0, "period": 2, "full_sync_interval": 0}
     cfg.sga.score = {"name": "abs_m"}
-    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 20.0}
+    cfg.sga.selection = {"name": "topk", "method": "histogram", "ratio_percent": 20.0}
     cfg.sga.optimizer = {"name": "adamw", "residual_mean": True}
     cfg.sga.backend = {"name": "masked_pipelined"}
     expected_engine_cfg = sga_section_to_config(cfg)
@@ -297,8 +297,8 @@ def test_sga_top_level_allowlist():
     expect_error(lambda: sga_section_to_config(cfg), "unknown keys ['shadw']")
     # unknown key beats the mode-legality diagnostics (membership first)
     cfg2, _ = make_base()
-    cfg2.sga.selection = {"name": "circular_topk"}
-    cfg2.sga.slect = {"name": "circular_topk"}
+    cfg2.sga.selection = {"name": "topk", "method": "histogram"}
+    cfg2.sga.slect = {"name": "topk", "method": "histogram"}
     expect_error(lambda: sga_section_to_config(cfg2), "unknown keys ['slect']")
 
     # every top-level key at once (enabled path) resolves
@@ -343,21 +343,21 @@ def test_plugin_param_vocabulary():
     cfg, _ = make_base()
     _enable_standard(cfg)
 
-    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0,
-                         "rtaio": 5}
+    cfg.sga.selection = {"name": "topk", "method": "histogram",
+                         "ratio_percent": 30.0, "rtaio": 5}
     expect_error(lambda: sga_section_to_config(cfg), "unknown params ['rtaio']")
 
-    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": "30"}
+    cfg.sga.selection = {"name": "topk", "method": "histogram", "ratio_percent": "30"}
     expect_error(lambda: sga_section_to_config(cfg), "must be float")
 
-    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0,
-                         "hist_mode": "turbo"}
+    cfg.sga.selection = {"name": "topk", "method": "histogram",
+                         "ratio_percent": 30.0, "histogram_mode": "turbo"}
     expect_error(lambda: sga_section_to_config(cfg), "must be one of")
 
-    cfg.sga.selection = {"name": "circular_topk"}  # ratio_percent required
+    cfg.sga.selection = {"name": "topk", "method": "histogram"}  # ratio_percent required
     expect_error(lambda: sga_section_to_config(cfg), "required")
 
-    cfg.sga.selection = {"name": "circular_topk", "ratio_percent": 30.0}
+    cfg.sga.selection = {"name": "topk", "method": "histogram", "ratio_percent": 30.0}
     cfg.sga.optimizer = {"name": "adamw", "residual_mean": "yes"}
     expect_error(lambda: sga_section_to_config(cfg), "must be bool")
 

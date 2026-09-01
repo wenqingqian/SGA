@@ -5,7 +5,7 @@ Covers:
 - score registry formulas vs straightforward fp64 oracles (all four scores,
   scratch-routed == freshly-allocated, wd-free update variant);
 - selective reset fold semantics (undivided / /T / full clear);
-- circular topk: histogram threshold == exact torch.kthvalue threshold,
+- topk: histogram threshold == exact torch.kthvalue threshold,
   mask equality, k rounding bound, three-tier geometry + chunking;
 - adaptive controller band logic, clamps and lifecycle;
 - declaration-based combination validation + build injection + decl coverage.
@@ -23,14 +23,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sga.plugins.optimizer.adamw import SgaAdamW, selective_reset
 from sga.plugins.scores import SCRATCH_SCORES, get_score_spec, score_names
-from sga.plugins.selection.circular_topk import (
-    CircularTopkSelection,
+from sga.plugins.selection._exact import select_masks_exact_kthvalue
+from sga.plugins.selection._histogram import (
     _HIST_BINS,
     _abs_bit_top16,
     _histogram_select_threshold,
-    _select_masks_exact_kthvalue,
-    _select_masks_histogram,
+    select_masks_histogram,
 )
+from sga.plugins.selection.topk import _METHOD_KEYS, TopkSelection
 
 torch.manual_seed(0)
 
@@ -43,6 +43,18 @@ class _Ctx:
 
 
 # ------------------------------------------------------------- score registry
+
+def test_old_selection_name_fails_loud():
+    """circular_topk (renamed to topk earlier) must fail with the
+    curated unknown-plugin error — not a KeyError from the dispatch dict."""
+    from sga.plugins import build_selection
+    try:
+        build_selection("circular_topk", {"ratio_percent": 20.0})
+        raise AssertionError("old name accepted")
+    except ValueError as e:
+        assert "circular_topk" in str(e) and "['topk']" in str(e), e
+    print("ok: old selection name fails loud with the registered list")
+
 
 def test_registry_contents():
     assert score_names() == ["abs_g", "abs_m", "coi", "update"]
@@ -221,14 +233,14 @@ def test_selective_reset_fold_semantics():
             assert torch.equal(grad[~active], ref[~active])
 
 
-# --------------------------------------------------------------- circular topk
+# --------------------------------------------------------------- topk
 
-def test_histogram_matches_exact_kthvalue():
+def test_histogram_matches_exact_method():
     for trial in range(5):
         grads = [torch.randn(1000), torch.randn(317), torch.randn(1)]
         k = 100 + trial * 37
-        t_h, m_h = _select_masks_histogram(grads, k, None)
-        t_e, m_e = _select_masks_exact_kthvalue(grads, k, None)
+        t_h, m_h = select_masks_histogram(grads, k, None)
+        t_e, m_e = select_masks_exact_kthvalue(grads, k, None)
         assert t_h == t_e, (t_h, t_e)
         for a, b in zip(m_h, m_e):
             assert torch.equal(a, b)
@@ -236,8 +248,8 @@ def test_histogram_matches_exact_kthvalue():
         assert n_sel >= k  # ties at the boundary are all selected
 
 
-def test_circular_topk_k_rounding():
-    sel = CircularTopkSelection({"ratio_percent": 10.0})
+def test_topk_k_rounding():
+    sel = TopkSelection({"method": "histogram", "ratio_percent": 10.0})
     n = 1000
     assert sel.k_for(n) == 100
     # rounding bound from k = max(1, round(n * r)): |selected/n - r| <= 0.5/n
@@ -250,16 +262,29 @@ def test_warmup_sync_target_anchor():
     T iters from the run start leaves max(0, (N*T - 1 - start) // T) gated
     syncs for a selection starting at start_iter; a late start (window
     already over) leaves a single bootstrap; an unset window yields None."""
-    sel = CircularTopkSelection({"ratio_percent": 40.0, "adaptive": True,
+    sel = TopkSelection({"method": "adaptive", "ratio_percent": 40.0,
                                  "adaptive_warmup_syncs": 5})
     assert sel.warmup_sync_target(start_iter=0, period=4) == 4  # syncs at 4,8,12,16
     assert sel.warmup_sync_target(start_iter=6, period=4) == (20 - 1 - 6) // 4
     assert sel.warmup_sync_target(start_iter=25, period=4) == 0
 
-    unset = CircularTopkSelection({"ratio_percent": 40.0, "adaptive": True,
+    unset = TopkSelection({"method": "adaptive", "ratio_percent": 40.0,
                                    "adaptive_warmup_syncs": None})
-    assert unset.adaptive_warmup_syncs is None
+    assert unset.params["adaptive_warmup_syncs"] is None
     assert unset.warmup_sync_target(start_iter=0, period=4) is None
+
+    # null syncs + no engine anchor (warmup_target=None): the gate
+    # short-circuits to a single bootstrap, then the persistent tau path
+    # takes over (the old code crashed here with max(None, 1))
+    torch.manual_seed(4)
+    grads = [torch.randn(2048)]
+    sel0 = TopkSelection({"method": "adaptive", "ratio_percent": 10.0,
+                          "adaptive_warmup_syncs": None})
+    masks = sel0.select(_Ctx(grads, comm_group=None, warmup_target=None))
+    assert sum(int(torch.count_nonzero(m).item()) for m in masks) > 0
+    assert sel0.tau is not None and sel0.tau > 0.0
+    sel0.select(_Ctx(grads, comm_group=None, warmup_target=None))
+    assert sel0.last_threshold == sel0.tau  # steady state: tau-driven
 
 
 def test_histogram_world_replica_threshold():
@@ -299,8 +324,8 @@ def test_hist_tiers_geometry_and_chunking():
     n_total = sum(g.numel() for g in grads)
     k = int(round(n_total * 0.10))
 
-    t_exact, m_exact = _select_masks_histogram(grads, k, None)
-    t_ctl, m_ctl = _select_masks_exact_kthvalue(grads, k, None)
+    t_exact, m_exact = select_masks_histogram(grads, k, None)
+    t_ctl, m_ctl = select_masks_exact_kthvalue(grads, k, None)
     assert t_exact == t_ctl
     for a, b in zip(m_exact, m_ctl):
         assert torch.equal(a, b)
@@ -310,7 +335,7 @@ def test_hist_tiers_geometry_and_chunking():
     assert old_chunk % _h._HIST_SAMPLE_STRIDE == 0
     _h._HIST_CHUNK = 1024
     try:
-        t_ch, m_ch = _select_masks_histogram(grads, k, None)
+        t_ch, m_ch = select_masks_histogram(grads, k, None)
         assert t_ch == t_exact
         for a, b in zip(m_ch, m_exact):
             assert torch.equal(a, b)
@@ -343,21 +368,23 @@ def test_hist_tiers_geometry_and_chunking():
     b3 = int(torch.searchsorted(torch.cumsum(hist * 3, 0), r1 * 3).item())
     assert b1 == b3
 
-    # selection plumbing: hist_mode flows through, unknown modes rejected
-    sel = CircularTopkSelection({"ratio_percent": 10.0, "hist_mode": "fast"})
+    # selection plumbing: histogram_mode flows through, unknown modes rejected
+    sel = TopkSelection({"method": "histogram", "ratio_percent": 10.0,
+                        "histogram_mode": "fast"})
     sel.select(_Ctx(grads, comm_group=None))
     bits = torch.tensor(sel.last_threshold, dtype=torch.float32).view(torch.int32).item()
     assert (bits & ((1 << 19) - 1)) == 0
     try:
-        CircularTopkSelection({"ratio_percent": 10.0, "hist_mode": "turbo"})
-        raise AssertionError("unknown hist_mode accepted")
+        TopkSelection({"method": "histogram", "ratio_percent": 10.0,
+                        "histogram_mode": "turbo"})
+        raise AssertionError("unknown histogram_mode accepted")
     except ValueError:
         pass
     print("ok: hist tiers (exact/balanced/fast) geometry, chunking, closeness")
 
 
 def test_adaptive_threshold_band_and_clamps():
-    from sga.plugins.selection.circular_topk import _adapt_threshold
+    from sga.plugins.selection._adaptive import _adapt_threshold
 
     tau = 1.0
     # inside the ±1pp dead band: unchanged
@@ -372,39 +399,39 @@ def test_adaptive_threshold_band_and_clamps():
     print("ok: adaptive threshold band + log-space clamps")
 
 
-def test_circular_topk_adaptive_lifecycle():
+def test_topk_adaptive_lifecycle():
     """Bootstrap -> gated warmup -> persistent tau feedback -> collapse
     re-bootstrap (v3.1 semantics, default fast-mode warmup histogram)."""
     torch.manual_seed(12)
     grads = [torch.randn(4096), torch.randn(1000)]
-    sel = CircularTopkSelection({"ratio_percent": 10.0, "adaptive": True})
-    assert sel.adaptive_warmup_mode == "fast"
+    sel = TopkSelection({"method": "adaptive", "ratio_percent": 10.0})
+    assert sel._impl.warmup_mode == "fast"
 
     # 1) bootstrap from the warmup-mode histogram; tau is its bin edge
     sel.select(_Ctx(grads, comm_group=None, warmup_target=3))
     bits = torch.tensor(sel.last_threshold, dtype=torch.float32).view(torch.int32).item()
     assert (bits & ((1 << 19) - 1)) == 0
-    assert sel._tau == sel.last_threshold
-    assert sel._warmup_passed in (0, 1)  # gated on the measured ratio
+    assert sel.tau == sel.last_threshold
+    assert sel.warmup_passed in (0, 1)  # gated on the measured ratio
 
     # 2) a miss extends the warmup (never escalates): still bootstrapping
-    sel._warmup_passed = 0
+    sel._impl.warmup_passed = 0
     sel.select(_Ctx(grads, comm_group=None, warmup_target=3))
-    assert sel._tau == sel.last_threshold
+    assert sel.tau == sel.last_threshold
 
     # 3) after the gate: masks == |g| >= tau, built with the OLD tau while
     # the feedback moves the persistent tau for the next cycle
-    sel._warmup_passed = 3
-    tau = sel._tau
+    sel._impl.warmup_passed = 3
+    tau = sel.tau
     masks = sel.select(_Ctx(grads, comm_group=None, warmup_target=3))
     for g, m in zip(grads, masks):
         assert torch.equal(m, (g.abs() >= tau).to(torch.uint8))
     assert sel.last_threshold == tau
 
     # 4) collapse guard: everything below tau -> re-bootstrap from histogram
-    sel._tau = 1e30
+    sel._impl.tau = 1e30
     masks = sel.select(_Ctx(grads, comm_group=None, warmup_target=3))
-    assert sel._tau < 1e30
+    assert sel.tau < 1e30
     assert any(int(torch.count_nonzero(m).item()) for m in masks)
 
     # 5) a latched zero tau cannot persist: the collapse guard treats
@@ -414,37 +441,36 @@ def test_circular_topk_adaptive_lifecycle():
     #    feedback could otherwise never leave zero).
     import unittest.mock as mock
 
-    import sga.plugins.selection.circular_topk as ct_mod
+    import sga.plugins.selection._adaptive as adapt_mod
     from sga.plugins.selection._histogram import _bin_edge_float
 
-    sel._warmup_passed = 5
-    sel._tau = 0.0
+    sel._impl.warmup_passed = 5
+    sel._impl.tau = 0.0
     canned_zero = (0.0, [(grads[0].abs() >= 0.10).to(torch.uint8)])
-    with mock.patch.object(ct_mod, "select_masks_histogram",
+    with mock.patch.object(adapt_mod, "select_masks_histogram",
                            return_value=canned_zero):
         masks = sel.select(_Ctx(grads, comm_group=None, warmup_target=0))
-    assert sel._tau > 0.0, sel._tau
-    assert sel._tau == _bin_edge_float(1, 19), sel._tau  # fast mode floor
+    assert sel.tau > 0.0, sel.tau
+    assert sel.tau == _bin_edge_float(1, 19), sel.tau  # fast mode floor
     assert all(int(torch.count_nonzero(m).item()) for m in masks)
 
-    # the A/B control path and adaptive are mutually exclusive
-    try:
-        CircularTopkSelection({"ratio_percent": 10.0, "adaptive": True,
-                               "exact_kthvalue": True})
-        raise AssertionError("adaptive + exact_kthvalue accepted")
-    except ValueError:
-        pass
-    # an explicit hist_mode beside adaptive is rejected loudly too — it
-    # would be silently dead there (bootstrap uses adaptive_warmup_mode,
-    # steady state uses the persistent tau)
-    try:
-        CircularTopkSelection({"ratio_percent": 10.0, "adaptive": True,
-                               "hist_mode": "balanced"})
-        raise AssertionError("adaptive + explicit hist_mode accepted")
-    except ValueError as e:
-        assert "hist_mode" in str(e), e
-    print("ok: circular_topk adaptive lifecycle "
-          "(bootstrap/warmup/tau/collapse/tau-zero latch)")
+    # per-method vocabulary: a foreign method's knob is rejected loudly —
+    # it would be silently dead under the configured method (full product)
+    for method in ("adaptive", "exact", "histogram"):
+        for key, val in (("histogram_mode", "exact"),
+                         ("adaptive_warmup_syncs", 3),
+                         ("adaptive_warmup_mode", "fast")):
+            cfg = {"method": method, "ratio_percent": 10.0, key: val}
+            if key in _METHOD_KEYS[method]:
+                TopkSelection(cfg)  # legal under its own method
+                continue
+            try:
+                TopkSelection(cfg)
+                raise AssertionError(f"{method} + {key} accepted")
+            except ValueError as e:
+                assert key in str(e) and method in str(e), e
+    print("ok: topk adaptive lifecycle (bootstrap/warmup/tau/collapse/"
+          "tau-zero latch) + per-method foreign-key rejection")
 
 
 # ------------------------------------------------- score emission (full step)
@@ -550,12 +576,12 @@ def test_combination_validator_and_build_injection():
     cycle = {"period": 8, "full_sync_interval": 0}
     for name in ("update", "coi", "abs_g", "abs_m"):
         assert name in opt_decl.emittable_scores
-        validate_combination(name, get_selection_decl("circular_topk"),
+        validate_combination(name, get_selection_decl("topk"),
                              opt_decl, get_backend_plugin_decl("indexed_sparse"),
                              cycle)
     # an unknown score name is rejected with the registered list
     try:
-        validate_combination("nope", get_selection_decl("circular_topk"),
+        validate_combination("nope", get_selection_decl("topk"),
                              opt_decl, get_backend_plugin_decl("indexed_sparse"),
                              cycle)
         raise AssertionError("unknown score accepted")
@@ -567,7 +593,7 @@ def test_combination_validator_and_build_injection():
     # promotion gate)
     non_emitting = OptimizerDecl(name="stub", emittable_scores=frozenset())
     try:
-        validate_combination("abs_m", get_selection_decl("circular_topk"),
+        validate_combination("abs_m", get_selection_decl("topk"),
                              non_emitting,
                              get_backend_plugin_decl("indexed_sparse"), cycle)
         raise AssertionError("offline-only score accepted")
@@ -577,13 +603,13 @@ def test_combination_validator_and_build_injection():
     for bad in ({"period": 8, "full_sync_interval": 4},
                 {"period": 8, "full_sync_interval": 16}):
         try:
-            validate_combination("abs_m", get_selection_decl("circular_topk"),
+            validate_combination("abs_m", get_selection_decl("topk"),
                                  opt_decl,
                                  get_backend_plugin_decl("indexed_sparse"), bad)
             raise AssertionError(f"full_sync_interval {bad} accepted")
         except ValueError as e:
             assert "full_sync" in str(e), e
-    validate_combination("abs_m", get_selection_decl("circular_topk"),
+    validate_combination("abs_m", get_selection_decl("topk"),
                          opt_decl, get_backend_plugin_decl("indexed_sparse"),
                          {"period": 8, "full_sync_interval": 8})
 
@@ -604,14 +630,14 @@ def test_combination_validator_and_build_injection():
     names = registered_names()
     assert names["score"] == score_names()
     assert names["optimizer"] == ["adamw"]
-    assert names["selection"] == ["circular_topk"]
+    assert names["selection"] == ["topk"]
     for n in names["backend"]:
         be = build_backend_plugin(n, {})
         assert be.decl.consumes in ("mask", "idx"), n
     for n in names["optimizer"]:
         assert hasattr(build_optimizer(n, {}), "decl"), n
     for n in names["selection"]:
-        assert hasattr(build_selection(n, {"ratio_percent": 40.0}), "decl"), n
+        assert hasattr(build_selection(n, {"method": "histogram", "ratio_percent": 40.0}), "decl"), n
     print("ok: combination validator + build injection + decl coverage")
 
 

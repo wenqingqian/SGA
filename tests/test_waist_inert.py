@@ -143,7 +143,7 @@ def test_api_version_mismatch_rejected_at_build():
 
         config = {
             "score": {"name": "abs_m"},
-            "selection": {"name": "circular_topk"},
+            "selection": {"name": "topk"},
             "optimizer": {"name": "adamw"},
             "backend": {"name": "masked_pipelined"},
             "cycle": {},

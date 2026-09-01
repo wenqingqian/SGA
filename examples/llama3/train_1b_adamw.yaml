@@ -1,8 +1,8 @@
-# SGA "radius" named preset : circular-topk scheme as a pure
+# SGA "radius" named preset : topk scheme (method=histogram) as a pure
 # four-field config combination. Everything outside the sga: section mirrors
 # examples/llama3/train_1b_dense.yaml so runs are directly comparable.
 #
-# score=update + selection=circular_topk (histogram exact topk) +
+# score=update + selection=topk method=histogram (exact tier) +
 # optimizer=adamw (residual) + backend=indexed_sparse.
 # Cycle: full sync + reselect every period-8 boundary after start_iter;
 # residual folds undivided at boundaries (paper-exact).
@@ -63,9 +63,9 @@ sga:
   score:
     name: update
   selection:
-    name: circular_topk
+    name: topk
+    method: histogram
     ratio_percent: 10.0
-    exact_kthvalue: false
   optimizer:
     name: adamw
     residual_mean: false

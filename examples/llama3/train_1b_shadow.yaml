@@ -6,7 +6,7 @@
 # Numerics must stay bitwise identical to a dense-only run.
 # sga.shadow_score=false (probe variant) strips even the read-only scoring.
 #
-# score=update + selection=circular_topk (histogram exact topk) +
+# score=update + selection=topk method=histogram (exact tier) +
 # optimizer=adamw (residual) + backend=indexed_sparse (never used
 # for communication in shadow — grad_sync always returns False).
 # Cycle: shadow reselection at every period-8 boundary after start_iter.
@@ -67,9 +67,9 @@ sga:
   score:
     name: update
   selection:
-    name: circular_topk
+    name: topk
+    method: histogram
     ratio_percent: 10.0
-    exact_kthvalue: false
   optimizer:
     name: adamw
     residual_mean: false

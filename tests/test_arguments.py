@@ -63,7 +63,7 @@ def _nested_section(extra_cycle=None, **kw):
         "enabled": True,
         "cycle": {"start_iter": 20, "period": 8, "full_sync_interval": 0},
         "score": {"name": "update"},
-        "selection": {"name": "circular_topk", "ratio_percent": 10.0},
+        "selection": {"name": "topk", "method": "histogram", "ratio_percent": 10.0},
         "optimizer": {"name": "adamw"},
         "backend": {"name": "indexed_sparse"},
     }
@@ -84,7 +84,8 @@ def test_flag_table_generated_from_declarations():
         assert f in flags, f
     # per-axis plugin params (data-driven: a decl param implies its flag)
     assert flags["--sga-selection-ratio-percent"].type is float
-    assert flags["--sga-selection-hist-mode"].choices == ("balanced", "exact", "fast")
+    assert flags["--sga-selection-method"].choices == ("adaptive", "exact", "histogram")
+    assert flags["--sga-selection-histogram-mode"].choices == ("balanced", "exact", "fast")
     assert flags["--sga-optimizer-residual-mean"].type is bool
     assert flags["--sga-backend-num-slices"].type is int
     assert flags["--sga-backend-slices"].type is int
@@ -110,9 +111,8 @@ def test_dual_form_equivalence():
                 _nested_section(optimizer={"name": "adamw",
                                            "residual_mean": True}),
                 # int-spelled float: canonical is spelling-invariant (10 -> 10.0)
-                _nested_section(selection={"name": "circular_topk",
+                _nested_section(selection={"name": "topk", "method": "adaptive",
                                            "ratio_percent": 10,
-                                           "adaptive": True,
                                            "adaptive_warmup_syncs": None})):
         engine_config = sga_section_to_config(cfg)
         assert engine_config["selection"]["ratio_percent"] == 10.0
@@ -130,9 +130,8 @@ def test_dual_form_equivalence():
 
 def test_handwritten_flat_flags_equal():
     """A user hand-writing the flags reaches the same canonical JSON."""
-    cfg = _nested_section(selection={"name": "circular_topk",
-                                     "ratio_percent": 40.0,
-                                     "adaptive": True})
+    cfg = _nested_section(selection={"name": "topk", "method": "adaptive",
+                                     "ratio_percent": 40.0})
     want = canonical_config_json(sga_section_to_config(cfg))
     args = _parse([
         "--sga-enabled", "true",
@@ -140,17 +139,17 @@ def test_handwritten_flat_flags_equal():
         "--sga-cycle-period", "8",
         "--sga-cycle-full-sync-interval", "0",
         "--sga-score-name", "update",
-        "--sga-selection-name", "circular_topk",
+        "--sga-selection-name", "topk",
+        "--sga-selection-method", "adaptive",
         "--sga-selection-ratio-percent", "40.0",
-        "--sga-selection-adaptive", "true",
         "--sga-optimizer-name", "adamw",
         "--sga-backend-name", "indexed_sparse",
     ])
     assert args.sga_config == want, (args.sga_config, want)
     # the engine reads the expanded adaptive defaults at build time
     got = json.loads(args.sga_config)
-    assert got["selection"] == {"name": "circular_topk", "ratio_percent": 40.0,
-                                "adaptive": True}
+    assert got["selection"] == {"name": "topk", "method": "adaptive",
+                                "ratio_percent": 40.0}
     print("ok: hand-written flat flags equal the nested form")
 
 
@@ -224,7 +223,8 @@ def test_unknown_flat_values_rejected():
     # vocabulary domains are enforced by argparse choices at parse time
     expect_error(lambda: _parse(["--sga-enabled", "true",
                                  "--sga-score-name", "update",
-                                 "--sga-selection-name", "circular_topk",
+                                 "--sga-selection-name", "topk",
+                                 "--sga-selection-method", "histogram",
                                  "--sga-selection-ratio-percent", "30",
                                  "--sga-optimizer-name", "adamw",
                                  "--sga-backend-name", "quantum"]),
@@ -252,9 +252,8 @@ def test_explicit_false_and_null_spellings():
                                  "--sga-score-name", "update"]),
                  "require --sga-enabled true")
     # hand-written null spelling reaches the engine as a real null
-    cfg = _nested_section(selection={"name": "circular_topk",
+    cfg = _nested_section(selection={"name": "topk", "method": "adaptive",
                                      "ratio_percent": 40.0,
-                                     "adaptive": True,
                                      "adaptive_warmup_syncs": None})
     want = canonical_config_json(sga_section_to_config(cfg))
     args = _parse([
@@ -263,9 +262,9 @@ def test_explicit_false_and_null_spellings():
         "--sga-cycle-period", "8",
         "--sga-cycle-full-sync-interval", "0",
         "--sga-score-name", "update",
-        "--sga-selection-name", "circular_topk",
+        "--sga-selection-name", "topk",
+        "--sga-selection-method", "adaptive",
         "--sga-selection-ratio-percent", "40.0",
-        "--sga-selection-adaptive", "true",
         "--sga-selection-adaptive-warmup-syncs", "null",
         "--sga-optimizer-name", "adamw",
         "--sga-backend-name", "indexed_sparse",
@@ -288,12 +287,14 @@ def test_schema_and_resolve_cli():
     assert out.returncode == 0, out.stderr
     schema = json.loads(out.stdout)
     assert schema["score"]["names"] == ["abs_g", "abs_m", "coi", "update"]
-    circular = schema["selection"]["circular_topk"]
+    circular = schema["selection"]["topk"]
     by_name = {p["name"]: p for p in circular}
     assert by_name["ratio_percent"]["required"] is True
-    assert by_name["hist_mode"]["default"] == "exact"
+    assert by_name["method"]["required"] is True
+    assert by_name["histogram_mode"]["default"] == "exact"
     assert by_name["adaptive_warmup_syncs"]["nullable"] is True
-    assert schema["flat_flags"]["selection"]["hist_mode"] == "--sga-selection-hist-mode"
+    assert schema["flat_flags"]["selection"]["histogram_mode"] == \
+        "--sga-selection-histogram-mode"
     # argc-strict: trailing junk on schema exits with usage
 
     example = os.path.join(root, "examples", "llama3", "train_1b_adamw.yaml")
@@ -302,8 +303,15 @@ def test_schema_and_resolve_cli():
     assert out.returncode == 0, out.stderr
     resolved = json.loads(out.stdout)
     assert resolved["selection"]["ratio_percent"] == 10.0
-    # plugin defaults expanded (canonical JSON would omit them)
-    assert resolved["selection"]["hist_mode"] == "exact"
+    # plugin defaults expanded (canonical JSON would omit them) — and the
+    # expansion is method-aware: only the configured method's keys appear,
+    # and the block rebuilds through build_selection verbatim (a union-
+    # default dump would be rejected by the constructor's foreign-key check)
+    from sga.plugins import build_selection, register_default_plugins
+    register_default_plugins()
+    sel = resolved["selection"]
+    assert set(sel) == {"name", "method", "ratio_percent", "histogram_mode"}, sel
+    build_selection(sel["name"], {k: v for k, v in sel.items() if k != "name"})
     assert resolved["optimizer"]["residual_mean"] is False
     assert resolved["cycle"] == {"start_iter": 20, "period": 8,
                                  "full_sync_interval": 0}
@@ -324,12 +332,35 @@ def test_schema_and_resolve_cli():
         assert json.loads(out.stdout) == {"sga": "disabled (dense)"}
     finally:
         os.unlink(disabled)
+
+    # the other methods expand exactly their own vocabulary (adaptive:
+    # +2 adaptive keys; exact: none) and equally reconstruct
+    for method, extra in (("adaptive", {"adaptive_warmup_syncs",
+                                        "adaptive_warmup_mode"}),
+                          ("exact", set())):
+        tmp = os.path.join(root, "tests", "_tmp_method.yaml")
+        with open(tmp, "w") as f:
+            f.write(f"sga: {{enabled: true, backend: {{name: indexed_sparse}}, "
+                    f"score: {{name: update}}, optimizer: {{name: adamw}}, "
+                    f"selection: {{name: topk, "
+                    f"method: {method}, ratio_percent: 10.0}}}}\n")
+        try:
+            out = subprocess.run([sys.executable, "-m", "sga.config", "resolve",
+                                  tmp], capture_output=True, text=True,
+                                 cwd=root, env=env)
+            assert out.returncode == 0, out.stderr
+            sel = json.loads(out.stdout)["selection"]
+            assert set(sel) == {"name", "method", "ratio_percent"} | extra, sel
+            build_selection(sel["name"],
+                            {k: v for k, v in sel.items() if k != "name"})
+        finally:
+            os.unlink(tmp)
     print("ok: schema + resolve CLI")
 
 
 def test_typo_plugin_param_rejected_both_forms():
     # nested form: unknown plugin param named in the error (loader gate)
-    cfg = _nested_section(selection={"name": "circular_topk",
+    cfg = _nested_section(selection={"name": "topk", "method": "histogram",
                                      "ratio_percent": 10.0, "rtaio": 5})
     expect_error(lambda: sga_section_to_config(cfg), "unknown params ['rtaio']")
     # flat form: the vocabulary has no such flag -> argparse rejects it
