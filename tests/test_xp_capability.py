@@ -30,10 +30,9 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import sga.plugins.selection.circular_topk as ct
-from sga.plugins.optimizer.adamw import (
-    _grad_correct_torch,
-    adamw_grad_correct,
-)
+from sga.plugins.optimizer.adamw import adamw_grad_correct
+from sga.plugins.optimizer.adamw_torch import grad_correct_torch
+from sga.plugins.scores import Score
 from sga.plugins.selection._histogram import (
     _HIST_BINS,
     _abs_bit_top16,
@@ -286,13 +285,11 @@ def test_coi_score_matches_fp64_oracle():
         m = torch.randn(n, generator=g) * 1e-3
         v = torch.rand(n, generator=g) * 1e-6
         w = torch.randn(n, generator=g) * 0.02
-        buf = grad.clone()  # becomes the coi score under write_update
-        side = torch.empty(n)
-        _grad_correct_torch(
+        buf = grad.clone()  # becomes the coi score under the full-step emit
+        grad_correct_torch(
             w, buf, m.clone(), v.clone(), 0.0, b1, b2, eps, 0.0,
             1 - b1 ** step, 1 - b2 ** step,
-            None, True,
-            score_out=side, score_mode="coi",
+            None, int(Score.coi),
         )
         ref = _coi_reference(grad, m, v, b1, b2, eps, step)
         rel = ((buf.double() - ref).abs().max() / ref.max()).item()
@@ -302,10 +299,9 @@ def test_coi_score_matches_fp64_oracle():
     # zero-state edge (m = v = 0): U(0) = 0, score = |U(g)|
     grad = torch.randn(1000, generator=g) * 1e-3
     buf = grad.clone()
-    _grad_correct_torch(
+    grad_correct_torch(
         torch.zeros(1000), buf, torch.zeros(1000), torch.zeros(1000),
-        0.0, b1, b2, eps, 0.0, 1 - b1, 1 - b2, None, True,
-        score_out=torch.empty(1000), score_mode="coi",
+        0.0, b1, b2, eps, 0.0, 1 - b1, 1 - b2, None, int(Score.coi),
     )
     ref = _coi_reference(grad, torch.zeros(1000), torch.zeros(1000),
                          b1, b2, eps, 1)
@@ -314,7 +310,7 @@ def test_coi_score_matches_fp64_oracle():
     # empty input: noop via the public wrapper
     adamw_grad_correct(torch.empty(0), torch.empty(0), torch.empty(0),
                         torch.empty(0), 1e-3, b1, b2, eps, 0.0, 1,
-                        score_out=torch.empty(0), score_mode="coi")
+                        emit_mode=int(Score.coi))
     print("ok: coi score == fp64 oracle (steps 1/2/17/1501, zero-state, empty)")
 
 

@@ -6,7 +6,7 @@ fused kernel path is compared against the pure-torch fallback that the CPU
 unit tests already pin to fp64 oracles:
 
 - adamw grad-correct Triton kernel vs its torch reference (sparse apply and
-  full-step materialization, plus the named-score emission swap);
+  full-step score materialization, every emittable score);
 - masked_scale / scatter_selected: bitwise-equality contracts;
 - masked_norm_sq_contribution: same aggregate within atomic-order jitter.
 
@@ -25,10 +25,9 @@ from sga.kernels import (
     masked_scale,
     scatter_selected,
 )
-from sga.plugins.optimizer.adamw import (
-    _grad_correct_torch,
-    adamw_grad_correct,
-)
+from sga.plugins.optimizer.adamw import adamw_grad_correct
+from sga.plugins.optimizer.adamw_torch import grad_correct_torch
+from sga.plugins.scores import Score, emittable_score_names, get_score_spec
 
 torch.manual_seed(0)
 
@@ -41,37 +40,38 @@ def test_grad_correct_triton_matches_fallback():
     m0, v0 = torch.randn(n) * 0.1, torch.rand(n) * 0.1
     mask = (torch.rand(n) < 0.4).to(torch.uint8)
 
-    # Sparse path (write_update=False): fused apply; grad buffer untouched.
+    # Sparse path (emit_mode=None): fused apply; grad buffer untouched.
     p_d = param0.clone().to(device); mm_d = m0.clone().to(device)
     vv_d = v0.clone().to(device); g_d = torch.randn(n).to(device)
     mk_d = mask.clone().to(device)
     adamw_grad_correct(p_d, g_d, mm_d, vv_d, lr, b1, b2, eps, wd, step,
-                       mask=mk_d, write_update=False)
+                       mask=mk_d, emit_mode=None)
     p_ref, m_ref, v_ref = map(torch.clone, (param0, m0, v0))
     g_init = g_d.cpu().clone()
-    _grad_correct_torch(
+    grad_correct_torch(
         p_ref, g_init, m_ref, v_ref, lr, b1, b2, eps, wd,
         1 - b1 ** step, 1 - b2 ** step,
-        mask, False,
+        mask, None,
     )
     torch.testing.assert_close(p_d.cpu(), p_ref, rtol=1e-5, atol=1e-7)
     torch.testing.assert_close(mm_d.cpu(), m_ref, rtol=1e-5, atol=1e-7)
     torch.testing.assert_close(vv_d.cpu(), v_ref, rtol=1e-4, atol=1e-6)
     assert torch.equal(g_d.cpu(), g_init), "sparse step must not touch grads"
 
-    # Full path (write_update=True): materialize the update INTO the grad.
+    # Full path (emit_mode=update): materialize the update INTO the grad,
+    # with the apply fused in the same pass on both paths.
     p_d = param0.clone().to(device); mm_d = m0.clone().to(device)
     vv_d = v0.clone().to(device)
     grads = torch.randn(n)          # fresh residual-shaped input
     g_d = grads.clone().to(device)
     adamw_grad_correct(p_d, g_d, mm_d, vv_d, lr, b1, b2, eps, wd, step,
-                       mask=None, write_update=True)
+                       mask=None, emit_mode=int(Score.update))
     p_ref, m_ref, v_ref = map(torch.clone, (param0, m0, v0))
     g_ref = grads.clone()
-    _grad_correct_torch(
+    grad_correct_torch(
         p_ref, g_ref, m_ref, v_ref, lr, b1, b2, eps, wd,
         1 - b1 ** step, 1 - b2 ** step,
-        None, True,
+        None, int(Score.update),
     )
     torch.testing.assert_close(g_d.cpu(), g_ref, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(p_d.cpu(), p_ref, rtol=1e-5, atol=1e-7)
@@ -117,11 +117,11 @@ def test_scatter_selected_roundtrip():
 
 
 def test_score_modes_purity_and_content():
-    """Triton full-step score emission : with a named score the
-    two outputs swap targets — the score lands in the grad buffer, the signed
-    update in score_out — and moments/params stay bitwise identical to the
-    default run; the emitted score matches its reference from the PRE-commit
-    state (migrated from test_sga_scheme_xp_mask_score.py)."""
+    """Triton full-step score emission : every named score lands
+    in the grad buffer with the apply fused in the same pass, and the
+    emitted score matches its reference from the PRE-commit state; the
+    bare-int kernel modes equal the Score enum members BY NAME (the enum is
+    the namespace; migrated from test_sga_scheme_xp_mask_score.py)."""
     device = "cuda"
     n = 999_999
     lr, b1, b2, eps, wd, step = 5e-5, 0.9, 0.95, 1e-8, 0.1, 1501
@@ -131,45 +131,62 @@ def test_score_modes_purity_and_content():
     m0 = torch.randn(n) * 1e-3
     v0 = torch.rand(n) * 1e-6
 
-    def run(score_mode=None):
+    def run(score):
         w = w0.clone().to(device)
         g = g0.clone().to(device)
         m, v = m0.clone().to(device), v0.clone().to(device)
-        side = None if score_mode is None else torch.empty(n, device=device)
         adamw_grad_correct(w, g, m, v, lr, b1, b2, eps, wd, step,
-                           mask=None, write_update=True,
-                           score_out=side, score_mode=score_mode or "coi")
-        return w, g, m, v, side
+                           mask=None, emit_mode=int(score))
+        return w, g, m, v
 
-    w1, g1, m1, v1, _ = run(None)               # default: update in grads
+    w1, g1, m1, v1 = run(Score.update)        # default: update in grads
     bc1, bc2 = 1 - b1 ** step, 1 - b2 ** step
-    m1c = b1 * m0 + (1 - b1) * g0
-    v1c = b2 * v0 + (1 - b2) * g0 * g0
-    u_g = (m1c / bc1) / ((v1c / bc2).sqrt() + eps)
 
-    for mode, ref in (
-        ("coi", (u_g - (b1 * m0 / bc1) / ((b2 * v0 / bc2).sqrt() + eps)).abs()),
-        ("abs_g", g0.abs()),
-        ("abs_m", m0.abs()),
-    ):
-        w2, g2, m2, v2, side = run(mode)
+    # Content + purity for EVERY emittable score, iterated from the registry
+    # (derived: a score registered without a kernel branch fails HERE at the
+    # GPU gate instead of mid-cluster). The reference is the registry
+    # formula — the same single-source math the torch fallback calls,
+    # fp64-oracle-pinned on CPU by tests/test_xp_capability.py — computed
+    # from the same PRE-commit state.
+    for name in sorted(emittable_score_names()):
+        w2, g2, m2, v2 = run(Score[name])
+        ref = get_score_spec(name).formula(
+            w0, m0, v0, g0, b1, b2, eps, wd, bc1, bc2,
+            update_includes_wd=True,
+        )
+        # purity: the m/v commit is identical (bitwise) across every mode
         assert torch.equal(m1.cpu(), m2.cpu())
         assert torch.equal(v1.cpu(), v2.cpu())
-        assert torch.equal(w1.cpu(), w2.cpu())   # write_update never touches w
-        torch.testing.assert_close(side.cpu(), g1.cpu(), rtol=1e-5, atol=1e-6)
+        # content: the emitted score matches its registry formula
         rel = ((g2.cpu().double() - ref.double()).abs().max()
                / ref.double().max().clamp(min=1e-30)).item()
-        assert rel < 1e-5, (mode, rel)
+        assert rel < 1e-5, (name, rel)
+        # the apply is fused in the same pass: every mode's PARAMS must
+        # equal the default run's (same update, same fused arithmetic)
+        torch.testing.assert_close(w2.cpu(), w1.cpu(), rtol=1e-5, atol=1e-7)
 
-    # unknown score mode is rejected host-side before any launch
+    # the bare kernel-mode ints equal the enum values (Score is the single
+    # namespace: the kernel's EMIT_MODE comments must not drift)
+    for name, mode in (("update", 0), ("abs_g", 1), ("abs_m", 2), ("coi", 3)):
+        assert int(Score[name]) == mode, name
+
+    # offline sentinel mode is rejected host-side before any launch
     try:
         adamw_grad_correct(w0.clone(), g0.clone(), m0.clone(), v0.clone(),
                            lr, b1, b2, eps, wd, step, mask=None,
-                           write_update=True,
-                           score_out=torch.empty(n), score_mode="bogus")
-        raise AssertionError("bogus score_mode accepted")
+                           emit_mode=int(Score.OFFLINE))
+        raise AssertionError("offline emit_mode accepted")
     except ValueError as e:
-        assert "score_mode" in str(e), e
+        assert "OFFLINE" in str(e), e
+
+    # any out-of-range int gets the same host-side rejection with owned text
+    # (not the raw enum-cast error) — the public unknown-mode contract
+    try:
+        adamw_grad_correct(w0.clone(), g0.clone(), m0.clone(), v0.clone(),
+                           lr, b1, b2, eps, wd, step, mask=None, emit_mode=7)
+        raise AssertionError("out-of-range emit_mode accepted")
+    except ValueError as e:
+        assert "not a valid Score" in str(e), e
 
 
 if __name__ == "__main__":

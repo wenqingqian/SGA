@@ -133,6 +133,9 @@ def test_score_formula_scratch_routing_bitwise():
         assert torch.equal(fresh, with_scratch), name
         assert with_scratch.data_ptr() != scratch[0].data_ptr()
         assert with_scratch.data_ptr() != scratch[1].data_ptr()
+    assert SCRATCH_SCORES == frozenset(
+        n for n in score_names() if get_score_spec(n).scratch
+    )
     assert SCRATCH_SCORES == frozenset(("update", "coi"))
 
     # the wd-free variant must ALSO return a fresh tensor with a caller
@@ -451,8 +454,8 @@ class _Rec:
     """Minimal ParamRecord stand-in for SgaAdamW.full_step.
 
     __hash__ = None mirrors the engine's @dataclass ParamRecord (value-eq
-    classes are unhashable): any dict keyed by the record itself — like the
-    Phase-0 side buffers — fails here first, not on the cluster."""
+    classes are unhashable): any dict keyed by the record itself fails here
+    first, not on the cluster."""
 
     __hash__ = None
 

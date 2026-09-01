@@ -38,7 +38,8 @@ def readonly_score(rec, emit_name: str, scratch=None) -> torch.Tensor:
     dtype (fp32 in practice) on w's device that the formula chain's DYING
     temporaries are routed into via out= — see the score registry's module
     docstring; it exists so the boundary's allocator high-water stays flat.
-    Callers may skip the allocation for scores outside SCRATCH_SCORES.
+    Callers may skip the allocation for scores whose spec does not declare
+    ``scratch``.
     """
     w = rec.main_param.data
     if rec.grad is None:

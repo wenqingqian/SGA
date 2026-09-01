@@ -3,11 +3,11 @@
 
 A scheme is a pure configuration combination (field model):
 ``score / selection / optimizer / backend``, each with its own params.
-Scores are DATA in the score registry (sga/plugins/scores.py: name -> formula
-+ doc — no classes); selection/optimizer/backend are class plugins that each
-declare their attributes. The combination validator checks legality from
-those declarations — there is NO hardcoded list of legal combinations and NO
-scheme names anywhere in the engine.
+Scores are DATA in the score registry (sga/plugins/scores.py: name ->
+emission mode + formula + doc — no classes); selection/optimizer/backend are
+class plugins that each declare their attributes. The combination validator
+checks legality from those declarations — there is NO hardcoded list of
+legal combinations and NO scheme names anywhere in the engine.
 
 Declaration facts used by the validator (see ``validate_combination``):
   - Optimizer.emittable_scores: the score names this template's full-step
@@ -23,9 +23,10 @@ Declaration facts used by the validator (see ``validate_combination``):
 
 from dataclasses import dataclass
 
-from sga.plugins.scores import ScoreSpec, get_score_spec, score_names
+from sga.plugins.scores import Score, ScoreSpec, get_score_spec, score_names
 
 __all__ = [
+    "Score",
     "ScoreSpec",
     "get_score_spec",
     "score_names",

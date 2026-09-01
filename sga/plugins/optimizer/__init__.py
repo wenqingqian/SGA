@@ -35,8 +35,8 @@ class ParamRecord:
     @property
     def grad(self):
         """Main grad: post-prepare_grads this is the (clipped) synced gradient
-        view; on full steps with a named score it becomes the materialized
-        score after ``full_step``."""
+        view; on full steps it becomes the materialized score after
+        ``full_step``."""
         return self.main_param.grad
 
     @property

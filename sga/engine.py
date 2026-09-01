@@ -56,7 +56,7 @@ from sga.kernels import (
     sga_peek_step,
 )
 from sga.plugins.optimizer import OptContext, ParamRecord
-from sga.plugins.scores import SCRATCH_SCORES
+from sga.plugins.scores import get_score_spec
 from sga.shadow import readonly_score
 from sga.support import BucketSupport, Support
 from sga.trace import TraceCollector
@@ -522,7 +522,7 @@ class SGAEngine:
         # allocator high-water otherwise spikes several param-sized
         # allocations on the largest param.
         scratch = None
-        if records and emit in SCRATCH_SCORES:
+        if records and get_score_spec(emit).scratch:
             max_n = max(r.main_param.numel() for r in records)
             ref = records[0].main_param
             scratch = (

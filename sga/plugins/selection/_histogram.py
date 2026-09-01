@@ -34,10 +34,11 @@ hard invariant.
 
 Every pass is chunked at ``_HIST_CHUNK`` elements: the int32 bit-pattern
 view/copy of a full 1.2B-element bucket is GB-scale, and stacked on the
-non-update score side buffers and the persistent sparse-comm buffers it
-OOM'd the legacy scheme's second full-sync select at 1B scale. The chunk
-size is a multiple of the sample stride, so the chunked histogram/subsample
-is bitwise identical to the unchunked one.
+legacy scheme's (since-deleted) non-update score side buffers and the
+persistent sparse-comm buffers it OOM'd the legacy scheme's second
+full-sync select at 1B scale. The chunk size is a multiple of the sample
+stride, so the chunked histogram/subsample is bitwise identical to the
+unchunked one.
 """
 
 import torch

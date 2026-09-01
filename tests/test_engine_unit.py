@@ -407,7 +407,7 @@ class _FakeMPOpt:
 
 
 # The default-score combo: 'update' materializes straight into the main grads
-# (no side buffers) over a mask-consuming backend.
+# over a mask-consuming backend.
 _UPDATE = {
     "score": "update",
     "selection": "circular_topk",
@@ -418,9 +418,8 @@ _UPDATE = {
     "backend": MaskedPipelinedBackend({"num_slices": 2}),
 }
 
-# The named-score combo: abs_m swaps the full-step output targets (score into
-# the grad buffer, signed update into per-record side buffers) over an
-# idx-consuming backend.
+# The named-score combo: abs_m materializes into the grad buffer with the
+# apply fused in the same pass, over an idx-consuming backend.
 _ABS_M = {
     "score": "abs_m",
     "selection": "circular_topk",

@@ -6,26 +6,31 @@ The AdamW update is split so the weight-update direction can be materialized:
 
     update = weight_decay * w + (m / bias1) / (sqrt(v / bias2) + eps)
 
-- Sparse steps (WRITE_UPDATE=False): fused apply ``w -= lr * update``; the
-  grad buffer is untouched so the residual at non-topk positions keeps
-  accumulating. m/v update at EVERY coordinate (masked-out coords
-  contribute a zero gradient; momentum keeps decaying).
-- Full steps (WRITE_UPDATE=True): the score named by the config is written
-  into the fp32 main grads (the reselection reads it from there). With the
-  default 'update' score the SIGNED update takes the grad buffer directly;
-  with a named score (abs_g/abs_m/coi) the two outputs swap targets — the
-  score takes over the grad buffer and the signed update goes to per-record
-  side buffers, applied and freed record-by-record BEFORE the reselection
-  reads the score views. The grad buffer ALIASES the DDP bucket's fp32 grad
-  storage (megatron: main_param.grad = model_param.main_grad.float() is an
-  identity view for fp32 buckets), so the write lands in the bucket where
-  the residual lives. Safety is purely ORDER-based, and the invariant holds:
-  on a full step the residual was just fully communicated; the engine reads
-  the score views BEFORE the caller's selective reset zeroes them; only after that
-  does the selection read the still-materialized score (the optimizer->score
-  handoff). Score math is defined by the score registry (sga/plugins/scores.py);
-  the kernel branches here are its online materialization, pinned against the
-  torch reference within GPU tolerance by tests/test_kernels_gpu.py.
+One fused kernel pass per record on EVERY step — m/v update at every
+coordinate (sparse steps: masked-out coords contribute a zero gradient,
+momentum keeps decaying) and the apply ``w -= lr * update`` ALWAYS fused
+(single arithmetic implementation, no Python-side second pass):
+
+- Sparse steps (EMIT_MODE=-1): masked m/v update + fused apply; the grad
+  buffer is untouched so the residual at non-topk positions keeps
+  accumulating.
+- Full steps (EMIT_MODE>=0, the Score enum value of the configured score):
+  the same pass additionally materializes the score into the fp32 main grads
+  (the reselection reads it from there). The grad buffer ALIASES the DDP
+  bucket's fp32 grad storage (megatron: main_param.grad =
+  model_param.main_grad.float() is an identity view for fp32 buckets), so
+  the write lands in the bucket where the residual lives. Safety is purely
+  ORDER-based, and the invariant holds: on a full step the residual was just
+  fully communicated; the engine reads the score views BEFORE the caller's
+  selective reset zeroes them; only after that does the selection read the
+  still-materialized score (the optimizer->score handoff).
+
+Score math is defined by the score registry (sga/plugins/scores.py); the
+kernel branches here are its online materialization, spelled as bare ints
+with name comments (Triton takes compile-time ints only) and pinned against
+the torch reference by tests/test_kernels_gpu.py. The torch reference path
+lives in adamw_torch.py (physical isolation: this file is Triton + dispatch
+only); CPU unit tests keep working without Triton.
 
 Reset contract (selective with residual fold): sparse steps zero only the
 communicated (topk) positions; when the NEXT step is a full sync and
@@ -39,6 +44,8 @@ from typing import Optional
 import torch
 
 from sga.plugins import OptimizerDecl
+from sga.plugins.optimizer.adamw_torch import grad_correct_torch, selective_reset_torch
+from sga.plugins.scores import Score, emittable_score_names, get_score_spec
 
 try:
     import triton
@@ -52,34 +59,51 @@ except ImportError:  # pragma: no cover
 DECL = OptimizerDecl(
     name="adamw",
     reset_mode="selective",
-    emittable_scores=frozenset({"update", "abs_g", "abs_m", "coi"}),
+    # Derived, not restated: this template implements every registry score's
+    # kernel branch (a second template would declare its own branch subset).
+    emittable_scores=emittable_score_names(),
     requires_full_sync_every_period=True,
 )
 
-_BLOCK_SIZE = 1024
+# The bare-int EMIT_MODE branches _grad_correct_kernel implements below.
+# Load-time tie between the DERIVED emittable set above and that hardcoded
+# branch coverage: a score registered without a branch here would pass every
+# CPU gate (the registry formula exists) and only crash inside Triton
+# tracing on the first GPU full step — possibly hours into a cluster run.
+_IMPLEMENTED_MODES = frozenset({0, 1, 2, 3})
+_MISSING_BRANCHES = sorted(
+    n for n in emittable_score_names()
+    if int(get_score_spec(n).score) not in _IMPLEMENTED_MODES
+)
+if _MISSING_BRANCHES:
+    raise ValueError(
+        f"registry scores {_MISSING_BRANCHES} have no _grad_correct_kernel "
+        f"branch (implemented EMIT_MODEs: {sorted(_IMPLEMENTED_MODES)}) — "
+        "add the branch or mark the score OFFLINE"
+    )
 
-# Score emission modes for full steps (SCORE_MODE constexpr). Everything is
-# computed from values only reachable in this kernel pass: abs_m reads the
-# PRE-commit momentum that the same pass overwrites; coi reads both the
-# pre-commit and the folded moments. Mode 0 (the 'update' score) is the
-# historical default: the signed update itself is the materialized score.
-_SCORE_MODES = {"abs_g": 1, "abs_m": 2, "coi": 3}
+_BLOCK_SIZE = 1024
 
 
 if _HAS_TRITON:
 
     @triton.jit
     def _grad_correct_kernel(
-        param_ptr, grad_ptr, m_ptr, v_ptr, mask_ptr, score_ptr,
+        param_ptr, grad_ptr, m_ptr, v_ptr, mask_ptr,
         lr, beta1, beta2, eps, weight_decay,
         bias_correction1, bias_correction2,
         n_elements,
         BLOCK_SIZE: tl.constexpr,
         HAS_MASK: tl.constexpr,
-        WRITE_UPDATE: tl.constexpr,
-        SCORE_MODE: tl.constexpr,
+        EMIT_MODE: tl.constexpr,
     ):
-        """AdamW m/v update + weight-update, fused-apply or materialize-score."""
+        """AdamW m/v update + fused apply, with full-step score emission.
+
+        EMIT_MODE is the Score enum value as a compile-time int: -1 = sparse
+        (masked commit, grad buffer untouched); >=0 = full step (score
+        materialized into the grad buffer). Both paths apply
+        ``w -= lr * update`` in this same pass.
+        """
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         valid = offsets < n_elements
@@ -102,13 +126,13 @@ if _HAS_TRITON:
 
         update = weight_decay * param + m_hat / (tl.sqrt(v_hat) + eps)
 
-        if SCORE_MODE == 1:
+        if EMIT_MODE == 1:
             # abs_g: |g| of the gradient being committed this step.
             score = tl.abs(grad)
-        elif SCORE_MODE == 2:
+        elif EMIT_MODE == 2:
             # abs_m: |m| of the PRE-commit momentum.
             score = tl.abs(m)
-        elif SCORE_MODE == 3:
+        elif EMIT_MODE == 3:
             # coi: |U(g) - U(0)| with the PRE-commit moments; the weight-decay
             # term cancels in the difference. m/v are read, not yet mutated.
             u_0 = (beta1 * m / bias_correction1) / (
@@ -118,23 +142,19 @@ if _HAS_TRITON:
 
         tl.store(m_ptr + offsets, m_new, mask=valid)
         tl.store(v_ptr + offsets, v_new, mask=valid)
-        if WRITE_UPDATE:
-            if SCORE_MODE > 0:
-                # Full step with a named score: the score takes over the grad
-                # buffer (the reselection reads it from there, exactly like
-                # the default update score) and the signed update goes to the
-                # side buffer; the caller applies from it and frees it before
-                # the reselection, so the select-time peak carries no
-                # model-sized side-buffer set.
-                tl.store(grad_ptr + offsets, score, mask=valid)
-                tl.store(score_ptr + offsets, update, mask=valid)
-            else:
-                # Default (update score): materialize the update for the topk.
+        if EMIT_MODE >= 0:
+            if EMIT_MODE == 0:
+                # update: the signed update itself is the materialized score.
                 tl.store(grad_ptr + offsets, update, mask=valid)
-        else:
-            # Masked iteration: fused apply; grad buffer keeps the residual.
-            param = param - lr * update
-            tl.store(param_ptr + offsets, param, mask=valid)
+            else:
+                # Named score: it takes over the grad buffer; the reselection
+                # reads it from there exactly like the default update score.
+                tl.store(grad_ptr + offsets, score, mask=valid)
+        # Fused apply on every path (sparse: masked-out coords loaded grad=0,
+        # so their update is the pure weight-decay/momentum drift — applied
+        # exactly like the historical kernel did).
+        param = param - lr * update
+        tl.store(param_ptr + offsets, param, mask=valid)
 
     @triton.jit
     def _selective_reset_kernel(
@@ -176,42 +196,49 @@ def adamw_grad_correct(
     weight_decay: float,
     step: int,
     mask: torch.Tensor = None,
-    write_update: bool = False,
-    score_out: torch.Tensor = None,
-    score_mode: str = None,
+    emit_mode: Optional[int] = None,
 ) -> None:
     """Run the grad-correct step on contiguous same-size buffers.
 
-    Updates m/v in place. ``write_update=True`` writes the materialized score
-    into ``grad_buffer``; otherwise applies ``w -= lr * update`` and leaves
-    the grad buffer untouched. With ``mask``, positions outside it contribute
-    a zero gradient.
-
-    Full-step score emission (``score_out`` given): the named score (one of
-    abs_g / abs_m / coi, all computed from pre-commit state reachable only
-    inside this pass) is written into ``grad_buffer`` — the reselection reads
-    it from there exactly like the default update score — and the signed
-    update goes to ``score_out`` instead; the caller applies and frees it
-    before the reselection. An unknown ``score_mode`` alongside ``score_out``
-    is rejected before any work.
+    Updates m/v in place and always fuses the apply ``w -= lr * update``.
+    ``emit_mode=None`` is the sparse step: with ``mask``, positions outside
+    it contribute a zero gradient; the grad buffer (residual) is untouched.
+    An int mode (a ``Score`` value) is the full step: the mode's score — all
+    computed from pre-commit state reachable only inside this pass — is
+    materialized into ``grad_buffer`` in the same pass (the reselection reads
+    it from there). An unknown int or the OFFLINE sentinel raises a
+    ValueError (owned messages) before any work.
     """
     bias_correction1 = 1.0 - beta1 ** step
     bias_correction2 = 1.0 - beta2 ** step
-    has_score = score_out is not None
-    if has_score and score_mode not in _SCORE_MODES:
-        raise ValueError(f"unknown score_mode: {score_mode!r}")
+    if emit_mode is not None:
+        emit_mode = int(emit_mode)
+        try:
+            mode = Score(emit_mode)
+        except ValueError:
+            # Owned text: the raw enum-cast error ("7 is not a valid Score")
+            # doesn't say which modes ARE valid.
+            raise ValueError(
+                f"emit_mode {emit_mode} is not a valid Score — known "
+                f"full-step modes: "
+                f"{[int(m) for m in Score if m is not Score.OFFLINE]}"
+            ) from None
+        if mode is Score.OFFLINE:
+            raise ValueError(
+                f"emit_mode {emit_mode} is Score.OFFLINE — offline-only "
+                "scores have no kernel branch to materialize"
+            )
 
     n_elements = param_buffer.numel()
     if n_elements == 0:
         return
 
     if not (_HAS_TRITON and param_buffer.is_cuda):
-        _grad_correct_torch(
+        grad_correct_torch(
             param_buffer, grad_buffer, exp_avg_buffer, exp_avg_sq_buffer,
             lr, beta1, beta2, eps, weight_decay,
             bias_correction1, bias_correction2,
-            mask, write_update,
-            score_out, score_mode if has_score else None,
+            mask, emit_mode,
         )
         return
 
@@ -221,52 +248,15 @@ def adamw_grad_correct(
     _grad_correct_kernel[grid](
         param_buffer, grad_buffer, exp_avg_buffer, exp_avg_sq_buffer,
         mask_u8 if has_mask else grad_buffer,
-        score_out if has_score else grad_buffer,
         lr, beta1, beta2, eps, weight_decay,
         bias_correction1, bias_correction2,
         n_elements,
         BLOCK_SIZE=_BLOCK_SIZE,
         HAS_MASK=has_mask,
-        WRITE_UPDATE=write_update,
-        SCORE_MODE=_SCORE_MODES[score_mode] if has_score else 0,
+        # -1 here is the kernel's sparse-step sentinel; Score.OFFLINE's -1
+        # never reaches this point (rejected host-side above).
+        EMIT_MODE=emit_mode if emit_mode is not None else -1,
     )
-
-
-def _grad_correct_torch(
-    param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
-    bias_correction1, bias_correction2,
-    mask, write_update,
-    score_out=None, score_mode=None,
-) -> None:
-    """Pure-torch reference path (CPU unit tests); same math as the kernel."""
-    if mask is not None:
-        g = torch.where(mask > 0, grad, torch.zeros_like(grad))
-    else:
-        g = grad
-    m_new = beta1 * m + (1.0 - beta1) * g
-    v_new = beta2 * v + (1.0 - beta2) * g * g
-    m_hat = m_new / bias_correction1
-    v_hat = v_new / bias_correction2
-    update = weight_decay * param + m_hat / (v_hat.sqrt() + eps)
-    if score_mode == "abs_g":
-        score = g.abs()
-    elif score_mode == "abs_m":
-        score = m.abs()
-    elif score_mode == "coi":
-        u_0 = (beta1 * m / bias_correction1) / (
-            (beta2 * v / bias_correction2).sqrt() + eps
-        )
-        score = (m_hat / (v_hat.sqrt() + eps) - u_0).abs()
-    m.copy_(m_new)
-    v.copy_(v_new)
-    if write_update:
-        if score_out is not None:
-            grad.copy_(score)
-            score_out.copy_(update)
-        else:
-            grad.copy_(update)
-    else:
-        param.sub_(lr * update)
 
 
 def selective_reset(grad_buffer: torch.Tensor, mask: torch.Tensor,
@@ -286,13 +276,7 @@ def selective_reset(grad_buffer: torch.Tensor, mask: torch.Tensor,
             BLOCK_SIZE=_BLOCK_SIZE, FOLD=fold,
         )
         return
-    # Element-wise on purpose (boolean indexing materializes full-bucket
-    # int64 indices, ~GB-scale). The unconditional divide is exact: actives
-    # were just set to 0.0, and 0.0 / interval == 0.0.
-    active = mask_u8 > 0
-    grad_buffer.masked_fill_(active, 0.0)
-    if fold:
-        grad_buffer.div_(interval)
+    selective_reset_torch(grad_buffer, mask_u8, interval, fold)
 
 
 class SgaAdamW:
@@ -305,18 +289,22 @@ class SgaAdamW:
         self.residual_mean = bool(params.get("residual_mean", False))
         # Which registry score to materialize on full steps (build-time
         # injection). None/'update' keeps the historical default: the signed
-        # AdamW update itself is the topk input.
-        self.emit_score = emit_score or "update"
-        if self.emit_score not in DECL.emittable_scores:
+        # AdamW update itself is the topk input. The emission mode int is
+        # resolved ONCE here from the registry (the kernel branches on it).
+        self.emit_score = emit_score or Score.update.name
+        spec = get_score_spec(self.emit_score)
+        if spec.score is Score.OFFLINE:
             raise ValueError(
-                f"adamw cannot emit score '{self.emit_score}' "
-                f"(emittable: {sorted(DECL.emittable_scores)})"
+                f"adamw cannot emit score '{self.emit_score}': it is "
+                "offline-only (no kernel branch). Emittable: "
+                f"{sorted(DECL.emittable_scores)}"
             )
+        self._emit_mode = int(spec.score)
 
     def ensure_state(self, bucket_states):
         pass  # no persistent per-bucket buffers beyond the Support caches
 
-    def _records_pass(self, ctx, write_update, use_mask, score_bufs=None):
+    def _records_pass(self, ctx, emit_mode, use_mask):
         for rec in ctx.records:
             state = rec._state
             if len(state) == 0:
@@ -334,54 +322,21 @@ class SgaAdamW:
                 weight_decay=rec.weight_decay,
                 step=rec.step,
                 mask=rec.mask_u8() if use_mask else None,
-                write_update=write_update,
-                score_out=score_bufs.get(id(rec)) if score_bufs else None,
-                score_mode=self.emit_score,
+                emit_mode=emit_mode,
             )
 
     @torch.no_grad()
     def full_step(self, ctx):
-        """Full-sync step: materialize the configured score and apply the update.
-
-        With the default 'update' score the signed update lands in the main
-        grads (Phase 2 applies from there). With a named score
-        (abs_g/abs_m/coi) the two outputs swap targets: the score takes over
-        the grad buffer and the update goes to per-record side buffers,
-        applied and freed record-by-record BEFORE the engine's reselection
-        reads the score views — the select-time GPU peak then carries no
-        model-sized side-buffer set (the legacy scheme's OOM fix). Caveat on
-        the Phase-0 allocation: side buffers for ALL records are allocated
-        up front, so a named-score full step transiently carries +1
-        model-sized fp32 buffer set versus the default path — size GPU
-        headroom accordingly at 1B+ scale.
-        """
-        # Phase 0: side buffers for the signed update (named scores only).
-        # Keyed by id(): ParamRecord is a dataclass — unhashable by value.
-        # Flat: the grad-correct buffers are the params' view(-1) spans.
-        score_bufs = None
-        if self.emit_score != "update":
-            score_bufs = {
-                id(rec): torch.empty_like(rec.main_param.data.view(-1))
-                for rec in ctx.records
-            }
-        # Phase 1: grad-correct; the configured score materializes into main grads.
-        self._records_pass(ctx, write_update=True, use_mask=False,
-                           score_bufs=score_bufs)
-        # Phase 2: apply w -= lr * update (from side buffers for named scores,
-        # from main grads for the default), freeing each as it is consumed.
-        for rec in ctx.records:
-            upd = score_bufs.pop(id(rec), None) if score_bufs else None
-            if upd is not None:
-                rec.main_param.data.add_(upd.view_as(rec.main_param.data),
-                                         alpha=-rec.lr)
-            else:
-                rec.main_param.data.add_(rec.grad.data, alpha=-rec.lr)
+        """Full-sync step: one fused pass per record — m/v commit, the
+        configured score materialized into the main grads (the reselection
+        reads it from there), and the apply ``w -= lr * update``."""
+        self._records_pass(ctx, emit_mode=self._emit_mode, use_mask=False)
 
     @torch.no_grad()
     def sparse_step(self, ctx):
         """Sparse step: fused grad-correct + apply with the persisted mask;
         the grad buffer (residual) is untouched."""
-        self._records_pass(ctx, write_update=False, use_mask=True)
+        self._records_pass(ctx, emit_mode=None, use_mask=True)
 
     def reset(self, ctx, was_full: bool):
         """Sparse steps: zero communicated positions, optionally pre-fold the

@@ -27,9 +27,16 @@ from omegaconf import OmegaConf
 
 from sga.config import sga_section_to_config
 from sga.engine import SGAEngine
-from sga.plugins import build_optimizer, build_selection
+from sga.plugins import (
+    Score,
+    build_optimizer,
+    build_selection,
+    get_optimizer_decl,
+    register_default_plugins,
+)
 from sga.plugins.optimizer import ParamRecord
-from sga.plugins.optimizer.adamw import _grad_correct_torch
+from sga.plugins.optimizer.adamw_torch import grad_correct_torch
+from sga.plugins.scores import emittable_score_names, score_names
 from sga.shadow import readonly_score
 
 from test_engine_unit import (
@@ -233,10 +240,12 @@ def test_shadow_rng_guard_raises():
 
 
 def test_readonly_score_matches_optimizer_torch_reference():
-    """readonly_score vs _grad_correct_torch's materialized output,
-    elementwise, for every registry emit name (the anti-drift pin; the
-    registry formula is the single source of score math, the kernel its
-    online materialization); inputs stay untouched (read-only)."""
+    """readonly_score vs grad_correct_torch's materialized output,
+    elementwise, for every registry emit name (a plumbing-equivalence pin,
+    not a math one: both sides call the same registry formulas, so the
+    score-math comparison is tautological by design — what this actually
+    pins is state selection, bias-correction/step resolution, the read-only
+    contract and scratch routing); inputs stay untouched (read-only)."""
     torch.manual_seed(4)
     for emit in ("update", "coi", "abs_g", "abs_m"):
         n = 256
@@ -246,15 +255,13 @@ def test_readonly_score_matches_optimizer_torch_reference():
         v0 = torch.rand(n) * 0.01 + 1e-4
         b1, b2, eps, wd, lr = 0.9, 0.95, 1e-8, 0.1, 1e-3
         step = 37
-        # kernel reference over clones: named scores land in the grad buffer,
-        # the default signed update lands there when no side buffer is given
+        # kernel reference over clones: the score lands in the grad buffer
         g_ref = g.clone()
-        _grad_correct_torch(
-            w.clone(), g_ref, m0.clone(), v0.clone(), lr, b1, b2, eps, wd,
+        w_ref = w.clone()
+        grad_correct_torch(
+            w_ref, g_ref, m0.clone(), v0.clone(), lr, b1, b2, eps, wd,
             1.0 - b1 ** step, 1.0 - b2 ** step,
-            None, True,
-            score_out=(None if emit == "update" else torch.empty(n)),
-            score_mode=(None if emit == "update" else emit),
+            None, int(Score[emit]),
         )
         # shadow: fresh record over the same pre-commit state
         main_p = torch.nn.Parameter(w.clone())
@@ -308,12 +315,10 @@ def test_readonly_score_matches_optimizer_torch_reference():
         )
         rec._state = {}
         g_ref = g.clone()
-        _grad_correct_torch(
+        grad_correct_torch(
             w.clone(), g_ref, torch.zeros(n), torch.zeros(n), 1e-3, 0.9, 0.95,
             1e-8, 0.1, 1.0 - 0.9 ** 1, 1.0 - 0.95 ** 1,
-            None, True,
-            score_out=(None if emit == "update" else torch.empty(n)),
-            score_mode=(None if emit == "update" else emit),
+            None, int(Score[emit]),
         )
         assert torch.equal(readonly_score(rec, emit), g_ref), \
             f"{emit} at zero state: shadow score != kernel reference"
@@ -657,8 +662,6 @@ def test_registry_scores_shadow_evaluable_and_decl_alignment():
     stays a subset of the registry (a decl advertising an unregistered name
     would pass config validation and blow up mid-run; today every registry
     entry is online-usable, so the subset is an equality pin)."""
-    from sga.plugins import get_optimizer_decl, register_default_plugins, score_names
-
     torch.manual_seed(2)
     n = 16
     main_p = torch.nn.Parameter(torch.randn(n))
@@ -685,7 +688,9 @@ def test_registry_scores_shadow_evaluable_and_decl_alignment():
     decl = get_optimizer_decl("adamw")
     assert set(decl.emittable_scores) <= set(score_names()), \
         "decl advertises unregistered scores"
-    assert decl.emittable_scores == frozenset(score_names()), \
+    assert decl.emittable_scores == emittable_score_names(), \
+        "the single template's emittable set must stay the DERIVED online set"
+    assert emittable_score_names() == frozenset(score_names()), \
         ("every registry entry is online-usable today (an offline-only entry "
          "must consciously relax this pin)")
     print("PASS test_registry_scores_shadow_evaluable_and_decl_alignment")

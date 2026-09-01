@@ -1,13 +1,21 @@
 # Copyright (c) 2026, SGA framework contributors.
-"""Scheme-agnostic Triton kernels and helpers shared by SGA plugins.
+"""Scheme-agnostic Triton kernels and dispatchers shared by SGA plugins.
 
 Ported from the historical fork's ``megatron/core/sga/common.py`` (survey:
 AGENTSPACE/iterations/earlier probing/data/survey-oldfl-schemes.md S4). The
 Megatron-coupled clip plumbing lives in the engine's clip service instead;
-only pure tensor kernels and the AdamW step-counter helper live here.
+only pure tensor kernels and the AdamW step-counter helper live here. The
+pure-torch fallbacks are physically isolated in ``sga/kernels_torch.py`` —
+this file is Triton + dispatch.
 """
 
 import torch
+
+from sga.kernels_torch import (
+    masked_norm_sq_contribution_torch,
+    masked_scale_torch,
+    scatter_selected_torch,
+)
 
 try:
     import triton
@@ -88,7 +96,7 @@ def scatter_selected(dst: torch.Tensor, indices: torch.Tensor, src: torch.Tensor
             src, indices, dst, n, BLOCK_SIZE=_CLIP_BLOCK_SIZE
         )
     else:
-        dst[indices.long()] = src
+        scatter_selected_torch(dst, indices, src)
 
 
 def use_fused_masked_op(grad: torch.Tensor, mask: torch.Tensor) -> bool:
@@ -121,8 +129,7 @@ def masked_norm_sq_contribution(grad: torch.Tensor, mask: torch.Tensor,
             BLOCK_SIZE=_CLIP_BLOCK_SIZE,
         )
     else:
-        masked = grad_flat[mask_flat.bool()]
-        total_norm_sq += masked.float().pow(2).sum()
+        masked_norm_sq_contribution_torch(grad_flat, mask_flat, total_norm_sq)
 
 
 def masked_scale(grad: torch.Tensor, mask: torch.Tensor, coeff: float) -> None:
@@ -136,7 +143,7 @@ def masked_scale(grad: torch.Tensor, mask: torch.Tensor, coeff: float) -> None:
             BLOCK_SIZE=_CLIP_BLOCK_SIZE,
         )
     else:
-        grad_flat[mask_flat.bool()] *= coeff
+        masked_scale_torch(grad_flat, mask_flat, coeff)
 
 
 def sga_peek_step(wrapper, group):
