@@ -309,12 +309,14 @@ def build_optimizer(name, params, emit_score: str = None):
 def build_backend_plugin(name, params):
     from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
     from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
+    from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
 
     register_default_plugins()
     params = _resolved("backend", name, params)  # curated unknown-name error
     return {
         "torch_pipelined_index": TorchPipelinedIndexBackend,
         "torch_pipelined_mask": TorchPipelinedMaskBackend,
+        "nccl_pipelined_index": NcclPipelinedIndexBackend,
     }[name](params)
 
 
@@ -351,10 +353,12 @@ def register_default_plugins() -> None:
 
     from sga.backends.torch_pipelined_index import DECL as tpi_decl
     from sga.backends.torch_pipelined_mask import DECL as tpm_decl
+    from sga.backends.nccl_pipelined_index import DECL as npi_decl
 
     for name, decl in (
         ("torch_pipelined_index", tpi_decl),
         ("torch_pipelined_mask", tpm_decl),
+        ("nccl_pipelined_index", npi_decl),
     ):
         if name not in _BACKEND_PLUGINS:
             register_backend_plugin(name, decl)

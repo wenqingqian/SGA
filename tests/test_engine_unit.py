@@ -267,6 +267,128 @@ def test_resume_fail_closed_refusal_and_hermetic_override():
           "override honored, env restored)")
 
 
+def test_nccl_pipelined_index_decl_and_loud_gates():
+    """Everything reachable without a live raw NCCL comm: the decl
+    vocabulary, param gates, uniform bounds, and the loud refusals. The
+    real comm path (prepare / uid exchange / ctypes launch) is covered by
+    the 2-rank CUDA dist suite with SGA_NCCL_SAR_LIB set."""
+    from sga.backends.nccl_pipelined_index import (
+        DECL, NcclPipelinedIndexBackend)
+    ns = SimpleNamespace
+    base = dict(pipeline_model_parallel_size=1,
+                tensor_model_parallel_size=1,
+                context_parallel_size=1,
+                expert_model_parallel_size=1)
+
+    be = NcclPipelinedIndexBackend({})
+    assert be.decl is DECL and DECL.name == "nccl_pipelined_index"
+    assert be.decl.consumes == "idx"  # engine routes by this attribute
+    # uniform i*k//s split at any slices (no midpoint special case: the
+    # kernel reduces each coordinate once, the partition cannot change
+    # results)
+    assert be._bounds(7) == [(0, 3), (3, 7)]
+    assert NcclPipelinedIndexBackend({"slices": 3})._bounds(7) == \
+        [(0, 2), (2, 4), (4, 7)]
+    try:
+        NcclPipelinedIndexBackend({"slices": 0})
+        raise AssertionError("slices=0 accepted")
+    except ValueError:
+        pass
+
+    # _scale_buf growth discipline (CPU-exercisable: no dist, no lib):
+    # grow-only on shrink with 4M rounding; a dtype-change realloc (the
+    # same branch as a device change) preserves the grown capacity
+    sb = NcclPipelinedIndexBackend({})
+    sb._scale_buf(0, 1000, torch.float32, torch.device("cpu"))
+    cap = sb._scale_bufs[0].numel()
+    assert cap == 4 << 20
+    sb._scale_buf(0, 10, torch.float32, torch.device("cpu"))
+    assert sb._scale_bufs[0].numel() == cap  # shrink keeps capacity
+    sb._scale_buf(0, 2 * cap, torch.float32, torch.device("cpu"))
+    assert sb._scale_bufs[0].numel() == 2 * cap  # growth rounds to 4M
+    sb._scale_buf(0, 10, torch.float64, torch.device("cpu"))
+    assert sb._scale_bufs[0].numel() == 2 * cap  # realloc preserves it
+
+    g = torch.randn(64)
+    sup = BucketSupport((torch.rand(64) < 0.5).to(torch.uint8))
+    # pinned dtype/op vocabulary refuses before anything else
+    try:
+        be.allreduce_sparse(g.double(), sup, None, 1.0,
+                            torch.distributed.ReduceOp.SUM, key=0)
+        raise AssertionError("fp64 accepted")
+    except ValueError as e:
+        assert "fp32" in str(e), e
+    try:
+        be.allreduce_sparse(g, sup, None, 1.0,
+                            torch.distributed.ReduceOp.MAX, key=0)
+        raise AssertionError("MAX accepted")
+    except ValueError as e:
+        assert "SUM" in str(e), e
+    # empty support: clean no-op, no comm needed
+    be.allreduce_sparse(g, BucketSupport(torch.zeros(64, dtype=torch.uint8)),
+                        None, 1.0, torch.distributed.ReduceOp.SUM, key=0)
+    # non-empty support without a prepared comm: loud, not a silent fallback
+    try:
+        be.allreduce_sparse(g, sup, None, 1.0,
+                            torch.distributed.ReduceOp.SUM, key=0)
+        raise AssertionError("missing comm accepted")
+    except RuntimeError as e:
+        assert "prepare()" in str(e), e
+
+    # validate_runtime: topology gates mirror the twin-mode contract
+    be.validate_runtime(ns(**base))
+    for bad in ({"pipeline_model_parallel_size": 2},
+                {"tensor_model_parallel_size": 2},
+                {"context_parallel_size": 2},
+                {"expert_model_parallel_size": 4}):
+        try:
+            be.validate_runtime(ns(**bad))
+            raise AssertionError(f"bad topology accepted: {bad}")
+        except ValueError:
+            pass
+    print("ok: nccl_pipelined_index decl/params/bounds/loud gates")
+
+
+def test_nccl_pipelined_index_resume_fail_closed():
+    """Same resume conventions as the twin mode: a load dir WITH a tracker
+    is refused (raw-comm residency unmeasured for resume, conservative
+    refusal), cold start passes, the shared escape hatch overrides; env
+    scrubbed before the refusal assertion and restored after."""
+    import tempfile
+
+    import sga.backends.nccl_pipelined_index as npi
+    from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
+
+    ns = SimpleNamespace
+    base = dict(pipeline_model_parallel_size=1,
+                tensor_model_parallel_size=1,
+                context_parallel_size=1,
+                expert_model_parallel_size=1)
+    be = NcclPipelinedIndexBackend({})
+    with tempfile.TemporaryDirectory() as td:
+        ckpt = os.path.join(td, "checkpoints")
+        os.makedirs(ckpt)
+        be.validate_runtime(ns(**base, load=os.path.join(td, "missing")))
+        be.validate_runtime(ns(**base, load=ckpt))
+        open(os.path.join(ckpt, "latest_checkpointed_iteration.txt"), "w").write("60")
+        prev = os.environ.pop(npi._RESUME_OVERRIDE_ENV, None)
+        try:
+            try:
+                be.validate_runtime(ns(**base, load=ckpt))
+                raise AssertionError("resume accepted")
+            except ValueError as e:
+                assert npi._RESUME_OVERRIDE_ENV in str(e), e
+            os.environ[npi._RESUME_OVERRIDE_ENV] = "1"
+            be.validate_runtime(ns(**base, load=ckpt))  # override passes
+        finally:
+            if prev is None:
+                os.environ.pop(npi._RESUME_OVERRIDE_ENV, None)
+            else:
+                os.environ[npi._RESUME_OVERRIDE_ENV] = prev
+    print("ok: nccl_pipelined_index resume fail-closed (cold start passes, "
+          "tracker refused, override honored, env restored)")
+
+
 # ------------------------------------------------ consistency negative tests
 
 class _MutatingAllReduce:

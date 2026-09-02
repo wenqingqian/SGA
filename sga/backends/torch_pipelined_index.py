@@ -49,6 +49,7 @@ import os
 
 import torch
 
+from sga.backends import COMM_WARMUP_ENV, RESUME_OVERRIDE_ENV
 from sga.kernels import scatter_selected
 from sga.plugins import BackendDecl, PluginParam, resolve_plugin_params
 
@@ -74,12 +75,12 @@ DECL = BackendDecl(
 # set identically on every rank (export via env.sh, not per-node): a
 # partial export raises on only some ranks while the rest proceed into the
 # next world collective.
-_RESUME_OVERRIDE_ENV = "SGA_ALLOW_RESUME_PIPELINED"
+_RESUME_OVERRIDE_ENV = RESUME_OVERRIDE_ENV
 # Emergency/diagnostic bypass for the twin-PG warmup. Parsed as exactly "1"
 # (the unset default); any OTHER value disables the warmup. Must be set
 # identically on every rank: ranks that skip the warmup's blocking
 # allreduce while the rest enter it deadlock the job inside NCCL at attach.
-_WARMUP_ENV = "SGA_COMM_WARMUP"
+_WARMUP_ENV = COMM_WARMUP_ENV
 # 8M fp32 elements = 32MB: at/above the largest single-slice allreduce in
 # production (buckets ~40M elements × 40% support / 2 slices ≈ 8M), so the
 # warmup connects every NCCL channel the real path will ever use. Assumed

@@ -80,6 +80,40 @@ def main():
     # --- backends agree bitwise on the communicated coordinates -----------
     assert torch.equal(g_idx[active], g_mask[active])
 
+    # --- raw-kernel backend (needs the sparse library; skip loudly) -------
+    lib = os.environ.get("SGA_NCCL_SAR_LIB")
+    if lib:
+        from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
+
+        be = NcclPipelinedIndexBackend({})
+        be.prepare(group, device=device)
+        be.prepare(group, device=device)  # idempotent: one comm per group
+        assert len(be._comms) == 1
+        g_nccl = local.clone()
+        be.allreduce_sparse(g_nccl, support, group, factor, op, key=9)
+        torch.cuda.synchronize()
+        assert torch.equal(g_nccl[~active], local[~active]), "residual changed"
+        # pow2 factor + one add per coordinate: bitwise agreement with the
+        # torch backends (validated on A100 singlesocket + cross-node IB)
+        assert torch.equal(g_nccl[active], expected_selected[active]), \
+            f"nccl backend selected coords wrong (rank {rank})"
+        assert torch.equal(g_nccl[active], g_idx[active])
+
+        # a second backend instance (different slices) exercising the
+        # factor-1.0 fast path: no pre-scale, plain SUM over 2 ranks
+        be3 = NcclPipelinedIndexBackend({"slices": 3})
+        be3.prepare(group, device=device)
+        g_fast = local.clone()
+        be3.allreduce_sparse(g_fast, support, group, 1.0, op, key=10)
+        torch.cuda.synchronize()
+        assert torch.equal(g_fast[~active], local[~active]), "residual changed"
+        expected_fast = _vec(100) + _vec(101)  # (a + b) * 1.0: no scaling
+        assert torch.equal(g_fast[active], expected_fast[active]), \
+            f"nccl fast-path selected coords wrong (rank {rank})"
+    else:
+        if rank == 0:
+            print("skip: nccl_pipelined_index arm (SGA_NCCL_SAR_LIB unset)")
+
     # --- empty support is a clean no-op ------------------------------------
     empty = BucketSupport(torch.zeros(n, dtype=torch.uint8, device=device))
     g_empty = local.clone()

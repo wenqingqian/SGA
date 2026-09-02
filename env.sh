@@ -85,6 +85,20 @@ _sga_main() {
     _pythonpath_prepend "$_SGA_ROOT"
     export PYTHONPATH
 
+    # Sparse NCCL library for the nccl_pipelined_index backend: the nccl-sar
+    # fork's modified ncclAllReduce signature makes it mutually exclusive
+    # with torch's bundled NCCL, so it is only ever loaded explicitly via
+    # ctypes. The v5 build is the sparse_index branch, and its "-mask"
+    # artifact name is what serves the index backend (it exports
+    # ncclSparseAllReduce). Unset when the sibling checkout has no built
+    # library — that backend then fails its own loud prepare() check
+    # instead of here.
+    _SPARSE_LIB="${_SGA_ROOT}/../nccl-sar/libs/v5/libnccl-mask.so"
+    if [ -z "${SGA_NCCL_SAR_LIB:-}" ] && [ -f "$_SPARSE_LIB" ]; then
+        export SGA_NCCL_SAR_LIB="$_SPARSE_LIB"
+    fi
+    unset _SPARSE_LIB
+
     if ! _sga_check_megatron_source; then
         return 1
     fi

@@ -12,5 +12,5 @@ repos:
   nccl-sar:
     path: ../nccl-sar
     branch: master
-    base_commit: 63cf786     # NCCL 2.30.7 fork; reserved, not built by SGA yet
+    base_commit: 63cf786     # NCCL 2.30.7 fork; built (libs/v5), auto-discovered by env.sh
     note: sparse allreduce kernel placeholder repo
