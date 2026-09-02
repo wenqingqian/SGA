@@ -3,7 +3,7 @@
 # examples/llama3/train_1b_dense.yaml so runs are directly comparable.
 #
 # score=update + selection=topk method=histogram (exact tier) +
-# optimizer=adamw (residual) + backend=indexed_sparse.
+# optimizer=adamw (residual) + backend=torch_pipelined_index.
 # Cycle: full sync + reselect every period-8 boundary after start_iter;
 # residual folds undivided at boundaries (paper-exact).
 
@@ -69,7 +69,7 @@ sga:
     name: adamw
     residual_mean: false
   backend:
-    name: indexed_sparse
+    name: torch_pipelined_index
 
 #### model ####
 

@@ -56,6 +56,23 @@ def test_old_selection_name_fails_loud():
     print("ok: old selection name fails loud with the registered list")
 
 
+def test_old_backend_name_fails_loud():
+    """Pre-unification backend names must fail with a migration hint that
+    names the reproducing configuration — not a silent dict miss."""
+    from sga.plugins import get_backend_plugin_decl
+    for old, hint in (
+        ("indexed_sparse", "high_priority_group: false"),
+        ("pipelined_idx_sorted", "high_priority_group: true, slices: 3"),
+        ("masked_pipelined", "torch_pipelined_mask"),
+    ):
+        try:
+            get_backend_plugin_decl(old)
+            raise AssertionError(f"old name accepted: {old}")
+        except ValueError as e:
+            assert old in str(e) and hint in str(e), (old, e)
+    print("ok: old backend names fail loud with migration hints")
+
+
 def test_registry_contents():
     assert score_names() == ["abs_g", "abs_m", "coi", "update"]
     for name in score_names():
@@ -577,12 +594,12 @@ def test_combination_validator_and_build_injection():
     for name in ("update", "coi", "abs_g", "abs_m"):
         assert name in opt_decl.emittable_scores
         validate_combination(name, get_selection_decl("topk"),
-                             opt_decl, get_backend_plugin_decl("indexed_sparse"),
+                             opt_decl, get_backend_plugin_decl("torch_pipelined_index"),
                              cycle)
     # an unknown score name is rejected with the registered list
     try:
         validate_combination("nope", get_selection_decl("topk"),
-                             opt_decl, get_backend_plugin_decl("indexed_sparse"),
+                             opt_decl, get_backend_plugin_decl("torch_pipelined_index"),
                              cycle)
         raise AssertionError("unknown score accepted")
     except ValueError as e:
@@ -595,7 +612,7 @@ def test_combination_validator_and_build_injection():
     try:
         validate_combination("abs_m", get_selection_decl("topk"),
                              non_emitting,
-                             get_backend_plugin_decl("indexed_sparse"), cycle)
+                             get_backend_plugin_decl("torch_pipelined_index"), cycle)
         raise AssertionError("offline-only score accepted")
     except ValueError as e:
         assert "emittable" in str(e), e
@@ -605,12 +622,12 @@ def test_combination_validator_and_build_injection():
         try:
             validate_combination("abs_m", get_selection_decl("topk"),
                                  opt_decl,
-                                 get_backend_plugin_decl("indexed_sparse"), bad)
+                                 get_backend_plugin_decl("torch_pipelined_index"), bad)
             raise AssertionError(f"full_sync_interval {bad} accepted")
         except ValueError as e:
             assert "full_sync" in str(e), e
     validate_combination("abs_m", get_selection_decl("topk"),
-                         opt_decl, get_backend_plugin_decl("indexed_sparse"),
+                         opt_decl, get_backend_plugin_decl("torch_pipelined_index"),
                          {"period": 8, "full_sync_interval": 8})
 
     # build injection: the optimizer instance carries the requested emission

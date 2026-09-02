@@ -530,7 +530,7 @@ _BASE = {
         "score": {"name": "abs_m"},
         "selection": {"name": "topk", "method": "histogram", "ratio_percent": 30.0},
         "optimizer": {"name": "adamw"},
-        "backend": {"name": "indexed_sparse"},
+        "backend": {"name": "torch_pipelined_index"},
     },
     "train": {"system": {"tensor_model_parallel_size": 1},
               "model": {"num_layers": 2},

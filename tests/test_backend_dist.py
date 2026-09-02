@@ -6,8 +6,9 @@ prototype's methodology:
 
 - payload scaling under a real SUM allreduce: non-selected coordinates are
   BITWISE unchanged, selected ones equal (a + b) * factor;
-- the two backends (masked_pipelined / indexed_sparse) produce bitwise-
-  identical communicated coordinates (same element set, single fp32 add);
+- the two backends (torch_pipelined_mask / torch_pipelined_index) produce
+  bitwise-identical communicated coordinates (same element set, single fp32
+  add);
 - an empty support is a clean no-op;
 - the engine's layer-1 count check passes on identical supports and REFUSES
   (raises, no collective mismatch) on diverged ones.
@@ -25,8 +26,8 @@ import torch.distributed as dist
 SGA_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SGA_ROOT)
 
-from sga.backends.indexed_sparse import IndexedSparseBackend
-from sga.backends.masked_pipelined import MaskedPipelinedBackend
+from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
+from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
 from sga.engine import SGAEngineError
 from sga.support import BucketSupport
 
@@ -61,7 +62,7 @@ def main():
 
     # --- masked backend ---------------------------------------------------
     g_mask = local.clone()
-    MaskedPipelinedBackend({"num_slices": 2}).allreduce_sparse(
+    TorchPipelinedMaskBackend({"num_slices": 2}).allreduce_sparse(
         g_mask, support, group, factor, op, key=0)
     active = support.mask_u8 > 0
     assert torch.equal(g_mask[~active], local[~active]), "residual changed"
@@ -70,7 +71,7 @@ def main():
 
     # --- indexed backend --------------------------------------------------
     g_idx = local.clone()
-    IndexedSparseBackend({}).allreduce_sparse(
+    TorchPipelinedIndexBackend({}).allreduce_sparse(
         g_idx, support, group, factor, op, key=0)
     assert torch.equal(g_idx[~active], local[~active]), "residual changed"
     assert torch.equal(g_idx[active], expected_selected[active]), \
@@ -82,9 +83,9 @@ def main():
     # --- empty support is a clean no-op ------------------------------------
     empty = BucketSupport(torch.zeros(n, dtype=torch.uint8, device=device))
     g_empty = local.clone()
-    MaskedPipelinedBackend({"num_slices": 2}).allreduce_sparse(
+    TorchPipelinedMaskBackend({"num_slices": 2}).allreduce_sparse(
         g_empty, empty, group, factor, op, key=1)
-    IndexedSparseBackend({}).allreduce_sparse(
+    TorchPipelinedIndexBackend({}).allreduce_sparse(
         g_empty, empty, group, factor, op, key=1)
     assert torch.equal(g_empty, local)
     dist.barrier()

@@ -22,7 +22,7 @@ import torch
 from sga.plugins import BackendDecl, PluginParam, resolve_plugin_params
 
 DECL = BackendDecl(
-    name="masked_pipelined",
+    name="torch_pipelined_mask",
     consumes="mask",
     params=(
         PluginParam(
@@ -33,13 +33,13 @@ DECL = BackendDecl(
 )
 
 
-class MaskedPipelinedBackend:
+class TorchPipelinedMaskBackend:
     """Consumes the mask form of a bucket's support."""
 
     decl = DECL
 
     def __init__(self, params: dict):
-        params = resolve_plugin_params("backend", "masked_pipelined", DECL,
+        params = resolve_plugin_params("backend", "torch_pipelined_mask", DECL,
                                        dict(params))
         self.num_slices = int(params["num_slices"]) or 2
 

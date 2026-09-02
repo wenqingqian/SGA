@@ -10,8 +10,8 @@
 # selection=topk method=adaptive (v3.1: fast-histogram warmup gated on the
 # measured ratio, then a persistent threshold with the ±1pp dead band and
 # log-space steps) + optimizer=adamw (residual) +
-# backend=pipelined_idx_sorted (S=3 compact-set pipeline on a twin
-# high-priority NCCL process group). Cycle start_iter=4 / period=4 with
+# backend=torch_pipelined_index with high_priority_group: true and S=3
+# slices on a twin high-priority NCCL process group). Cycle start_iter=4 / period=4 with
 # adaptive_warmup_syncs=5 (historical validation context: the transition was
 # originally confirmed within a 60-iter smoke; the preset now runs
 # train_iters=5000).
@@ -79,7 +79,9 @@ sga:
     name: adamw
     residual_mean: false
   backend:
-    name: pipelined_idx_sorted
+    name: torch_pipelined_index
+    high_priority_group: true
+    slices: 3
 
 #### model ####
 

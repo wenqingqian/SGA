@@ -29,8 +29,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sga.backends.indexed_sparse import IndexedSparseBackend
-from sga.backends.masked_pipelined import MaskedPipelinedBackend
+from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
+from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
 from sga.engine import BucketState, CycleManager, SGAEngine, SGAEngineError
 from sga.plugins import build_optimizer, build_selection
 from sga.support import BucketSupport, Support
@@ -103,7 +103,7 @@ def test_payload_scaling_preserves_residual_bitwise():
     grad = grad0.clone()
     factor = 0.125  # power of two -> scaling is exact, comparison bitwise
 
-    backend = MaskedPipelinedBackend({"num_slices": 2})
+    backend = TorchPipelinedMaskBackend({"num_slices": 2})
     with _ReplicaWorld(world=4):
         backend.allreduce_sparse(grad, support, None, factor,
                                  torch.distributed.ReduceOp.SUM, key=0)
@@ -114,12 +114,17 @@ def test_payload_scaling_preserves_residual_bitwise():
     assert torch.equal(grad[active], grad0[active] * 4 * factor)
 
 
-def test_pipelined_idx_sorted_matches_indexed_sparse():
-    """The S-slice hiprio twin-group backend lands bitwise-identical gradients
-    to the two-slice midpoint backend (same element sets, same collective
-    order within the slice partition, payload scaling on selected only)."""
-    from sga.backends.indexed_sparse import IndexedSparseBackend
-    from sga.backends.pipelined_idx_sorted import PipelinedIdxSortedBackend
+def test_torch_pipelined_index_modes_and_mechanics():
+    """The unified idx backend: both transport modes (plain default vs
+    high-priority twin) land bitwise-identical gradients (same element
+    sets, payload scaling on selected only), the default mode uses the
+    legacy bucket-midpoint split, grow-only buffers hold, prepare() is
+    twin-mode-gated, and validate_runtime only constrains twin mode."""
+    plain = TorchPipelinedIndexBackend({})          # hiprio=False, S=2
+    twin = TorchPipelinedIndexBackend({"high_priority_group": True,
+                                       "slices": 3})
+    assert plain.decl.consumes == "idx"  # engine activates by this attribute
+    assert plain.decl.name == "torch_pipelined_index"
 
     for world, k_shape in ((1, None), (4, None), (4, 7)):  # incl. tiny uneven K
         torch.manual_seed(21 + world)
@@ -134,20 +139,24 @@ def test_pipelined_idx_sorted_matches_indexed_sparse():
         g_ref = torch.randn(n)
         g_new = g_ref.clone()
         with _ReplicaWorld(world=world):
-            IndexedSparseBackend({}).allreduce_sparse(
-                g_ref, support, None, factor,
-                torch.distributed.ReduceOp.SUM, key=0)
-            PipelinedIdxSortedBackend({}).allreduce_sparse(
-                g_new, support, None, factor,
-                torch.distributed.ReduceOp.SUM, key=0)
+            plain.allreduce_sparse(g_ref, support, None, factor,
+                                   torch.distributed.ReduceOp.SUM, key=0)
+            twin.allreduce_sparse(g_new, support, None, factor,
+                                  torch.distributed.ReduceOp.SUM, key=0)
         assert torch.equal(g_new, g_ref), (world, k_shape)
 
+    # default mode splits at the legacy bucket midpoint; other configs
+    # split the selected count evenly
+    support = BucketSupport((torch.rand(4096) < 0.3).to(torch.uint8))
+    k = support.idx.numel()
+    assert plain._bounds(support, k) == [(0, support.split), (support.split, k)]
+    assert twin._bounds(support, k) == [(i * k // 3, (i + 1) * k // 3)
+                                        for i in range(3)]
+    assert TorchPipelinedIndexBackend({"slices": 3})._bounds(support, k) == \
+        [(i * k // 3, (i + 1) * k // 3) for i in range(3)]
+
     # grow-only discipline: a smaller second cycle keeps the same capacity
-    be = PipelinedIdxSortedBackend({})
-    assert be.decl.consumes == "idx"  # engine activates by this attribute
-    assert be.decl.name == "pipelined_idx_sorted"
-    from sga.backends.indexed_sparse import IndexedSparseBackend
-    assert IndexedSparseBackend({}).decl.consumes == "idx"
+    be = TorchPipelinedIndexBackend({})
     with _ReplicaWorld(world=1):
         be.allreduce_sparse(torch.randn(1000), BucketSupport(
             torch.ones(1000, dtype=torch.uint8)), None, 1.0,
@@ -158,32 +167,33 @@ def test_pipelined_idx_sorted_matches_indexed_sparse():
             torch.distributed.ReduceOp.SUM, key=3)
     assert be._gather_bufs[3].numel() == cap
 
-    # eager twin-group plumbing: prepare() is where the ONLY group creation
-    # happens (never lazily inside allreduce_sparse); idempotent; without a
-    # live NCCL world the plain group is kept.
-    be = PipelinedIdxSortedBackend({})
-    assert be._twins == {}
+    # prepare() is twin-mode-gated and, in twin mode, where the ONLY group
+    # creation happens (never lazily inside allreduce_sparse); idempotent;
+    # without a live NCCL world the plain group is kept.
     sentinel = object()
-    be.prepare(None)                       # missing group: no-op
-    be.prepare(sentinel)                   # no NCCL init here: keep plain
-    be.prepare(sentinel)                   # idempotent
-    assert len(be._twins) == 1 and be._twins[sentinel] is sentinel
-    assert be._group_for(sentinel) is sentinel
-    assert be._group_for(None) is None
+    plain.prepare(sentinel)                 # plain mode: no-op
+    assert plain._twins == {}
+    assert twin._twins == {}
+    twin.prepare(None)                      # missing group: no-op
+    twin.prepare(sentinel)                  # no NCCL init here: keep plain
+    twin.prepare(sentinel)                  # idempotent
+    assert len(twin._twins) == 1 and twin._twins[sentinel] is sentinel
+    assert twin._group_for(sentinel) is sentinel
+    assert twin._group_for(None) is None
     try:
-        PipelinedIdxSortedBackend({"slices": 0})
+        TorchPipelinedIndexBackend({"slices": 0})
         raise AssertionError("slices=0 accepted")
     except ValueError:
         pass
 
-    # backend-owned runtime validation: single pipeline phase + exactly one
-    # DP-CP group covering the world (multi-DP-CP / tensor / context /
-    # expert layouts are refused at config time, not ordered at new_group).
+    # validate_runtime constrains TWIN mode only: single pipeline phase +
+    # exactly one DP-CP group covering the world (multi-DP-CP / tensor /
+    # context / expert layouts are refused at config time, not ordered at
+    # new_group); the plain mode imposes nothing beyond the shared v1 set.
     ns = SimpleNamespace
-    be.validate_runtime(ns(pipeline_model_parallel_size=1,
-                           tensor_model_parallel_size=1,
-                           context_parallel_size=1,
-                           expert_model_parallel_size=1))
+    ok = ns(pipeline_model_parallel_size=1, tensor_model_parallel_size=1,
+            context_parallel_size=1, expert_model_parallel_size=1)
+    twin.validate_runtime(ok)
     for bad in (
         {"pipeline_model_parallel_size": 2},
         {"tensor_model_parallel_size": 2},
@@ -191,15 +201,17 @@ def test_pipelined_idx_sorted_matches_indexed_sparse():
         {"expert_model_parallel_size": 4},
     ):
         try:
-            be.validate_runtime(ns(**bad))
+            twin.validate_runtime(ns(**{**ok.__dict__, **bad}))
             raise AssertionError(f"bad topology accepted: {bad}")
         except ValueError:
             pass
+    plain.validate_runtime(ns(**{**ok.__dict__, "pipeline_model_parallel_size": 8,
+                                 "tensor_model_parallel_size": 4}))
 
     # (resume fail-closed coverage lives in its own test function below so
-    # a failure names that concern, not this parity mega-test)
-    print("ok: pipelined_idx_sorted == indexed_sparse "
-          "(world 1/4, uneven K, grow-only, eager prepare, validate_runtime)")
+    # a failure names that concern, not this mechanics mega-test)
+    print("ok: torch_pipelined_index modes (parity, midpoint/even bounds, "
+          "grow-only, gated prepare/validate_runtime)")
 
 
 def test_resume_fail_closed_refusal_and_hermetic_override():
@@ -213,15 +225,16 @@ def test_resume_fail_closed_refusal_and_hermetic_override():
     running the suite)."""
     import tempfile
 
-    import sga.backends.pipelined_idx_sorted as pis
-    from sga.backends.pipelined_idx_sorted import PipelinedIdxSortedBackend
+    import sga.backends.torch_pipelined_index as tpi
+    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 
     ns = SimpleNamespace
     base = dict(pipeline_model_parallel_size=1,
                 tensor_model_parallel_size=1,
                 context_parallel_size=1,
                 expert_model_parallel_size=1)
-    be = PipelinedIdxSortedBackend({})
+    be = TorchPipelinedIndexBackend({"high_priority_group": True})
+    be_plain = TorchPipelinedIndexBackend({})
     with tempfile.TemporaryDirectory() as td:
         ckpt = os.path.join(td, "checkpoints")
         os.makedirs(ckpt)
@@ -231,23 +244,25 @@ def test_resume_fail_closed_refusal_and_hermetic_override():
         # tracker present: resume, refuse (message names the alternative
         # AND the documented escape hatch)
         open(os.path.join(ckpt, "latest_checkpointed_iteration.txt"), "w").write("60")
+        # plain mode is the resume path: no gate applies
+        be_plain.validate_runtime(ns(**base, load=ckpt))
         # hermetic: scrub any pre-exported escape hatch so the refusal
         # below tests the default behavior; restore whatever was set.
-        prev = os.environ.pop(pis._RESUME_OVERRIDE_ENV, None)
+        prev = os.environ.pop(tpi._RESUME_OVERRIDE_ENV, None)
         try:
             try:
                 be.validate_runtime(ns(**base, load=ckpt))
                 raise AssertionError("resume accepted")
             except ValueError as e:
-                assert "indexed_sparse" in str(e)
-                assert pis._RESUME_OVERRIDE_ENV in str(e)
-            os.environ[pis._RESUME_OVERRIDE_ENV] = "1"
+                assert "high_priority_group" in str(e)
+                assert tpi._RESUME_OVERRIDE_ENV in str(e)
+            os.environ[tpi._RESUME_OVERRIDE_ENV] = "1"
             be.validate_runtime(ns(**base, load=ckpt))  # override passes
         finally:
             if prev is None:
-                os.environ.pop(pis._RESUME_OVERRIDE_ENV, None)
+                os.environ.pop(tpi._RESUME_OVERRIDE_ENV, None)
             else:
-                os.environ[pis._RESUME_OVERRIDE_ENV] = prev
+                os.environ[tpi._RESUME_OVERRIDE_ENV] = prev
     print("ok: resume fail-closed (cold start passes, tracker refused, "
           "override honored, env restored)")
 
@@ -415,7 +430,7 @@ _UPDATE = {
     "opt": "adamw",
     "opt_params": {"residual_mean": False},
     "cycle": {"start_iter": 0, "period": 3, "full_sync_interval": 0},
-    "backend": MaskedPipelinedBackend({"num_slices": 2}),
+    "backend": TorchPipelinedMaskBackend({"num_slices": 2}),
 }
 
 # The named-score combo: abs_m materializes into the grad buffer with the
@@ -427,7 +442,7 @@ _ABS_M = {
     "opt": "adamw",
     "opt_params": {"residual_mean": False},
     "cycle": {"start_iter": 2, "period": 3, "full_sync_interval": 0},
-    "backend": IndexedSparseBackend({}),
+    "backend": TorchPipelinedIndexBackend({}),
 }
 
 
@@ -719,7 +734,7 @@ class _HookSelection:
         return masks
 
 
-class _PrepareBackend(IndexedSparseBackend):
+class _PrepareBackend(TorchPipelinedIndexBackend):
     def __init__(self):
         super().__init__({})
         self.prepared = []
@@ -773,7 +788,7 @@ def test_count_guard_once_per_cycle_and_flag_off():
         opt = build_optimizer("adamw", {"residual_mean": False},
                               emit_score="update")
         eng = SGAEngine({"cycle": dict(_ABS_M["cycle"]), **config_extra},
-                        "update", selection, opt, IndexedSparseBackend({}))
+                        "update", selection, opt, TorchPipelinedIndexBackend({}))
         eng._dp_cp_group = lambda: None
         calls = []
         orig = eng._check_counts

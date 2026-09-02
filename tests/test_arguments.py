@@ -65,7 +65,7 @@ def _nested_section(extra_cycle=None, **kw):
         "score": {"name": "update"},
         "selection": {"name": "topk", "method": "histogram", "ratio_percent": 10.0},
         "optimizer": {"name": "adamw"},
-        "backend": {"name": "indexed_sparse"},
+        "backend": {"name": "torch_pipelined_index"},
     }
     if extra_cycle:
         section["cycle"].update(extra_cycle)
@@ -143,7 +143,7 @@ def test_handwritten_flat_flags_equal():
         "--sga-selection-method", "adaptive",
         "--sga-selection-ratio-percent", "40.0",
         "--sga-optimizer-name", "adamw",
-        "--sga-backend-name", "indexed_sparse",
+        "--sga-backend-name", "torch_pipelined_index",
     ])
     assert args.sga_config == want, (args.sga_config, want)
     # the engine reads the expanded adaptive defaults at build time
@@ -267,7 +267,7 @@ def test_explicit_false_and_null_spellings():
         "--sga-selection-ratio-percent", "40.0",
         "--sga-selection-adaptive-warmup-syncs", "null",
         "--sga-optimizer-name", "adamw",
-        "--sga-backend-name", "indexed_sparse",
+        "--sga-backend-name", "torch_pipelined_index",
     ])
     assert args.sga_config == want, (args.sga_config, want)
     assert json.loads(args.sga_config)["selection"]["adaptive_warmup_syncs"] is None
@@ -340,7 +340,7 @@ def test_schema_and_resolve_cli():
                           ("exact", set())):
         tmp = os.path.join(root, "tests", "_tmp_method.yaml")
         with open(tmp, "w") as f:
-            f.write(f"sga: {{enabled: true, backend: {{name: indexed_sparse}}, "
+            f.write(f"sga: {{enabled: true, backend: {{name: torch_pipelined_index}}, "
                     f"score: {{name: update}}, optimizer: {{name: adamw}}, "
                     f"selection: {{name: topk, "
                     f"method: {method}, ratio_percent: 10.0}}}}\n")

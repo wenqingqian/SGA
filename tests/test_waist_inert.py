@@ -145,7 +145,7 @@ def test_api_version_mismatch_rejected_at_build():
             "score": {"name": "abs_m"},
             "selection": {"name": "topk"},
             "optimizer": {"name": "adamw"},
-            "backend": {"name": "masked_pipelined"},
+            "backend": {"name": "torch_pipelined_mask"},
             "cycle": {},
         }
         try:

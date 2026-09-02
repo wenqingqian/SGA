@@ -189,6 +189,18 @@ _SELECTIONS: dict = {}
 _OPTIMIZERS: dict = {}
 _BACKEND_PLUGINS: dict = {}
 
+# Absorbed backend names -> the migration hint raised on lookup. The
+# unification  merged indexed_sparse + pipelined_idx_sorted
+# into torch_pipelined_index (its high_priority_group param selects the
+# legacy behavior) and renamed masked_pipelined -> torch_pipelined_mask.
+_RENAMED_BACKENDS = {
+    "indexed_sparse": "torch_pipelined_index (high_priority_group: false, "
+                      "the default, reproduces indexed_sparse)",
+    "pipelined_idx_sorted": "torch_pipelined_index (high_priority_group: "
+                            "true, slices: 3 reproduces pipelined_idx_sorted)",
+    "masked_pipelined": "torch_pipelined_mask",
+}
+
 
 def register_selection(name, decl):
     _register("selection", _SELECTIONS, name, decl)
@@ -222,6 +234,11 @@ def get_optimizer_decl(name):
 
 
 def get_backend_plugin_decl(name):
+    if name in _RENAMED_BACKENDS:
+        raise ValueError(
+            f"SGA backend '{name}' was absorbed in the backend unification; "
+            f"use {_RENAMED_BACKENDS[name]}"
+        )
     return _lookup(_BACKEND_PLUGINS, name, "backend")
 
 
@@ -290,16 +307,14 @@ def build_optimizer(name, params, emit_score: str = None):
 
 
 def build_backend_plugin(name, params):
-    from sga.backends.masked_pipelined import MaskedPipelinedBackend
-    from sga.backends.indexed_sparse import IndexedSparseBackend
-    from sga.backends.pipelined_idx_sorted import PipelinedIdxSortedBackend
+    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
+    from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
 
     register_default_plugins()
     params = _resolved("backend", name, params)  # curated unknown-name error
     return {
-        "masked_pipelined": MaskedPipelinedBackend,
-        "indexed_sparse": IndexedSparseBackend,
-        "pipelined_idx_sorted": PipelinedIdxSortedBackend,
+        "torch_pipelined_index": TorchPipelinedIndexBackend,
+        "torch_pipelined_mask": TorchPipelinedMaskBackend,
     }[name](params)
 
 
@@ -308,9 +323,11 @@ def _resolved(axis, name, params):
     single resolver (defaults expand once, explicit-vs-default stays
     distinguishable for cross-param legality like topk's per-method
     foreign-key refusal)."""
-    registry = {"selection": _SELECTIONS, "optimizer": _OPTIMIZERS,
-                "backend": _BACKEND_PLUGINS}[axis]
-    _lookup(registry, name, axis)
+    if axis == "backend":
+        get_backend_plugin_decl(name)  # owns the _RENAMED_BACKENDS hints
+    else:
+        registry = {"selection": _SELECTIONS, "optimizer": _OPTIMIZERS}[axis]
+        _lookup(registry, name, axis)
     params = dict(params)
     params.pop("name", None)
     return params
@@ -332,14 +349,12 @@ def register_default_plugins() -> None:
         if name not in _OPTIMIZERS:
             register_optimizer(name, decl)
 
-    from sga.backends.masked_pipelined import DECL as mp_decl
-    from sga.backends.indexed_sparse import DECL as is_decl
-    from sga.backends.pipelined_idx_sorted import DECL as pis_decl
+    from sga.backends.torch_pipelined_index import DECL as tpi_decl
+    from sga.backends.torch_pipelined_mask import DECL as tpm_decl
 
     for name, decl in (
-        ("masked_pipelined", mp_decl),
-        ("indexed_sparse", is_decl),
-        ("pipelined_idx_sorted", pis_decl),
+        ("torch_pipelined_index", tpi_decl),
+        ("torch_pipelined_mask", tpm_decl),
     ):
         if name not in _BACKEND_PLUGINS:
             register_backend_plugin(name, decl)

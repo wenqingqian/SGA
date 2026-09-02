@@ -56,7 +56,7 @@ def _enable_standard(cfg):
     cfg.sga.score = {"name": "abs_m"}
     cfg.sga.selection = {"name": "topk", "method": "histogram", "ratio_percent": 30.0}
     cfg.sga.optimizer = {"name": "adamw"}
-    cfg.sga.backend = {"name": "indexed_sparse"}
+    cfg.sga.backend = {"name": "torch_pipelined_index"}
     return cfg
 
 
@@ -238,7 +238,7 @@ def test_enabled_emits_flat_flag_sequence():
     cfg.sga.score = {"name": "abs_m"}
     cfg.sga.selection = {"name": "topk", "method": "histogram", "ratio_percent": 20.0}
     cfg.sga.optimizer = {"name": "adamw", "residual_mean": True}
-    cfg.sga.backend = {"name": "masked_pipelined"}
+    cfg.sga.backend = {"name": "torch_pipelined_mask"}
     expected_engine_cfg = sga_section_to_config(cfg)
 
     from sga.config.arguments import sga_config_to_flags
@@ -362,7 +362,7 @@ def test_plugin_param_vocabulary():
     expect_error(lambda: sga_section_to_config(cfg), "must be bool")
 
     cfg.sga.optimizer = {"name": "adamw"}
-    cfg.sga.backend = {"name": "indexed_sparse", "anything": 1}
+    cfg.sga.backend = {"name": "torch_pipelined_index", "anything": 1}
     expect_error(lambda: sga_section_to_config(cfg), "unknown params ['anything']")
     print("ok: plugin param vocabulary enforced (unknown/type/choices/required)")
 
