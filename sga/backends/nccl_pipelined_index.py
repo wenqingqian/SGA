@@ -22,16 +22,20 @@ are untouched.
 
 Attach-time discipline mirrors the twin-group rules (see
 torch_pipelined_index): ``prepare()`` eagerly builds the comm and runs a
-warmup pair (one op at/above the largest production slice at the default
-``slices: 2``, one 1-element op) so lazily-created NCCL structures appear
-at the process's cleanest memory moment; ``validate_runtime`` refuses
-every topology whose comm creation order is not provably deterministic
-(single DP-CP group spanning the world) and refuses resume runs on the
-same residency grounds
+warmup pair (one op at/above the largest production op, one 1-element op)
+so lazily-created NCCL structures appear at the process's cleanest memory
+moment; ``validate_runtime`` refuses every topology whose comm creation
+order is not provably deterministic (single DP-CP group spanning the
+world) and refuses resume runs on the same residency grounds
 (``SGA_ALLOW_RESUME_PIPELINED=1`` overrides on hardware with headroom;
 raw-comm residency is smaller than a twin process group, but no 40GB
 resume steady-state measurement exists yet, so the refusal stays closed
 until multi-node data lands).
+
+One kernel launch per sync, unconditionally: the measured cost of an extra
+slice is one more full kernel invocation (per-call fixed cost, cross-node
+amplified), with no overlap on the kernel stream to pay for it, so no
+slicing is offered.
 
 Stream semantics satisfy the calling-stream completion contract: the
 selected payload is pre-scaled on the calling stream (only when
@@ -59,17 +63,12 @@ import torch
 
 from sga.backends import COMM_WARMUP_ENV, RESUME_OVERRIDE_ENV
 from sga.kernels import scatter_selected
-from sga.plugins import BackendDecl, PluginParam, resolve_plugin_params
+from sga.plugins import BackendDecl, resolve_plugin_params
 
 DECL = BackendDecl(
     name="nccl_pipelined_index",
     consumes="idx",
-    params=(
-        PluginParam(
-            "slices", int, default=2,
-            doc="number of idx slices launched on the kernel stream",
-        ),
-    ),
+    params=(),
 )
 
 # Path to the nccl-sar sparse library exporting ncclSparseAllReduce (the
@@ -82,12 +81,10 @@ _LIB_ENV = "SGA_NCCL_SAR_LIB"
 # backend for the deadlock/refusal rationale each flag documents).
 _RESUME_OVERRIDE_ENV = RESUME_OVERRIDE_ENV
 _WARMUP_ENV = COMM_WARMUP_ENV
-# Sized like the twin warmup: at/above the largest single-slice allreduce
-# in production (buckets ~40M elements x 40% support / 2 slices = 8M), so
-# the warmup connects every NCCL channel the real path will use. NOT
-# scaled with self._slices: with slices: 1 the first real allreduce
-# exceeds this warmup op.
-_WARMUP_ELEMS = 8 << 20
+# Sized at/above the largest single-op allreduce possible in production
+# (one whole bucket, ~40M elements — the ratio-100% corner), so the warmup
+# connects every NCCL channel the real path can use.
+_WARMUP_ELEMS = 40 << 20
 
 _NCCL_FLOAT32 = 7
 _NCCL_SUM = 0
@@ -112,11 +109,10 @@ class NcclPipelinedIndexBackend:
     decl = DECL
 
     def __init__(self, params: dict):
-        params = resolve_plugin_params("backend", "nccl_pipelined_index",
-                                       DECL, dict(params))
-        self._slices = int(params["slices"])
-        if self._slices < 1:
-            raise ValueError(f"slices must be >= 1, got {self._slices}")
+        # Validation-only (the decl declares no vocabulary): unknown keys
+        # fail here, loudly.
+        resolve_plugin_params("backend", "nccl_pipelined_index", DECL,
+                              dict(params))
         # comm_group -> _RawComm. Keyed by the group OBJECT with a strong
         # reference held on both sides (an id() key could collide after a
         # source group is released and Python reuses its id). Populated
@@ -238,7 +234,7 @@ class NcclPipelinedIndexBackend:
 
     def _warm_up_comm(self, lib, comm, stream, device, flag) -> None:
         """Build every lazily-created NCCL structure at attach time with a
-        dense-index op at/above the largest production slice plus a
+        dense-index op at/above the largest production op plus a
         1-element op; the synchronize turns a sticky CUDA error into an
         immediate, well-located failure. ``flag`` is the resolved
         ``_WARMUP_ENV`` value, echoed on rank 0 so a divergent export is
@@ -341,13 +337,6 @@ class NcclPipelinedIndexBackend:
             self._scale_bufs[key] = buf
         return buf
 
-    def _bounds(self, k):
-        """(lo, hi) ranges into the sorted idx per slice — even i*k//s
-        split; the kernel reduces each communicated coordinate exactly
-        once, so the partition cannot change results, only launch shape."""
-        s = self._slices
-        return [(i * k // s, (i + 1) * k // s) for i in range(s)]
-
     def allreduce_sparse(self, grad_data: torch.Tensor, support, comm_group,
                          gradient_scaling_factor: float, reduce_op,
                          key: int) -> None:
@@ -413,11 +402,7 @@ class NcclPipelinedIndexBackend:
         ready = torch.cuda.Event()
         ready.record(calling)
         ready.wait(entry.stream)
-        for lo, hi in self._bounds(k):
-            if hi <= lo:
-                continue
-            self._launch(entry.lib, entry.comm, entry.stream, grad_data,
-                         indices[lo:hi])
+        self._launch(entry.lib, entry.comm, entry.stream, grad_data, indices)
         done = torch.cuda.Event()
         done.record(entry.stream)
         done.wait(calling)

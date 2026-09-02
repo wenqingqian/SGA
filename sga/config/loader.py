@@ -16,10 +16,11 @@ the waist reads only that JSON.
 
 Field model: a scheme is the four-field combination
 score/selection/optimizer/backend, each with its own params, plus the engine
-cycle {start_iter, period, full_sync_interval}. Legality is checked from
-plugin DECLARATIONS (sga.plugins.validate_combination) — no hardcoded
-scheme list — and each plugin's parameter vocabulary is declared on its
-decl (unknown keys fail loud). ``enabled: false`` keeps the SGA-off
+cycle {start_iter, start_iter_percent, period,
+decouple_full_sync_interval_and_period, full_sync_interval}. Legality is
+checked from plugin DECLARATIONS (sga.plugins.validate_combination) — no
+hardcoded scheme list — and each plugin's parameter vocabulary is declared
+on its decl (unknown keys fail loud). ``enabled: false`` keeps the SGA-off
 semantics: dense training, backend name must be 'dense'.
 """
 
@@ -50,7 +51,13 @@ _SGA_KEYS = frozenset(
     )
 )
 _CYCLE_KEYS = frozenset(
-    ("start_iter", "start_iter_percent", "period", "full_sync_interval")
+    (
+        "start_iter",
+        "start_iter_percent",
+        "period",
+        "decouple_full_sync_interval_and_period",
+        "full_sync_interval",
+    )
 )
 
 

@@ -385,7 +385,7 @@ def test_meta_carries_engine_phase():
         # after the first reselect are sparse
         eng = _build_traced_engine(
             {"dir": td, "branch_points": [0], "window": 4}, chunk,
-            cycle={"start_iter": 0, "period": 2, "full_sync_interval": 0})
+            cycle={"start_iter": 0, "period": 2})
         _drive_steps(eng, chunk, mp, [0, 1, 2, 3])
         phases = {}
         for s in range(4):

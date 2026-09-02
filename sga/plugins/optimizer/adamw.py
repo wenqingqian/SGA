@@ -34,8 +34,9 @@ only); CPU unit tests keep working without Triton.
 
 Reset contract (selective with residual fold): sparse steps zero only the
 communicated (topk) positions; when the NEXT step is a full sync and
-``residual_mean`` is set, the residual is pre-divided by the cycle period T
-(fused kernel multiplies by the fp32 host reciprocal — bitwise identical to
+``residual_mean`` is set, the residual is pre-divided by the fold window T
+(the accumulation span between full syncs; fused kernel multiplies by the
+fp32 host reciprocal — bitwise identical to
 torch's scalar division). Full steps zero everything.
 """
 
@@ -62,12 +63,12 @@ DECL = OptimizerDecl(
     # Derived, not restated: this template implements every registry score's
     # kernel branch (a second template would declare its own branch subset).
     emittable_scores=emittable_score_names(),
-    requires_full_sync_every_period=True,
     params=(
         PluginParam(
             "residual_mean", bool, default=False,
-            doc="pre-fold the accumulated residual by the cycle period at "
-                "full-sync boundaries (residual-mean semantics)",
+            doc="pre-fold the accumulated residual by the fold window (the "
+                "accumulation span between full syncs) at full-sync "
+                "boundaries (residual-mean semantics)",
         ),
     ),
 )
@@ -347,9 +348,9 @@ class SgaAdamW:
 
     def reset(self, ctx, was_full: bool):
         """Sparse steps: zero communicated positions, optionally pre-fold the
-        residual by T when the next step is a full sync. Full steps: zero all.
-        The engine keeps each bucket's ``active_mask_u8`` in sync with the
-        support used by this step's sync."""
+        residual by the fold window when the next step is a full sync. Full
+        steps: zero all. The engine keeps each bucket's ``active_mask_u8`` in
+        sync with the support used by this step's sync."""
         fold_all = self.residual_mean and ctx.next_step_is_full
         for bs in ctx.bucket_states:
             grad_data = bs.grad_data
@@ -357,6 +358,6 @@ class SgaAdamW:
             if was_full or mask is None:
                 grad_data.zero_()
             else:
-                selective_reset(grad_data, mask, float(ctx.cycle_period), fold_all)
+                selective_reset(grad_data, mask, float(ctx.fold_window), fold_all)
             for grad in bs.extra_main_grads:
                 grad.zero_()

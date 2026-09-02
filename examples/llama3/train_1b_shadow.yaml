@@ -62,7 +62,6 @@ sga:
   cycle:
     start_iter: 20
     period: 8
-    full_sync_interval: 0
   score:
     name: update
   selection:

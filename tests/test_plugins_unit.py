@@ -590,7 +590,7 @@ def test_combination_validator_and_build_injection():
 
     register_default_plugins()
     opt_decl = get_optimizer_decl("adamw")
-    cycle = {"period": 8, "full_sync_interval": 0}
+    cycle = {"period": 8}
     for name in ("update", "coi", "abs_g", "abs_m"):
         assert name in opt_decl.emittable_scores
         validate_combination(name, get_selection_decl("topk"),
@@ -616,19 +616,27 @@ def test_combination_validator_and_build_injection():
         raise AssertionError("offline-only score accepted")
     except ValueError as e:
         assert "emittable" in str(e), e
-    # the residual contract pins full_sync_interval to 0 or the period
+    # cycle-calendar legality is engine-level: an explicit
+    # full_sync_interval is illegal without the decouple switch, and the
+    # decoupled interval must be a strict divisor of the period
     for bad in ({"period": 8, "full_sync_interval": 4},
-                {"period": 8, "full_sync_interval": 16}):
+                {"period": 8, "full_sync_interval": 8},
+                {"period": 8, "decouple_full_sync_interval_and_period": True},
+                {"period": 8, "decouple_full_sync_interval_and_period": True,
+                 "full_sync_interval": 16},
+                {"period": 8, "decouple_full_sync_interval_and_period": True,
+                 "full_sync_interval": 3}):
         try:
             validate_combination("abs_m", get_selection_decl("topk"),
                                  opt_decl,
                                  get_backend_plugin_decl("torch_pipelined_index"), bad)
-            raise AssertionError(f"full_sync_interval {bad} accepted")
+            raise AssertionError(f"cycle {bad} accepted")
         except ValueError as e:
-            assert "full_sync" in str(e), e
+            assert "full_sync" in str(e) or "decouple" in str(e), e
     validate_combination("abs_m", get_selection_decl("topk"),
                          opt_decl, get_backend_plugin_decl("torch_pipelined_index"),
-                         {"period": 8, "full_sync_interval": 8})
+                         {"period": 8, "decouple_full_sync_interval_and_period": True,
+                          "full_sync_interval": 4})
 
     # build injection: the optimizer instance carries the requested emission
     opt = build_optimizer("adamw", {}, emit_score="abs_m")

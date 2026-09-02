@@ -69,5 +69,7 @@ class OptContext:
     phase: str                          # 'full' | 'sparse'
     support: object = None              # active Support on sparse steps
     bucket_states: list = None          # engine BucketStates (for reset)
-    cycle_period: int = 1               # T (residual fold divisor)
+    fold_window: int = 1                # residual fold divisor = accumulation
+                                        # window between full syncs (period,
+                                        # or full_sync_interval when decoupled)
     next_step_is_full: bool = False     # for residual fold decisions

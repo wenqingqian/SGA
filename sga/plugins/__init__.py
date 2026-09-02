@@ -22,10 +22,12 @@ Declaration facts used by the validator (see ``validate_combination``):
     handoff). The configured score MUST be a member — this is the single
     cross-axis legality rule; registry entries outside every template's
     emittable set are offline-only (replay-evaluable, config-rejected).
-  - Optimizer.requires_full_sync_every_period: the residual contract only
-    folds at full syncs, so cycle boundaries must be full.
   - Backend.consumes: 'mask' or 'idx' — the Support object provides both,
     so this routes the backend rather than restricting combinations.
+
+Cycle-calendar legality is engine-level (not optimizer-declared): reselection
+boundaries are structurally full syncs, so the residual fold contract holds
+for any decoupled full-sync interval that divides the period.
 """
 
 from dataclasses import dataclass
@@ -165,8 +167,6 @@ class OptimizerDecl:
     # Score names this template can materialize into main grads on full steps
     # (the optimizer->score handoff); the configured score must be a member.
     emittable_scores: frozenset = frozenset()
-    # Residual contract folds only at full syncs => cycle boundaries must be full.
-    requires_full_sync_every_period: bool = False
     params: tuple = ()             # (PluginParam, ...)
     # Same inspection hook as SelectionDecl.effective (unused today).
     effective: object = None
@@ -265,9 +265,11 @@ def validate_combination(score_name: str, selection: SelectionDecl,
     """Declaration-based combination validation (config time, no scheme names).
 
     ``backend`` is a BackendDecl; ``cycle`` is the engine cycle config dict
-    (start_iter / period / full_sync_interval). ``selection`` and ``backend``
-    are accepted for interface completeness only — the cross-axis legality
-    rules live on the optimizer decl (checked below).
+    (start_iter / period / decouple_full_sync_interval_and_period /
+    full_sync_interval). ``selection`` and ``backend`` are accepted for
+    interface completeness only — the cross-axis legality rule lives on the
+    optimizer decl (emittable scores); the cycle-calendar rules are
+    engine-level (checked below).
     """
     problems = []
     get_score_spec(score_name)  # unknown name fails with the registered list
@@ -278,14 +280,29 @@ def validate_combination(score_name: str, selection: SelectionDecl,
             f"{sorted(optimizer.emittable_scores) or 'nothing'}) — the score "
             "is offline-only under this optimizer"
         )
-    if optimizer.requires_full_sync_every_period:
-        period = cycle.get("period", 1)
-        if cycle.get("full_sync_interval", 0) not in (0, period):
+    period = int(cycle.get("period", 1))
+    decouple = bool(cycle.get("decouple_full_sync_interval_and_period", False))
+    interval = cycle.get("full_sync_interval", None)
+    if not decouple:
+        if interval is not None:
             problems.append(
-                f"optimizer '{optimizer.name}' folds residuals only at full "
-                f"syncs: full_sync_interval must be 0 or equal to the cycle "
-                f"period ({period})"
+                f"sga.cycle.full_sync_interval is set ({interval}) but "
+                "decouple_full_sync_interval_and_period is false; every "
+                "cycle boundary is already a full sync — leave "
+                "full_sync_interval unset"
             )
+    elif interval is None:
+        problems.append(
+            "decouple_full_sync_interval_and_period is true but "
+            "sga.cycle.full_sync_interval is unset — set a divisor of the "
+            f"period smaller than it (period={period})"
+        )
+    elif not (0 < int(interval) < period and period % int(interval) == 0):
+        problems.append(
+            f"decoupled full_sync_interval ({interval}) must satisfy "
+            f"0 < full_sync_interval < period ({period}) and "
+            f"period % full_sync_interval == 0"
+        )
     if problems:
         raise ValueError("Illegal SGA plugin combination: " + "; ".join(problems))
 

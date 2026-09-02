@@ -67,7 +67,6 @@ sga:
   cycle:
     start_iter: 4
     period: 4
-    full_sync_interval: 0
   score:
     name: abs_m
   selection:

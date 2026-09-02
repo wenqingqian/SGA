@@ -52,7 +52,7 @@ def expect_error(fn, needle):
 def _enable_standard(cfg):
     """The canonical enabled combo: abs_m + topk(histogram) + adamw."""
     cfg.sga.enabled = True
-    cfg.sga.cycle = {"start_iter": 0, "period": 8, "full_sync_interval": 0}
+    cfg.sga.cycle = {"start_iter": 0, "period": 8}
     cfg.sga.score = {"name": "abs_m"}
     cfg.sga.selection = {"name": "topk", "method": "histogram", "ratio_percent": 30.0}
     cfg.sga.optimizer = {"name": "adamw"}
@@ -149,8 +149,7 @@ def test_start_iter_percent_resolves():
     cfg, _ = make_base()
     cfg.train.model.train_iters = 5000
     _enable_standard(cfg)
-    cfg.sga.cycle = {"start_iter_percent": 10.0, "period": 4,
-                     "full_sync_interval": 0}
+    cfg.sga.cycle = {"start_iter_percent": 10.0, "period": 4}
     engine_cfg = sga_section_to_config(cfg)
     assert engine_cfg["cycle"]["start_iter"] == 500
     assert "start_iter_percent" not in engine_cfg["cycle"]
@@ -172,11 +171,29 @@ def test_illegal_combination_rejected():
     _enable_standard(cfg)
     cfg.sga.score = {"name": "update_ratio"}  # the pre-rename name must fail
     expect_error(lambda: validate_sga_section(cfg), "Unknown SGA score")
-    # the optimizer's residual contract pins full_sync_interval to 0 or period
+    # cycle-calendar legality: an explicit full_sync_interval is illegal
+    # without the decouple switch (including the exact legacy fsi=0
+    # spelling); decoupled values must be strict divisors
     cfg.sga.score = {"name": "abs_m"}
     cfg.sga.cycle = {"start_iter": 0, "period": 8, "full_sync_interval": 4}
     expect_error(lambda: validate_sga_section(cfg), "full_sync")
-    print("ok: illegal combinations rejected (unknown score / cycle mismatch)")
+    cfg.sga.cycle = {"start_iter": 0, "period": 8, "full_sync_interval": 0}
+    expect_error(lambda: validate_sga_section(cfg),
+                 "leave full_sync_interval unset")
+    cfg.sga.cycle = {"start_iter": 0, "period": 8,
+                     "decouple_full_sync_interval_and_period": True}
+    expect_error(lambda: validate_sga_section(cfg), "full_sync")
+    cfg.sga.cycle = {"start_iter": 0, "period": 8,
+                     "decouple_full_sync_interval_and_period": True,
+                     "full_sync_interval": 3}
+    expect_error(lambda: validate_sga_section(cfg), "full_sync")
+    # the legal decoupled spelling round-trips
+    cfg.sga.cycle = {"start_iter": 0, "period": 8,
+                     "decouple_full_sync_interval_and_period": True,
+                     "full_sync_interval": 4}
+    engine_cfg = sga_section_to_config(cfg)
+    assert engine_cfg["cycle"]["full_sync_interval"] == 4
+    print("ok: illegal combinations rejected (unknown score / cycle rules)")
 
 
 def test_sparse_backend_required_when_enabled():
@@ -234,7 +251,7 @@ def test_enabled_emits_flat_flag_sequence():
     canonical args.sga_config JSON."""
     cfg, tmp = make_base()
     cfg.sga.enabled = True
-    cfg.sga.cycle = {"start_iter": 0, "period": 2, "full_sync_interval": 0}
+    cfg.sga.cycle = {"start_iter": 0, "period": 2}
     cfg.sga.score = {"name": "abs_m"}
     cfg.sga.selection = {"name": "topk", "method": "histogram", "ratio_percent": 20.0}
     cfg.sga.optimizer = {"name": "adamw", "residual_mean": True}
@@ -328,7 +345,7 @@ def test_cycle_interior_allowlist():
     instead of the configured cycle, with no diagnostic anywhere."""
     cfg, _ = make_base()
     _enable_standard(cfg)
-    cfg.sga.cycle = {"start_iter": 0, "peroid": 8, "full_sync_interval": 0}
+    cfg.sga.cycle = {"start_iter": 0, "peroid": 8}
     expect_error(lambda: sga_section_to_config(cfg), "unknown keys ['peroid']")
 
     cfg.sga.cycle = 5

@@ -145,7 +145,7 @@ def test_shadow_numerics_equal_stock_loop():
     mp_sh = _ShadowCapableMPOpt(chunk_sh)
     mp_st = _ShadowCapableMPOpt(chunk_st)
     eng = _build_shadow_engine(
-        _ABS_M, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
+        _ABS_M, cycle={"start_iter": 0, "period": 1},
         shadow_score=True)
     eng.attach(chunk_sh)
 
@@ -211,7 +211,7 @@ def test_shadow_rng_guard_raises():
     selection = build_selection("topk", {"method": "histogram", "ratio_percent": 30.0})
     opt = build_optimizer("adamw", {}, emit_score="abs_m")
     eng = SGAEngine({"cycle": {"start_iter": 0, "period": 1,
-                               "full_sync_interval": 0},
+                               },
                      "shadow": True}, "abs_m", selection, opt,
                     _ABS_M["backend"])
     eng._dp_cp_group = lambda: None
@@ -381,7 +381,7 @@ def test_shadow_peek_matches_stock_fusedadam_step():
 
     mp.optimizer.step = fused_style_step
     eng = _build_shadow_engine(
-        _ABS_M, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
+        _ABS_M, cycle={"start_iter": 0, "period": 1},
         shadow_score=True)
     eng.attach(chunk)
     gen = torch.Generator().manual_seed(11)
@@ -407,7 +407,7 @@ def test_shadow_peek_value_tracks_upcoming_commit_torch_adamw():
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
     eng = _build_shadow_engine(
-        _ABS_M, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
+        _ABS_M, cycle={"start_iter": 0, "period": 1},
         shadow_score=True)
     eng.attach(chunk)
     gen = torch.Generator().manual_seed(19)
@@ -447,7 +447,7 @@ def test_shadow_probe_config_never_builds_records_or_state():
             mp = _ShadowCapableMPOpt(chunk)
             eng = _build_shadow_engine(
                 _ABS_M, cycle={"start_iter": 0, "period": 2,
-                               "full_sync_interval": 0},
+                               },
                 shadow_score=False)
             eng.attach(chunk)
             refresh_calls = []
@@ -499,7 +499,7 @@ def test_shadow_metrics_reselected_tracks_boundary_reselection():
             mp = _ShadowCapableMPOpt(chunk)
             eng = _build_shadow_engine(
                 _ABS_M, cycle={"start_iter": 0, "period": 2,
-                               "full_sync_interval": 0},
+                               },
                 shadow_score=True)
             eng.attach(chunk)
             gen = torch.Generator().manual_seed(17)
@@ -526,7 +526,7 @@ _BASE = {
                    "runner": {"type": "ssh"}},
     "sga": {
         "enabled": True,
-        "cycle": {"start_iter": 0, "period": 8, "full_sync_interval": 0},
+        "cycle": {"start_iter": 0, "period": 8},
         "score": {"name": "abs_m"},
         "selection": {"name": "topk", "method": "histogram", "ratio_percent": 30.0},
         "optimizer": {"name": "adamw"},
@@ -592,7 +592,7 @@ def test_shadow_rng_guard_cuda_half_raises():
     selection = build_selection("topk", {"method": "histogram", "ratio_percent": 30.0})
     opt = build_optimizer("adamw", {}, emit_score="abs_m")
     eng = SGAEngine({"cycle": {"start_iter": 0, "period": 1,
-                               "full_sync_interval": 0},
+                               },
                      "shadow": True}, "abs_m", selection, opt,
                     _ABS_M["backend"])
     eng._dp_cp_group = lambda: None
@@ -709,7 +709,7 @@ def test_shadow_activates_without_idx_materialization():
     # pre-first-commit moments would tie at 0 everywhere and select all)
     combo = dict(_ABS_M, score="update")
     eng = _build_shadow_engine(
-        combo, cycle={"start_iter": 0, "period": 1, "full_sync_interval": 0},
+        combo, cycle={"start_iter": 0, "period": 1},
         shadow_score=True)
     eng.attach(chunk)
     gen = torch.Generator().manual_seed(5)

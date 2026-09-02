@@ -103,8 +103,10 @@ def _expanded(path: str) -> dict:
             resolved = decl.effective(resolved)
         engine_config[axis] = {"name": name, **resolved}
     engine_config.setdefault("cycle", {})
+    # full_sync_interval has no default: absent means "not decoupled" (the
+    # validator rejects a value without decouple=true).
     for key, default in (("start_iter", 0), ("period", 1),
-                         ("full_sync_interval", 0)):
+                         ("decouple_full_sync_interval_and_period", False)):
         engine_config["cycle"].setdefault(key, default)
     return engine_config
 

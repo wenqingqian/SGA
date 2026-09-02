@@ -101,32 +101,65 @@ class CycleManager:
     iteration number — see SGAEngine.optimizer_step for the consistency assert).
 
     Steps are 1-based. A step is FULL (dense sync) when forced, when still in
-    the bootstrap region (<= start_iter), when the optimizer's residual contract
-    requires it at a cycle boundary, when the periodic full_sync_interval
-    hits, or when no support exists yet. Reselection happens at cycle
-    boundaries ((step - start_iter) % period == 0, step > start_iter) on
+    the bootstrap region (<= start_iter), or when no support exists yet.
+    Cycle boundaries ((step - start_iter) % period == 0, step > start_iter)
+    are STRUCTURALLY full: reselection must read dense-averaged,
+    rank-identical scores, so mask regeneration without a full sync is not
+    a representable schedule. With ``decouple`` on, an additional full-sync
+    grid ``(step - start_iter) % full_sync_interval == 0`` interleaves EXTRA
+    dense steps between boundaries (same origin, so boundary steps are a
+    subset of it — validated at config time: 0 < interval < period and
+    period % interval == 0). Reselection happens at cycle boundaries on
     non-forced steps only — forced full steps advance the cycle but never
     reselect.
     """
 
-    def __init__(self, start_iter: int, period: int, full_sync_interval: int,
-                 boundary_implies_full: bool):
+    def __init__(self, start_iter: int, period: int, decouple: bool = False,
+                 full_sync_interval: int = None):
         assert period >= 1
+        if decouple:
+            assert (full_sync_interval is not None
+                    and 0 < full_sync_interval < period
+                    and period % full_sync_interval == 0), (
+                f"decoupled full_sync_interval ({full_sync_interval}) must "
+                f"satisfy 0 < full_sync_interval < period ({period}) and "
+                "period % full_sync_interval == 0"
+            )
+        else:
+            assert full_sync_interval is None, (
+                "full_sync_interval is only settable with "
+                "decouple_full_sync_interval_and_period=true; boundaries are "
+                "full syncs by construction (leave it unset)"
+            )
         self.start_iter = start_iter
         self.period = period
+        self.decouple = decouple
         self.full_sync_interval = full_sync_interval
-        self.boundary_implies_full = boundary_implies_full
         self.force_next = False  # grad-norm bypass, consumed at next grad_sync
+
+    @property
+    def fold_window(self) -> int:
+        """Residual accumulation window between full syncs — the
+        ``residual_mean`` fold divisor (the period, or the tighter
+        full_sync_interval when decoupled)."""
+        return self.full_sync_interval if self.decouple else self.period
 
     def reselect_boundary(self, step: int) -> bool:
         return step > self.start_iter and (step - self.start_iter) % self.period == 0
 
+    def extra_full(self, step: int) -> bool:
+        """Decoupled mid-cycle full syncs (boundary steps are included by
+        the divisibility invariant; is_full checks boundaries first)."""
+        return (self.decouple
+                and step > self.start_iter
+                and (step - self.start_iter) % self.full_sync_interval == 0)
+
     def is_full(self, step: int, force: bool = False) -> bool:
         if force or step <= self.start_iter:
             return True
-        if self.boundary_implies_full and self.reselect_boundary(step):
+        if self.reselect_boundary(step):
             return True
-        if self.full_sync_interval > 0 and step % self.full_sync_interval == 0:
+        if self.extra_full(step):
             return True
         return False
 
@@ -155,8 +188,11 @@ class SGAEngine:
         self._cycle = CycleManager(
             start_iter=int(cycle.get("start_iter", 0)),
             period=int(cycle.get("period", 1)),
-            full_sync_interval=int(cycle.get("full_sync_interval", 0)),
-            boundary_implies_full=opt.decl.requires_full_sync_every_period,
+            decouple=bool(cycle.get("decouple_full_sync_interval_and_period",
+                                    False)),
+            full_sync_interval=(int(cycle["full_sync_interval"])
+                                if cycle.get("full_sync_interval") is not None
+                                else None),
         )
         self._chunks = {}                 # id(chunk) -> chunk
         self._bucket_states = []          # global ordered list (Support alignment)
@@ -368,7 +404,7 @@ class SGAEngine:
             phase="full" if was_full else "sparse",
             support=self._active_support,
             bucket_states=self._bucket_states,
-            cycle_period=self._cycle.period,
+            fold_window=self._cycle.fold_window,
             next_step_is_full=next_full,
         )
         if was_full:

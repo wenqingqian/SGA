@@ -61,7 +61,7 @@ def _parse(argv):
 def _nested_section(extra_cycle=None, **kw):
     section = {
         "enabled": True,
-        "cycle": {"start_iter": 20, "period": 8, "full_sync_interval": 0},
+        "cycle": {"start_iter": 20, "period": 8},
         "score": {"name": "update"},
         "selection": {"name": "topk", "method": "histogram", "ratio_percent": 10.0},
         "optimizer": {"name": "adamw"},
@@ -78,6 +78,7 @@ def test_flag_table_generated_from_declarations():
     # engine sections
     for f in ("--sga-enabled", "--sga-shadow", "--sga-shadow-score",
               "--sga-cycle-start-iter", "--sga-cycle-period",
+              "--sga-cycle-decouple-full-sync-interval-and-period",
               "--sga-cycle-full-sync-interval", "--sga-checks-count-guard",
               "--sga-trace-dir", "--sga-trace-branch-points",
               "--sga-trace-window"):
@@ -128,6 +129,29 @@ def test_dual_form_equivalence():
     print("ok: nested-yaml and flat-flag forms produce identical canonical JSON")
 
 
+def test_decoupled_cycle_round_trip():
+    """The decoupled cycle keys survive the launcher's own pipeline intact:
+    nested yaml -> flags -> argparse -> assemble reproduces the canonical
+    JSON byte-identically, with decouple=true AND full_sync_interval=4
+    exactly (the decouple redesign's new flag surface)."""
+    cfg = _nested_section(extra_cycle={
+        "decouple_full_sync_interval_and_period": True,
+        "full_sync_interval": 4,
+    })
+    engine_config = sga_section_to_config(cfg)
+    want = canonical_config_json(engine_config)
+    argv = sga_config_to_flags(engine_config)
+    # the generated flag names (flat_flags() spelling, dashes for underscores)
+    assert "--sga-cycle-decouple-full-sync-interval-and-period" in argv
+    assert "--sga-cycle-full-sync-interval" in argv
+    args = _parse(argv)
+    assert args.sga_config == want, (args.sga_config, want)
+    got = json.loads(args.sga_config)["cycle"]
+    assert got["decouple_full_sync_interval_and_period"] is True
+    assert got["full_sync_interval"] == 4
+    print("ok: decoupled cycle keys round-trip the flag pipeline exactly")
+
+
 def test_handwritten_flat_flags_equal():
     """A user hand-writing the flags reaches the same canonical JSON."""
     cfg = _nested_section(selection={"name": "topk", "method": "adaptive",
@@ -137,7 +161,6 @@ def test_handwritten_flat_flags_equal():
         "--sga-enabled", "true",
         "--sga-cycle-start-iter", "20",
         "--sga-cycle-period", "8",
-        "--sga-cycle-full-sync-interval", "0",
         "--sga-score-name", "update",
         "--sga-selection-name", "topk",
         "--sga-selection-method", "adaptive",
@@ -157,8 +180,7 @@ def test_percent_resolves_during_translation():
     """start_iter_percent has no flag: the launcher translation resolves it
     to the absolute start_iter BEFORE emitting flags."""
     cfg = _nested_section()
-    OmegaConf.update(cfg, "sga.cycle", {"start_iter_percent": 10.0, "period": 8,
-                                        "full_sync_interval": 0},
+    OmegaConf.update(cfg, "sga.cycle", {"start_iter_percent": 10.0, "period": 8},
                      merge=False)
     engine_config = sga_section_to_config(cfg)
     assert engine_config["cycle"]["start_iter"] == 500
@@ -260,7 +282,6 @@ def test_explicit_false_and_null_spellings():
         "--sga-enabled", "true",
         "--sga-cycle-start-iter", "20",
         "--sga-cycle-period", "8",
-        "--sga-cycle-full-sync-interval", "0",
         "--sga-score-name", "update",
         "--sga-selection-name", "topk",
         "--sga-selection-method", "adaptive",
@@ -314,7 +335,7 @@ def test_schema_and_resolve_cli():
     build_selection(sel["name"], {k: v for k, v in sel.items() if k != "name"})
     assert resolved["optimizer"]["residual_mean"] is False
     assert resolved["cycle"] == {"start_iter": 20, "period": 8,
-                                 "full_sync_interval": 0}
+                                 "decouple_full_sync_interval_and_period": False}
 
     # schema is argc-strict (trailing junk prints usage, exits 2)
     out = subprocess.run([sys.executable, "-m", "sga.config", "schema", "x"],

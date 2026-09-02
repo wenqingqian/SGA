@@ -31,9 +31,13 @@ from dataclasses import dataclass
 # Sections whose params the ENGINE owns (declared here, not on a plugin).
 # start_iter_percent is deliberately NOT flagged: it needs the
 # train.model.train_iters context and resolves in the nested-yaml translation.
+# full_sync_interval is only legal alongside
+# decouple_full_sync_interval_and_period=true (validator-enforced).
 _ENGINE_SECTIONS = {
     "cycle": (
-        ("start_iter", int), ("period", int), ("full_sync_interval", int),
+        ("start_iter", int), ("period", int),
+        ("decouple_full_sync_interval_and_period", bool),
+        ("full_sync_interval", int),
     ),
     "checks": (("count_guard", bool),),
     "trace": (("dir", str), ("branch_points", "list"), ("window", int)),

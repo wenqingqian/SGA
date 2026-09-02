@@ -2,16 +2,20 @@
 """Unit tests for the SGAEngine core (CPU, fakes, mocked collectives).
 
 Covers:
-- CycleManager phase semantics: the fsi cadence (period 1 + fsi 10, a
-  template without the full-sync requirement may run boundary-sparse cycles)
-  and the boundary-full pattern (bootstrap region + period-8 boundaries,
-  boundaries imply full — today's adamw contract);
+- CycleManager phase semantics: the boundary-full pattern (bootstrap region
+  + period-8 boundaries — boundaries are structurally full), the decoupled
+  full-sync grid (extra dense steps interleaved between boundaries, same
+  origin, divisor-validated), the fold-window divisor and the calendar's
+  constructor contracts;
 - support lifecycle: bootstrap guard, force steps never reselect, the
   grad-norm bypass forces the next step full;
 - payload-scaling residual preservation (the regression test for the bug the
   old fork dodged via average_in_collective=True): with a SUM-replica mocked
   collective, non-selected coordinates are BITWISE unchanged across a sparse
   sync and selected ones get exactly sum*scale;
+- the decoupled fold-divisor pin: adamw's selective reset divides the
+  surviving residual by ctx.fold_window (= the decoupled full_sync_interval,
+  not the period) ahead of a mid-cycle full sync;
 - negative tests for the three consistency layers (count mismatch refuses,
   dual-checksum divergence refuses, norm-spread violation raises pre-score);
 - a fake end-to-end optimizer_step flow (the default 'update' and the named
@@ -33,6 +37,7 @@ from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
 from sga.engine import BucketState, CycleManager, SGAEngine, SGAEngineError
 from sga.plugins import build_optimizer, build_selection
+from sga.plugins.optimizer import OptContext
 from sga.support import BucketSupport, Support
 
 torch.manual_seed(0)
@@ -40,25 +45,65 @@ torch.manual_seed(0)
 
 # ------------------------------------------------------------------- cycle
 
-def test_cycle_fsi_pattern():
-    cm = CycleManager(start_iter=0, period=1, full_sync_interval=10,
-                      boundary_implies_full=False)
-    phases = ["full" if cm.is_full(s) else "sparse" for s in range(1, 16)]
-    # Pure cycle semantics (the engine ORs in the bootstrap no-support guard):
-    # a template without the full-sync requirement may run boundary-sparse
-    # cycles; fsi=10 -> step 10 full.
-    assert phases == ["sparse"] * 9 + ["full"] + ["sparse"] * 5, phases
-    assert all(cm.reselect_boundary(s) for s in range(1, 16))  # T=1
-
-
 def test_cycle_boundary_full_pattern():
-    cm = CycleManager(start_iter=20, period=8, full_sync_interval=0,
-                      boundary_implies_full=True)
+    # Boundaries are STRUCTURALLY full (reselection must read dense-averaged,
+    # rank-identical scores) — no optimizer declaration involved anymore.
+    cm = CycleManager(start_iter=20, period=8)
     fulls = [s for s in range(1, 61) if cm.is_full(s)]
     assert [s for s in fulls if s <= 20] == list(range(1, 21))  # bootstrap
     assert [s for s in fulls if s > 20] == [28, 36, 44, 52, 60]
     assert [s for s in range(1, 61) if cm.reselect_boundary(s)] == \
         [28, 36, 44, 52, 60]
+    assert cm.fold_window == 8  # residual fold divisor = the period
+
+
+def test_cycle_decoupled_grid():
+    # period=8 interval=4 start_iter=20: mask rounds at 28, 36, ...; full
+    # syncs at 24, 28, 32, ... — same origin, boundaries are a subset.
+    cm = CycleManager(start_iter=20, period=8, decouple=True,
+                      full_sync_interval=4)
+    assert [s for s in range(21, 45) if cm.is_full(s)] == \
+        [24, 28, 32, 36, 40, 44]
+    # reselection ONLY at period boundaries — extra fulls never reselect
+    assert [s for s in range(21, 45) if cm.reselect_boundary(s)] == \
+        [28, 36, 44]
+    assert cm.fold_window == 4  # divisor = the fold window, not the period
+    assert cm.extra_full(24) and not cm.reselect_boundary(24)
+    assert cm.extra_full(28) and cm.reselect_boundary(28)  # subset rule
+
+    # NON-coincident origin: start_iter=22 gives 22 % 4 != 0 — the case that
+    # distinguishes the ANCHORED grid (step - start_iter) % interval == 0
+    # from the deleted unanchored step % interval == 0 (which would yield
+    # [24, 28, 32, 36, 40, 44] here, and passes every coincident-origin
+    # case above). Spacing stays uniformly 4 == fold_window.
+    cm = CycleManager(start_iter=22, period=8, decouple=True,
+                      full_sync_interval=4)
+    assert [s for s in range(23, 46) if cm.is_full(s)] == \
+        [26, 30, 34, 38, 42]
+    # boundaries remain exactly the reselect subset of the dense grid
+    assert [s for s in range(23, 46) if cm.reselect_boundary(s)] == \
+        [30, 38]
+
+
+def test_cycle_constructor_contracts():
+    # decouple=True needs a strict divisor of the period (the calendar
+    # guards are asserts; catching only AssertionError keeps a real
+    # regression from being masked by this refusal loop)
+    for bad_interval in (None, 0, 8, 16, 3):
+        try:
+            CycleManager(start_iter=0, period=8, decouple=True,
+                         full_sync_interval=bad_interval)
+        except AssertionError:
+            continue  # expected: the calendar refuses this combination
+        raise AssertionError(f"decoupled interval {bad_interval!r} accepted")
+    # decouple=False: boundaries are structurally full, an explicit
+    # interval has no meaning there and must fail loud
+    try:
+        CycleManager(start_iter=0, period=8, full_sync_interval=4)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("non-decoupled interval accepted")
 
 
 # (the v3.1 warmup-anchor formula moved INTO the selection impl with the
@@ -112,6 +157,39 @@ def test_payload_scaling_preserves_residual_bitwise():
     assert torch.equal(grad[~active], grad0[~active])
     # selected coords: exactly sum-over-replicas * factor (2-pow exact)
     assert torch.equal(grad[active], grad0[active] * 4 * factor)
+
+
+# ------------------------------------------------- decoupled fold divisor
+
+def test_adamw_reset_folds_residual_by_decoupled_fold_window():
+    """CPU pin of the decoupled fold divisor: ahead of a MID-CYCLE full sync
+    (next_step_is_full=True after a sparse step, was_full=False), adamw's
+    selective reset folds the residual at the UNCOMMUNICATED positions by
+    ctx.fold_window — the decoupled full_sync_interval (4), NOT the period
+    (8) — and zeroes the communicated positions. A revert to the period
+    divisor would leave every residual coordinate 2x too large on the
+    decoupled calendar (the 'divides by 4, not 8' contract at adamw.py)."""
+    opt = build_optimizer("adamw", {"residual_mean": True})
+    n = 256
+    mask = torch.zeros(n, dtype=torch.uint8)
+    mask[::4] = 1  # communicated this cycle
+    orig = torch.randn(n)
+    bs = BucketState(orig.clone(), None, 1.0, 0)
+    bs.active_mask_u8 = mask
+    ctx = OptContext(records=[], phase="sparse", bucket_states=[bs],
+                     fold_window=4, next_step_is_full=True)
+
+    opt.reset(ctx, was_full=False)
+
+    active = mask > 0
+    # communicated positions: zeroed (their residual was consumed by the
+    # just-finished sparse sync)
+    assert torch.equal(bs.grad_data[active],
+                       torch.zeros(int(active.sum())))
+    # residual positions: divided by exactly the fold window (4 — a power
+    # of two, so the comparison is bitwise), not by the period (8)
+    assert torch.equal(bs.grad_data[~active], orig[~active] / 4)
+    assert not torch.equal(bs.grad_data[~active], orig[~active] / 8)
 
 
 def test_torch_pipelined_index_modes_and_mechanics():
@@ -283,15 +361,13 @@ def test_nccl_pipelined_index_decl_and_loud_gates():
     be = NcclPipelinedIndexBackend({})
     assert be.decl is DECL and DECL.name == "nccl_pipelined_index"
     assert be.decl.consumes == "idx"  # engine routes by this attribute
-    # uniform i*k//s split at any slices (no midpoint special case: the
-    # kernel reduces each coordinate once, the partition cannot change
-    # results)
-    assert be._bounds(7) == [(0, 3), (3, 7)]
-    assert NcclPipelinedIndexBackend({"slices": 3})._bounds(7) == \
-        [(0, 2), (2, 4), (4, 7)]
+    # single launch per sync (each extra slice = one more full kernel
+    # invocation): no slicing vocabulary remains, and a stale config
+    # carrying it fails loud
+    assert DECL.params == ()
     try:
-        NcclPipelinedIndexBackend({"slices": 0})
-        raise AssertionError("slices=0 accepted")
+        NcclPipelinedIndexBackend({"slices": 3})
+        raise AssertionError("removed `slices` param accepted")
     except ValueError:
         pass
 
@@ -551,7 +627,7 @@ _UPDATE = {
     "selection_params": {"method": "histogram", "ratio_percent": 30.0},
     "opt": "adamw",
     "opt_params": {"residual_mean": False},
-    "cycle": {"start_iter": 0, "period": 3, "full_sync_interval": 0},
+    "cycle": {"start_iter": 0, "period": 3},
     "backend": TorchPipelinedMaskBackend({"num_slices": 2}),
 }
 
@@ -563,7 +639,7 @@ _ABS_M = {
     "selection_params": {"method": "histogram", "ratio_percent": 30.0},
     "opt": "adamw",
     "opt_params": {"residual_mean": False},
-    "cycle": {"start_iter": 2, "period": 3, "full_sync_interval": 0},
+    "cycle": {"start_iter": 2, "period": 3},
     "backend": TorchPipelinedIndexBackend({}),
 }
 
@@ -879,7 +955,7 @@ def test_generic_optional_hooks_fire():
     selection = _HookSelection()
     opt = build_optimizer("adamw", {}, emit_score="abs_g")
     eng = SGAEngine(
-        {"cycle": {"start_iter": 0, "period": 1, "full_sync_interval": 0}},
+        {"cycle": {"start_iter": 0, "period": 1}},
         "abs_g", selection, opt, backend)
     eng._dp_cp_group = lambda: None  # single-process: skip cross-rank layers
 

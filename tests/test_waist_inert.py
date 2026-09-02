@@ -159,11 +159,13 @@ def test_api_version_mismatch_rejected_at_build():
 
 def test_config_from_args_parses_json_string_not_path():
     _reset_waist()
-    canonical = '{"cycle": {"start_iter": 0, "period": 1, "full_sync_interval": 10}}'
+    canonical = ('{"cycle": {"period": 8, '
+                 '"decouple_full_sync_interval_and_period": true, '
+                 '"full_sync_interval": 4}}')
     saved = _with_args(sga_config=canonical, sga_allow_config_override=False)
     try:
         cfg = sga_waist._config_from_args()
-        assert isinstance(cfg, dict) and cfg["cycle"]["period"] == 1
+        assert isinstance(cfg, dict) and cfg["cycle"]["period"] == 8
         # a filesystem path is not a JSON payload
         _mt.get_args = lambda: SimpleNamespace(
             sga_config="/tmp/nonexistent.json", sga_allow_config_override=False)

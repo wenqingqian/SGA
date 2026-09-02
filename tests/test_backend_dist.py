@@ -99,9 +99,9 @@ def main():
             f"nccl backend selected coords wrong (rank {rank})"
         assert torch.equal(g_nccl[active], g_idx[active])
 
-        # a second backend instance (different slices) exercising the
-        # factor-1.0 fast path: no pre-scale, plain SUM over 2 ranks
-        be3 = NcclPipelinedIndexBackend({"slices": 3})
+        # a second backend instance exercising the factor-1.0 fast path:
+        # no pre-scale, plain SUM over 2 ranks
+        be3 = NcclPipelinedIndexBackend({})
         be3.prepare(group, device=device)
         g_fast = local.clone()
         be3.allreduce_sparse(g_fast, support, group, 1.0, op, key=10)
