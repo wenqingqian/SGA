@@ -50,7 +50,6 @@ import torch
 
 from sga.kernels import (
     masked_norm_sq_contribution,
-    masked_scale,
     sga_advance_step,
     sga_peek_step,
 )
@@ -383,7 +382,10 @@ class SGAEngine:
             return (False, None, None)
 
         # 2. masked clip (single shared service; unconditional DP-bitwise fix).
-        grad_norm = self._masked_clip_grad_norm(mp_opt, was_full)
+        # Sparse steps get the coeff back for grad_correct's fused multiply
+        # instead of an in-place masked-scale pass here.
+        grad_norm, sparse_coeff = self._masked_clip_grad_norm(
+            mp_opt, was_full, step)
 
         # 3. num_zeros BEFORE the optimizer template (its full step
         # overwrites main grads with the materialized score).
@@ -406,6 +408,7 @@ class SGAEngine:
             bucket_states=self._bucket_states,
             fold_window=self._cycle.fold_window,
             next_step_is_full=next_full,
+            apply_coeff=1.0 if was_full else sparse_coeff,
         )
         if was_full:
             self.opt.full_step(opt_ctx)
@@ -758,8 +761,9 @@ class SGAEngine:
         self._refresh_step = step_key
         return self._records
 
-    def _masked_clip_grad_norm(self, mp_opt, was_full):
-        """Single shared masked clip service.
+    def _masked_clip_grad_norm(self, mp_opt, was_full, step=None):
+        """Single shared masked clip service; returns ``(grad_norm,
+        sparse_coeff)``.
 
         Managed params contribute the RAW accumulated grad at support-masked
         coords; unmanaged/full-step params contribute in full. One global
@@ -767,6 +771,14 @@ class SGAEngine:
         DP-CP + divide by world) — without it the fused kernel's atomic-add
         ulp jitter diverges clip coefficients, then masks, then deadlocks the
         sparse allreduce.
+
+        The coeff application routes three ways : full steps
+        scale in place and return 1.0; sparse steps with a materializing
+        trace dump this step scale explicitly (rank-consistently — the dump
+        slot reads the post-clip view) and return 1.0; all other sparse
+        steps return the coeff for grad_correct's fused in-register
+        multiply. Nothing but num_zeros' zero-count (order-invariant) reads
+        the grad buffer between here and that kernel.
         """
         clip_grad = getattr(mp_opt.config, "clip_grad", 0.0)
         records = self._records or self._refresh_records(mp_opt)
@@ -803,18 +815,45 @@ class SGAEngine:
         self._dp_bitwise_fix(total_norm_sq)
         grad_norm = total_norm_sq.sqrt().item()
 
+        sparse_coeff = 1.0
         if clip_grad > 0.0:
             coeff = clip_grad / (grad_norm + 1.0e-6)
             if coeff < 1.0:
-                for rec in records:
-                    if rec.grad is None:
-                        continue
-                    mask = None if was_full else rec.mask_u8()
-                    if mask is None:
+                # The dump slot reads a post-clip full-layout view, so on
+                # steps that actually dump (wants() is config-derived —
+                # identical on every rank, so no all-rank divergence) keep
+                # the explicit scale and hand the kernel coeff=1.0; the
+                # same fp32 multiply either way, bitwise identical to the
+                # fused path. Non-dumping trace steps take the fast path.
+                trace_dumps = (self._trace is not None and step is not None
+                               and any(self._trace.wants(step)))
+                if was_full:
+                    for rec in records:
+                        if rec.grad is None:
+                            continue
                         rec.grad.data.mul_(coeff)
-                    else:
-                        masked_scale(rec.grad.data.float(), mask, coeff)
-        return grad_norm
+                elif trace_dumps:
+                    for rec in records:
+                        if rec.grad is None:
+                            continue
+                        m = rec.mask_u8()
+                        if m is None:
+                            rec.grad.data.mul_(coeff)
+                        else:
+                            rec.grad.data.view(-1)[m > 0] *= coeff
+                else:
+                    # Sparse steps defer the coeff to grad_correct's fused
+                    # in-register multiply; nothing reads the
+                    # grad buffer between here and that kernel. Degenerate
+                    # mask-less buckets take the explicit full scale (the
+                    # kernel path refuses the fusion knobs without a mask).
+                    for rec in records:
+                        if rec.grad is None:
+                            continue
+                        if rec.mask_u8() is None:
+                            rec.grad.data.mul_(coeff)
+                    sparse_coeff = float(coeff)
+        return grad_norm, sparse_coeff
 
     def _param_counts_locally(self, rec) -> bool:
         """Shared/tensor-parallel duplicate filters (trivially True at tp=1)."""

@@ -12,7 +12,6 @@ import torch
 
 from sga.kernels_torch import (
     masked_norm_sq_contribution_torch,
-    masked_scale_torch,
     scatter_selected_torch,
 )
 
@@ -42,22 +41,6 @@ if _HAS_TRITON:
         active = valid & (mask_val > 0)
         g = tl.load(grad_ptr + offsets, mask=active, other=0.0)
         tl.atomic_add(out_ptr, tl.sum(g * g))
-
-    @triton.jit
-    def _masked_scale_kernel(
-        grad_ptr, mask_ptr, coeff, n_elements,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        """``grad[mask] *= coeff`` without boolean indexing. Per-element the
-        same IEEE fp32 multiply as the torch masked path, hence bitwise
-        identical results."""
-        pid = tl.program_id(0)
-        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        valid = offsets < n_elements
-        mask_val = tl.load(mask_ptr + offsets, mask=valid, other=0)
-        active = valid & (mask_val > 0)
-        g = tl.load(grad_ptr + offsets, mask=active, other=0.0)
-        tl.store(grad_ptr + offsets, g * coeff, mask=active)
 
     @triton.jit
     def _scatter_selected_kernel(
@@ -99,8 +82,8 @@ def scatter_selected(dst: torch.Tensor, indices: torch.Tensor, src: torch.Tensor
 
 
 def use_fused_masked_op(grad: torch.Tensor, mask: torch.Tensor) -> bool:
-    """The fused Triton paths need CUDA fp32 grads and a 1-byte mask
-    (uint8/bool), both contiguous."""
+    """The fused masked-op Triton path (masked norm-sq accumulation) needs
+    CUDA fp32 grads and a 1-byte mask (uint8/bool), both contiguous."""
     return (
         _HAS_TRITON
         and grad.is_cuda
@@ -129,20 +112,6 @@ def masked_norm_sq_contribution(grad: torch.Tensor, mask: torch.Tensor,
         )
     else:
         masked_norm_sq_contribution_torch(grad_flat, mask_flat, total_norm_sq)
-
-
-def masked_scale(grad: torch.Tensor, mask: torch.Tensor, coeff: float) -> None:
-    """``grad[mask] *= coeff`` in place (fused when possible, bitwise-equal fallback)."""
-    grad_flat = grad.view(-1)
-    mask_flat = mask.view(-1)
-    if use_fused_masked_op(grad_flat, mask_flat):
-        grid = ((grad_flat.numel() + _CLIP_BLOCK_SIZE - 1) // _CLIP_BLOCK_SIZE,)
-        _masked_scale_kernel[grid](
-            grad_flat, mask_flat, coeff, grad_flat.numel(),
-            BLOCK_SIZE=_CLIP_BLOCK_SIZE,
-        )
-    else:
-        masked_scale_torch(grad_flat, mask_flat, coeff)
 
 
 def sga_peek_step(wrapper, group):

@@ -7,8 +7,10 @@ unit tests already pin to fp64 oracles:
 
 - adamw grad-correct Triton kernel vs its torch reference (sparse apply and
   full-step score materialization, every emittable score);
-- masked_scale / scatter_selected: bitwise-equality contracts;
-- masked_norm_sq_contribution: same aggregate within atomic-order jitter.
+- scatter_selected: bitwise-equality contract;
+- masked_norm_sq_contribution: same aggregate within atomic-order jitter;
+- the fused sparse grad-correct path (coeff/clear/fold knobs) vs
+  the standalone sequence it replaces: bitwise per buffer.
 
 Run: python tests/test_kernels_gpu.py
 """
@@ -22,7 +24,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sga.kernels import (
     masked_norm_sq_contribution,
-    masked_scale,
     scatter_selected,
 )
 from sga.plugins.optimizer.adamw import adamw_grad_correct
@@ -79,23 +80,61 @@ def test_grad_correct_triton_matches_fallback():
     torch.testing.assert_close(vv_d.cpu(), v_ref, rtol=1e-4, atol=1e-6)
 
 
-def test_masked_scale_bitwise_and_norm_aggregate():
+def test_grad_correct_sparse_fusion_bitwise():
+    """coeff+clear+fold fused into grad-correct == the standalone
+    three-pass sequence, bitwise, on every buffer.
+
+    Reference mirrors: prescale via a torch elementwise multiply (a lone fp32
+    multiply is exactly rounded on every backend), the plain kernel with no
+    fusion knobs, then masked zero-fill and multiply-by-host-reciprocal fold
+    (interval 7.0 exercises the non-power-of-two reciprocal; within ONE
+    backend mul-by-reciprocal is self-consistent — the CPU fallback's true
+    division may sit 1 ulp from it). Any coeff value is fair game — there is
+    no add adjacent for FMA contraction, which the C1 on-GPU bench (99
+    records, real coeffs) already confirmed at full scale.
+    """
+    device = "cuda"
+    n = 8192
+    kw = dict(lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8,
+              weight_decay=0.1, step=1000)
+    for coeff in (0.125, 0.7, 1.0):
+        for fold, interval in [(False, 8.0), (True, 8.0), (True, 7.0)]:
+            g0 = torch.randn(n)
+            mask = (torch.rand(n) < 0.3).to(torch.uint8)
+            p, m, v = torch.randn(n), torch.randn(n) * .1, torch.rand(n) * .01
+
+            fp, fg, fm, fv = (t.clone().to(device) for t in (p, g0, m, v))
+            adamw_grad_correct(fp, fg, fm, fv, mask=mask.to(device),
+                               emit_mode=None, coeff=coeff, clear=True,
+                               fold=fold, interval=interval, **kw)
+
+            rp, rg, rm, rv = (t.clone().to(device) for t in (p, g0, m, v))
+            dmask = mask.to(device)
+            if coeff != 1.0:
+                rg = torch.where(dmask > 0, rg * coeff, rg)
+            adamw_grad_correct(rp, rg, rm, rv, mask=dmask, emit_mode=None, **kw)
+            rg.masked_fill_(dmask > 0, 0.0)
+            if fold:
+                inv = float((torch.ones(1, dtype=torch.float32) / interval).item())
+                rg.mul_(inv)
+            for got, ref, name in ((fp, rp, "param"), (fm, rm, "exp_avg"),
+                                   (fv, rv, "exp_avg_sq"), (fg, rg, "grad")):
+                assert torch.equal(got, ref), (
+                    f"fused sparse path diverged ({name}, coeff={coeff}, "
+                    f"fold={fold})"
+                )
+
+
+def test_masked_norm_sq_aggregate():
     device = "cuda"
     n = 8192
     grad0 = torch.randn(n)
     mask = (torch.rand(n) < 0.3).to(torch.uint8)
-    coeff = 0.125  # power of two -> scaling is exact on both paths
 
     dev = grad0.clone().to(device)
-    masked_scale(dev.float(), mask.to(device), coeff)
-    ref = grad0.clone()
-    ref[mask.bool()] *= coeff
-    # contract of the fused scale kernel: bitwise identical to the fallback
-    assert torch.equal(dev.cpu(), ref), "masked_scale lost bitwise equality"
-
     total_dev = torch.zeros(1, device=device)
-    masked_norm_sq_contribution(dev, mask.to(device), total_dev)
-    ref_sq = float((ref ** 2)[mask.bool()].sum())
+    masked_norm_sq_contribution(dev.float(), mask.to(device), total_dev)
+    ref_sq = float((grad0 ** 2)[mask.bool()].sum())
     assert abs(total_dev.item() - ref_sq) <= 1e-4 * max(1.0, abs(ref_sq)), (
         total_dev.item(), ref_sq
     )

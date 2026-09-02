@@ -30,20 +30,30 @@ def _registry_score(mode: Score, param, m, v, g, beta1, beta2, eps,
 
 def grad_correct_torch(param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
                        bias_correction1, bias_correction2,
-                       mask, emit_mode) -> None:
+                       mask, emit_mode,
+                       coeff=1.0, clear=False, fold=False, interval=1.0) -> None:
     """Torch reference of the grad-correct step; same contract as the kernel.
 
-    ``emit_mode=None`` is the sparse step: fused apply, grad buffer untouched.
-    An int mode (a ``Score`` value) is the full step: the mode's score
-    materializes into ``grad`` and the apply is fused in the same pass.
-    Wrapper-fed: ``adamw_grad_correct`` validates ``emit_mode`` first — a
-    DIRECT call with ``-1`` bypasses that guard and dies in the registry
-    lookup with the misleading "Unknown SGA score 'OFFLINE'" message.
+    ``emit_mode=None`` is the sparse step: fused apply. An int mode (a
+    ``Score`` value) is the full step: the mode's score materializes into
+    ``grad`` and the apply is fused in the same pass. Wrapper-fed:
+    ``adamw_grad_correct`` validates ``emit_mode`` and the sparse-fusion
+    knob combinations first — a DIRECT call with ``-1`` bypasses that guard
+    and dies in the registry lookup with the misleading "Unknown SGA score
+    'OFFLINE'" message.
+
+    Sparse-fusion knobs (mirror the kernel): ``coeff`` multiplies
+    the working gradient at mask-active positions, ``clear`` zeroes the
+    active positions of ``grad`` after use, ``fold`` divides ``grad`` by
+    ``interval`` (actives are 0 by then — 0/T == 0 exact, the same op
+    sequence the standalone torch reset performed).
     """
     if mask is not None:
         g = torch.where(mask > 0, grad, torch.zeros_like(grad))
     else:
         g = grad
+    if coeff != 1.0:
+        g = torch.where(mask > 0, g * coeff, g)
     # The update doubles as the 'update' score; both come from the registry
     # so the reference path can never drift from the online math.
     update = _registry_score(Score.update, param, m, v, g, beta1, beta2, eps,
@@ -65,18 +75,9 @@ def grad_correct_torch(param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
     v.copy_(v_new)
     if emit_mode is not None:
         grad.copy_(score)
+    else:
+        if clear and mask is not None:
+            grad.masked_fill_(mask > 0, 0.0)
+        if fold:
+            grad.div_(interval)
     param.sub_(lr * update)
-
-
-def selective_reset_torch(grad_buffer: torch.Tensor, mask_u8: torch.Tensor,
-                          interval: float, fold: bool) -> None:
-    """Torch fallback of the fused selective reset.
-
-    Element-wise on purpose (boolean indexing materializes full-bucket
-    int64 indices, ~GB-scale). The unconditional divide is exact: actives
-    were just set to 0.0, and 0.0 / interval == 0.0.
-    """
-    active = mask_u8 > 0
-    grad_buffer.masked_fill_(active, 0.0)
-    if fold:
-        grad_buffer.div_(interval)

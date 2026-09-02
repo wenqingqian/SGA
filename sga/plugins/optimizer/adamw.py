@@ -11,9 +11,14 @@ coordinate (sparse steps: masked-out coords contribute a zero gradient,
 momentum keeps decaying) and the apply ``w -= lr * update`` ALWAYS fused
 (single arithmetic implementation, no Python-side second pass):
 
-- Sparse steps (EMIT_MODE=-1): masked m/v update + fused apply; the grad
-  buffer is untouched so the residual at non-topk positions keeps
-  accumulating.
+- Sparse steps (EMIT_MODE=-1): masked m/v update + fused apply, with the
+  clip coeff multiplied in-register and the selective buffer reset fused
+  post-commit  — communicated positions store 0, and on the
+  pre-boundary step with ``residual_mean`` the non-topk positions store
+  their residual times the fp32 host reciprocal of the fold window; on all
+  other sparse steps the grad buffer outside the mask is untouched so the
+  residual keeps accumulating (bitwise the former masked-scale ->
+  grad-correct -> selective-reset three-pass sequence).
 - Full steps (EMIT_MODE>=0, the Score enum value of the configured score):
   the same pass additionally materializes the score into the fp32 main grads
   (the reselection reads it from there). The grad buffer ALIASES the DDP
@@ -21,8 +26,8 @@ momentum keeps decaying) and the apply ``w -= lr * update`` ALWAYS fused
   model_param.main_grad.float() is an identity view for fp32 buckets), so
   the write lands in the bucket where the residual lives. Safety is purely
   ORDER-based, and the invariant holds: on a full step the residual was just
-  fully communicated; the engine reads the score views BEFORE the caller's
-  selective reset zeroes them; only after that does the selection read the
+  fully communicated; the engine reads the score views BEFORE the engine-side
+  reset zeroes them; only after that does the selection read the
   still-materialized score (the optimizer->score handoff).
 
 Score math is defined by the score registry (sga/plugins/scores.py); the
@@ -32,12 +37,10 @@ the torch reference by tests/test_kernels_gpu.py. The torch reference path
 lives in adamw_torch.py (physical isolation: this file is Triton + dispatch
 only); CPU unit tests keep working without Triton.
 
-Reset contract (selective with residual fold): sparse steps zero only the
-communicated (topk) positions; when the NEXT step is a full sync and
-``residual_mean`` is set, the residual is pre-divided by the fold window T
-(the accumulation span between full syncs; fused kernel multiplies by the
-fp32 host reciprocal — bitwise identical to
-torch's scalar division). Full steps zero everything.
+Reset contract (SgaAdamW.reset): sparse steps do NOTHING to the grad buffer
+— the fused kernel already cleared the communicated positions (and folded
+the residual when configured); zeroing again would destroy the accumulating
+residual. Degenerate mask-less buckets and full steps zero everything.
 """
 
 from typing import Optional
@@ -45,7 +48,7 @@ from typing import Optional
 import torch
 
 from sga.plugins import OptimizerDecl, PluginParam, resolve_plugin_params
-from sga.plugins.optimizer.adamw_torch import grad_correct_torch, selective_reset_torch
+from sga.plugins.optimizer.adamw_torch import grad_correct_torch
 from sga.plugins.scores import Score, emittable_score_names, get_score_spec
 
 try:
@@ -100,17 +103,35 @@ if _HAS_TRITON:
         param_ptr, grad_ptr, m_ptr, v_ptr, mask_ptr,
         lr, beta1, beta2, eps, weight_decay,
         bias_correction1, bias_correction2,
+        coeff, inv_interval,
         n_elements,
         BLOCK_SIZE: tl.constexpr,
         HAS_MASK: tl.constexpr,
         EMIT_MODE: tl.constexpr,
+        APPLY_COEFF: tl.constexpr,
+        CLEAR: tl.constexpr,
+        FOLD: tl.constexpr,
     ):
         """AdamW m/v update + fused apply, with full-step score emission.
 
         EMIT_MODE is the Score enum value as a compile-time int: -1 = sparse
-        (masked commit, grad buffer untouched); >=0 = full step (score
-        materialized into the grad buffer). Both paths apply
-        ``w -= lr * update`` in this same pass.
+        (masked commit), >=0 = full step (score materialized into the grad
+        buffer). Both paths apply ``w -= lr * update`` in this same pass.
+
+        Sparse-step fusion (CLEAR/APPLY_COEFF/FOLD are sparse-only,
+        the dispatch refuses them on full steps):
+        - APPLY_COEFF: the clip coeff multiplies the loaded grad in-register
+          — bitwise the standalone masked-scale pass (round_fp32(x*coeff)
+          whether stored-and-reloaded or kept in a register).
+        - CLEAR: active positions store 0 after use — bitwise the standalone
+          selective-reset pass; nothing reads the grad buffer between this
+          kernel and the next backward's accumulation.
+        - FOLD: inactive positions store grad*inv_interval (the host fp32
+          reciprocal, exactly the standalone reset kernel's fold). Needs the
+          raw grad at inactive positions, so the load widens to full-valid
+          only on fold steps (once per period at most) — the m/v commit
+          still sees zero there (``grad = where(active, raw, 0)``); the
+          residual enters the optimizer only via the boundary full step.
         """
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -122,8 +143,19 @@ if _HAS_TRITON:
         else:
             active = valid
 
+        if FOLD:
+            # Fold needs the raw residual at inactive coords for the store,
+            # but the m/v commit must still see ZERO there (the old sequence
+            # committed via the active-masked load and folded in a separate
+            # kernel — the residual enters m only at the boundary full step).
+            raw = tl.load(grad_ptr + offsets, mask=valid, other=0.0)
+            grad = tl.where(active, raw, 0.0)
+        else:
+            grad = tl.load(grad_ptr + offsets, mask=active, other=0.0)
+        if APPLY_COEFF:
+            grad = tl.where(active, grad * coeff, grad)
+
         param = tl.load(param_ptr + offsets, mask=valid, other=0.0)
-        grad = tl.load(grad_ptr + offsets, mask=active, other=0.0)
         m = tl.load(m_ptr + offsets, mask=valid, other=0.0)
         v = tl.load(v_ptr + offsets, mask=valid, other=0.0)
 
@@ -158,37 +190,21 @@ if _HAS_TRITON:
                 # Named score: it takes over the grad buffer; the reselection
                 # reads it from there exactly like the default update score.
                 tl.store(grad_ptr + offsets, score, mask=valid)
+        else:
+            if CLEAR:
+                tl.store(
+                    grad_ptr + offsets,
+                    tl.zeros([BLOCK_SIZE], tl.float32), mask=active,
+                )
+            if FOLD:
+                inactive = valid & (mask_val == 0)
+                tl.store(
+                    grad_ptr + offsets, raw * inv_interval, mask=inactive,
+                )
         # Fused apply on every path (sparse: masked-out coords loaded grad=0,
         # so their update is the pure weight-decay/momentum drift).
         param = param - lr * update
         tl.store(param_ptr + offsets, param, mask=valid)
-
-    @triton.jit
-    def _selective_reset_kernel(
-        grad_ptr, mask_ptr,
-        inv_interval,
-        n_elements,
-        BLOCK_SIZE: tl.constexpr,
-        FOLD: tl.constexpr,
-    ):
-        """Selective residual reset, fused into a single pass:
-        - mask-active (topk, communicated) positions: store 0;
-        - inactive positions with FOLD=True: store grad * inv_interval —
-          exact vs torch's ``/= interval`` on the CPU/torch path; on GPU the
-          kernel multiplies by the host-computed fp32 reciprocal, matching
-          CUDA scalar division (no GPU fused-reset A/B test exists)."""
-        pid = tl.program_id(0)
-        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        valid = offsets < n_elements
-        mask_val = tl.load(mask_ptr + offsets, mask=valid, other=0)
-        active = valid & (mask_val > 0)
-
-        tl.store(grad_ptr + offsets, tl.zeros([BLOCK_SIZE], tl.float32), mask=active)
-
-        if FOLD:
-            inactive = valid & (mask_val == 0)
-            g = tl.load(grad_ptr + offsets, mask=inactive, other=0.0)
-            tl.store(grad_ptr + offsets, g * inv_interval, mask=inactive)
 
 
 def adamw_grad_correct(
@@ -204,17 +220,33 @@ def adamw_grad_correct(
     step: int,
     mask: torch.Tensor = None,
     emit_mode: Optional[int] = None,
+    coeff: float = 1.0,
+    clear: bool = False,
+    fold: bool = False,
+    interval: float = 1.0,
 ) -> None:
-    """Run the grad-correct step on contiguous same-size buffers.
+    """Run the grad-correct step on contiguous same-size 1-D buffers.
 
+    Callers pass ``.view(-1)`` flats (the engine flattens every buffer;
+    a 2-D grad against the 1-D bucket mask would broadcast-error here).
     Updates m/v in place and always fuses the apply ``w -= lr * update``.
     ``emit_mode=None`` is the sparse step: with ``mask``, positions outside
-    it contribute a zero gradient; the grad buffer (residual) is untouched.
-    An int mode (a ``Score`` value) is the full step: the mode's score — all
-    computed from pre-commit state reachable only inside this pass — is
-    materialized into ``grad_buffer`` in the same pass (the reselection reads
-    it from there). An unknown int or the OFFLINE sentinel raises a
-    ValueError (owned messages) before any work.
+    it contribute a zero gradient. An int mode (a ``Score`` value) is the
+    full step: the mode's score — all computed from pre-commit state
+    reachable only inside this pass — is materialized into ``grad_buffer``
+    in the same pass (the reselection reads it from there). An unknown int
+    or the OFFLINE sentinel raises a ValueError (owned messages) before any
+    work.
+
+    Sparse-step fusion knobs (refused on full steps and without a
+    mask — they only make sense for the masked commit path):
+    - ``coeff != 1.0`` multiplies the loaded grads in-register — bitwise
+      equal to a standalone masked-scale pass before this call.
+    - ``clear`` zeroes the mask-active positions after use — bitwise equal
+      to a standalone selective-reset pass after this call.
+    - ``fold`` multiplies mask-inactive positions by 1/``interval`` (the
+      host fp32 reciprocal on the Triton path) — bitwise equal to the
+      standalone reset kernel's fold branch.
     """
     bias_correction1 = 1.0 - beta1 ** step
     bias_correction2 = 1.0 - beta2 ** step
@@ -236,6 +268,16 @@ def adamw_grad_correct(
                 "scores have no kernel branch to materialize"
             )
 
+    sparse_fusion = (coeff != 1.0) or clear or fold
+    if sparse_fusion and (emit_mode is not None or mask is None):
+        raise ValueError(
+            f"grad-correct sparse fusion (coeff={coeff!r}, clear={clear!r}, "
+            f"fold={fold!r}) requires a sparse step (emit_mode=None) with a "
+            "mask — full steps scale in place engine-side and never clear "
+            "(the reselection reads the materialized score from the grad "
+            "buffer)"
+        )
+
     n_elements = param_buffer.numel()
     if n_elements == 0:
         return
@@ -246,44 +288,34 @@ def adamw_grad_correct(
             lr, beta1, beta2, eps, weight_decay,
             bias_correction1, bias_correction2,
             mask, emit_mode,
+            coeff=coeff, clear=clear, fold=fold, interval=interval,
         )
         return
 
     has_mask = mask is not None
     mask_u8 = mask.to(torch.uint8) if (has_mask and mask.dtype != torch.uint8) else mask
+    # fp32 reciprocal, computed exactly as the standalone reset kernel did
+    # (bitwise-matches CUDA scalar division on the multiply path).
+    inv_interval = float(
+        (torch.ones(1, dtype=torch.float32) / interval).item()
+    ) if fold else 1.0
     grid = ((n_elements + _BLOCK_SIZE - 1) // _BLOCK_SIZE,)
     _grad_correct_kernel[grid](
         param_buffer, grad_buffer, exp_avg_buffer, exp_avg_sq_buffer,
         mask_u8 if has_mask else grad_buffer,
         lr, beta1, beta2, eps, weight_decay,
         bias_correction1, bias_correction2,
+        coeff, inv_interval,
         n_elements,
         BLOCK_SIZE=_BLOCK_SIZE,
         HAS_MASK=has_mask,
         # -1 here is the kernel's sparse-step sentinel; Score.OFFLINE's -1
         # never reaches this point (rejected host-side above).
         EMIT_MODE=emit_mode if emit_mode is not None else -1,
+        APPLY_COEFF=coeff != 1.0,
+        CLEAR=clear,
+        FOLD=fold,
     )
-
-
-def selective_reset(grad_buffer: torch.Tensor, mask: torch.Tensor,
-                    interval: float, fold: bool) -> None:
-    """Fused selective reset: zero communicated positions, optionally fold
-    (divide by interval) the residual at inactive positions."""
-    n_elements = grad_buffer.numel()
-    if n_elements == 0:
-        return
-    mask_u8 = mask if mask.dtype == torch.uint8 else mask.to(torch.uint8)
-    if _HAS_TRITON and grad_buffer.is_cuda and grad_buffer.dtype == torch.float32:
-        # fp32 reciprocal, computed exactly as torch's CUDA scalar division.
-        inv_interval = float((torch.ones(1, dtype=torch.float32) / interval).item())
-        grid = ((n_elements + _BLOCK_SIZE - 1) // _BLOCK_SIZE,)
-        _selective_reset_kernel[grid](
-            grad_buffer, mask_u8, inv_interval, n_elements,
-            BLOCK_SIZE=_BLOCK_SIZE, FOLD=fold,
-        )
-        return
-    selective_reset_torch(grad_buffer, mask_u8, interval, fold)
 
 
 class SgaAdamW:
@@ -312,12 +344,14 @@ class SgaAdamW:
     def ensure_state(self, bucket_states):
         pass  # no persistent per-bucket buffers beyond the Support caches
 
-    def _records_pass(self, ctx, emit_mode, use_mask):
+    def _records_pass(self, ctx, emit_mode, use_mask,
+                      coeff=1.0, clear=False, fold=False, interval=1.0):
         for rec in ctx.records:
             state = rec._state
             if len(state) == 0:
                 state["exp_avg"] = torch.zeros_like(rec.main_param.data)
                 state["exp_avg_sq"] = torch.zeros_like(rec.main_param.data)
+            m = rec.mask_u8() if use_mask else None
             adamw_grad_correct(
                 param_buffer=rec.main_param.data.view(-1),
                 grad_buffer=rec.grad.data.view(-1),
@@ -329,8 +363,16 @@ class SgaAdamW:
                 eps=rec.eps,
                 weight_decay=rec.weight_decay,
                 step=rec.step,
-                mask=rec.mask_u8() if use_mask else None,
+                mask=m,
                 emit_mode=emit_mode,
+                # Degenerate mask-less bucket on a sparse step: plain full
+                # commit (old behavior) — the fusion knobs require a mask,
+                # and the engine scaled such a record explicitly; reset's
+                # mask-less branch zeroes it afterwards.
+                coeff=coeff if m is not None else 1.0,
+                clear=clear and m is not None,
+                fold=fold and m is not None,
+                interval=interval,
             )
 
     @torch.no_grad()
@@ -343,21 +385,26 @@ class SgaAdamW:
     @torch.no_grad()
     def sparse_step(self, ctx):
         """Sparse step: fused grad-correct + apply with the persisted mask;
-        the grad buffer (residual) is untouched."""
-        self._records_pass(ctx, emit_mode=None, use_mask=True)
+        the clip coeff (``ctx.apply_coeff``) multiplies in-register and the
+        communicated positions clear post-commit — residual fold at the
+        inactive positions on the pre-boundary step when ``residual_mean``
+        is set — all in the SAME pass (bitwise equal to the
+        former masked-scale → grad-correct → selective-reset sequence)."""
+        fold = self.residual_mean and ctx.next_step_is_full
+        self._records_pass(
+            ctx, emit_mode=None, use_mask=True,
+            coeff=float(getattr(ctx, "apply_coeff", 1.0)),
+            clear=True, fold=fold, interval=float(ctx.fold_window),
+        )
 
     def reset(self, ctx, was_full: bool):
-        """Sparse steps: zero communicated positions, optionally pre-fold the
-        residual by the fold window when the next step is a full sync. Full
-        steps: zero all. The engine keeps each bucket's ``active_mask_u8`` in
-        sync with the support used by this step's sync."""
-        fold_all = self.residual_mean and ctx.next_step_is_full
+        """Sparse steps need no grad-buffer work anymore: the communicated
+        positions were cleared (and the residual folded, when configured)
+        inside grad_correct's fused pass — zeroing here would
+        destroy the accumulating residual. Full steps (and the degenerate
+        mask-less bucket): zero all. ``extra_main_grads`` zeroing stays."""
         for bs in ctx.bucket_states:
-            grad_data = bs.grad_data
-            mask = bs.active_mask_u8
-            if was_full or mask is None:
-                grad_data.zero_()
-            else:
-                selective_reset(grad_data, mask, float(ctx.fold_window), fold_all)
+            if was_full or bs.active_mask_u8 is None:
+                bs.grad_data.zero_()
             for grad in bs.extra_main_grads:
                 grad.zero_()

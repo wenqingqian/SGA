@@ -425,6 +425,87 @@ def test_meta_carries_engine_phase():
     print("PASS test_meta_carries_engine_phase")
 
 
+def test_sparse_dump_dualpath_content():
+    """dual-path, content level: on a DUMPING sparse step (trace
+    window active) the engine applies the clip explicitly engine-side —
+    payload = where(mask, g*coeff, g), inactives raw — and hands the
+    optimizer apply_coeff == 1.0 (no double scale). A regression that
+    scales the full layout, scales nothing, or re-defers the coeff on dump
+    steps fails here and would silently corrupt offline replay inputs."""
+    torch.manual_seed(5)
+    with tempfile.TemporaryDirectory() as td:
+        chunk = _FakeChunk()
+        mp = _FakeMPOpt(chunk)
+        # period 2: steps 0/1 bootstrap full, 2 boundary full + reselect,
+        # 3 the sparse step inside the [0, 4) dump window
+        eng = _build_traced_engine(
+            {"dir": td, "branch_points": [0], "window": 4}, chunk,
+            cycle={"start_iter": 0, "period": 2})
+
+        seen = {}
+        orig_sparse = eng.opt.sparse_step
+
+        def spy_sparse(ctx):
+            seen["apply_coeff"] = ctx.apply_coeff
+            return orig_sparse(ctx)
+
+        eng.opt.sparse_step = spy_sparse
+        orig_prepare = mp.prepare_grads
+        captured = {}
+        arming = {"next": False}
+
+        def prepare_spy():
+            found_inf = orig_prepare()
+            if arming["next"]:
+                captured["grads"] = [m.grad.clone() for m in mp.main_params]
+                arming["next"] = False
+            return found_inf
+
+        mp.prepare_grads = prepare_spy
+
+        with _ReplicaWorld(world=1):
+            for it in (0, 1, 2):
+                off = 0
+                for p in chunk.params:
+                    n = p.numel()
+                    chunk.bucket.grad_data[off:off + n] += torch.randn(n)
+                    off += n
+                assert eng.grad_sync(chunk, force_all_reduce=False) is True
+                ok, _, _ = eng.optimizer_step(mp, [chunk], it)
+                assert ok
+            mask = eng._bucket_states[0].active_mask_u8
+            assert mask is not None          # reselect happened at step 2
+            mask = mask.clone()
+            arming["next"] = True
+            off = 0
+            for p in chunk.params:
+                n = p.numel()
+                chunk.bucket.grad_data[off:off + n] += torch.randn(n)
+                off += n
+            assert eng.grad_sync(chunk, force_all_reduce=False) is True
+            ok, gn, _ = eng.optimizer_step(mp, [chunk], 3)
+            assert ok
+
+        coeff = 1.0 / (gn + 1.0e-6)
+        assert coeff < 1.0                  # random grads: clip is active
+        assert seen["apply_coeff"] == 1.0, seen   # engine scaled, not kernel
+
+        dumped = torch.load(os.path.join(td, "step_000003_g.pt"),
+                            weights_only=False)["payload"]
+        m = mask > 0
+        off = 0
+        for i, p in enumerate(chunk.params):
+            n = p.numel()
+            g = captured["grads"][i]
+            want = torch.where(m[off:off + n], g.view(-1) * coeff,
+                               g.view(-1)).view_as(g)
+            assert torch.equal(dumped[f"p{i}"], want), (
+                f"p{i}: sparse dump is not the masked-clipped grad"
+            )
+            off += n
+    print("PASS test_sparse_dump_dualpath_content")
+
+
 def main():
     test_parse_branch_points()
     test_canonical_name_strips_module_prefixes()
@@ -435,6 +516,7 @@ def main():
     test_bind_param_group_contract()
     test_rank_gate()
     test_meta_carries_engine_phase()
+    test_sparse_dump_dualpath_content()
     print("\nall trace tests passed")
 
 

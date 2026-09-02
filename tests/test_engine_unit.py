@@ -37,7 +37,7 @@ from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
 from sga.engine import BucketState, CycleManager, SGAEngine, SGAEngineError
 from sga.plugins import build_optimizer, build_selection
-from sga.plugins.optimizer import OptContext
+from sga.plugins.optimizer import OptContext, ParamRecord
 from sga.support import BucketSupport, Support
 
 torch.manual_seed(0)
@@ -162,13 +162,15 @@ def test_payload_scaling_preserves_residual_bitwise():
 # ------------------------------------------------- decoupled fold divisor
 
 def test_adamw_reset_folds_residual_by_decoupled_fold_window():
-    """CPU pin of the decoupled fold divisor: ahead of a MID-CYCLE full sync
-    (next_step_is_full=True after a sparse step, was_full=False), adamw's
-    selective reset folds the residual at the UNCOMMUNICATED positions by
-    ctx.fold_window — the decoupled full_sync_interval (4), NOT the period
-    (8) — and zeroes the communicated positions. A revert to the period
+    """CPU pin of the decoupled fold divisor: on the pre-boundary SPARSE step
+    (next_step_is_full=True after a sparse sync, residual_mean set), the
+    grad-correct fused pass folds the residual at the UNCOMMUNICATED
+    positions by ctx.fold_window — the decoupled full_sync_interval (4), NOT
+    the period (8) — and clears the communicated positions; reset()
+    afterwards must leave the folded residual intact (moved both
+    the clear and the fold INTO the kernel pass). A revert to the period
     divisor would leave every residual coordinate 2x too large on the
-    decoupled calendar (the 'divides by 4, not 8' contract at adamw.py)."""
+    decoupled calendar."""
     opt = build_optimizer("adamw", {"residual_mean": True})
     n = 256
     mask = torch.zeros(n, dtype=torch.uint8)
@@ -176,20 +178,33 @@ def test_adamw_reset_folds_residual_by_decoupled_fold_window():
     orig = torch.randn(n)
     bs = BucketState(orig.clone(), None, 1.0, 0)
     bs.active_mask_u8 = mask
-    ctx = OptContext(records=[], phase="sparse", bucket_states=[bs],
+    w = torch.randn(n)
+    w.grad = bs.grad_data          # the record's grad IS the bucket buffer
+    rec = ParamRecord(model_param=w, main_param=w, bucket_state=bs,
+                      start=0, end=n, lr=1e-3, beta1=0.9, beta2=0.95,
+                      eps=1e-8, weight_decay=0.0, step=7, _state={})
+    ctx = OptContext(records=[rec], phase="sparse", bucket_states=[bs],
                      fold_window=4, next_step_is_full=True)
 
-    opt.reset(ctx, was_full=False)
-
+    opt.sparse_step(ctx)
     active = mask > 0
-    # communicated positions: zeroed (their residual was consumed by the
-    # just-finished sparse sync)
+    # communicated positions: zeroed in the fused pass (their residual was
+    # consumed by the just-finished sparse sync)
     assert torch.equal(bs.grad_data[active],
                        torch.zeros(int(active.sum())))
     # residual positions: divided by exactly the fold window (4 — a power
     # of two, so the comparison is bitwise), not by the period (8)
     assert torch.equal(bs.grad_data[~active], orig[~active] / 4)
     assert not torch.equal(bs.grad_data[~active], orig[~active] / 8)
+
+    # reset on the sparse step must NOT touch the bucket (the folded
+    # residual is the accumulation base the boundary full sync consumes);
+    # on a full step it zeroes everything
+    folded = bs.grad_data.clone()
+    opt.reset(ctx, was_full=False)
+    assert torch.equal(bs.grad_data, folded)
+    opt.reset(ctx, was_full=True)
+    assert torch.all(bs.grad_data == 0)
 
 
 def test_torch_pipelined_index_modes_and_mechanics():
@@ -713,11 +728,13 @@ def test_abs_m_flow_boundaries_and_materialization():
 def test_reselect_boundary_orders_reset_before_activation():
     """Instrumented pin of the load-bearing support-switch ordering at a
     successful reselection boundary: optimizer full step -> model copy ->
-    selection -> reset (consuming the OLD support's masks) -> activate(new
-    support) -> host reset. The stub selection's consecutive masks are
-    DISJOINT, so 'reset saw the old mask' is falsifiable: a refactor that
-    activated the new support before reset would hand the optimizer the new
-    mask and silently skip the old support's residual handling."""
+    selection (reads the materialized score views) -> reset (zeroes the
+    consumed grad buffers — captured here while the OLD support is still
+    the active one on the buckets; an earlier round reset no longer reads the
+    masks itself) -> activate(new support) -> host reset. The stub
+    selection's consecutive masks are DISJOINT, so 'reset ran under the old
+    support' is falsifiable: a refactor that activated the new support
+    before reset would swap the bucket masks early and break the capture."""
     class _DisjointSelection:
         """Selection no. n masks every n-th-position parity: consecutive
         selections produce disjoint per-param masks."""

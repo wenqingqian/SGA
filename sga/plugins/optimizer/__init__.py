@@ -73,3 +73,8 @@ class OptContext:
                                         # window between full syncs (period,
                                         # or full_sync_interval when decoupled)
     next_step_is_full: bool = False     # for residual fold decisions
+    apply_coeff: float = 1.0            # sparse-step clip coeff, folded into
+                                        # the grad-correct read (grad_correct
+                                        # multiplies in-register — bitwise the
+                                        # standalone masked-scale pass; full
+                                        # steps keep 1.0, they scale in place)

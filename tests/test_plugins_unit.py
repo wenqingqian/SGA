@@ -4,7 +4,8 @@
 Covers:
 - score registry formulas vs straightforward fp64 oracles (all four scores,
   scratch-routed == freshly-allocated, wd-free update variant);
-- selective reset fold semantics (undivided / /T / full clear);
+- selective reset semantics as fused into the sparse grad-correct pass
+  (clear / fold / coeff == prescale, plus the SgaAdamW end-state invariant);
 - topk: histogram threshold == exact torch.kthvalue threshold,
   mask equality, k rounding bound, three-tier geometry + chunking;
 - adaptive controller band logic, clamps and lifecycle;
@@ -21,7 +22,9 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sga.plugins.optimizer.adamw import SgaAdamW, selective_reset
+from sga.plugins.optimizer import OptContext
+from sga.plugins.optimizer.adamw import SgaAdamW, adamw_grad_correct
+from sga.plugins.optimizer.adamw_torch import grad_correct_torch
 from sga.plugins.scores import SCRATCH_SCORES, get_score_spec, score_names
 from sga.plugins.selection._exact import select_masks_exact_kthvalue
 from sga.plugins.selection._histogram import (
@@ -232,22 +235,42 @@ def test_update_formula_wd_free_variant():
     assert float(diff.abs().max()) <= 1e-6 * scale
 
 
-# ------------------------------------------------------------ selective reset
+# ------------------------------------------- sparse fusion (, CPU)
 
-def test_selective_reset_fold_semantics():
+def test_grad_correct_sparse_fusion_semantics():
+    """grad_correct_torch fusion knobs == the standalone sequence: coeff is
+    a masked prescale, clear zeroes the active positions, fold divides the
+    inactive residual by the window — every buffer bitwise."""
+    torch.manual_seed(7)
+    n = 64
+    b1, b2, step = 0.9, 0.95, 5
+    kw = dict(lr=1e-3, beta1=b1, beta2=b2, eps=1e-8, weight_decay=1e-2,
+              bias_correction1=1 - b1 ** step,
+              bias_correction2=1 - b2 ** step)
     for fold, interval in [(False, 8), (True, 8)]:
-        grad = torch.randn(64)
-        mask = (torch.rand(64) < 0.25).to(torch.uint8)
-        ref = grad.clone()
-        selective_reset(grad, mask, float(interval), fold)
-        active = mask > 0
-        assert torch.all(grad[active] == 0)
-        if fold:
-            torch.testing.assert_close(
-                grad[~active], ref[~active] / interval, rtol=0, atol=0,
-            )
-        else:
-            assert torch.equal(grad[~active], ref[~active])
+        for coeff in (0.5, 1.0):
+            g0 = torch.randn(n)
+            mask = (torch.rand(n) < 0.25).to(torch.uint8)
+            p, m, v = torch.randn(n), torch.randn(n) * .1, torch.rand(n) * .1
+
+            p1, g1, m1, v1 = p.clone(), g0.clone(), m.clone(), v.clone()
+            grad_correct_torch(p1, g1, m1, v1, mask=mask, emit_mode=None,
+                               coeff=coeff, clear=True, fold=fold,
+                               interval=float(interval), **kw)
+
+            p2, m2, v2 = p.clone(), m.clone(), v.clone()
+            g2 = g0.clone()
+            if coeff != 1.0:
+                g2 = torch.where(mask > 0, g2 * coeff, g2)
+            grad_correct_torch(p2, g2, m2, v2, mask=mask, emit_mode=None,
+                               clear=True, fold=fold,
+                               interval=float(interval), **kw)
+
+            for got, ref, name in ((p1, p2, "param"), (m1, m2, "exp_avg"),
+                                   (v1, v2, "exp_avg_sq"), (g1, g2, "grad")):
+                assert torch.equal(got, ref), (
+                    f"fused sparse path diverged ({name}, coeff={coeff}, "
+                    f"fold={fold})")
 
 
 # --------------------------------------------------------------- topk
@@ -570,6 +593,101 @@ def test_score_emission_matches_oracles():
     torch.testing.assert_close(rec._state["exp_avg"], m_new, rtol=1e-5, atol=1e-7)
     torch.testing.assert_close(rec._state["exp_avg_sq"], v_new, rtol=1e-4, atol=1e-7)
     print("ok: score emission matches oracles (coi/abs_g/abs_m)")
+
+
+# ------------------------------------- sparse end-state (, CPU)
+
+class _SparseRec(_Rec):
+    """_Rec with a realizable mask for the sparse step."""
+
+    def __init__(self, param, grad, mask):
+        super().__init__(param, grad)
+        self._mask = mask
+
+    def mask_u8(self):
+        return self._mask
+
+
+class _Bucket:
+    def __init__(self, grad_data, mask):
+        self.grad_data = grad_data
+        self.active_mask_u8 = mask
+        self.extra_main_grads = [torch.randn(3)]
+
+
+def test_sparse_step_end_state_invariant():
+    """The an earlier round contract pinned end-to-end at SgaAdamW level: after
+    sparse_step + reset, mask-active coords are bitwise 0 and mask-inactive
+    coords keep the accumulating residual (folded by the window only on the
+    pre-boundary step with residual_mean); reset() on a sparse step must
+    NOT zero the bucket (zeroing would destroy the residual), on a full
+    step it zeroes everything."""
+    torch.manual_seed(11)
+    n = 256
+    mask = (torch.rand(n) < 0.25).to(torch.uint8)
+    active = mask > 0
+    for residual_mean, next_full, fold_window in [(False, False, 8),
+                                                  (True, False, 8),
+                                                  (True, True, 8)]:
+        w = torch.randn(n)
+        g0 = torch.randn(n)
+        rec = _SparseRec(w, g0.clone(), mask)
+        ctx = OptContext(records=[rec], phase="sparse", bucket_states=[],
+                         fold_window=fold_window, next_step_is_full=next_full,
+                         apply_coeff=0.5)
+        opt = SgaAdamW({"residual_mean": residual_mean})
+        opt.sparse_step(ctx)
+
+        assert torch.all(rec.grad.data[active] == 0)
+        if residual_mean and next_full:
+            torch.testing.assert_close(
+                rec.grad.data[~active], g0[~active] / fold_window,
+                rtol=0, atol=0)
+        else:
+            assert torch.equal(rec.grad.data[~active], g0[~active])
+
+        # reset on the sparse step: snapshot compare (bucket.grad_data IS
+        # rec.grad.data here, so assert against values, not identity)
+        bucket = _Bucket(rec.grad.data, mask)
+        ctx.bucket_states = [bucket]
+        post_step = rec.grad.data.clone()
+        extra_before = bucket.extra_main_grads[0].clone()
+        opt.reset(ctx, was_full=False)
+        assert torch.equal(bucket.grad_data, post_step)
+        assert torch.all(bucket.grad_data[active] == 0)
+        assert torch.all(bucket.extra_main_grads[0] == 0)
+        assert not torch.equal(bucket.extra_main_grads[0], extra_before)
+
+        opt.reset(ctx, was_full=True)
+        assert torch.all(bucket.grad_data == 0)
+
+    # degenerate mask-less bucket: reset zeroes it even on a sparse step
+    bare = _Bucket(torch.randn(n), None)
+    ctx = OptContext(records=[], phase="sparse", bucket_states=[bare])
+    SgaAdamW({}).reset(ctx, was_full=False)
+    assert torch.all(bare.grad_data == 0)
+
+
+def test_grad_correct_sparse_fusion_knob_guard():
+    """The fusion knobs are sparse-step-only: the dispatch refuses them on
+    full steps (emit_mode) and without a mask — owned message, before any
+    buffer work."""
+    n = 32
+    kw = dict(lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=1e-2,
+              step=5)
+    p, g, m, v = (torch.randn(n) for _ in range(4))
+    for kwargs in (dict(emit_mode=None, mask=None, coeff=0.5),
+                   dict(emit_mode=None, mask=None, clear=True),
+                   dict(emit_mode=None, mask=None, fold=True),
+                   dict(emit_mode=0, mask=(torch.rand(n) < .5).to(torch.uint8),
+                        clear=True)):
+        try:
+            adamw_grad_correct(p.clone(), g.clone(), m.clone(), v.clone(),
+                               **kwargs, **kw)
+        except ValueError as e:
+            assert "requires a sparse step" in str(e), e
+        else:
+            raise AssertionError(f"guard did not fire for {kwargs}")
 
 
 # ----------------------------------------------------- combination validation
