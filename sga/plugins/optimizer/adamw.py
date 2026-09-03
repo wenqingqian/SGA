@@ -226,9 +226,7 @@ if _HAS_TRITON:
         APPLY_COEFF: tl.constexpr, FOLD: tl.constexpr,
     ):
         """Compact-emission grad-correct: merge-join against the bucket-level
-        sorted idx/values (expert-reviewed; kernel form validated
-        bitwise at the reconstruction level by the pre-registered
-        compact passthrough bench).
+        sorted idx/values.
 
         The record's selected positions form a contiguous segment of the
         sorted bucket idx. Per block (coords [c0, c0+BLOCK)): two

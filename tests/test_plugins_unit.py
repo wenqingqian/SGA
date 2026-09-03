@@ -23,6 +23,16 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from sga.plugins import (
+    BackendDecl,
+    OptimizerDecl,
+    _register,
+    get_backend_plugin_decl,
+    get_optimizer_decl,
+    get_selection_decl,
+    register_default_plugins,
+    validate_combination,
+)
 from sga.plugins.optimizer import OptContext
 from sga.plugins.optimizer.adamw import SgaAdamW, adamw_grad_correct
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch
@@ -792,16 +802,6 @@ def test_emission_declaration_and_compact_capability():
     writeback scatter), and a compact-emission backend combined with an
     optimizer that does not declare consumes_compact is refused at config
     time (the communicated values would never reach the m/v commit)."""
-    from sga.plugins import (
-        BackendDecl,
-        OptimizerDecl,
-        _register,
-        get_backend_plugin_decl,
-        get_optimizer_decl,
-        get_selection_decl,
-        register_default_plugins,
-        validate_combination,
-    )
 
     seen = {}
     for bad in ("comapct", "write", "", None):

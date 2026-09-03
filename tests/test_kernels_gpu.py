@@ -34,6 +34,7 @@ from sga.kernels import (
     pack_selected,
     scatter_selected,
 )
+from sga.kernels_torch import pack_selected_torch
 from sga.plugins.optimizer.adamw import (
     adamw_grad_correct,
     adamw_grad_correct_compact,
@@ -448,7 +449,6 @@ def test_pack_selected_contract():
         assert torch.equal(vals, ref_vals), f"pack values (factor={factor})"
         assert torch.equal(g, ref), f"pack zero-store (factor={factor})"
     # torch fallback parity (small, CPU)
-    from sga.kernels_torch import pack_selected_torch
     gc_ = g0.clone()
     vc_ = torch.empty(k)
     idx_cpu = idx.cpu()

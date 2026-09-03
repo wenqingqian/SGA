@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 from sga.engine import SGAEngine
 from sga.plugins import build_optimizer, build_selection
 from sga.trace import TraceCollector, _canonical_name, parse_branch_points
@@ -517,7 +518,6 @@ def test_sparse_dump_compact_rebuild_content():
     invariant before grad_correct (the pack's clear does not repeat —
     the restore pass is the only thing keeping the end state clean)."""
     torch.manual_seed(5)
-    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 
     with tempfile.TemporaryDirectory() as td:
         chunk = _FakeChunk()
@@ -598,7 +598,6 @@ def test_sparse_dump_compact_restore_on_dump_exception():
     finally, so a failed dump cannot leak step-scoped state (selected
     coords non-zero) into the next backward's accumulation."""
     torch.manual_seed(6)
-    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 
     class _DumpFailure(RuntimeError):
         pass
