@@ -12,13 +12,16 @@ momentum keeps decaying) and the apply ``w -= lr * update`` ALWAYS fused
 (single arithmetic implementation, no Python-side second pass):
 
 - Sparse steps (EMIT_MODE=-1): masked m/v update + fused apply, with the
-  clip coeff multiplied in-register and the selective buffer reset fused
-  post-commit  — communicated positions store 0, and on the
-  pre-boundary step with ``residual_mean`` the non-topk positions store
-  their residual times the fp32 host reciprocal of the fold window; on all
-  other sparse steps the grad buffer outside the mask is untouched so the
-  residual keeps accumulating (bitwise the former masked-scale ->
-  grad-correct -> selective-reset three-pass sequence).
+  clip coeff multiplied in-register. Writeback-emission backends keep the
+  selective buffer reset fused post-commit — communicated
+  positions store 0, and on the pre-boundary step with ``residual_mean``
+  the non-topk positions store their residual times the fp32 host
+  reciprocal of the fold window; on all other sparse steps the grad
+  buffer outside the mask is untouched so the residual keeps accumulating.
+  Compact-emission backends never touch the grad buffer here:
+  the pack kernel already zeroed the communicated positions at grad_sync
+  time, the commit reads (idx, values) via merge-join, and the fold step
+  alone re-reads the residual at inactive coords.
 - Full steps (EMIT_MODE>=0, the Score enum value of the configured score):
   the same pass additionally materializes the score into the fp32 main grads
   (the reselection reads it from there). The grad buffer ALIASES the DDP
@@ -63,6 +66,10 @@ except ImportError:  # pragma: no cover
 DECL = OptimizerDecl(
     name="adamw",
     reset_mode="selective",
+    # The sparse path consumes the compact-emission (idx, values) handoff
+    # directly (_records_pass_compact) — required by compact backends,
+    # ignored by writeback ones.
+    consumes_compact=True,
     # Derived, not restated: this template implements every registry score's
     # kernel branch (a second template would declare its own branch subset).
     emittable_scores=emittable_score_names(),
@@ -207,6 +214,101 @@ if _HAS_TRITON:
         tl.store(param_ptr + offsets, param, mask=valid)
 
 
+    @triton.jit
+    def _grad_correct_compact_kernel(
+        param_ptr, grad_ptr, m_ptr, v_ptr, idx_ptr, val_ptr,
+        lr, beta1, beta2, eps, weight_decay,
+        bias_correction1, bias_correction2,
+        coeff, inv_interval,
+        rec_start, n_elements, k_total,
+        BLOCK_SIZE: tl.constexpr, SEARCH_DEPTH: tl.constexpr,
+        LANE_DEPTH: tl.constexpr,
+        APPLY_COEFF: tl.constexpr, FOLD: tl.constexpr,
+    ):
+        """Compact-emission grad-correct: merge-join against the bucket-level
+        sorted idx/values (expert-reviewed; kernel form validated
+        bitwise at the reconstruction level by the pre-registered
+        compact passthrough bench).
+
+        The record's selected positions form a contiguous segment of the
+        sorted bucket idx. Per block (coords [c0, c0+BLOCK)): two
+        lower_bounds on the full idx bracket the segment [p, q) — its length
+        is unconditionally <= BLOCK (the block's selected coords are a
+        subset of its coords), so the per-lane search runs L1-resident.
+        No CLEAR branch by design: the pack kernel zeroed the communicated
+        positions at grad_sync time. FOLD keeps the full sequential grad
+        read — the residual it folds lives at inactive coords only, which
+        the compact buffer does not carry. The m/v/param arithmetic is
+        statement-identical to the masked kernel; ulp-level (FMA
+        contraction per compilation), never bitwise, vs it — same binary
+        reruns are bitwise-stable.
+        """
+        pid = tl.program_id(0)
+        offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        valid = offs < n_elements
+        coords = rec_start + offs
+
+        c0 = rec_start + pid * BLOCK_SIZE
+        c1 = c0 + BLOCK_SIZE
+        a = 0
+        b = k_total
+        for _ in tl.static_range(SEARCH_DEPTH):
+            run = a < b
+            mid = (a + b) // 2
+            mv = tl.load(idx_ptr + mid, mask=run, other=2147483647)
+            a = tl.where(run & (mv < c0), mid + 1, a)
+            b = tl.where(run & (mv >= c0), mid, b)
+        p = a
+        a = p
+        b = k_total
+        for _ in tl.static_range(SEARCH_DEPTH):
+            run = a < b
+            mid = (a + b) // 2
+            mv = tl.load(idx_ptr + mid, mask=run, other=2147483647)
+            a = tl.where(run & (mv < c1), mid + 1, a)
+            b = tl.where(run & (mv >= c1), mid, b)
+        q = a
+
+        la = tl.zeros([BLOCK_SIZE], tl.int32) + p
+        lb = tl.zeros([BLOCK_SIZE], tl.int32) + q
+        for _ in tl.static_range(LANE_DEPTH):
+            run = la < lb
+            mid = (la + lb) // 2
+            mv = tl.load(idx_ptr + mid, mask=run, other=2147483647)
+            take = run & (mv < coords)
+            la = tl.where(take, mid + 1, la)
+            lb = tl.where(run & (~take), mid, lb)
+        inseg = la < q
+        fidx = tl.load(idx_ptr + la, mask=inseg, other=-1)
+        found = valid & inseg & (fidx == coords)
+        val = tl.load(val_ptr + la, mask=found, other=0.0)
+
+        grad = tl.where(found, val, 0.0)
+        if APPLY_COEFF:
+            grad = tl.where(found, grad * coeff, grad)
+
+        if FOLD:
+            raw = tl.load(grad_ptr + offs, mask=valid, other=0.0)
+
+        param = tl.load(param_ptr + offs, mask=valid, other=0.0)
+        m = tl.load(m_ptr + offs, mask=valid, other=0.0)
+        v = tl.load(v_ptr + offs, mask=valid, other=0.0)
+
+        m_new = beta1 * m + (1.0 - beta1) * grad
+        v_new = beta2 * v + (1.0 - beta2) * grad * grad
+        m_hat = m_new / bias_correction1
+        v_hat = v_new / bias_correction2
+        update = weight_decay * param + m_hat / (tl.sqrt(v_hat) + eps)
+
+        tl.store(m_ptr + offs, m_new, mask=valid)
+        tl.store(v_ptr + offs, v_new, mask=valid)
+        if FOLD:
+            tl.store(grad_ptr + offs, raw * inv_interval,
+                     mask=valid & (~found))
+        param = param - lr * update
+        tl.store(param_ptr + offs, param, mask=valid)
+
+
 def adamw_grad_correct(
     param_buffer: torch.Tensor,
     grad_buffer: torch.Tensor,
@@ -318,6 +420,102 @@ def adamw_grad_correct(
     )
 
 
+def adamw_grad_correct_compact(
+    param_buffer: torch.Tensor,
+    grad_buffer: torch.Tensor,
+    exp_avg_buffer: torch.Tensor,
+    exp_avg_sq_buffer: torch.Tensor,
+    idx: torch.Tensor,
+    values: torch.Tensor,
+    rec_start: int,
+    lr: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    weight_decay: float,
+    step: int,
+    coeff: float = 1.0,
+    fold: bool = False,
+    interval: float = 1.0,
+) -> None:
+    """Compact-emission grad-correct on contiguous same-size 1-D buffers.
+
+    Sparse step only (no score emission — compact values never carry the
+    materialized score path). ``idx``/``values`` are the BUCKET-level sorted
+    int32 indices and the communicated payload; ``rec_start`` is this
+    record's element offset inside the bucket. ``grad_buffer`` is read only
+    under ``fold`` (the accumulated residual at inactive coords). The clip
+    ``coeff`` multiplies the loaded values in-register; the communicated
+    positions of ``grad_buffer`` are NOT touched here — the pack kernel
+    zeroed them at grad_sync time (there is deliberately no clear knob).
+
+    ulp-class contract: values-level math is single-rounding (bitwise the
+    masked path's), the m/v/param tail differs from the masked kernel by
+    per-compilation FMA contraction only; the same binary reruns
+    bitwise-stable (pinned by tests/test_kernels_gpu.py).
+    """
+    if not idx.is_contiguous() or not values.is_contiguous():
+        raise ValueError(
+            "adamw_grad_correct_compact requires contiguous idx/values "
+            "(the gather buffer slices are; a strided view would silently "
+            "corrupt the merge-join)"
+        )
+    bias_correction1 = 1.0 - beta1 ** step
+    bias_correction2 = 1.0 - beta2 ** step
+    n_elements = param_buffer.numel()
+    if n_elements == 0:
+        return
+    k_total = idx.numel()
+    if not (_HAS_TRITON and param_buffer.is_cuda):
+        # Fallback: scatter this record's value segment back into the
+        # (pack-cleared) grad buffer and run the plain masked reference —
+        # end state identical to the compact path (values consumed, actives
+        # re-zeroed by clear, inactives folded when configured).
+        lo = 0 if k_total == 0 else int(
+            torch.searchsorted(idx, rec_start).item())
+        hi = 0 if k_total == 0 else int(
+            torch.searchsorted(idx, rec_start + n_elements).item())
+        mask = torch.zeros(n_elements, dtype=torch.uint8,
+                           device=param_buffer.device)
+        if hi > lo:
+            local = idx[lo:hi].long() - rec_start
+            mask[local] = 1
+            grad_buffer[local] = values[lo:hi]
+        grad_correct_torch(
+            param_buffer, grad_buffer, exp_avg_buffer, exp_avg_sq_buffer,
+            lr, beta1, beta2, eps, weight_decay,
+            bias_correction1, bias_correction2,
+            mask, None,
+            coeff=coeff, clear=True, fold=fold, interval=interval,
+        )
+        return
+
+    # fp32 reciprocal, computed exactly as the masked dispatcher does.
+    inv_interval = float(
+        (torch.ones(1, dtype=torch.float32) / interval).item()
+    ) if fold else 1.0
+    grid = ((n_elements + _BLOCK_SIZE - 1) // _BLOCK_SIZE,)
+    _grad_correct_compact_kernel[grid](
+        param_buffer, grad_buffer, exp_avg_buffer, exp_avg_sq_buffer,
+        idx, values,
+        lr, beta1, beta2, eps, weight_decay,
+        bias_correction1, bias_correction2,
+        coeff, inv_interval,
+        rec_start, n_elements, k_total,
+        BLOCK_SIZE=_BLOCK_SIZE,
+        SEARCH_DEPTH=max(1, (k_total + 1).bit_length()),
+        # Lane search depth: a lower bound over a <= BLOCK_SIZE segment has
+        # BLOCK_SIZE + 1 candidate positions, i.e. ceil(log2(BLOCK + 1)) ==
+        # bit_length(BLOCK) iterations. One short and the loop exits with
+        # (la, lb) un-converged inside a fully-selected block: the equality
+        # probe reads idx[la] at the wrong lane and silently drops that
+        # coordinate (grad committed as 0).
+        LANE_DEPTH=_BLOCK_SIZE.bit_length(),
+        APPLY_COEFF=coeff != 1.0,
+        FOLD=fold,
+    )
+
+
 class SgaAdamW:
     """The SGA AdamW optimizer template: grad-correct + residual reset."""
 
@@ -375,6 +573,44 @@ class SgaAdamW:
                 interval=interval,
             )
 
+    def _records_pass_compact(self, ctx, coeff=1.0, fold=False, interval=1.0):
+        """Compact-emission variant: consumes the backend's (idx, values)
+        directly per record; the grad buffer is only read on fold steps."""
+        for rec in ctx.records:
+            state = rec._state
+            if len(state) == 0:
+                state["exp_avg"] = torch.zeros_like(rec.main_param.data)
+                state["exp_avg_sq"] = torch.zeros_like(rec.main_param.data)
+            bs = rec.bucket_state
+            values = ctx.compact_values.get(id(bs))
+            if values is None:
+                # Degenerate mask-less bucket (no compact values): plain
+                # full-buffer commit, mirror of the masked path's contract
+                # (the engine scaled such a record explicitly; reset's
+                # mask-less branch zeroes it afterwards).
+                adamw_grad_correct(
+                    param_buffer=rec.main_param.data.view(-1),
+                    grad_buffer=rec.grad.data.view(-1),
+                    exp_avg_buffer=state["exp_avg"].view(-1),
+                    exp_avg_sq_buffer=state["exp_avg_sq"].view(-1),
+                    lr=rec.lr, beta1=rec.beta1, beta2=rec.beta2,
+                    eps=rec.eps, weight_decay=rec.weight_decay,
+                    step=rec.step, mask=None, emit_mode=None,
+                )
+                continue
+            idx = ctx.support.buckets[bs.support_index].idx
+            adamw_grad_correct_compact(
+                param_buffer=rec.main_param.data.view(-1),
+                grad_buffer=rec.grad.data.view(-1),
+                exp_avg_buffer=state["exp_avg"].view(-1),
+                exp_avg_sq_buffer=state["exp_avg_sq"].view(-1),
+                idx=idx, values=values, rec_start=rec.start,
+                lr=rec.lr, beta1=rec.beta1, beta2=rec.beta2,
+                eps=rec.eps, weight_decay=rec.weight_decay,
+                step=rec.step,
+                coeff=coeff, fold=fold, interval=interval,
+            )
+
     @torch.no_grad()
     def full_step(self, ctx):
         """Full-sync step: one fused pass per record — m/v commit, the
@@ -384,13 +620,21 @@ class SgaAdamW:
 
     @torch.no_grad()
     def sparse_step(self, ctx):
-        """Sparse step: fused grad-correct + apply with the persisted mask;
-        the clip coeff (``ctx.apply_coeff``) multiplies in-register and the
-        communicated positions clear post-commit — residual fold at the
-        inactive positions on the pre-boundary step when ``residual_mean``
-        is set — all in the SAME pass (bitwise equal to the
-        former masked-scale → grad-correct → selective-reset sequence)."""
+        """Sparse step: fused grad-correct + apply. Compact-emission backends
+        (``ctx.compact_values`` set) consume (idx, values) directly — the
+        communicated positions were zeroed by the pack kernel at grad_sync
+        time, so there is no clear here; the clip coeff multiplies
+        in-register and the residual fold (when ``residual_mean`` is set on
+        the pre-boundary step) reads the grad buffer at inactive coords in
+        the same pass. Writeback backends keep the masked kernel with the
+        fused clear (semantics unchanged)."""
         fold = self.residual_mean and ctx.next_step_is_full
+        if getattr(ctx, "compact_values", None):
+            self._records_pass_compact(
+                ctx, coeff=float(getattr(ctx, "apply_coeff", 1.0)),
+                fold=fold, interval=float(ctx.fold_window),
+            )
+            return
         self._records_pass(
             ctx, emit_mode=None, use_mask=True,
             coeff=float(getattr(ctx, "apply_coeff", 1.0)),
@@ -398,11 +642,12 @@ class SgaAdamW:
         )
 
     def reset(self, ctx, was_full: bool):
-        """Sparse steps need no grad-buffer work anymore: the communicated
-        positions were cleared (and the residual folded, when configured)
-        inside grad_correct's fused pass — zeroing here would
-        destroy the accumulating residual. Full steps (and the degenerate
-        mask-less bucket): zero all. ``extra_main_grads`` zeroing stays."""
+        """Sparse steps need no grad-buffer work anymore: writeback backends
+        got the clear inside grad_correct's fused pass; compact backends got
+        it from the pack kernel at grad_sync time. Zeroing here would
+        destroy the accumulating residual either way. Full steps (and the
+        degenerate mask-less bucket): zero all. ``extra_main_grads`` zeroing
+        stays."""
         for bs in ctx.bucket_states:
             if was_full or bs.active_mask_u8 is None:
                 bs.grad_data.zero_()

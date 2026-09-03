@@ -236,6 +236,17 @@ def test_runtime_args_guards():
                 raise AssertionError("fp16 was not rejected")
             except ValueError as e:
                 assert "fp16" in str(e), e
+            # bf16 + --loss-scale fails loudly: megatron builds a
+            # ConstantGradScaler and runs the in-place amp unscale over the
+            # bucket buffers every step — the compact values in the gather
+            # buffer escape it, so the communicated coordinates would ride a
+            # silently different scale than the residual
+            _mt.get_args = lambda: _args(loss_scale=4.0)
+            try:
+                _assert_args_compatible()
+                raise AssertionError("bf16 + loss-scale was not rejected")
+            except ValueError as e:
+                assert "loss-scale" in str(e), e
     finally:
         _mt.get_args = saved
 

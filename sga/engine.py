@@ -49,7 +49,9 @@ import os
 import torch
 
 from sga.kernels import (
+    compact_norm_sq_contribution,
     masked_norm_sq_contribution,
+    scatter_selected,
     sga_advance_step,
     sga_peek_step,
 )
@@ -199,6 +201,14 @@ class SGAEngine:
         self._param_locations = {}        # id(model_param) -> (bucket_state, start, end)
         self._selection_meta = None       # per-param (bs, start, end) view metadata
         self._active_support = None
+        # Compact-emission step state: {id(BucketState): the
+        # values view allreduce_sparse returned}. Filled at grad_sync only
+        # by compact backends, consumed in optimizer_step (clip + dump
+        # rebuild + grad_correct handoff), wiped at the first sync of every
+        # step and on the failed-step path — a stale view must never
+        # outlive the pack that wrote it.
+        self._compact_values = {}
+        self._compact_values_step = None
         self._mask_pool = None            # per-bucket [slot_a, slot_b] uint8 pair (lazy)
         self._mask_turn = 0               # active slot index (flips at activate)
         self._idx_pools = None            # per-bucket grow-only IndexPool list (lazy)
@@ -315,6 +325,13 @@ class SGAEngine:
         self._step_full = full
         self._step_forced = forced
 
+        # Step-scoped compact state: wipe at the FIRST sync of a step (the
+        # marker survives optimizer_step, which bumps _iter at its end), so
+        # multi-chunk syncs accumulate instead of clobbering each other.
+        if self._compact_values_step != step:
+            self._compact_values = {}
+            self._compact_values_step = step
+
         if full:
             # Delegate to the REAL dense path — bitwise parity exactly where
             # it matters (full-sync steps produce the scoring input).
@@ -323,12 +340,25 @@ class SGAEngine:
 
         avg = getattr(model_chunk.ddp_config, "average_in_collective", False)
         reduce_op = torch.distributed.ReduceOp.AVG if avg else torch.distributed.ReduceOp.SUM
+        compact = self.backend.decl.emission == "compact"
         for bucket_key, bs in self._chunk_buckets(model_chunk):
             support = self._active_support.buckets[bs.support_index]
             factor = 1.0 if avg else bs.gradient_scaling_factor
-            self.backend.allreduce_sparse(
+            out = self.backend.allreduce_sparse(
                 bs.grad_data, support, bs.dp_group, factor, reduce_op, key=bucket_key,
             )
+            if compact:
+                # The declared contract: a compact backend ALWAYS returns a
+                # Tensor (empty when nothing was selected — None is the
+                # writeback backends' signature and must not alias it).
+                if not isinstance(out, torch.Tensor):
+                    raise SGAEngineError(
+                        "compact-emission backend returned "
+                        f"{type(out).__name__} instead of a values Tensor — "
+                        "the clip/grad_correct compact paths would silently "
+                        "consume a stale buffer"
+                    )
+                self._compact_values[id(bs)] = out
         return True
 
     def _chunk_buckets(self, model_chunk):
@@ -388,15 +418,34 @@ class SGAEngine:
             mp_opt, was_full, step)
 
         # 3. num_zeros BEFORE the optimizer template (its full step
-        # overwrites main grads with the materialized score).
+        # overwrites main grads with the materialized score). Compact-
+        # emission sparse steps report the WRITEBACK view: the pack
+        # zeroed the communicated coords, so the count re-enters them
+        # through the values buffer (see _count_zeros) — the metric does
+        # not shift with the emission mode.
         num_zeros = self._count_zeros(mp_opt) if self._log_num_zeros_flag() else None
 
         # 3b. trace dump slot (frozen slot: AFTER count_zeros, BEFORE the
         #     optimizer rewrites main_param.grad — the post-unscale post-clip
         #     view the offline replay consumes; grad_norm is this step's own
-        #     clip).
-        if self._trace is not None:
-            self._trace.maybe_dump(self, mp_opt, step, grad_norm)
+        #     clip). Compact-emission sparse steps rebuild the full-layout
+        #     view IN PLACE for the dump window (the clip service already
+        #     scaled the values), then restore the buffer-state invariant
+        #     (selected coords zero) before grad_correct — dump steps only.
+        rebuilt = None
+        if (self._trace is not None and not was_full and self._compact_values
+                and step is not None and any(self._trace.wants(step))):
+            rebuilt = self._rebuild_full_views()
+        try:
+            if self._trace is not None:
+                self._trace.maybe_dump(self, mp_opt, step, grad_norm)
+        finally:
+            # Exception-safe: a dump I/O failure must not leave the
+            # scattered values in the grad buffer (the selected-coords-
+            # zero invariant is step-scoped state) — restore first, then
+            # let the original error propagate.
+            if rebuilt:
+                self._restore_compact_invariant(rebuilt)
 
         # 4. The optimizer template owns the entire inner step.
         records = self._refresh_records(mp_opt)
@@ -409,6 +458,9 @@ class SGAEngine:
             fold_window=self._cycle.fold_window,
             next_step_is_full=next_full,
             apply_coeff=1.0 if was_full else sparse_coeff,
+            compact_values=(self._compact_values
+                            if (not was_full and self._compact_values)
+                            else None),
         )
         if was_full:
             self.opt.full_step(opt_ctx)
@@ -783,6 +835,18 @@ class SGAEngine:
         clip_grad = getattr(mp_opt.config, "clip_grad", 0.0)
         records = self._records or self._refresh_records(mp_opt)
 
+        # Compact-emission sparse steps: the communicated values ARE the
+        # norm input (post-allreduce, pre-coeff) — a contiguous
+        # deterministic reduction with no atomics (the masked kernel's
+        # atomic accumulation was the run-to-run jitter source; the
+        # DP-bitwise fix below stays as an unconditional invariant, no
+        # longer load-bearing for it).
+        compact = (self._compact_values
+                   if (not was_full and self._compact_values
+                       and self.backend.decl.emission == "compact")
+                   else None)
+        compact_seen = set() if compact is not None else None
+
         device = "cpu"
         for rec in records:
             if rec.grad is not None:
@@ -791,6 +855,48 @@ class SGAEngine:
         total_norm_sq = torch.zeros(1, dtype=torch.float32, device=device)
         for rec in records:
             if rec.grad is None:
+                continue
+            if compact is not None:
+                # The values tensor is BUCKET-level and covers every record
+                # sharing the bucket, so it enters the reduction ONCE per
+                # bucket. Each such record must also count locally: a
+                # shared/tensor-parallel duplicate's coords are inside the
+                # bucket values but the compact contract has no per-record
+                # exclusion for them (v1 pins tp == 1, where the check is
+                # trivially True — fail closed rather than miscount on a
+                # future topology).
+                if not self._param_counts_locally(rec):
+                    raise SGAEngineError(
+                        "compact clip: record does not count locally "
+                        f"(shared/tensor-parallel duplicate, shape "
+                        f"{tuple(rec.model_param.shape)}) — the "
+                        "bucket-level values contract has no per-record "
+                        "exclusion for it"
+                    )
+                if rec.mask_u8() is None:
+                    # The pack zeroed this record's selected coords at
+                    # grad_sync, so a "full contribution" would silently
+                    # omit every communicated value and deflate the norm
+                    # (unreachable in the pinned topology: a compact
+                    # sparse step implies an active support with masks).
+                    raise SGAEngineError(
+                        "compact clip: record without an active mask — "
+                        "its communicated coords are already zeroed in "
+                        "the grad buffer and no mask-less compact "
+                        "contract exists"
+                    )
+                vals = compact.get(id(rec.bucket_state))
+                if vals is None:
+                    raise SGAEngineError(
+                        "compact clip: bucket state without a values entry "
+                        "(grad_sync skipped a supported bucket?)"
+                    )
+                if id(rec.bucket_state) not in compact_seen:
+                    compact_seen.add(id(rec.bucket_state))
+                    if vals.numel() > 0:
+                        compact_norm_sq_contribution(vals, total_norm_sq)
+                # Zero selection contributes exactly zero, same as the
+                # all-zero masked sum.
                 continue
             if not self._param_counts_locally(rec):
                 continue
@@ -832,6 +938,27 @@ class SGAEngine:
                         if rec.grad is None:
                             continue
                         rec.grad.data.mul_(coeff)
+                elif compact is not None:
+                    # Compact sparse step: the coeff rides the values —
+                    # either in grad_correct's in-register multiply (fast
+                    # path) or as an explicit values scale on dump steps
+                    # (the rebuild around maybe_dump scatters the scaled
+                    # values into the full layout, so the dump slot reads
+                    # the same post-clip view the writeback path produced;
+                    # grad_correct then runs coeff=1.0 — the same fp32
+                    # multiply either way). Degenerate mask-less records
+                    # keep the explicit full-buffer scale in both cases.
+                    if trace_dumps:
+                        for vals in compact.values():
+                            if vals.numel() > 0:
+                                vals.mul_(coeff)
+                    for rec in records:
+                        if rec.grad is None:
+                            continue
+                        if rec.mask_u8() is None:
+                            rec.grad.data.mul_(coeff)
+                    if not trace_dumps:
+                        sparse_coeff = float(coeff)
                 elif trace_dumps:
                     for rec in records:
                         if rec.grad is None:
@@ -854,6 +981,31 @@ class SGAEngine:
                             rec.grad.data.mul_(coeff)
                     sparse_coeff = float(coeff)
         return grad_norm, sparse_coeff
+
+    def _rebuild_full_views(self):
+        """Dump-window helper (compact emission, dump steps only): scatter
+        the clip-scaled values back into the full grad buffers so the dump
+        slot reads the same post-clip full-layout view the writeback path
+        produced. Returns the scatter list for the restore pass; the
+        state invariant (selected coords zero) is re-established in
+        :meth:`_restore_compact_invariant` before grad_correct runs."""
+        rebuilt = []
+        for bs in self._bucket_states:
+            vals = self._compact_values.get(id(bs))
+            if vals is None or vals.numel() == 0:
+                continue
+            idx = self._active_support.buckets[bs.support_index].idx
+            scatter_selected(bs.grad_data, idx, vals)
+            rebuilt.append((bs, idx))
+        return rebuilt
+
+    def _restore_compact_invariant(self, rebuilt):
+        """Re-zero the scattered positions (dump steps only — ~the pack
+        clear's write cost, once per dump)."""
+        for bs, idx in rebuilt:
+            scatter_selected(bs.grad_data, idx,
+                             torch.zeros(idx.numel(), dtype=bs.grad_data.dtype,
+                                         device=bs.grad_data.device))
 
     def _param_counts_locally(self, rec) -> bool:
         """Shared/tensor-parallel duplicate filters (trivially True at tp=1)."""
@@ -883,11 +1035,33 @@ class SGAEngine:
         total_norm_sq.div_(world)
 
     def _count_zeros(self, mp_opt):
+        """Pre-optimizer zero count of the main grads (frozen measurement
+        point). Compact-emission sparse steps reproduce the writeback
+        view: the pack zeroed the communicated coords at grad_sync, so
+        per compact bucket with k > 0 the raw buffer count subtracts k
+        and re-counts the values buffer's own zeros (a communicated
+        exactly-0.0 value counts as a zero, same as after a writeback
+        scatter). The dict is empty on full steps and writeback backends,
+        so the adjustment is a no-op there."""
         records = self._records or self._refresh_records(mp_opt)
+        compact = self._compact_values
+        compact_seen = set()
         n = 0
         for rec in records:
-            if rec.grad is not None:
-                n += rec.grad.data.numel() - int(torch.count_nonzero(rec.grad.data).item())
+            if rec.grad is None:
+                continue
+            buf = rec.grad.data
+            zeros = buf.numel() - int(torch.count_nonzero(buf).item())
+            bs_id = id(rec.bucket_state)
+            vals = compact.get(bs_id)
+            if vals is not None and vals.numel() > 0 and bs_id not in compact_seen:
+                # Bucket-level adjustment ONCE per bucket: the records
+                # tile the bucket, so their raw counts sum to the whole
+                # buffer while k spans it.
+                compact_seen.add(bs_id)
+                zeros -= vals.numel()
+                zeros += int((vals == 0).sum().item())
+            n += zeros
         return n
 
     # -------------------------------------------------- consistency machinery
@@ -992,6 +1166,8 @@ class SGAEngine:
             bs.grad_data.zero_()
             for grad in bs.extra_main_grads:
                 grad.zero_()
+        self._compact_values = {}
+        self._compact_values_step = None
         self._reset_host_state(model_chunks)
 
     def _reset_host_state(self, model_chunks):

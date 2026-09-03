@@ -24,6 +24,10 @@ Declaration facts used by the validator (see ``validate_combination``):
     emittable set are offline-only (replay-evaluable, config-rejected).
   - Backend.consumes: 'mask' or 'idx' — the Support object provides both,
     so this routes the backend rather than restricting combinations.
+  - Backend.emission + Optimizer.consumes_compact: a compact-emission
+    backend leaves the communicated values out of the grad buffer and
+    hands (idx, values) back; the optimizer must declare that its sparse
+    path consumes that handoff, or the combination is rejected.
 
 Cycle-calendar legality is engine-level (not optimizer-declared): reselection
 boundaries are structurally full syncs, so the residual fold contract holds
@@ -31,7 +35,7 @@ for any decoupled full-sync interval that divides the period.
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from sga.plugins.scores import Score, ScoreSpec, get_score_spec, score_names
 
@@ -164,6 +168,12 @@ class OptimizerDecl:
     name: str
     # Post-update buffer reset semantics the optimizer template owns.
     reset_mode: str = "selective"  # 'selective' | 'full'
+    # Whether the template's sparse path consumes the compact-emission
+    # (idx, values) handoff. A compact backend requires True: the values
+    # never enter the grad buffer, so an optimizer without the compact
+    # commit would silently drop every communicated gradient on sparse
+    # steps (enforced in validate_combination).
+    consumes_compact: bool = False
     # Score names this template can materialize into main grads on full steps
     # (the optimizer->score handoff); the configured score must be a member.
     emittable_scores: frozenset = frozenset()
@@ -180,6 +190,14 @@ class OptimizerDecl:
 class BackendDecl:
     name: str
     consumes: str = "mask"  # 'mask' | 'idx'
+    # What allreduce_sparse LEAVES BEHIND: 'writeback' = the
+    # communicated values are scattered back into the full grad buffer
+    # (returns None); 'compact' = they STAY in the backend's compact buffer
+    # and the return value is that values view (empty tensor when nothing
+    # was selected) — the engine's clip/grad_correct then consume
+    # (idx, values) directly. SGA-internal contract (the waist's three call
+    # points and registries are unchanged), so no SGA_API_VERSION bump.
+    emission: Literal["writeback", "compact"] = "writeback"
     params: tuple = ()      # (PluginParam, ...)
     # Same inspection hook as SelectionDecl.effective (unused today).
     effective: object = None
@@ -222,6 +240,16 @@ def _register(axis, registry, name, decl):
     for p in decl.params:
         if not p.required:
             _check_value(axis, name, p, p.default)
+    # The engine routes emission by EXACT equality, so a typo'd declaration
+    # would silently behave as writeback while the backend skips the
+    # writeback scatter. Only backend decls carry the field; the getattr
+    # default keeps the check axis-generic.
+    emission = getattr(decl, "emission", "writeback")
+    if emission not in ("writeback", "compact"):
+        raise ValueError(
+            f"sga.{axis} ({name}): decl emission must be 'writeback' or "
+            f"'compact' (got {emission!r})"
+        )
     registry[name] = decl
 
 
@@ -266,10 +294,11 @@ def validate_combination(score_name: str, selection: SelectionDecl,
 
     ``backend`` is a BackendDecl; ``cycle`` is the engine cycle config dict
     (start_iter / period / decouple_full_sync_interval_and_period /
-    full_sync_interval). ``selection`` and ``backend`` are accepted for
-    interface completeness only — the cross-axis legality rule lives on the
-    optimizer decl (emittable scores); the cycle-calendar rules are
-    engine-level (checked below).
+    full_sync_interval). ``selection`` is accepted for interface
+    completeness only; the cross-axis legality rules live on the
+    optimizer/backend decls (emittable scores; compact emission requires
+    an optimizer that consumes the compact handoff) and the
+    cycle-calendar rules are engine-level (checked below).
     """
     problems = []
     get_score_spec(score_name)  # unknown name fails with the registered list
@@ -279,6 +308,14 @@ def validate_combination(score_name: str, selection: SelectionDecl,
             f"'{score_name}' into main grads on full steps (emittable: "
             f"{sorted(optimizer.emittable_scores) or 'nothing'}) — the score "
             "is offline-only under this optimizer"
+        )
+    if backend.emission == "compact" and not optimizer.consumes_compact:
+        problems.append(
+            f"backend '{backend.name}' declares emission='compact' but "
+            f"optimizer '{optimizer.name}' does not consume the compact "
+            "(idx, values) handoff (consumes_compact=false) — the "
+            "communicated values would never reach the m/v commit and "
+            "every sparse step would silently drop them"
         )
     period = int(cycle.get("period", 1))
     decouple = bool(cycle.get("decouple_full_sync_interval_and_period", False))

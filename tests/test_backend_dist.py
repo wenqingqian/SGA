@@ -6,10 +6,15 @@ prototype's methodology:
 
 - payload scaling under a real SUM allreduce: non-selected coordinates are
   BITWISE unchanged, selected ones equal (a + b) * factor;
-- the two backends (torch_pipelined_mask / torch_pipelined_index) produce
-  bitwise-identical communicated coordinates (same element set, single fp32
-  add);
-- an empty support is a clean no-op;
+- torch_pipelined_mask (writeback emission): the communicated values are
+  scattered into the full buffer and the call returns None;
+- torch_pipelined_index (compact emission): the call returns the
+  values view — content bitwise-equal to the mask backend's written-back
+  values — and the full buffer's selected coords are ZERO (the fused pack
+  cleared them); non-selected coords keep the residual;
+- an empty support is a clean no-op (empty Tensor return on the compact
+  backend — a Tensor, not None, so the engine can tell zero-selection
+  apart from a writeback backend);
 - the engine's layer-1 count check passes on identical supports and REFUSES
   (raises, no collective mismatch) on diverged ones.
 
@@ -60,25 +65,32 @@ def main():
     local = _vec(100 + rank)
     expected_selected = (_vec(100) + _vec(101)) * factor  # (a + b) * factor
 
-    # --- masked backend ---------------------------------------------------
+    # --- masked backend (writeback emission) -------------------------------
     g_mask = local.clone()
-    TorchPipelinedMaskBackend({"num_slices": 2}).allreduce_sparse(
+    ret_mask = TorchPipelinedMaskBackend({"num_slices": 2}).allreduce_sparse(
         g_mask, support, group, factor, op, key=0)
     active = support.mask_u8 > 0
+    assert ret_mask is None, "writeback backend must return None"
     assert torch.equal(g_mask[~active], local[~active]), "residual changed"
     assert torch.equal(g_mask[active], expected_selected[active]), \
         f"masked backend selected coords wrong (rank {rank})"
 
-    # --- indexed backend --------------------------------------------------
+    # --- indexed backend (compact emission) --------------------------------
     g_idx = local.clone()
-    TorchPipelinedIndexBackend({}).allreduce_sparse(
+    ret_idx = TorchPipelinedIndexBackend({}).allreduce_sparse(
         g_idx, support, group, factor, op, key=0)
+    assert isinstance(ret_idx, torch.Tensor), (
+        "compact backend must return the values view (a Tensor)"
+    )
     assert torch.equal(g_idx[~active], local[~active]), "residual changed"
-    assert torch.equal(g_idx[active], expected_selected[active]), \
-        f"indexed backend selected coords wrong (rank {rank})"
+    assert torch.equal(g_idx[active], torch.zeros_like(g_idx[active])), \
+        "compact backend must leave the selected coords ZERO (pack cleared)"
+    # idx order is ascending, boolean indexing is ascending: elementwise.
+    assert torch.equal(ret_idx, expected_selected[active]), \
+        f"indexed backend values wrong (rank {rank})"
 
-    # --- backends agree bitwise on the communicated coordinates -----------
-    assert torch.equal(g_idx[active], g_mask[active])
+    # --- the two emissions agree bitwise on the communicated values -------
+    assert torch.equal(ret_idx, g_mask[active])
 
     # --- raw-kernel backend (needs the sparse library; skip loudly) -------
     lib = os.environ.get("SGA_NCCL_SAR_LIB")
@@ -97,7 +109,7 @@ def main():
         # torch backends (validated on A100 singlesocket + cross-node IB)
         assert torch.equal(g_nccl[active], expected_selected[active]), \
             f"nccl backend selected coords wrong (rank {rank})"
-        assert torch.equal(g_nccl[active], g_idx[active])
+        assert torch.equal(g_nccl[active], ret_idx)
 
         # a second backend instance exercising the factor-1.0 fast path:
         # no pre-scale, plain SUM over 2 ranks
@@ -117,10 +129,14 @@ def main():
     # --- empty support is a clean no-op ------------------------------------
     empty = BucketSupport(torch.zeros(n, dtype=torch.uint8, device=device))
     g_empty = local.clone()
-    TorchPipelinedMaskBackend({"num_slices": 2}).allreduce_sparse(
+    ret_m = TorchPipelinedMaskBackend({"num_slices": 2}).allreduce_sparse(
         g_empty, empty, group, factor, op, key=1)
-    TorchPipelinedIndexBackend({}).allreduce_sparse(
+    ret_i = TorchPipelinedIndexBackend({}).allreduce_sparse(
         g_empty, empty, group, factor, op, key=1)
+    assert ret_m is None
+    # zero-selection is an EMPTY TENSOR on compact backends (never None —
+    # that is the writeback signature)
+    assert isinstance(ret_i, torch.Tensor) and ret_i.numel() == 0
     assert torch.equal(g_empty, local)
     dist.barrier()
 

@@ -11,7 +11,9 @@ this file is Triton + dispatch.
 import torch
 
 from sga.kernels_torch import (
+    compact_norm_sq_contribution_torch,
     masked_norm_sq_contribution_torch,
+    pack_selected_torch,
     scatter_selected_torch,
 )
 
@@ -56,6 +58,37 @@ if _HAS_TRITON:
         vals = tl.load(src_ptr + offsets, mask=valid, other=0.0)
         tl.store(dst_ptr + idx, vals, mask=valid)
 
+    @triton.jit
+    def _pack_kernel(grad_ptr, idx_ptr, val_ptr, factor, k,
+                     BLOCK_SIZE: tl.constexpr, SCALE: tl.constexpr):
+        """Fused sparse pack: ``values[i] = grad[idx[i]] * factor`` and
+        ``grad[idx[i]] = 0`` in one pass. The zero store MOVES the selective
+        clear here from grad_correct: the buffer state invariant
+        (selected coords zero before the next backward's accumulation) is
+        established at grad_sync time on compact-emission paths. Bitwise
+        equal to index_select + payload scale + scatter-style clear: one
+        fp32 multiply per element, pure stores."""
+        pid = tl.program_id(0)
+        t = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        valid = t < k
+        i = tl.load(idx_ptr + t, mask=valid, other=0)
+        v = tl.load(grad_ptr + i, mask=valid, other=0.0)
+        if SCALE:
+            v = v * factor
+        tl.store(val_ptr + t, v, mask=valid)
+        tl.store(grad_ptr + i, tl.zeros([BLOCK_SIZE], tl.float32), mask=valid)
+
+    @triton.jit
+    def _compact_norm_stage1(val_ptr, part_ptr, k, BLOCK_SIZE: tl.constexpr):
+        """Block partial sums of val**2 into ``part[pid]`` — fixed reduction
+        order per block, NO atomics: the compact norm is run-to-run
+        deterministic (the masked atomic kernel it replaces was the
+        run-to-run clip-coeff jitter source)."""
+        pid = tl.program_id(0)
+        t = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        v = tl.load(val_ptr + t, mask=t < k, other=0.0)
+        tl.store(part_ptr + pid, tl.sum(v * v, axis=0))
+
 
 _CLIP_BLOCK_SIZE = 1024
 
@@ -79,6 +112,50 @@ def scatter_selected(dst: torch.Tensor, indices: torch.Tensor, src: torch.Tensor
         )
     else:
         scatter_selected_torch(dst, indices, src)
+
+
+def pack_selected(grad: torch.Tensor, indices: torch.Tensor,
+                  values: torch.Tensor, factor: float) -> None:
+    """Fused pack: gather ``grad[indices]`` into ``values`` (scaled by
+    ``factor``) and ZERO those positions of ``grad`` in the same pass.
+
+    ``factor == 1.0`` compiles the multiply out (constexpr skip). int32
+    indices, < 2^31 bucket elements, same contract as scatter_selected.
+    """
+    k = indices.numel()
+    if k == 0:
+        return
+    assert grad.numel() < 2 ** 31, (
+        f"pack_selected assumes < 2^31 bucket elements, got {grad.numel()}"
+    )
+    if _HAS_TRITON and grad.is_cuda:
+        grid = ((k + _CLIP_BLOCK_SIZE - 1) // _CLIP_BLOCK_SIZE,)
+        _pack_kernel[grid](
+            grad, indices, values, factor, k,
+            BLOCK_SIZE=_CLIP_BLOCK_SIZE, SCALE=factor != 1.0,
+        )
+    else:
+        pack_selected_torch(grad, indices, values, factor)
+
+
+def compact_norm_sq_contribution(values: torch.Tensor,
+                                 total_norm_sq: torch.Tensor) -> None:
+    """Accumulate ``sum(values**2)`` into the fp32 scalar ``total_norm_sq``.
+
+    Two-stage deterministic reduction (block partials + a final sum over the
+    small partials buffer) — no atomics, fixed order per shape.
+    """
+    k = values.numel()
+    if k == 0:
+        return
+    if _HAS_TRITON and values.is_cuda:
+        nblk = (k + _CLIP_BLOCK_SIZE - 1) // _CLIP_BLOCK_SIZE
+        parts = torch.empty(nblk, dtype=torch.float32, device=values.device)
+        _compact_norm_stage1[(nblk,)](values, parts, k,
+                                      BLOCK_SIZE=_CLIP_BLOCK_SIZE)
+        total_norm_sq += parts.sum()
+    else:
+        compact_norm_sq_contribution_torch(values, total_norm_sq)
 
 
 def use_fused_masked_op(grad: torch.Tensor, mask: torch.Tensor) -> bool:

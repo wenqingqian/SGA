@@ -725,6 +725,116 @@ def test_abs_m_flow_boundaries_and_materialization():
     assert 0 < ratio < 1.0
 
 
+def test_compact_emission_state_invariants():
+    """Compact emission: pin the state contract at BOTH
+    observation points of a sparse step. A (grad_sync return): the pack
+    cleared the selected coords in-place, the values view is captured
+    under the bucket key, the residual is bitwise untouched. B
+    (optimizer_step return): selected coords STAY zero and the residual
+    survives bitwise (residual_mean=False), the capture lives until the
+    next step's first sync wipes it. The sparse-step grad_norm is pinned
+    against an independent oracle over the captured values — the
+    bucket-level reduction must happen ONCE per bucket (this fake has 2
+    records on 1 bucket, so a per-record reduction inflates the norm by
+    sqrt(2) and silently over-clips) — and num_zeros is pinned to the
+    writeback view (pack-cleared coords re-entered through the values
+    buffer). Plus the fail-closed guards: a writeback backend never
+    populates the capture, and a declared-compact backend returning None
+    is refused."""
+    chunk = _FakeChunk()
+    mp = _FakeMPOpt(chunk)
+    eng = _build_engine(_ABS_M)
+    eng.attach(chunk)
+    with _ReplicaWorld(world=1):
+        # bootstrap to the first sparse step: 1-5 full, 6 sparse (see
+        # test_abs_m_flow_boundaries_and_materialization)
+        for step in range(1, 6):
+            _accumulate_into_bucket(chunk)
+            assert eng.grad_sync(chunk, force_all_reduce=False) is True
+            assert eng._compact_values == {}  # full steps never capture
+            ok, _, _ = eng.optimizer_step(mp, [chunk], step)
+            assert ok is True
+        bs = eng._bucket_states[0]
+        idx = eng._active_support.buckets[bs.support_index].idx.long()
+        rest = torch.ones(bs.grad_data.numel(), dtype=torch.bool)
+        rest[idx] = False
+        _accumulate_into_bucket(chunk)
+        pre = bs.grad_data.clone()
+        assert eng.grad_sync(chunk, force_all_reduce=False) is True
+        # observation point A: the compact communication result
+        assert set(eng._compact_values) == {id(bs)}
+        vals = eng._compact_values[id(bs)].clone()
+        assert isinstance(vals, torch.Tensor)
+        assert vals.numel() == idx.numel() > 0
+        # gather with factor==1.0: a pure memory move, bitwise
+        assert torch.equal(vals, pre[idx])
+        # the pack cleared the communicated coords in grad_data
+        assert torch.count_nonzero(bs.grad_data[idx]).item() == 0
+        # the residual at unselected coords is bitwise untouched
+        assert torch.equal(bs.grad_data[rest], pre[rest])
+        # num-zeros measurement point on a sparse compact step: the
+        # writeback view — raw post-pack zeros minus the communicated
+        # coords, re-counted through the values buffer
+        eng._log_num_zeros = True
+        ok, grad_norm, nz = eng.optimizer_step(mp, [chunk], 6)
+        assert ok is True and grad_norm is not None
+        # independent norm oracle over the captured bucket values: one
+        # contribution per bucket, exact against the engine's own fp32
+        # reduction (a per-record double count fails this by ~sqrt(2))
+        oracle_norm = float(vals.pow(2).sum().sqrt())
+        assert abs(grad_norm - oracle_norm) <= 1e-5 * oracle_norm, (
+            grad_norm, oracle_norm
+        )
+        assert nz == (int((pre[rest] == 0).sum().item())
+                      + int((vals == 0).sum().item())), (nz,)
+        # observation point B: the post-consumption end state
+        assert torch.count_nonzero(bs.grad_data[idx]).item() == 0
+        assert torch.equal(bs.grad_data[rest], pre[rest])
+        # the capture survives optimizer_step; the NEXT first-sync wipes it
+        assert id(bs) in eng._compact_values
+        _accumulate_into_bucket(chunk)
+        assert eng.grad_sync(chunk, force_all_reduce=False) is True
+        assert eng._compact_values_step == 7
+
+    # writeback emission (mask backend) keeps its None contract: sparse
+    # steps over it never populate the capture
+    chunk2 = _FakeChunk()
+    mp2 = _FakeMPOpt(chunk2)
+    eng2 = _build_engine(_UPDATE)  # start=0, T=3: sparse at steps 4-5
+    eng2.attach(chunk2)
+    with _ReplicaWorld(world=1):
+        for step in range(1, 4):
+            _accumulate_into_bucket(chunk2)
+            assert eng2.grad_sync(chunk2, force_all_reduce=False) is True
+            assert eng2.optimizer_step(mp2, [chunk2], step)[0] is True
+        _accumulate_into_bucket(chunk2)
+        assert eng2.grad_sync(chunk2, force_all_reduce=False) is True
+        assert eng2._compact_values == {}
+        assert eng2.optimizer_step(mp2, [chunk2], 4)[0] is True
+
+    # declared compact but returned None: fail closed (a stale buffer must
+    # not silently feed clip/grad_correct)
+    class _NoneBackend(TorchPipelinedIndexBackend):
+        def allreduce_sparse(self, *a, **k):
+            return None
+
+    chunk3 = _FakeChunk()
+    mp3 = _FakeMPOpt(chunk3)
+    eng3 = _build_engine({**_ABS_M, "backend": _NoneBackend({})})
+    eng3.attach(chunk3)
+    with _ReplicaWorld(world=1):
+        for step in range(1, 6):
+            _accumulate_into_bucket(chunk3)
+            assert eng3.grad_sync(chunk3, force_all_reduce=False) is True
+            assert eng3.optimizer_step(mp3, [chunk3], step)[0] is True
+        _accumulate_into_bucket(chunk3)
+        try:
+            eng3.grad_sync(chunk3, force_all_reduce=False)
+            raise AssertionError("None from compact backend accepted")
+        except SGAEngineError as e:
+            assert "values Tensor" in str(e), e
+
+
 def test_reselect_boundary_orders_reset_before_activation():
     """Instrumented pin of the load-bearing support-switch ordering at a
     successful reselection boundary: optimizer full step -> model copy ->

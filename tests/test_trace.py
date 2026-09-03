@@ -5,7 +5,8 @@ Covers: branch-point parsing, canonical (module.-stripped) catalog keys, the
 frozen dump slot (after count_zeros / clip, BEFORE the EF — pinned by a
 call-order spy), absolute (resume-safe) step numbering, per-group
 hyperparameter meta, state_absent semantics, window gating, the rank gate,
-and the zero-overhead-when-off structural contract.
+the zero-overhead-when-off structural contract, and the exception-safe
+compact dump-window restore.
 """
 import os
 import sys
@@ -28,14 +29,15 @@ from test_engine_unit import (
 )
 
 
-def _build_traced_engine(trace_cfg, chunk, cycle=None):
+def _build_traced_engine(trace_cfg, chunk, cycle=None, backend=None):
     selection = build_selection(_UPDATE["selection"],
                                 dict(_UPDATE["selection_params"]))
     opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
                           emit_score=_UPDATE["score"])
     eng = SGAEngine({"cycle": cycle or dict(_UPDATE["cycle"]),
                      "trace": trace_cfg},
-                    _UPDATE["score"], selection, opt, _UPDATE["backend"])
+                    _UPDATE["score"], selection, opt,
+                    backend or _UPDATE["backend"])
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
     return eng
@@ -506,6 +508,148 @@ def test_sparse_dump_dualpath_content():
     print("PASS test_sparse_dump_dualpath_content")
 
 
+def test_sparse_dump_compact_rebuild_content():
+    """Compact emission, dump-window content: on a DUMPING
+    sparse step the engine scales the compact values in-place, scatters
+    them into the full grad layout around the dump (the slot reads the
+    same post-clip full view the writeback path produced), hands the
+    optimizer apply_coeff == 1.0, and RESTORES the selected-coords-zero
+    invariant before grad_correct (the pack's clear does not repeat —
+    the restore pass is the only thing keeping the end state clean)."""
+    torch.manual_seed(5)
+    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
+
+    with tempfile.TemporaryDirectory() as td:
+        chunk = _FakeChunk()
+        mp = _FakeMPOpt(chunk)
+        # same cadence as test_sparse_dump_dualpath_content: period 2,
+        # steps 0/1/2 full, 3 the sparse step inside the [0, 4) window
+        eng = _build_traced_engine(
+            {"dir": td, "branch_points": [0], "window": 4}, chunk,
+            cycle={"start_iter": 0, "period": 2},
+            backend=TorchPipelinedIndexBackend({}))
+
+        seen = {}
+        orig_sparse = eng.opt.sparse_step
+
+        def spy_sparse(ctx):
+            seen["apply_coeff"] = ctx.apply_coeff
+            seen["compact"] = ctx.compact_values is not None
+            return orig_sparse(ctx)
+
+        eng.opt.sparse_step = spy_sparse
+
+        with _ReplicaWorld(world=1):
+            for it in (0, 1, 2):
+                off = 0
+                for p in chunk.params:
+                    n = p.numel()
+                    chunk.bucket.grad_data[off:off + n] += torch.randn(n)
+                    off += n
+                assert eng.grad_sync(chunk, force_all_reduce=False) is True
+                assert eng.optimizer_step(mp, [chunk], it)[0]
+            bs = eng._bucket_states[0]
+            mask = bs.active_mask_u8
+            assert mask is not None          # reselect happened at step 2
+            mask = mask.clone()
+            off = 0
+            for p in chunk.params:
+                n = p.numel()
+                chunk.bucket.grad_data[off:off + n] += torch.randn(n)
+                off += n
+            pre = bs.grad_data.clone()       # pre-communication full layout
+            assert eng.grad_sync(chunk, force_all_reduce=False) is True
+            vals_pre = eng._compact_values[id(bs)].clone()
+            ok, gn, _ = eng.optimizer_step(mp, [chunk], 3)
+            assert ok
+
+        coeff = 1.0 / (gn + 1.0e-6)
+        assert coeff < 1.0                  # random grads: clip is active
+        assert seen["apply_coeff"] == 1.0, seen   # engine scaled, not kernel
+        assert seen["compact"] is True, seen      # compact context reached opt
+
+        dumped = torch.load(os.path.join(td, "step_000003_g.pt"),
+                            weights_only=False)["payload"]
+        m = mask > 0
+        # the full-layout post-clip view: selected = scaled values, the
+        # residual raw (exactly what the writeback path dumps)
+        want_full = torch.zeros_like(pre)
+        want_full[m] = vals_pre * coeff
+        want_full[~m] = pre[~m]
+        off = 0
+        for i, p in enumerate(chunk.params):
+            n = p.numel()
+            assert torch.equal(dumped[f"p{i}"],
+                               want_full[off:off + n].view_as(p)), (
+                f"p{i}: compact dump is not the rebuilt post-clip view"
+            )
+            off += n
+        # the restore pass re-zeroed the scattered coords: the end state
+        # keeps the pack's invariant (consumption leaves no stale values)
+        assert torch.count_nonzero(bs.grad_data[m]).item() == 0
+        assert torch.equal(bs.grad_data[~m], pre[~m])
+    print("PASS test_sparse_dump_compact_rebuild_content")
+
+
+def test_sparse_dump_compact_restore_on_dump_exception():
+    """Compact dump-window exception safety: when maybe_dump raises
+    inside the rebuild window, the exception must propagate AND the
+    scattered values must be re-zeroed first — the restore runs in a
+    finally, so a failed dump cannot leak step-scoped state (selected
+    coords non-zero) into the next backward's accumulation."""
+    torch.manual_seed(6)
+    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
+
+    class _DumpFailure(RuntimeError):
+        pass
+
+    with tempfile.TemporaryDirectory() as td:
+        chunk = _FakeChunk()
+        mp = _FakeMPOpt(chunk)
+        # same cadence as test_sparse_dump_compact_rebuild_content: period 2,
+        # steps 0/1/2 full, 3 the sparse step inside the [0, 4) window
+        eng = _build_traced_engine(
+            {"dir": td, "branch_points": [0], "window": 4}, chunk,
+            cycle={"start_iter": 0, "period": 2},
+            backend=TorchPipelinedIndexBackend({}))
+
+        with _ReplicaWorld(world=1):
+            for it in (0, 1, 2):
+                off = 0
+                for p in chunk.params:
+                    n = p.numel()
+                    chunk.bucket.grad_data[off:off + n] += torch.randn(n)
+                    off += n
+                assert eng.grad_sync(chunk, force_all_reduce=False) is True
+                assert eng.optimizer_step(mp, [chunk], it)[0]
+            bs = eng._bucket_states[0]
+            mask = bs.active_mask_u8
+            assert mask is not None          # reselect happened at step 2
+            sel = mask > 0
+            rest = ~sel
+            off = 0
+            for p in chunk.params:
+                n = p.numel()
+                chunk.bucket.grad_data[off:off + n] += torch.randn(n)
+                off += n
+            pre = bs.grad_data.clone()       # pre-communication full layout
+            assert eng.grad_sync(chunk, force_all_reduce=False) is True
+
+            def raising_dump(*a, **k):
+                raise _DumpFailure("dump I/O exploded")
+
+            eng._trace.maybe_dump = raising_dump
+            try:
+                eng.optimizer_step(mp, [chunk], 3)
+                raise AssertionError("dump exception was swallowed")
+            except _DumpFailure:
+                pass
+            # the finally restored the invariant BEFORE the exception flew
+            assert torch.count_nonzero(bs.grad_data[sel]).item() == 0
+            assert torch.equal(bs.grad_data[rest], pre[rest])
+    print("PASS test_sparse_dump_compact_restore_on_dump_exception")
+
+
 def main():
     test_parse_branch_points()
     test_canonical_name_strips_module_prefixes()
@@ -517,6 +661,8 @@ def main():
     test_rank_gate()
     test_meta_carries_engine_phase()
     test_sparse_dump_dualpath_content()
+    test_sparse_dump_compact_rebuild_content()
+    test_sparse_dump_compact_restore_on_dump_exception()
     print("\nall trace tests passed")
 
 

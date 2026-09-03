@@ -10,7 +10,13 @@ unit tests already pin to fp64 oracles:
 - scatter_selected: bitwise-equality contract;
 - masked_norm_sq_contribution: same aggregate within atomic-order jitter;
 - the fused sparse grad-correct path (coeff/clear/fold knobs) vs
-  the standalone sequence it replaces: bitwise per buffer.
+  the standalone sequence it replaces: bitwise per buffer;
+- the compact-emission path: fused pack + merge-join
+  grad-correct vs the writeback chain — three-leg criterion (values/grad
+  bitwise; m/v/param ulp-class: Triton FMA contraction differs per
+  compilation, same-binary reruns bitwise-stable); pack contract incl. the
+  factor==1.0 constexpr skip; compact norm determinism (no atomics — the
+  run-to-run jitter source the masked kernel carried is gone).
 
 Run: python tests/test_kernels_gpu.py
 """
@@ -23,14 +29,72 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sga.kernels import (
+    compact_norm_sq_contribution,
     masked_norm_sq_contribution,
+    pack_selected,
     scatter_selected,
 )
-from sga.plugins.optimizer.adamw import adamw_grad_correct
+from sga.plugins.optimizer.adamw import (
+    adamw_grad_correct,
+    adamw_grad_correct_compact,
+)
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch
 from sga.plugins.scores import Score, emittable_score_names, get_score_spec
 
 torch.manual_seed(0)
+
+# Measured contraction class of the compact merge-join tail vs the masked
+# kernel tail: worst ~2.3 ulps AT THE OPERAND SCALE across every A/B arm,
+# dense-run/rec_start geometry leg and seed (FMA contraction is decided per
+# compilation; the yardstick must be the operand scale — near a cancelling
+# coordinate the result falls many binades below its inputs, where a
+# result-relative bound is meaningless). A real lookup bug moves
+# committed-grad-sized chunks: ~1e6 operand-scale ulps. The class is pinned
+# just above the measurement so re-seeds do not flap.
+_COMPACT_TAIL_ULP = 4
+
+
+def _ulp_distance(got: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """Ordered-int ULP distance between two finite fp32 tensors: the
+    IEEE-754 bit patterns remapped to a monotonic integer rank (sign bit
+    folded into the magnitude order), so the difference is the exact ulp
+    distance."""
+    ia = got.contiguous().view(torch.int32).to(torch.int64)
+    ib = ref.contiguous().view(torch.int32).to(torch.int64)
+    ka = torch.where(ia < 0, -(ia & 0x7FFFFFFF), ia)
+    kb = torch.where(ib < 0, -(ib & 0x7FFFFFFF), ib)
+    return (ka - kb).abs()
+
+
+def _assert_tail_ulp_class(got, ref, op_scale, ctx):
+    """Pin a kernel tail to ``_COMPACT_TAIL_ULP`` ulps at the operand scale.
+
+    ``op_scale`` is the per-element magnitude of the largest operand the
+    tail consumes (re-derived from the pre-commit state; the right SCALE is
+    required, not the exact operands). The ulp distance is computed on the
+    results (ordered-int) and rescaled by the binade gap to the operand
+    scale before the bound applies. Non-finite values must additionally
+    match bit-exactly — same specials on both sides (int32 view).
+    """
+    op_scale = op_scale.to(got.device)
+    fin = torch.isfinite(got) & torch.isfinite(ref)
+    assert torch.equal(got.view(torch.int32)[~fin],
+                       ref.view(torch.int32)[~fin]), (
+        f"non-finite tail values diverged ({ctx})"
+    )
+    if not fin.any():
+        return
+    x, y = got[fin], ref[fin]
+    d = _ulp_distance(x, y).double()
+    tiny = torch.finfo(torch.float32).tiny
+    mag = torch.maximum(x.abs(), y.abs()).clamp_min(tiny)
+    bin_gap = (op_scale[fin].clamp_min(tiny).log2().floor()
+               - mag.log2().floor()).clamp_min(0)
+    worst = float((d * torch.pow(2.0, -bin_gap.double())).max())
+    assert worst <= _COMPACT_TAIL_ULP, (
+        f"compact tail beyond the measured contraction class ({ctx}): "
+        f"{worst:.1f} operand-scale ulps — lookup bug, not contraction"
+    )
 
 
 def test_grad_correct_triton_matches_fallback():
@@ -153,6 +217,270 @@ def test_scatter_selected_roundtrip():
     rest = torch.ones(numel, dtype=torch.bool)
     rest[idx.long()] = False
     assert torch.all(dst.cpu()[rest] == 0)
+
+
+def test_compact_grad_correct_ab():
+    """Three-leg A/B: compact chain (fused pack -> merge-join
+    grad-correct) vs the writeback chain (index_select*scale -> scatter ->
+    masked fused kernel).
+
+    LEG-1 bitwise: values buffer and the grad buffer END STATE (single-mul
+    stores only). LEG-2 ulp-class: m/v/param pinned to the MEASURED
+    contraction class — ordered-int ulp distance at the operand scale
+    (see _assert_tail_ulp_class): Triton's FMA contraction is decided per
+    compilation, so two different kernel bodies can never be bitwise-equal
+    in the tail arithmetic, while a real lookup bug moves committed-grad-
+    sized chunks and misses the bound by orders of magnitude. Non-finite
+    values must match bit-exactly. LEG-3: the same compact binary reruns
+    bitwise-stable. Fold arms included (the raw residual read).
+    """
+    device = "cuda"
+    n = 200_000
+    kw = dict(lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8,
+              weight_decay=0.1, step=1000)
+    coeff, factor = 0.7, 0.125
+    for fold, interval in [(False, 8.0), (True, 8.0), (True, 7.0)]:
+        g0 = torch.randn(n)
+        mask = (torch.rand(n) < 0.3).to(torch.uint8)
+        idx = mask.nonzero(as_tuple=True)[0].to(torch.int32).to(device)
+        k = idx.numel()
+        # v must be POSITIVE (rand, not randn): the AdamW tail takes
+        # sqrt(v_hat) — a signed v would NaN ~half the params identically
+        # in both runs and torch.equal reads NaN != NaN (false alarm)
+        base = {t: torch.randn(n) * s for t, s in
+                (("p", 1.0), ("m", 0.1))} | {
+            "v": torch.rand(n) * 0.01}
+        base["g"] = g0
+
+        def chain_a():
+            a = {kk: vv.clone().to(device) for kk, vv in base.items()}
+            vals = torch.empty(k, device=device)
+            pack_selected(a["g"], idx, vals, factor)
+            adamw_grad_correct_compact(
+                a["p"], a["g"], a["m"], a["v"], idx, vals, 0,
+                coeff=coeff, fold=fold, interval=interval, **kw)
+            return a, vals
+
+        b = {kk: vv.clone().to(device) for kk, vv in base.items()}
+        vb = torch.empty(k, device=device)
+        torch.index_select(b["g"], 0, idx, out=vb)
+        vb *= factor
+        scatter_selected(b["g"], idx, vb)
+        adamw_grad_correct(b["p"], b["g"], b["m"], b["v"], mask=mask.to(device),
+                           emit_mode=None, coeff=coeff, clear=True,
+                           fold=fold, interval=interval, **kw)
+        a, vals = chain_a()
+        a2, vals2 = chain_a()  # LEG-3: same binary, fresh buffers
+        # LEG-1: pure memory / single-mul stores are bitwise
+        assert torch.equal(vals, vb), "values diverged (must be bitwise)"
+        assert torch.equal(a["g"], b["g"]), "grad end state diverged"
+        # LEG-3 compares raw BITS (int views): torch.equal would read a
+        # NaN as != itself even against an identical bit pattern
+        bits = lambda t: t.view(torch.int32)
+        assert all(torch.equal(bits(x), bits(y)) for x, y in
+                   [(a2["p"], a["p"]), (a2["m"], a["m"]),
+                    (a2["v"], a["v"]), (a2["g"], a["g"]), (vals2, vals)]), \
+            "compact kernel is not rerun-bitwise-stable"
+        # LEG-2: arithmetic tail pinned to the measured contraction class
+        # (operand-scale ulps). The scale re-derives each element's largest
+        # operand from the pre-commit state: param's update magnitude uses
+        # the committed moments as proxies.
+        gc = base["g"] * factor * coeff * mask.float()
+        bc1 = 1 - kw["beta1"] ** kw["step"]
+        bc2 = 1 - kw["beta2"] ** kw["step"]
+        upd = (kw["weight_decay"] * base["p"].abs()
+               + (a["m"].cpu().abs() / bc1)
+               / ((a["v"].cpu() / bc2).sqrt() + kw["eps"]))
+        scales = {
+            "p": torch.maximum(base["p"].abs(), kw["lr"] * upd),
+            "m": torch.maximum(kw["beta1"] * base["m"].abs(),
+                               (1 - kw["beta1"]) * gc.abs()),
+            "v": torch.maximum(kw["beta2"] * base["v"].abs(),
+                               (1 - kw["beta2"]) * gc.abs() ** 2),
+        }
+        for name in ("p", "m", "v"):
+            _assert_tail_ulp_class(a[name], b[name], scales[name],
+                                   f"{name}, fold={fold}")
+
+    # k == 0 boundary: empty idx == all-zero mask, pure decay, bitwise
+    n = 4096
+    z = {"p": torch.randn(n), "m": torch.randn(n) * .1,
+         "v": torch.rand(n) * .01}
+    z["g"] = torch.randn(n)
+    a = {kk: vv.clone().to(device) for kk, vv in z.items()}
+    b = {kk: vv.clone().to(device) for kk, vv in z.items()}
+    idx0 = torch.empty(0, dtype=torch.int32, device=device)
+    vals0 = torch.empty(0, device=device)
+    adamw_grad_correct_compact(a["p"], a["g"], a["m"], a["v"], idx0, vals0,
+                               0, coeff=coeff, **kw)
+    zero_mask = torch.zeros(n, dtype=torch.uint8, device=device)
+    adamw_grad_correct(b["p"], b["g"], b["m"], b["v"], mask=zero_mask,
+                       emit_mode=None, **kw)
+    for name in ("p", "m", "v", "g"):
+        assert torch.equal(a[name], b[name]), f"k==0 mismatch ({name})"
+
+
+def test_compact_grad_correct_dense_runs_and_rec_start():
+    """Merge-join geometry the Bernoulli A/B cannot reach: fully selected
+    1024-blocks amid sparse background (a lower bound over d elements has
+    d+1 candidate positions, i.e. ceil(log2(d+1)) iterations — a lane
+    search one iteration short leaves (la, lb) un-converged inside a full
+    block and silently drops the second coordinate, committing grad=0
+    there), exactly-block and one-short lengths, single selections at the
+    first/second/last position of a block, and the rec_start > 0 span
+    arithmetic (bucket-level idx vs record-local coords) with a segment
+    straddling a record-local block boundary and an empty record segment."""
+    device = "cuda"
+    n = 16384
+    kw = dict(lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8,
+              weight_decay=0.1, step=1000)
+    coeff, factor = 0.7, 0.125
+    bc1 = 1 - kw["beta1"] ** kw["step"]
+    bc2 = 1 - kw["beta2"] ** kw["step"]
+
+    def ab(mask, fold=False, interval=8.0, rec_lo=0, rec_hi=None):
+        """One A/B on the [rec_lo, rec_hi) record slice of a bucket-wide
+        mask: the compact call consumes the bucket-level (idx, values)
+        with rec_start == rec_lo; the reference runs the masked chain on
+        the full buffers. Values/grad bitwise, tail within the measured
+        contraction class."""
+        rec_hi = n if rec_hi is None else rec_hi
+        idx = mask.nonzero(as_tuple=True)[0].to(torch.int32).to(device)
+        k = idx.numel()
+        base = {"p": torch.randn(n), "m": torch.randn(n) * 0.1,
+                "v": torch.rand(n) * 0.01, "g": torch.randn(n)}
+        gc = base["g"] * factor * coeff * mask.float()
+
+        a = {kk: vv.clone().to(device) for kk, vv in base.items()}
+        vals = torch.empty(k, device=device)
+        pack_selected(a["g"], idx, vals, factor)
+        sl = slice(rec_lo, rec_hi)
+        adamw_grad_correct_compact(
+            a["p"][sl], a["g"][sl], a["m"][sl], a["v"][sl],
+            idx, vals, rec_lo, coeff=coeff, fold=fold,
+            interval=interval, **kw)
+
+        b = {kk: vv.clone().to(device) for kk, vv in base.items()}
+        vb = torch.empty(k, device=device)
+        torch.index_select(b["g"], 0, idx, out=vb)
+        vb *= factor
+        scatter_selected(b["g"], idx, vb)
+        adamw_grad_correct(b["p"], b["g"], b["m"], b["v"],
+                           mask=mask.to(device), emit_mode=None,
+                           coeff=coeff, clear=True, fold=fold,
+                           interval=interval, **kw)
+
+        assert torch.equal(a["g"][sl], b["g"][sl]), \
+            f"grad end state diverged (rec {rec_lo}:{rec_hi}, fold={fold})"
+        upd = (kw["weight_decay"] * base["p"].abs()
+               + (a["m"].cpu().abs() / bc1)
+               / ((a["v"].cpu() / bc2).sqrt() + kw["eps"]))
+        scales = {
+            "p": torch.maximum(base["p"].abs(), kw["lr"] * upd),
+            "m": torch.maximum(kw["beta1"] * base["m"].abs(),
+                               (1 - kw["beta1"]) * gc.abs()),
+            "v": torch.maximum(kw["beta2"] * base["v"].abs(),
+                               (1 - kw["beta2"]) * gc.abs() ** 2),
+        }
+        for name in ("p", "m", "v"):
+            _assert_tail_ulp_class(
+                a[name][sl], b[name][sl], scales[name][sl],
+                f"{name}, rec {rec_lo}:{rec_hi}, fold={fold}")
+
+    torch.manual_seed(11)
+    sparse = (torch.rand(n) < 0.05).to(torch.uint8)
+    # dense runs of block-boundary lengths (1025 / 1024 / 1023) amid a
+    # sparse background
+    for lo, hi in ((4096, 5121), (2048, 3072), (8192, 9215)):
+        for fold, interval in ((False, 8.0), (True, 7.0)):
+            m = sparse.clone()
+            m[lo:hi] = 1
+            ab(m, fold=fold, interval=interval)
+    # single selections at a block's first / second / last position: the
+    # lane search's only equality probe is idx[la] vs coords, so each
+    # must resolve exactly
+    for pos in (4096, 4097, 5119):
+        m = sparse.clone()
+        m[pos] = 1
+        ab(m)
+
+    # rec_start > 0: record 1 of a two-record bucket, its dense run
+    # straddling the record-local block boundary at rec_start + 1024 and
+    # a fully selected record-local block ([rec_start+3072, +4096)) deeper
+    # in; record 0 is the empty segment (no idx entries below rec_start).
+    rs = 1000
+    m = (torch.rand(n) < 0.05).to(torch.uint8)
+    m[:rs] = 0
+    m[rs + 1000:rs + 1060] = 1
+    m[rs + 3072:rs + 4096] = 1
+    ab(m, rec_lo=rs, rec_hi=n)                      # rec_start = 1000
+    ab(m, rec_lo=0, rec_hi=rs)                      # the empty segment
+    ab(m, fold=True, interval=7.0, rec_lo=rs, rec_hi=n)
+    # bucket idx holding selected coords BELOW rec_start (records are not
+    # aligned with selection density): the record's lower bounds must
+    # skip them
+    m2 = (torch.rand(n) < 0.05).to(torch.uint8)
+    m2[100:190] = 1
+    m2[rs + 1000:rs + 1060] = 1
+    m2[rs + 3072:rs + 4096] = 1
+    ab(m2, rec_lo=rs, rec_hi=n)
+
+
+def test_pack_selected_contract():
+    """Fused pack vs index_select + payload scale + zero-scatter reference:
+    bitwise at every factor, including the factor==1.0 constexpr skip; the
+    torch fallback agrees on the same contract (CPU)."""
+    device = "cuda"
+    n = 300_000
+    g0 = torch.randn(n)
+    mask = (torch.rand(n) < 0.25).to(torch.uint8)
+    idx = mask.nonzero(as_tuple=True)[0].to(torch.int32).to(device)
+    k = idx.numel()
+    for factor in (0.125, 1.0):
+        g = g0.clone().to(device)
+        vals = torch.empty(k, device=device)
+        pack_selected(g, idx, vals, factor)
+        ref = g0.clone().to(device)
+        ref_vals = ref[idx.long()].clone()
+        if factor != 1.0:
+            ref_vals *= factor
+        ref[idx.long()] = 0.0
+        assert torch.equal(vals, ref_vals), f"pack values (factor={factor})"
+        assert torch.equal(g, ref), f"pack zero-store (factor={factor})"
+    # torch fallback parity (small, CPU)
+    from sga.kernels_torch import pack_selected_torch
+    gc_ = g0.clone()
+    vc_ = torch.empty(k)
+    idx_cpu = idx.cpu()
+    pack_selected_torch(gc_, idx_cpu, vc_, 0.5)
+    ref = g0[idx_cpu.long()] * 0.5
+    assert torch.equal(vc_, ref)
+    assert torch.count_nonzero(gc_[idx_cpu.long()]).item() == 0
+
+
+def test_compact_norm_deterministic():
+    """Compact norm: same aggregate as the masked contribution (within the
+    declared ulp-class reduction-order difference) and DETERMINISTIC across
+    reruns — the masked atomic kernel this replaces was the run-to-run
+    clip-coeff jitter source the masked atomic kernel carried; the
+    compact path removes it from the sparse path)."""
+    device = "cuda"
+    n = 8192 * 64
+    vals = torch.rand(n, device=device) * 2 - 1
+    ref_sq = float((vals.cpu() ** 2).sum())
+    got = torch.zeros(1, device=device)
+    compact_norm_sq_contribution(vals, got)
+    assert abs(got.item() - ref_sq) <= 1e-5 * max(1.0, abs(ref_sq))
+    # determinism: 20 runs, exactly one distinct sum (pre-registered probe)
+    sums = set()
+    for _ in range(20):
+        t = torch.zeros(1, device=device)
+        compact_norm_sq_contribution(vals, t)
+        sums.add(t.item())
+    assert len(sums) == 1, (
+        f"compact norm is nondeterministic ({len(sums)} distinct sums in "
+        "20 runs) — the jitter source would be BACK"
+    )
 
 
 def test_score_modes_purity_and_content():

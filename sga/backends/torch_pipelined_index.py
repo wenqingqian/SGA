@@ -4,19 +4,23 @@
 One backend, two transport modes chosen by ``high_priority_group``:
 
 - ``false`` (default): collectives run on the training world's existing
-  DP-CP group — the legacy ``indexed_sparse`` semantics. With the default
+  DP-CP group — the legacy ``indexed_sparse`` transport. With the default
   ``slices: 2`` the split is the bucket-midpoint partition
-  (``support.split``), keeping this mode BITWISE-identical to the arms the
-  e2e baseline gate recorded under the old name.
+  (``support.split``).
 - ``true``: collectives run on a twin NCCL process group over the same
   ranks created with ``ProcessGroupNCCL.Options(is_high_priority_stream=
-  True)`` — the legacy ``pipelined_idx_sorted`` semantics (compact payloads
+  True)`` — the legacy ``pipelined_idx_sorted`` transport (compact payloads
   do not queue behind the training stream's communicator).
 
-The gather/writeback is shared: ``index_select`` into a persistent
-grow-only compact buffer, Triton ``scatter_selected`` writeback (measured
-~1.6x faster than ``index_put_`` on A100). Payload-only scaling as in the
-mask backend.
+COMPACT EMISSION: the pack is a fused gather+zero+scale Triton
+kernel into a persistent grow-only compact buffer, the allreduce runs on
+that buffer, and the communicated values STAY there — ``allreduce_sparse``
+returns the values view and never writes the full grad buffer back (the
+zero store inside pack establishes the buffer-state invariant at grad_sync
+time; clip/grad_correct consume (idx, values) via the engine's compact
+branches). The zeroed writeback that this backend performed before compact
+emission is gone (the "bitwise-identical to the recorded baseline arms"
+property of the old plain mode died with it).
 
 Twin-mode runtime gates (probed via the optional ``validate_runtime`` /
 ``prepare`` hooks, only active when ``high_priority_group`` is true):
@@ -50,12 +54,13 @@ import os
 import torch
 
 from sga.backends import COMM_WARMUP_ENV, RESUME_OVERRIDE_ENV
-from sga.kernels import scatter_selected
+from sga.kernels import pack_selected
 from sga.plugins import BackendDecl, PluginParam, resolve_plugin_params
 
 DECL = BackendDecl(
     name="torch_pipelined_index",
     consumes="idx",
+    emission="compact",
     params=(
         PluginParam(
             "high_priority_group", bool, default=False,
@@ -277,9 +282,8 @@ class TorchPipelinedIndexBackend:
         """(lo, hi) index ranges into ``support.idx`` per slice.
 
         Plain mode with the default 2 slices uses the bucket-midpoint split
-        (``support.split``) — the legacy indexed_sparse partition, kept so
-        this mode stays bitwise-identical to the e2e baseline arms recorded
-        under the old name. Everything else splits the selected set evenly
+        (``support.split``) — the historical partition, kept for arm
+        continuity. Everything else splits the selected set evenly
         (``i*k//s``).
         """
         if not self._hiprio and self._slices == 2:
@@ -290,15 +294,20 @@ class TorchPipelinedIndexBackend:
 
     def allreduce_sparse(self, grad_data: torch.Tensor, support, comm_group,
                          gradient_scaling_factor: float, reduce_op,
-                         key: int) -> None:
-        """Sparse allreduce of ``grad_data`` at ``support.idx`` positions.
+                         key: int):
+        """Sparse allreduce of ``grad_data`` at ``support.idx`` positions —
+        COMPACT EMISSION: returns the communicated values view.
 
         ``support`` is a ``sga.support.BucketSupport``; ``key`` identifies
-        the owning bucket state for the persistent gather buffer. The
-        element payload extracted per slice is scaled by
-        ``gradient_scaling_factor`` (payload-only; never the whole buffer)
-        before the SUM allreduce, replicating dense-path math on the
-        communicated coordinates.
+        the owning bucket state for the persistent gather buffer. The fused
+        pack kernel gathers ``grad_data[idx]`` into that buffer (scaled by
+        ``gradient_scaling_factor`` when the reduce op is SUM — payload-only
+        math, never the whole buffer) AND zeroes those positions of
+        ``grad_data`` in the same pass; the allreduce runs on the buffer and
+        the result stays there. The return value is ``buf[:k]`` — valid
+        until this bucket's next pack; an empty tensor when nothing was
+        selected (k == 0), still a Tensor so the engine can distinguish
+        compact zero-selection from a writeback backend's None.
         """
         # int32 canonical indices: refuse oversized buckets loudly instead
         # of wrapping silently (buckets ~40M elements today, 2^31 is far).
@@ -310,32 +319,30 @@ class TorchPipelinedIndexBackend:
         indices = support.idx
         k = indices.numel()
         if k == 0:
-            return
+            return torch.empty(0, dtype=grad_data.dtype,
+                               device=grad_data.device)
 
         gather_buf = self._gather_buf(key, k, grad_data.dtype, grad_data.device)
         group = self._group_for(comm_group)
+        pack_factor = (float(gradient_scaling_factor)
+                       if (reduce_op == torch.distributed.ReduceOp.SUM
+                           and gradient_scaling_factor != 1.0) else 1.0)
 
-        def _scale(payload: torch.Tensor) -> torch.Tensor:
-            if (reduce_op == torch.distributed.ReduceOp.SUM
-                    and gradient_scaling_factor != 1.0):
-                payload *= gradient_scaling_factor
-            return payload
-
-        # One allreduce in flight at a time: slice i+1's gather (compute
-        # stream) overlaps slice i's NCCL transfer.
-        prev = None  # (work, idx, sel)
+        # One allreduce in flight at a time: slice i+1's pack (compute
+        # stream) overlaps slice i's NCCL transfer. The pack of slice i+1
+        # (grad reads/clears at idx[i+1:], buf writes at [lo:hi]) touches
+        # disjoint memory from the in-flight allreduce on buf[:lo].
+        prev = None  # (work,)
         for lo, hi in self._bounds(support, k):
             if hi <= lo:
                 continue
             idx = indices[lo:hi]
             sel = gather_buf[lo:hi]
-            torch.index_select(grad_data, 0, idx, out=sel)
-            _scale(sel)
+            pack_selected(grad_data, idx, sel, pack_factor)
             if prev is not None:
                 prev[0].wait()
-                scatter_selected(grad_data, prev[1], prev[2])
             prev = (torch.distributed.all_reduce(
-                sel, op=reduce_op, group=group, async_op=True), idx, sel)
+                sel, op=reduce_op, group=group, async_op=True),)
         if prev is not None:
             prev[0].wait()
-            scatter_selected(grad_data, prev[1], prev[2])
+        return gather_buf[:k]

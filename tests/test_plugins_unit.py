@@ -9,7 +9,8 @@ Covers:
 - topk: histogram threshold == exact torch.kthvalue threshold,
   mask equality, k rounding bound, three-tier geometry + chunking;
 - adaptive controller band logic, clamps and lifecycle;
-- declaration-based combination validation + build injection + decl coverage.
+- declaration-based combination validation + build injection + decl coverage
+  (incl. the emission registration gate and the compact capability rule);
 
 Run: python tests/test_plugins_unit.py  (or pytest tests/test_plugins_unit.py)
 """
@@ -782,6 +783,60 @@ def test_combination_validator_and_build_injection():
     for n in names["selection"]:
         assert hasattr(build_selection(n, {"method": "histogram", "ratio_percent": 40.0}), "decl"), n
     print("ok: combination validator + build injection + decl coverage")
+
+
+def test_emission_declaration_and_compact_capability():
+    """Emission-legality validation: a typo'd emission is refused at
+    REGISTRATION (the engine routes by exact equality, so 'comapct' would
+    otherwise silently behave as writeback while the backend skips the
+    writeback scatter), and a compact-emission backend combined with an
+    optimizer that does not declare consumes_compact is refused at config
+    time (the communicated values would never reach the m/v commit)."""
+    from sga.plugins import (
+        BackendDecl,
+        OptimizerDecl,
+        _register,
+        get_backend_plugin_decl,
+        get_optimizer_decl,
+        get_selection_decl,
+        register_default_plugins,
+        validate_combination,
+    )
+
+    seen = {}
+    for bad in ("comapct", "write", "", None):
+        try:
+            _register("backend", seen, "stub",
+                      BackendDecl(name="stub", emission=bad))
+            raise AssertionError(f"emission {bad!r} accepted at registration")
+        except ValueError as e:
+            assert "emission" in str(e) and "compact" in str(e), e
+    _register("backend", seen, "stub",
+              BackendDecl(name="stub", emission="compact"))  # legal passes
+    assert isinstance(seen["stub"].emission, str)
+
+    register_default_plugins()
+    cycle = {"period": 8}
+    compact = get_backend_plugin_decl("torch_pipelined_index")
+    assert compact.emission == "compact"
+    assert get_optimizer_decl("adamw").consumes_compact is True
+    # the shipped pair is legal (also covered by the emittable-scores loop
+    # above, restated here so the capability rule's PASS case is explicit)
+    validate_combination("update", get_selection_decl("topk"),
+                         get_optimizer_decl("adamw"), compact, cycle)
+    # an optimizer WITHOUT the compact commit: refused on the compact
+    # backend, fine on writeback backends
+    stub = OptimizerDecl(name="stub", emittable_scores=frozenset({"update"}))
+    try:
+        validate_combination("update", get_selection_decl("topk"), stub,
+                             compact, cycle)
+        raise AssertionError("compact backend without consumes_compact accepted")
+    except ValueError as e:
+        assert "consumes_compact" in str(e), e
+        assert "m/v commit" in str(e), e
+    validate_combination("update", get_selection_decl("topk"), stub,
+                         get_backend_plugin_decl("torch_pipelined_mask"), cycle)
+    print("ok: emission registration gate + compact capability rule")
 
 
 # ------------------------------------------------------------------- support

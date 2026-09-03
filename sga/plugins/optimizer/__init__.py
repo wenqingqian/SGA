@@ -78,3 +78,9 @@ class OptContext:
                                         # multiplies in-register — bitwise the
                                         # standalone masked-scale pass; full
                                         # steps keep 1.0, they scale in place)
+    compact_values: dict = None         # compact-emission sparse steps only:
+                                        # {id(bucket_state): values view} the
+                                        # backend returned from allreduce_
+                                        # sparse — None/empty on writeback
+                                        # backends (masked path) and full
+                                        # steps

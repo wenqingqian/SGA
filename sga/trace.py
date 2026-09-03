@@ -42,6 +42,12 @@ exactly the legacy hook's view at the top of step_with_ready_grads. On
 sparse steps that gradient holds reduced values only at support coords
 (masked clip semantics); replay-grade traces come from full/dense (shadow)
 runs where every coord is reduced — the format does not distinguish.
+Compact-emission sparse steps: the values are scattered back
+into the full layout for the dump window and re-zeroed right after, so
+the dump reads the same view the writeback path produced; outside the
+dump window the unselected coords hold the raw accumulated residual
+(pack clears only the communicated positions) — same semantic as the
+writeback path, nothing dump-visible changes.
 
 Enabled by ``sga.trace.dir`` (yaml); absent (default) disables collection
 entirely: the engine holds ``_trace = None`` and the slot costs one

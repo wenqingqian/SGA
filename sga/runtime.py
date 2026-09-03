@@ -94,6 +94,19 @@ def _assert_args_compatible() -> None:
     _require(bool(getattr(args, "bf16", False)),
              "SGA v1 expects bf16 mixed-precision training (fp32 main grads); "
              "fp16 and fp32 paths are rejected (see the fp16 note above)")
+    # The unscale hazard is NOT fp16-only: megatron builds a
+    # ConstantGradScaler for bf16 too whenever --loss-scale is set
+    # (megatron/core/optimizer/__init__.py), and the same in-place
+    # _amp_foreach_non_finite_check_and_unscale_ runs every step. The
+    # compact-emission path makes the hole toxic: communicated
+    # values live in the backend's gather buffer, which the unscale never
+    # touches — every sparse step's committed grads would be off by exactly
+    # the constant scale. bf16 must run scaler-free.
+    _require(getattr(args, "loss_scale", None) is None,
+             "--loss-scale must be unset under bf16 (a constant grad scaler "
+             "unscales the fp32 bucket grads in place every step while the "
+             "compact communicated values escape it — scaled/unscaled units "
+             "mix across every sparse step)")
     _require(
         getattr(args, "accumulate_allreduce_grads_in_fp32", True),
         "accumulate-allreduce-grads-in-fp32 must hold (fp32 bucket buffers)",
