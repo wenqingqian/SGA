@@ -115,6 +115,13 @@ class BucketSupport:
     _idx: torch.Tensor = field(default=None, repr=False)
     # Midpoint split for two-slice pipelining (derived lazily, cached).
     _split: int = field(default=None, repr=False)
+    # Merge-join directory table (derived lazily): table[j] ==
+    # lower_bound(idx, j*1024). Lifetime = this cycle: idx is frozen once
+    # built (the mask never changes within a cycle), so the table cannot
+    # go stale. Lives HERE rather than in the optimizer so every record of
+    # the bucket shares one build (~0.5ms, amortized over the cycle's
+    # sparse steps).
+    _dir_table: torch.Tensor = field(default=None, repr=False)
 
     @property
     def count(self) -> int:
@@ -141,6 +148,19 @@ class BucketSupport:
         if self._idx is None:
             self._idx = compact_mask_u8(self.mask_u8, self.idx_pool)
         return self._idx
+
+    @property
+    def dir_table(self) -> torch.Tensor:
+        """Merge-join directory table over ``idx`` (lazy, cached per cycle).
+
+        Built by the optimizer plugin's kernel (lazy import: support must
+        stay importable without the plugin package — the engine may run
+        mask-path backends that never touch a table).
+        """
+        if self._dir_table is None:
+            from sga.plugins.optimizer.adamw import build_dir_table
+            self._dir_table = build_dir_table(self.idx, self.count)
+        return self._dir_table
 
     @property
     def split(self) -> int:

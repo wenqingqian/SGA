@@ -18,6 +18,7 @@ Run: python tests/test_plugins_unit.py  (or pytest tests/test_plugins_unit.py)
 import os
 import sys
 import warnings
+from types import SimpleNamespace
 
 import torch
 
@@ -677,6 +678,77 @@ def test_sparse_step_end_state_invariant():
     ctx = OptContext(records=[], phase="sparse", bucket_states=[bare])
     SgaAdamW({}).reset(ctx, was_full=False)
     assert torch.all(bare.grad_data == 0)
+
+
+def test_merge_join_dir_param_resolution():
+    """merge_join_dir: default 'table' (the benchmark-adjudicated prod
+    form), enum validated loudly, binary accepted. Silent no-op on
+    writeback backends / torch fallback is the DECL's documented contract
+    (they never reach the compact merge-join)."""
+    assert SgaAdamW({}).merge_join_dir == "table"
+    assert SgaAdamW({"merge_join_dir": "binary"}).merge_join_dir == "binary"
+    try:
+        SgaAdamW({"merge_join_dir": "quadtree"})
+        raise AssertionError("bogus merge_join_dir accepted")
+    except ValueError as e:
+        assert "merge_join_dir" in str(e), e
+    print("ok: merge_join_dir resolution (default table, enum validated)")
+
+
+class _CompactRec(_Rec):
+    """_Rec with the bucket fields _records_pass_compact consumes."""
+
+    def __init__(self, param, grad, bucket_state, start):
+        super().__init__(param, grad)
+        self.bucket_state = bucket_state
+        self.start = start
+
+
+def test_merge_join_dir_cpu_compact_dispatch():
+    """Fallback contract pin: merge_join_dir='table' must take the
+    torch fallback SILENTLY on the CPU compact path — the eager
+    bucket.dir_table build (a triton assert, or a CUDA kernel launched on
+    CPU tensors) must never run before the fallback engages (the DECL's
+    "silently ignored on ... the torch fallback path" contract). Drives
+    SgaAdamW.sparse_step -> _records_pass_compact with compact_values on
+    CPU tensors: the 'table' end state must be bitwise the 'binary' end
+    state, and the values must actually be consumed (the fallback is not
+    a silent no-op)."""
+    from sga.support import BucketSupport, Support
+
+    torch.manual_seed(23)
+    n = 512
+    mask = (torch.rand(n) < 0.25).to(torch.uint8)
+    idx = mask.nonzero(as_tuple=True)[0]
+    values = torch.randn(idx.numel())
+    param0, g0 = torch.randn(n), torch.randn(n)
+
+    def run(merge_join_dir):
+        bs = SimpleNamespace(support_index=0)
+        rec = _CompactRec(param0.clone(), g0.clone(), bs, 0)
+        support = Support(buckets=[BucketSupport(mask_u8=mask)])
+        ctx = OptContext(records=[rec], phase="sparse", support=support,
+                         bucket_states=[], fold_window=8,
+                         next_step_is_full=False, apply_coeff=0.5,
+                         compact_values={id(bs): values.clone()})
+        SgaAdamW({"merge_join_dir": merge_join_dir}).sparse_step(ctx)
+        return rec
+
+    rec_tab = run("table")
+    rec_bin = run("binary")
+    # bitwise-identical end states: the gated dispatch hands BOTH configs
+    # dir_table=None on CPU, so the fallback consumes the values the same way
+    assert torch.equal(rec_tab.main_param.data, rec_bin.main_param.data)
+    assert torch.equal(rec_tab.grad.data, rec_bin.grad.data)
+    assert torch.equal(rec_tab._state["exp_avg"], rec_bin._state["exp_avg"])
+    assert torch.equal(rec_tab._state["exp_avg_sq"],
+                       rec_bin._state["exp_avg_sq"])
+    # not a silent no-op: the values entered m (fresh state) and the
+    # communicated coords were re-cleared by the fallback
+    assert torch.count_nonzero(rec_tab._state["exp_avg"]).item() > 0
+    assert torch.count_nonzero(rec_tab.grad.data[idx]).item() == 0
+    print("ok: merge_join_dir CPU compact dispatch (table == binary end "
+          "state on the torch fallback)")
 
 
 def test_grad_correct_sparse_fusion_knob_guard():

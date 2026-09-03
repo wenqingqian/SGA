@@ -80,6 +80,19 @@ DECL = OptimizerDecl(
                 "accumulation span between full syncs) at full-sync "
                 "boundaries (residual-mean semantics)",
         ),
+        PluginParam(
+            "merge_join_dir", str, default="table",
+            choices=("table", "binary"),
+            doc="compact-path merge-join bracket source: 'table' builds a "
+                "1024-stride directory table of lower_bound(idx, j*1024) "
+                "once per selection cycle (the bucket idx is frozen within "
+                "a cycle, so the table cannot go stale) and brackets both "
+                "lower_bounds to <=1024 candidates (~0.5ms build, "
+                "amortized over the cycle's sparse steps); 'binary' keeps "
+                "the plain full-depth bisection (the historical form). "
+                "Silently ignored on writeback backends and the torch "
+                "fallback path (no compact merge-join there)",
+        ),
     ),
 )
 
@@ -323,6 +336,186 @@ if _HAS_TRITON:
         param = param - lr * update
         tl.store(param_ptr + offs, param, mask=valid)
 
+    @triton.jit
+    def _build_dir_table_kernel(
+        idx_ptr, table_ptr, k_total, n_table,
+        W: tl.constexpr, BLOCK: tl.constexpr, DEPTH: tl.constexpr,
+    ):
+        """Directory table: table[j] == lower_bound(idx, j*BLOCK).
+
+        Each table entry is an INDEPENDENT per-lane bisection over
+        [0, k_total] (no cross-lane reduction, no atomics) — W entries per
+        program, DEPTH = bit_length(k_total + 1) rounds, the same
+        full-depth formula the plain compact kernel's first search uses.
+        Overflow-safe midpoints (a + (b-a)//2) throughout.
+        """
+        pid = tl.program_id(0)
+        j = pid * W + tl.arange(0, W)
+        jv = j < n_table
+        key = j * BLOCK
+        a = tl.zeros([W], dtype=tl.int32)
+        b = tl.zeros([W], dtype=tl.int32) + k_total
+        for _ in tl.static_range(DEPTH):
+            run = a < b
+            mid = a + (b - a) // 2
+            mv = tl.load(idx_ptr + mid, mask=run & jv, other=2147483647)
+            a = tl.where(run & (mv < key), mid + 1, a)
+            b = tl.where(run & (mv >= key), mid, b)
+        tl.store(table_ptr + j, a, mask=jv)
+
+    @triton.jit
+    def _grad_correct_compact_table_kernel(
+        param_ptr, grad_ptr, m_ptr, v_ptr, idx_ptr, val_ptr, tab_ptr,
+        lr, beta1, beta2, eps, weight_decay,
+        bias_correction1, bias_correction2,
+        coeff, inv_interval,
+        rec_start, n_elements, k_total,
+        BLOCK_SIZE: tl.constexpr, TABLE_DEPTH: tl.constexpr,
+        LANE_DEPTH: tl.constexpr,
+        APPLY_COEFF: tl.constexpr, FOLD: tl.constexpr,
+    ):
+        """Table-bracketed merge-join (merge_join_dir=table).
+
+        Identical contract to _grad_correct_compact_kernel — same records,
+        same idx/values, same found set — with both scalar lower_bounds
+        seeded from the directory table instead of walking [0, k_total]
+        full-depth: for c0 in block b (r = c0 mod BLOCK),
+            p in [table[b],     min(k, table[b] + r)]     (<=1024 candidates)
+            q in [table[b+1], min(k, table[b+1] + r)]   (same remainder r)
+        so TABLE_DEPTH = 10 rounds pin each exactly (entries in [j*BLOCK,
+        c0) are <= r distinct integers — dedup makes the pigeonhole hold).
+
+        Numerical-invariance chain, four links: (i) idx is sorted and
+        duplicate-free (compact_mask_u8's construction + count/fill assert)
+        => lower_bound has a unique fixed point; (ii) the table equals
+        torch.searchsorted 'left' elementwise (pinned by a dedicated test
+        leg — a containment-preserving table error is invisible to every
+        downstream check, so exactness is the ONLY hard pin); (iii) the
+        tight brackets above CONTAIN the true p/q (monotonicity +
+        pigeonhole, for any table built by (ii)); (iv) a containing
+        bracket bisects to the SAME unique p/q => same lane reads, same
+        found set, same values. The m/v/param tail is
+        statement-identical to the plain kernel; ulp-level (per-
+        compilation FMA contraction — the table loads perturb LLVM's
+        contraction of the tail vs the plain kernel), never bitwise,
+        pinned by the fired-set + few-ulp A/B test legs.
+
+        The table is a per-cycle lazy derived field of BucketSupport: it
+        is built from the bucket idx, which is frozen for the cycle's
+        lifetime, so staleness is structurally impossible. Table tail
+        sentinel: entries at keys >= the last coordinate hold k (the
+        searchsorted convention), and n_table covers the b+1 lookup of
+        the last block plus one extra slot.
+        """
+        pid = tl.program_id(0)
+        offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        valid = offs < n_elements
+        coords = rec_start + offs
+
+        c0 = rec_start + pid * BLOCK_SIZE
+        c1 = c0 + BLOCK_SIZE
+        # The table stride is hardcoded below (b = c0 >> 10) while
+        # BLOCK_SIZE is a constexpr: pin the coupling so a BLOCK change
+        # cannot silently desync the table lookup from the kernel's
+        # blocks (the builder's _BLOCK_SIZE is the same constant).
+        tl.static_assert(BLOCK_SIZE == 1024)
+        b = c0 >> 10
+        r = c0 & (BLOCK_SIZE - 1)
+
+        t0 = tl.load(tab_ptr + b)
+        a = t0
+        bb = tl.minimum(k_total, t0 + r)
+        for _ in tl.static_range(TABLE_DEPTH):
+            run = a < bb
+            mid = a + (bb - a) // 2
+            mv = tl.load(idx_ptr + mid, mask=run, other=2147483647)
+            a = tl.where(run & (mv < c0), mid + 1, a)
+            bb = tl.where(run & (mv >= c0), mid, bb)
+        p = a
+
+        t1 = tl.load(tab_ptr + b + 1)
+        a2 = t1
+        b2 = tl.minimum(k_total, t1 + r)
+        for _ in tl.static_range(TABLE_DEPTH):
+            run = a2 < b2
+            mid = a2 + (b2 - a2) // 2
+            mv = tl.load(idx_ptr + mid, mask=run, other=2147483647)
+            a2 = tl.where(run & (mv < c1), mid + 1, a2)
+            b2 = tl.where(run & (mv >= c1), mid, b2)
+        q = a2
+
+        la = tl.zeros([BLOCK_SIZE], tl.int32) + p
+        lb = tl.zeros([BLOCK_SIZE], tl.int32) + q
+        for _ in tl.static_range(LANE_DEPTH):
+            run = la < lb
+            mid = la + (lb - la) // 2
+            mv = tl.load(idx_ptr + mid, mask=run, other=2147483647)
+            take = run & (mv < coords)
+            la = tl.where(take, mid + 1, la)
+            lb = tl.where(run & (~take), mid, lb)
+        inseg = la < q
+        fidx = tl.load(idx_ptr + la, mask=inseg, other=-1)
+        found = valid & inseg & (fidx == coords)
+        val = tl.load(val_ptr + la, mask=found, other=0.0)
+
+        grad = tl.where(found, val, 0.0)
+        if APPLY_COEFF:
+            grad = tl.where(found, grad * coeff, grad)
+
+        if FOLD:
+            raw = tl.load(grad_ptr + offs, mask=valid, other=0.0)
+
+        param = tl.load(param_ptr + offs, mask=valid, other=0.0)
+        m = tl.load(m_ptr + offs, mask=valid, other=0.0)
+        v = tl.load(v_ptr + offs, mask=valid, other=0.0)
+
+        m_new = beta1 * m + (1.0 - beta1) * grad
+        v_new = beta2 * v + (1.0 - beta2) * grad * grad
+        m_hat = m_new / bias_correction1
+        v_hat = v_new / bias_correction2
+        update = weight_decay * param + m_hat / (tl.sqrt(v_hat) + eps)
+
+        tl.store(m_ptr + offs, m_new, mask=valid)
+        tl.store(v_ptr + offs, v_new, mask=valid)
+        if FOLD:
+            tl.store(grad_ptr + offs, raw * inv_interval,
+                     mask=valid & (~found))
+        param = param - lr * update
+        tl.store(param_ptr + offs, param, mask=valid)
+
+
+def build_dir_table(idx: torch.Tensor, total_n: int) -> torch.Tensor:
+    """int32 directory table for the compact merge-join (host wrapper).
+
+    ``table[j] == lower_bound(idx, j*1024)`` for j in [0, n_table), with
+    n_table = (total_n >> 10) + 2 covering the last block's b+1 lookup
+    plus one sentinel slot; keys past the bucket hold k (the
+    torch.searchsorted 'left' convention). Built once per selection cycle
+    from the frozen bucket idx (~0.5ms at 500M elements — amortized over
+    the cycle's sparse steps it is ~0.01ms/step). No triton / CPU: the
+    caller's fallback path never asks for a table.
+    """
+    k = idx.numel()
+    n_table = (total_n >> 10) + 2
+    # The kernel lives under the triton guard; the torch/CPU fallback in
+    # adamw_grad_correct_compact never asks for a table.
+    assert _HAS_TRITON, "build_dir_table requires triton (CUDA compact path)"
+    # int32 offset contract (the compact kernel's precedent): the kernel
+    # forms j*BLOCK and t0 + r as int32 — crossing 2^31 wraps the table
+    # keys/brackets silently.
+    assert (n_table - 1) * _BLOCK_SIZE < 2 ** 31, (
+        f"build_dir_table: (n_table-1)*BLOCK = "
+        f"{(n_table - 1) * _BLOCK_SIZE} must stay < 2^31 (int32 table keys)"
+    )
+    table = torch.empty(n_table, dtype=torch.int32, device=idx.device)
+    grid = ((n_table + _BLOCK_SIZE - 1) // _BLOCK_SIZE,)
+    _build_dir_table_kernel[grid](
+        idx, table, k, n_table,
+        W=_BLOCK_SIZE, BLOCK=_BLOCK_SIZE,
+        DEPTH=max(1, (k + 1).bit_length()),
+    )
+    return table
+
 
 def adamw_grad_correct(
     param_buffer: torch.Tensor,
@@ -452,6 +645,7 @@ def adamw_grad_correct_compact(
     coeff: float = 1.0,
     fold: bool = False,
     interval: float = 1.0,
+    dir_table: Optional[torch.Tensor] = None,
 ) -> None:
     """Compact-emission grad-correct on contiguous same-size 1-D buffers.
 
@@ -463,6 +657,10 @@ def adamw_grad_correct_compact(
     ``coeff`` multiplies the loaded values in-register; the communicated
     positions of ``grad_buffer`` are NOT touched here — the pack kernel
     zeroed them at grad_sync time (there is deliberately no clear knob).
+
+    ``dir_table`` (merge_join_dir=table) routes to the table-bracketed
+    kernel; None keeps the plain full-depth binary form. Both forms share
+    this wrapper's contract; ignored on the torch fallback path.
 
     ulp-class contract: values-level math is single-rounding (bitwise the
     masked path's), the m/v/param tail differs from the masked kernel by
@@ -524,6 +722,49 @@ def adamw_grad_correct_compact(
         (torch.ones(1, dtype=torch.float32) / interval).item()
     ) if fold else 1.0
     grid = ((n_elements + _BLOCK_SIZE - 1) // _BLOCK_SIZE,)
+    if dir_table is not None:
+        # Host contract for the table argument (the idx/values checks'
+        # failure class — refuse loudly instead of corrupting silently):
+        # the kernel loads table[b] and table[b + 1] (b = c0 >> 10) as
+        # raw int32 brackets, so a non-int32 or strided table feeds
+        # garbage brackets and a table built for a smaller bucket reads
+        # out of bounds — both silently drop gradients.
+        assert dir_table.dtype == torch.int32 and dir_table.is_contiguous(), (
+            f"adamw_grad_correct_compact: dir_table must be contiguous "
+            f"int32 (raw int32 bracket loads), got {dir_table.dtype}, "
+            f"contiguous={dir_table.is_contiguous()}"
+        )
+        assert dir_table.numel() >= ((rec_start + n_elements - 1) >> 10) + 2, (
+            f"adamw_grad_correct_compact: dir_table has "
+            f"{dir_table.numel()} entries but the record's last block "
+            f"({(rec_start + n_elements - 1) >> 10}) needs its b+1 "
+            f"lookup (>= {((rec_start + n_elements - 1) >> 10) + 2} "
+            "entries) — table built for a smaller bucket reads out of "
+            "bounds"
+        )
+        _grad_correct_compact_table_kernel[grid](
+            param_buffer, grad_buffer, exp_avg_buffer, exp_avg_sq_buffer,
+            idx, values, dir_table,
+            lr, beta1, beta2, eps, weight_decay,
+            bias_correction1, bias_correction2,
+            coeff, inv_interval,
+            rec_start, n_elements, k_total,
+            BLOCK_SIZE=_BLOCK_SIZE,
+            # Both table brackets hold <= 1024 candidates (r = c0 mod
+            # BLOCK <= 1023), which 10 rounds pin exactly. One round
+            # short and the r=1023 geometry bites: closed width-1023
+            # brackets with p/q at the far edge exit 9 rounds with
+            # a = true - 1, and the q-side drop commits every
+            # fully-selected block's last coordinate as 0 (the ulp
+            # asserts catch it; the p-side under-convergence alone is
+            # lane-absorbed — the lane search re-derives within [p, q)).
+            # tests/test_kernels_gpu.py's r=1023 leg bites exactly there.
+            TABLE_DEPTH=10,
+            LANE_DEPTH=_BLOCK_SIZE.bit_length(),
+            APPLY_COEFF=coeff != 1.0,
+            FOLD=fold,
+        )
+        return
     _grad_correct_compact_kernel[grid](
         param_buffer, grad_buffer, exp_avg_buffer, exp_avg_sq_buffer,
         idx, values,
@@ -554,6 +795,13 @@ class SgaAdamW:
         params = resolve_plugin_params("optimizer", "adamw", DECL, dict(params))
         self.params = params
         self.residual_mean = bool(params["residual_mean"])
+        # Compact-path merge-join form: 'table' seeds both
+        # lower_bound brackets from the per-cycle directory table; 'binary'
+        # is the plain full-depth form. Dispatched per call (host
+        # branch) — the kernels stay branch-free. No-op on writeback
+        # backends (they never reach _records_pass_compact) and on the
+        # torch fallback (it ignores the table).
+        self.merge_join_dir = params["merge_join_dir"]
         # Which registry score to materialize on full steps (build-time
         # injection). None/'update' keeps the historical default: the signed
         # AdamW update itself is the topk input. The emission mode int is
@@ -627,7 +875,19 @@ class SgaAdamW:
                     step=rec.step, mask=None, emit_mode=None,
                 )
                 continue
-            idx = ctx.support.buckets[bs.support_index].idx
+            bucket = ctx.support.buckets[bs.support_index]
+            idx = bucket.idx
+            # merge_join_dir dual dispatch: the table is the bucket's lazy
+            # per-cycle derived field — first sparse step of the cycle pays
+            # the ~0.5ms build, the rest reuse it (idx frozen per cycle).
+            # Gated on the REAL execution path, not just the configured
+            # mode: on the torch fallback (CPU tensors / triton-less)
+            # there is no table to build — asking for one would raise
+            # before the fallback could engage, against the DECL's
+            # "silently ignored" contract.
+            dir_table = (bucket.dir_table
+                         if (self.merge_join_dir == "table"
+                             and _HAS_TRITON and idx.is_cuda) else None)
             adamw_grad_correct_compact(
                 param_buffer=rec.main_param.data.view(-1),
                 grad_buffer=rec.grad.data.view(-1),
@@ -638,6 +898,7 @@ class SgaAdamW:
                 eps=rec.eps, weight_decay=rec.weight_decay,
                 step=rec.step,
                 coeff=coeff, fold=fold, interval=interval,
+                dir_table=dir_table,
             )
 
     @torch.no_grad()

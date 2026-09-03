@@ -38,6 +38,7 @@ from sga.kernels_torch import pack_selected_torch
 from sga.plugins.optimizer.adamw import (
     adamw_grad_correct,
     adamw_grad_correct_compact,
+    build_dir_table,
 )
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch
 from sga.plugins.scores import Score, emittable_score_names, get_score_spec
@@ -578,6 +579,347 @@ def test_compact_grad_correct_full_density_clustered_and_bracket_fill():
     m2 = torch.ones(n, dtype=torch.uint8)
     m2[12000:] = (torch.rand(n - 12000) < 0.1).to(torch.uint8)
     ab(m2, rec_lo=1500, rec_hi=n)
+
+
+def test_compact_grad_correct_dir_table():
+    """merge_join_dir=table legs.
+
+    The directory table's exactness is the ONLY hard pin of the four-link
+    invariance chain: a containment-PRESERVING table error is invisible to
+    every downstream instrument (a bracket containing the true p/q
+    bisects to the same unique fixed point), so table ==
+    torch.searchsorted 'left' is asserted elementwise over adversarial
+    geometries. The corrupted-entry leg guards that comparator staying
+    exact — it pins the pin (a future tolerance-comparator swap), not a
+    plausible kernel fault (the poisoned entry differs from `ref` by
+    construction). The consumer legs pin: fired-set equality vs the
+    binary form (the integer path), the fp tail to the measured
+    contraction class, same-binary rerun stability, the r=1023
+    extreme-residue geometry (every p/q at its bracket's far edge)
+    through the writeback oracle chain, and bisecting brackets over
+    sparse idx (rec_start 1/500 legs put r = c0 mod 1024 != 0 in every
+    block). The r=1023 leg BITES TABLE_DEPTH=9: closed width-1023
+    brackets with the true p/q at the far edge exit 9 rounds with
+    a = true - 1, and the q-side drop makes every fully-selected block's
+    last coordinate fail its equality probe (committed 0) — exactly what
+    the m/v ulp asserts catch (the p-side under-convergence alone is
+    lane-absorbed: the lane search re-derives within [p, q)).
+    """
+    from sga.support import BucketSupport
+
+    device = "cuda"
+    kw = dict(lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8,
+              weight_decay=0.1, step=1000)
+    coeff = 0.7
+    bc1 = 1 - kw["beta1"] ** kw["step"]
+    bc2 = 1 - kw["beta2"] ** kw["step"]
+
+    # --- TB: table == searchsorted 'left' on adversarial geometries ---
+    torch.manual_seed(41)  # per-leg seed: the masks must not shift when a
+    n = 1 << 20            # test is inserted above
+    runs = torch.zeros(n, dtype=torch.uint8).view(-1, 1024)
+    runs[(torch.arange(runs.shape[0]) % 8) < 3] = 1  # full blocks adjacent
+    for tag, mask in (
+        ("empty", torch.zeros(8192, dtype=torch.uint8)),
+        ("short-777", (torch.rand(777) < 0.5).to(torch.uint8)),
+        ("sparse5%", (torch.rand(n) < 0.05).to(torch.uint8)),
+        ("full-dense", torch.ones(8192, dtype=torch.uint8)),
+        ("full-block-runs", runs.reshape(-1)),
+    ):
+        nn = mask.numel()
+        idx = mask.nonzero(as_tuple=True)[0].to(torch.int32).to(device)
+        table = build_dir_table(idx, nn)
+        keys = torch.arange(table.numel(), device=device,
+                            dtype=torch.int64) * 1024
+        ref = torch.searchsorted(idx.long(), keys)
+        assert torch.equal(table.long(), ref), (
+            f"table != searchsorted 'left' ({tag}) — the only hard pin "
+            "of the invariance chain failed")
+        if idx.numel() > 100:
+            # guards the comparator, not a kernel fault: bad[mid] += 1
+            # differs from ref by construction — the leg only proves the
+            # pin stays exact (no tolerance comparator may replace it)
+            bad = table.clone()
+            bad[bad.numel() // 2] += 1
+            assert not torch.equal(bad.long(), ref), (
+                f"({tag}) a corrupted table entry evaded the searchsorted "
+                "pin — the comparator went tolerant")
+
+    # int32 table-key contract: the assert fires on host geometry alone
+    # (no oversized tensor is built — the guard reads total_n before any
+    # allocation/launch)
+    try:
+        build_dir_table(idx[:8].contiguous(), (1 << 31) - 1)
+        raise AssertionError("int32 table-key overflow accepted silently")
+    except AssertionError as e:
+        assert "2^31" in str(e), e
+    # companion happy path just below the guard's edge (host arithmetic:
+    # ((2^31 - 2048) >> 10 + 1) * 1024 = 2^31 - 1024 < 2^31) must NOT
+    # raise — no oversized tensor is constructed, the 8-entry idx slice
+    # keeps the launch trivial
+    build_dir_table(idx[:8].contiguous(), (1 << 31) - 1024 * 2)
+
+    # BucketSupport.dir_table: lazy, cached per cycle, == searchsorted
+    torch.manual_seed(42)  # per-leg seed (cf. the TB leg above)
+    mask = (torch.rand(200_000) < 0.3).to(torch.uint8).to(device)
+    bs = BucketSupport(mask_u8=mask)
+    t1 = bs.dir_table
+    t2 = bs.dir_table
+    assert t1 is t2, "dir_table not cached (would rebuild per record)"
+    assert torch.equal(
+        t1.long(),
+        torch.searchsorted(bs.idx.long(),
+                           torch.arange(t1.numel(), device=device,
+                                        dtype=torch.int64) * 1024)), \
+        "BucketSupport.dir_table != searchsorted"
+    del bs, t1, t2
+
+    # --- on/off A/B (merge_join_dir table vs binary), fold arms included:
+    # LEG-1 grad end state bitwise (found is the kernels' integer
+    # predicate — identical when the integer path holds); fired-set
+    # symmetric difference within the rounding-absorption tail (the
+    # m-based detector flips only where |0.1*g| sinks below the stored
+    # ulp of 0.9*m — each kernel's own summation rounding decides that
+    # boundary); m/v/param in the measured contraction class. The
+    # rec_start legs matter beyond the whole-bucket form: rec_start 1/500
+    # leave r = c0 mod 1024 != 0 in every block, so the TABLE_DEPTH
+    # bracket loops actually bisect over sparse idx (at r == 0 both
+    # brackets collapse to width 0 — p/q are direct table reads, zero
+    # probes executed).
+    torch.manual_seed(7)
+    n = 200_000
+    for fold, interval in [(False, 8.0), (True, 8.0)]:
+        g0 = torch.randn(n)
+        mask = (torch.rand(n) < 0.3).to(torch.uint8)
+        idx = mask.nonzero(as_tuple=True)[0].to(torch.int32).to(device)
+        k = idx.numel()
+        base = {t: torch.randn(n) * s for t, s in (("p", 1.0), ("m", 0.1))}
+        base["v"] = torch.rand(n) * 0.01
+        base["g"] = g0
+        for rec_start in (0, 1, 500):
+            sl = slice(rec_start, n)
+
+            def chain(dir_table):
+                a = {kk: vv.clone().to(device) for kk, vv in base.items()}
+                vals = torch.empty(k, device=device)
+                pack_selected(a["g"], idx, vals, 0.125)
+                adamw_grad_correct_compact(
+                    a["p"][sl], a["g"][sl], a["m"][sl], a["v"][sl],
+                    idx, vals, rec_start,
+                    coeff=coeff, fold=fold, interval=interval,
+                    dir_table=dir_table, **kw)
+                return a
+
+            table = build_dir_table(idx, n)
+            a_bin = chain(None)
+            a_tab = chain(table)
+            a_tab2 = chain(table)  # rerun stability of the table binary
+            # rerun: raw bits identical
+            bits = lambda t: t.view(torch.int32)
+            assert all(torch.equal(bits(a_tab2[x]), bits(a_tab[x]))
+                       for x in ("p", "m", "v", "g")), \
+                "table kernel not rerun-bitwise-stable"
+            # LEG-1: grad end state bitwise. Vacuous at fold=False
+            # (neither compact form writes g — the pack zeroed both
+            # sides' selected coords before the call); at fold=True the
+            # (~found)-masked fold store detects a ghost-found (an
+            # unselected coord claimed) but not missed coords (raw was
+            # pre-zeroed by pack)
+            assert torch.equal(a_bin["g"], a_tab["g"]), \
+                "grad end state diverged (fold-arm ghost-found)"
+            # fired-set: symmetric difference within the absorption tail,
+            # counted on the record's slice only — coords below rec_start
+            # are untouched by this leg's calls (their m stays m0, which
+            # the m != 0.9*m0 probe would misread as fired)
+            m0 = base["m"].to(device)
+            fired_bin = a_bin["m"][sl] != 0.9 * m0[sl]
+            fired_tab = a_tab["m"][sl] != 0.9 * m0[sl]
+            sel = mask.to(device).bool()[sl]
+            assert int((fired_tab & ~sel).sum()) == 0, "ghost lookup (table)"
+            assert int((fired_bin & ~sel).sum()) == 0, "ghost lookup (binary)"
+            sym = int((fired_tab ^ fired_bin).sum())
+            # absorption tail: the m-detector flips only at summation
+            # rounding ties (~2e-8/element — expected sym is 0 at this
+            # k); the bound is deliberately coarse, the ulp legs carry
+            # the arithmetic pin
+            assert sym <= max(4, k >> 16), (
+                f"fired-set symmetric difference {sym} >> absorption tail "
+                f"({k} selected) — integer lookup path diverged")
+            # m/v/param: measured contraction class (same yardstick as the
+            # masked-vs-compact A/B), on the record's slice (the rest of
+            # the buffer is identical untouched input on both arms)
+            gc = base["g"].to(device) * 0.125 * coeff * mask.float().to(device)
+            upd = (kw["weight_decay"] * base["p"].abs().to(device)
+                   + (a_tab["m"].abs() / bc1)
+                   / ((base["v"].to(device) / bc2).sqrt() + kw["eps"]))
+            scales = {
+                "p": torch.maximum(base["p"].abs().to(device), kw["lr"] * upd),
+                "m": torch.maximum(kw["beta1"] * base["m"].abs().to(device),
+                                   (1 - kw["beta1"]) * gc.abs()),
+                "v": torch.maximum(kw["beta2"] * base["v"].abs().to(device),
+                                   (1 - kw["beta2"]) * gc.abs() ** 2),
+            }
+            for name in ("p", "m", "v"):
+                _assert_tail_ulp_class(a_tab[name][sl], a_bin[name][sl],
+                                       scales[name][sl],
+                                       f"table-vs-binary {name}, fold={fold}, "
+                                       f"rec_start={rec_start}")
+
+    # --- two records, one shared table (the production loop's shape:
+    # _records_pass_compact hands every record the SAME bucket-level
+    # table and values, only rec_start differs — record 1's b = c0 >> 10
+    # must index the table record 0 consumed, built once over the full
+    # bucket width; a per-record rebuild would hide a shared-table
+    # indexing bug). Two-record harness pattern of the binary-path test,
+    # record boundary NOT block-aligned so record 1 starts mid-block
+    # with a nonzero residue; instruments identical to the A/B legs
+    # above.
+    torch.manual_seed(43)
+    mask = (torch.rand(n) < 0.3).to(torch.uint8)
+    idx = mask.nonzero(as_tuple=True)[0].to(torch.int32).to(device)
+    k = idx.numel()
+    base = {t: torch.randn(n) * s for t, s in (("p", 1.0), ("m", 0.1))}
+    base["v"] = torch.rand(n) * 0.01
+    base["g"] = torch.randn(n)
+    table = build_dir_table(idx, n)  # BucketSupport-style: once per bucket
+
+    def chain2(dir_table):
+        a = {kk: vv.clone().to(device) for kk, vv in base.items()}
+        vals = torch.empty(k, device=device)
+        pack_selected(a["g"], idx, vals, 0.125)
+        for lo, hi in ((0, 1500), (1500, n)):
+            adamw_grad_correct_compact(
+                a["p"][lo:hi], a["g"][lo:hi], a["m"][lo:hi], a["v"][lo:hi],
+                idx, vals, lo,
+                coeff=coeff, dir_table=dir_table, **kw)
+        return a
+
+    a_bin = chain2(None)
+    a_tab = chain2(table)
+    a_tab2 = chain2(table)
+    bits = lambda t: t.view(torch.int32)
+    assert all(torch.equal(bits(a_tab2[x]), bits(a_tab[x]))
+               for x in ("p", "m", "v", "g")), \
+        "table kernel not rerun-bitwise-stable (two records)"
+    assert torch.equal(a_bin["g"], a_tab["g"]), \
+        "grad end state diverged (two records, one table)"
+    m0 = base["m"].to(device)
+    fired_bin = a_bin["m"] != 0.9 * m0
+    fired_tab = a_tab["m"] != 0.9 * m0
+    sel = mask.to(device).bool()
+    assert int((fired_tab & ~sel).sum()) == 0, "ghost lookup (table)"
+    assert int((fired_bin & ~sel).sum()) == 0, "ghost lookup (binary)"
+    sym = int((fired_tab ^ fired_bin).sum())
+    assert sym <= max(4, k >> 16), (
+        f"fired-set symmetric difference {sym} >> absorption tail "
+        f"({k} selected) — integer lookup path diverged")
+    gc = base["g"].to(device) * 0.125 * coeff * mask.float().to(device)
+    upd = (kw["weight_decay"] * base["p"].abs().to(device)
+           + (a_tab["m"].abs() / bc1)
+           / ((base["v"].to(device) / bc2).sqrt() + kw["eps"]))
+    scales = {
+        "p": torch.maximum(base["p"].abs().to(device), kw["lr"] * upd),
+        "m": torch.maximum(kw["beta1"] * base["m"].abs().to(device),
+                           (1 - kw["beta1"]) * gc.abs()),
+        "v": torch.maximum(kw["beta2"] * base["v"].abs().to(device),
+                           (1 - kw["beta2"]) * gc.abs() ** 2),
+    }
+    for name in ("p", "m", "v"):
+        _assert_tail_ulp_class(a_tab[name], a_bin[name], scales[name],
+                               f"table-vs-binary {name}, two records")
+
+    # --- r=1023 extreme residue: start 1023 over a full-dense bucket —
+    # every block's true p/q sits exactly at table[b]+1023 /
+    # table[b+1]+1023, the widest 1024-candidate brackets. This leg BITES
+    # a TABLE_DEPTH shortfall: 9 rounds exit with a = true - 1 and the
+    # q-side drop commits each fully-selected block's last coordinate as
+    # 0, which the m/v ulp asserts below catch (the p-side
+    # under-convergence alone is lane-absorbed — the lane search
+    # re-derives within [p, q)). No bitwise instrument here by construction: a["g"] is
+    # never written (no fold) and the oracle zeroes b["g"] — found-set
+    # sensitivity is carried by the ulp legs; the grad-bitwise pin lives
+    # in the A/B legs' rerun-stability assert.
+    n = 8192
+    rs = 1023
+    torch.manual_seed(5)
+    z = {"p": torch.randn(n - rs), "m": torch.randn(n - rs) * 0.1,
+         "v": torch.rand(n - rs) * 0.01, "g": torch.randn(n - rs)}
+    idx = torch.arange(n, dtype=torch.int32, device=device)
+    vals = torch.randn(n, device=device)
+    table = build_dir_table(idx, n)
+    a = {kk: vv.clone().to(device) for kk, vv in z.items()}
+    adamw_grad_correct_compact(a["p"], a["g"], a["m"], a["v"], idx, vals,
+                               rs, coeff=coeff, dir_table=table, **kw)
+    # oracle: record-local buffers (n - rs elements); the record's value
+    # segment is vals[rs:] scattered raw, coeff applied by the masked
+    # kernel — same single-rounding as the compact in-register multiply
+    # (the torch-fallback construction inside the wrapper)
+    b = {kk: vv.clone().to(device) for kk, vv in z.items()}
+    b["g"] = torch.zeros(n - rs, device=device)
+    b["g"][:] = vals[rs:]
+    mask = torch.ones(n - rs, dtype=torch.uint8, device=device)
+    adamw_grad_correct(b["p"], b["g"], b["m"], b["v"], mask=mask,
+                       emit_mode=None, coeff=coeff, clear=True, **kw)
+    gc = torch.zeros(n - rs, device=device)
+    gc[:] = vals[rs:] * coeff
+    upd = (kw["weight_decay"] * z["p"].abs().to(device)
+           + (a["m"].abs() / bc1)
+           / ((z["v"].to(device) / bc2).sqrt() + kw["eps"]))
+    scales = {
+        "p": torch.maximum(z["p"].abs().to(device), kw["lr"] * upd),
+        "m": torch.maximum(kw["beta1"] * z["m"].abs().to(device),
+                           (1 - kw["beta1"]) * gc.abs()),
+        "v": torch.maximum(kw["beta2"] * z["v"].abs().to(device),
+                           (1 - kw["beta2"]) * gc.abs() ** 2),
+    }
+    for name in ("p", "m", "v"):
+        _assert_tail_ulp_class(a[name], b[name], scales[name],
+                               f"r=1023 extreme residue {name}")
+
+    # --- k in {0, 1, 2, 3} through the table path: the bracket loops at
+    # their shortest, table degenerate (2-3 entries) ---
+    n = 4096
+    for k in (0, 1, 2, 3):
+        torch.manual_seed(44 + k)  # per-leg seed: each geometry pinned
+        mask = torch.zeros(n, dtype=torch.uint8)
+        if k:
+            mask[torch.randperm(n)[:k]] = 1
+        idx = mask.nonzero(as_tuple=True)[0].to(torch.int32).to(device)
+        kk = idx.numel()
+        z = {"p": torch.randn(n), "m": torch.randn(n) * 0.1,
+             "v": torch.rand(n) * 0.01, "g": torch.randn(n)}
+        a = {name: t.clone().to(device) for name, t in z.items()}
+        vals = torch.empty(kk, device=device)
+        pack_selected(a["g"], idx, vals, 1.0)  # values out, selected zeroed
+        table = build_dir_table(idx, n)
+        adamw_grad_correct_compact(a["p"], a["g"], a["m"], a["v"], idx,
+                                   vals, 0, coeff=coeff, dir_table=table,
+                                   **kw)
+        b = {name: t.clone().to(device) for name, t in z.items()}
+        adamw_grad_correct(b["p"], b["g"], b["m"], b["v"],
+                           mask=mask.to(device), emit_mode=None,
+                           coeff=coeff, clear=True, **kw)
+        # End-state equality re-pins pack-zeroing == clear-zeroing, NOT
+        # the found set: at fold=False neither form writes g, so a
+        # found-set error cannot show here (found sensitivity is the ulp
+        # legs')
+        assert torch.equal(a["g"], b["g"]), f"k={k} grad end state diverged"
+        gsel = z["g"].to(device) * coeff * mask.float().to(device)
+        upd = (kw["weight_decay"] * z["p"].abs().to(device)
+               + (a["m"].abs() / bc1)
+               / ((z["v"].to(device) / bc2).sqrt() + kw["eps"]))
+        scales = {
+            "p": torch.maximum(z["p"].abs().to(device), kw["lr"] * upd),
+            "m": torch.maximum(kw["beta1"] * z["m"].abs().to(device),
+                               (1 - kw["beta1"]) * gsel.abs()),
+            "v": torch.maximum(kw["beta2"] * z["v"].abs().to(device),
+                               (1 - kw["beta2"]) * gsel.abs() ** 2),
+        }
+        for name in ("p", "m", "v"):
+            _assert_tail_ulp_class(a[name], b[name], scales[name],
+                                   f"k={k} table {name}")
+    print("ok: compact dir-table legs (searchsorted pin + bite, on/off A/B "
+          "fired-set/ulp/rerun, r=1023 extreme, k=0..3, int32 guard)")
 
 
 def test_pack_selected_contract():
