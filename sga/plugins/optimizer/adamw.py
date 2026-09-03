@@ -229,10 +229,22 @@ if _HAS_TRITON:
         sorted idx/values.
 
         The record's selected positions form a contiguous segment of the
-        sorted bucket idx. Per block (coords [c0, c0+BLOCK)): two
-        lower_bounds on the full idx bracket the segment [p, q) — its length
-        is unconditionally <= BLOCK (the block's selected coords are a
-        subset of its coords), so the per-lane search runs L1-resident.
+        sorted bucket idx, which is globally sorted AND unique — uniqueness
+        comes from idx's producer ``compact_mask_u8`` (sga/support.py: its
+        per-chunk ``nonzero`` construction emits each set coordinate once,
+        and its count/fill assert pins the mask bytes to exactly 0/1); the
+        pack step only consumes idx. Per block (coords [c0, c0+BLOCK)): two
+        lower_bounds on the full idx bracket the segment [p, q), and
+        q <= min(k_total, p + BLOCK) follows from dedup plus window width
+        alone — idx holds at most one entry per coordinate and the window
+        [c0, c1) is exactly BLOCK wide, so at most BLOCK entries can lie
+        inside it. The per-lane search therefore runs L1-resident and
+        the second lower_bound is bounded to [p, min(k, p+BLOCK)] instead
+        of [p, k] (the unbounded form walked ~log2(k) dependent
+        scalar loads per block and was the measured merge-join hotspot:
+        -7.3ms/step on the real top-k distribution). All bisection
+        midpoints are overflow-safe (a + (b-a)//2): the naive (a+b)//2
+        wraps int32 once the sum exceeds 2^31, i.e. k_total > 2^30.
         No CLEAR branch by design: the pack kernel zeroed the communicated
         positions at grad_sync time. FOLD keeps the full sequential grad
         read — the residual it folds lives at inactive coords only, which
@@ -252,16 +264,21 @@ if _HAS_TRITON:
         b = k_total
         for _ in tl.static_range(SEARCH_DEPTH):
             run = a < b
-            mid = (a + b) // 2
+            mid = a + (b - a) // 2
             mv = tl.load(idx_ptr + mid, mask=run, other=2147483647)
             a = tl.where(run & (mv < c0), mid + 1, a)
             b = tl.where(run & (mv >= c0), mid, b)
         p = a
         a = p
-        b = k_total
+        # Block-subset upper bound: dedup + the BLOCK-wide coordinate window
+        # cap q - p at BLOCK, so ~log2(BLOCK) active rounds converge here.
+        # Do NOT widen back to k_total — a pure performance regression
+        # (cut ~28 active scalar rounds to <= 10) that stays
+        # mathematically correct, so no test would catch it.
+        b = tl.minimum(k_total, p + BLOCK_SIZE)
         for _ in tl.static_range(SEARCH_DEPTH):
             run = a < b
-            mid = (a + b) // 2
+            mid = a + (b - a) // 2
             mv = tl.load(idx_ptr + mid, mask=run, other=2147483647)
             a = tl.where(run & (mv < c1), mid + 1, a)
             b = tl.where(run & (mv >= c1), mid, b)
@@ -271,7 +288,7 @@ if _HAS_TRITON:
         lb = tl.zeros([BLOCK_SIZE], tl.int32) + q
         for _ in tl.static_range(LANE_DEPTH):
             run = la < lb
-            mid = (la + lb) // 2
+            mid = la + (lb - la) // 2
             mv = tl.load(idx_ptr + mid, mask=run, other=2147483647)
             take = run & (mv < coords)
             la = tl.where(take, mid + 1, la)
@@ -464,6 +481,20 @@ def adamw_grad_correct_compact(
     if n_elements == 0:
         return
     k_total = idx.numel()
+    # int32 offset contract, refused loudly instead of wrapping silently
+    # (the compact_mask_u8 precedent): the kernel forms p + BLOCK_SIZE
+    # (<= k_total + BLOCK) and c1 = c0 + BLOCK_SIZE (<= rec_start +
+    # n_elements + BLOCK) as int32 — crossing 2^31 wraps either negative
+    # and whole blocks drop out of the merge-join silently.
+    assert k_total + _BLOCK_SIZE < 2 ** 31, (
+        f"adamw_grad_correct_compact: k_total + BLOCK_SIZE = "
+        f"{k_total + _BLOCK_SIZE} must stay < 2^31 (int32 idx offsets)"
+    )
+    assert rec_start + n_elements + _BLOCK_SIZE < 2 ** 31, (
+        f"adamw_grad_correct_compact: rec_start + n_elements + BLOCK_SIZE = "
+        f"{rec_start + n_elements + _BLOCK_SIZE} must stay < 2^31 (int32 "
+        "coordinate offsets)"
+    )
     if not (_HAS_TRITON and param_buffer.is_cuda):
         # Fallback: scatter this record's value segment back into the
         # (pack-cleared) grad buffer and run the plain masked reference —

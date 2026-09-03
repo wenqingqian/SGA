@@ -320,6 +320,46 @@ def test_compact_grad_correct_ab():
     for name in ("p", "m", "v", "g"):
         assert torch.equal(a[name], b[name]), f"k==0 mismatch ({name})"
 
+    # k in {1, 2, 3}: minimal non-empty supports beside the k == 0 leg —
+    # the bracket loops at their shortest lengths. Values/grad bitwise;
+    # m/v/param within the measured contraction class (different kernel
+    # bodies are never bitwise in the FMA tail).
+    bc1 = 1 - kw["beta1"] ** kw["step"]
+    bc2 = 1 - kw["beta2"] ** kw["step"]
+    n3 = 4096
+    for k in (1, 2, 3):
+        mask = torch.zeros(n3, dtype=torch.uint8)
+        mask[torch.randperm(n3)[:k]] = 1
+        idx = mask.nonzero(as_tuple=True)[0].to(torch.int32).to(device)
+        z = {"p": torch.randn(n3), "m": torch.randn(n3) * .1,
+             "v": torch.rand(n3) * .01, "g": torch.randn(n3)}
+        a = {name: t.clone().to(device) for name, t in z.items()}
+        vals = torch.empty(k, device=device)
+        pack_selected(a["g"], idx, vals, 1.0)
+        adamw_grad_correct_compact(a["p"], a["g"], a["m"], a["v"],
+                                   idx, vals, 0, coeff=coeff, **kw)
+        b = {name: t.clone().to(device) for name, t in z.items()}
+        adamw_grad_correct(b["p"], b["g"], b["m"], b["v"],
+                           mask=mask.to(device), emit_mode=None,
+                           coeff=coeff, clear=True, **kw)
+        assert torch.equal(vals, z["g"].to(device)[idx.long()]), \
+            f"k={k} values diverged"
+        assert torch.equal(a["g"], b["g"]), f"k={k} grad end state diverged"
+        gc = z["g"] * coeff * mask.float()
+        upd = (kw["weight_decay"] * z["p"].abs()
+               + (a["m"].cpu().abs() / bc1)
+               / ((z["v"] / bc2).sqrt() + kw["eps"]))
+        scales = {
+            "p": torch.maximum(z["p"].abs(), kw["lr"] * upd),
+            "m": torch.maximum(kw["beta1"] * z["m"].abs(),
+                               (1 - kw["beta1"]) * gc.abs()),
+            "v": torch.maximum(kw["beta2"] * z["v"].abs(),
+                               (1 - kw["beta2"]) * gc.abs() ** 2),
+        }
+        for name in ("p", "m", "v"):
+            _assert_tail_ulp_class(a[name], b[name], scales[name],
+                                   f"k={k}, {name}")
+
 
 def test_compact_grad_correct_dense_runs_and_rec_start():
     """Merge-join geometry the Bernoulli A/B cannot reach: fully selected
@@ -425,6 +465,119 @@ def test_compact_grad_correct_dense_runs_and_rec_start():
     m2[rs + 1000:rs + 1060] = 1
     m2[rs + 3072:rs + 4096] = 1
     ab(m2, rec_lo=rs, rec_hi=n)
+
+
+def test_compact_grad_correct_full_density_clustered_and_bracket_fill():
+    """Legs for the bounded-bracket merge-join. (a) Full density:
+    every block's segment spans exactly BLOCK (q - p == 1024), the second
+    lower_bound's [p, min(k, p+BLOCK)] bound is tight at its maximum — and
+    a too-tight bound (p + BLOCK - 1) would drop the last coordinate of
+    every block, so this leg bites bracket-bound regressions. (b)
+    Heterogeneous occupancy: full, ~30%-partial and empty blocks side by
+    side, built deterministically and asserted — global top-k of IID
+    scores yields exchangeable per-block occupancy instead (no empty
+    blocks), so the heterogeneity must be constructed. (c) Adversarial
+    bracket fill: a record whose length is not a multiple of BLOCK ends
+    mid-block dense, and the NEXT record's selections complete that
+    bracket — those entries sit inside the record's [c0, c1) window at
+    coords equal to the out-of-range lanes', so what blocks their commit
+    is the ``valid = offs < n_elements`` mask on found/store in the
+    kernel (adamw.py), not the c-bounds."""
+    device = "cuda"
+    n = 16384
+    kw = dict(lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8,
+              weight_decay=0.1, step=1000)
+    coeff, factor = 0.7, 0.125
+    bc1 = 1 - kw["beta1"] ** kw["step"]
+    bc2 = 1 - kw["beta2"] ** kw["step"]
+
+    def ab(mask, fold=False, interval=8.0, rec_lo=0, rec_hi=None):
+        rec_hi = n if rec_hi is None else rec_hi
+        idx = mask.nonzero(as_tuple=True)[0].to(torch.int32).to(device)
+        k = idx.numel()
+        base = {"p": torch.randn(n), "m": torch.randn(n) * 0.1,
+                "v": torch.rand(n) * 0.01, "g": torch.randn(n)}
+        gc = base["g"] * factor * coeff * mask.float()
+
+        a = {kk: vv.clone().to(device) for kk, vv in base.items()}
+        vals = torch.empty(k, device=device)
+        pack_selected(a["g"], idx, vals, factor)
+        sl = slice(rec_lo, rec_hi)
+        adamw_grad_correct_compact(
+            a["p"][sl], a["g"][sl], a["m"][sl], a["v"][sl],
+            idx, vals, rec_lo, coeff=coeff, fold=fold,
+            interval=interval, **kw)
+
+        b = {kk: vv.clone().to(device) for kk, vv in base.items()}
+        vb = torch.empty(k, device=device)
+        torch.index_select(b["g"], 0, idx, out=vb)
+        vb *= factor
+        scatter_selected(b["g"], idx, vb)
+        adamw_grad_correct(b["p"], b["g"], b["m"], b["v"],
+                           mask=mask.to(device), emit_mode=None,
+                           coeff=coeff, clear=True, fold=fold,
+                           interval=interval, **kw)
+
+        assert torch.equal(a["g"][sl], b["g"][sl]), \
+            f"grad end state diverged (rec {rec_lo}:{rec_hi}, fold={fold})"
+        upd = (kw["weight_decay"] * base["p"].abs()
+               + (a["m"].cpu().abs() / bc1)
+               / ((a["v"].cpu() / bc2).sqrt() + kw["eps"]))
+        scales = {
+            "p": torch.maximum(base["p"].abs(), kw["lr"] * upd),
+            "m": torch.maximum(kw["beta1"] * base["m"].abs(),
+                               (1 - kw["beta1"]) * gc.abs()),
+            "v": torch.maximum(kw["beta2"] * base["v"].abs(),
+                               (1 - kw["beta2"]) * gc.abs() ** 2),
+        }
+        for name in ("p", "m", "v"):
+            _assert_tail_ulp_class(
+                a[name][sl], b[name][sl], scales[name][sl],
+                f"{name}, rec {rec_lo}:{rec_hi}, fold={fold}")
+
+    torch.manual_seed(22)
+    # (a) 100% density: every block span == BLOCK, single record and a
+    # mid-bucket record slice; both fold arms (all-dense masks: the FOLD
+    # store only fires on (b)'s non-dense fold leg)
+    full = torch.ones(n, dtype=torch.uint8)
+    for fold, interval in ((False, 8.0), (True, 7.0)):
+        ab(full.clone(), fold=fold, interval=interval)
+        ab(full.clone(), fold=fold, interval=interval, rec_lo=5000)
+
+    # (b) heterogeneous occupancy, constructed explicitly: 5 full + 4
+    # partial (~30% Bernoulli) + 7 empty 1024-blocks — the shape the
+    # bench's real arm measures (empty_frac 0.63 / full_frac 0.15). A
+    # global top-k of IID scores cannot produce it (per-block occupancy is
+    # exchangeable around ~k/BLOCK, no empty blocks), so the construction
+    # is deterministic and its heterogeneity is asserted.
+    bsz = 1024
+    m = torch.zeros(n, dtype=torch.uint8)
+    m[:5 * bsz] = 1
+    m[5 * bsz:9 * bsz] = (torch.rand(4 * bsz) < 0.3).to(torch.uint8)
+    occ = m.view(-1, bsz).sum(dim=1)
+    assert int((occ == 0).sum()) > 0 and int((occ == bsz).sum()) > 0, (
+        "leg (b) lost its occupancy heterogeneity (empty/full blocks)"
+    )
+    ab(m)
+    # fold=True on a NON-dense mask: the compact FOLD store
+    # (valid & ~found) actually fires at inactive coords
+    ab(m, fold=True, interval=7.0)
+
+    # (c) bracket fill: record 0 is dense and ends mid-block (1500 is not
+    # a multiple of 1024), record 1 continues dense from the next coord —
+    # record 1's idx entries land INSIDE record 0's final-block window at
+    # coords equal to the out-of-range lanes', and only the
+    # valid = offs < n_elements mask on found/store keeps them from
+    # committing (not the [c0, c1) bounds); record 1's own first block
+    # starts at an unaligned c0 = 1500
+    m = torch.ones(n, dtype=torch.uint8)
+    ab(m, rec_lo=0, rec_hi=1500)
+    ab(m, rec_lo=1500, rec_hi=n)
+    ab(m, fold=True, interval=9.0, rec_lo=1500, rec_hi=n)
+    # sparse tail on record 1 so its last blocks are partial too
+    m2 = torch.ones(n, dtype=torch.uint8)
+    m2[12000:] = (torch.rand(n - 12000) < 0.1).to(torch.uint8)
+    ab(m2, rec_lo=1500, rec_hi=n)
 
 
 def test_pack_selected_contract():
