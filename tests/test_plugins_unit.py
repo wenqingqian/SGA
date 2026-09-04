@@ -46,16 +46,17 @@ from sga.plugins.selection._histogram import (
     select_masks_histogram,
 )
 from sga.plugins.selection.topk import TopkSelection
-from sga.config.validation import _AXIS_PARAMS
 
 
 def _method_allows(method: str, key: str) -> bool:
-    """Is `key` a legal topk param under `method`? Derived from the
-    validation guards (the per-method vocabularies)."""
-    for suffix, requires in _AXIS_PARAMS["selection"]["topk"]:
-        if suffix == key:
-            return not requires or requires[1] == method
-    return False
+    """Is `key` a legal topk param under `method`? (topk's own literal
+    per-method vocabularies: base params always, guarded params under
+    the method that unlocks them.)"""
+    guarded = {"histogram_mode": "histogram",
+               "adaptive_warmup_syncs": "adaptive",
+               "adaptive_warmup_mode": "adaptive"}
+    return (key in ("method", "ratio_percent")
+            or (key in guarded and guarded[key] == method))
 
 torch.manual_seed(0)
 

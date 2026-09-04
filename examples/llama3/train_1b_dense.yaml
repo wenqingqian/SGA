@@ -51,10 +51,9 @@ hydra:
     dir: ${experiment.exp_dir}/hydra
 
 sga:
-  # Reserved SGA algorithm section: all off = pure dense.
+  # Reserved SGA algorithm section: everything off = pure dense.
   # Validated by sga.config before the launcher flattens train.*.
   sga_enabled: false
-  sga_backend: dense
 
 #### model ####
 

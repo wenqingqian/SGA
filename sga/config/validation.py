@@ -2,19 +2,27 @@
 """The flat SGA config validation core.
 
 Everything a config may say lives in ``sga/config/arguments.py`` (plain
-``add_argument`` declarations); THIS module derives the vocabulary from
-that file by parser introspection — no key set, default or choice is
-restated anywhere — and adds the context argparse cannot express:
+``add_argument`` declarations); THIS module derives the flag vocabulary
+from that file by parser introspection — no key set, default or choice is
+restated anywhere — and adds the context argparse cannot express as PLAIN
+CONDITIONAL RULES over the flat keys (megatron ``validate_args`` style:
+``if args.xxx: assert args.yyy``).
 
-  - unknown-key rejection (a typo'd ``sga_`` key fails loud, never
-    silently dense),
-  - the enabled/disabled contract (disabled = everything else default),
-  - axis-identity requirements and plugin-name membership (registries),
-  - per-plugin parameter attribution with equality guards ("belongs to
-    method=histogram"), preserving the historical foreign-key errors,
-  - ``sga_cycle_start_iter_percent`` resolution against train_iters,
-  - trace normalization, shadow constraints, float canonicalization,
-  - the cross-axis combination check (``sga.plugins.validate_combination``).
+Names carry no structure here. Which flags exist is a question for the
+declarations; what combinations of VALUES are legal is argued below, one
+rule per branch (the enabled/disabled contract, required flags, the
+cycle/trace/shadow rules, registered plugin names, topk's per-method
+rules). Per-plugin parameters are each plugin's own business: their
+vocabularies and defaults live with the plugins
+(``sga/plugins/__init__.py:expand_plugin_params``), never in a central
+table — a declared-but-foreign param is rejected by the owning
+constructor at build time (caveat: an explicit-but-at-default foreign
+key may be diffed away before the constructor, since
+``materialize_engine_config`` re-diffs the canonical down to explicit
+non-defaults). Note the two notions of "explicit" on the yaml route,
+intentional per the layer split: the topk dead-config guard fires on
+key presence in the explicit input, while the constructor route
+consumes the explicit-default diff of the canonical.
 
 Inputs are EXPLICIT-key dicts (only what the user actually wrote): the
 launcher passes the yaml ``sga:`` section verbatim; the training side
@@ -22,14 +30,14 @@ passes ``explicit_from_args(args)`` (the argparse-defaults diff — with
 real defaults filled in by argparse, "flag absent" is indistinguishable
 from "flag at default", and the two are semantically identical anyway).
 
-Output: ``(engine_config, canonical)`` where ``engine_config`` is the
-internal NESTED engine dict (section defaults materialized; plugin axes
-carry explicit params only — constructors expand defaults through
-``expand_plugin_params``) and ``canonical`` is the complete typed FLAT
-dict (percent resolved away) used for the engine's config print, the
-resume guard comparison and ``python -m sga.config resolve``.
+Output: the canonical FLAT dict (every dest at its resolved, typed
+value; percent resolved away) used for the engine's config print, the
+resume guard comparison and ``python -m sga.config resolve``. The
+engine's internal NESTED read shape is assembled from the canonical by
+``sga.runtime.materialize_engine_config`` — validation itself is flat
+in, flat out.
 
-Disabled-clean input returns ``(None, None)``.
+Disabled-clean input returns ``None``.
 """
 
 import argparse
@@ -37,41 +45,6 @@ import json
 import math
 
 from sga.config.arguments import add_sga_args, sga_bool, sga_int_or_null
-
-# The only plugin-vocabulary data outside arguments.py: which flat
-# suffixes belong to which plugin of an axis, and each guarded param's
-# equality condition (sibling param == value). Types/defaults/choices
-# are NOT here — they are introspected from the declarations. Convention:
-# a param whose declared default is None is REQUIRED (required-ness is
-# inferred from default-None); a future optional param needs a
-# table/annotation update before it can exist.
-_AXIS_PARAMS = {
-    "selection": {
-        "topk": (
-            ("method", None),
-            ("ratio_percent", None),
-            ("histogram_mode", ("method", "histogram")),
-            ("adaptive_warmup_syncs", ("method", "adaptive")),
-            ("adaptive_warmup_mode", ("method", "adaptive")),
-        ),
-    },
-    "optimizer": {
-        "adamw": (
-            ("residual_mean", None),
-            ("merge_join_dir", None),
-        ),
-    },
-    "backend": {
-        "torch_pipelined_index": (
-            ("high_priority_group", None),
-            ("slices", None),
-        ),
-        "torch_pipelined_mask": (
-            ("num_slices", None),
-        ),
-        "nccl_pipelined_index": (),
-    },
-}
 
 _PARSER = None
 
@@ -111,65 +84,6 @@ def engine_section_defaults(section: str) -> dict:
             for dest, action in sga_actions().items() if dest.startswith(prefix)}
 
 
-def axis_param_defaults(axis: str, plugin_name: str) -> dict:
-    """{suffix: default} for one plugin's params (guarded params included);
-    the score axis (no params) yields {}."""
-    defaults = sga_defaults()
-    return {suffix: defaults[f"sga_{axis}_{suffix}"]
-            for suffix, _ in _AXIS_PARAMS.get(axis, {}).get(plugin_name, ())}
-
-
-def expand_plugin_params(axis: str, plugin_name: str, params: dict) -> dict:
-    """Validate an explicit params dict and expand it to full defaults —
-    the constructors' single read path (defaults come from the
-    declarations, never from a restated ``params.get(name, default)``).
-    """
-    rows = _AXIS_PARAMS.get(axis, {}).get(plugin_name)
-    if rows is None:
-        # a registered plugin without attribution rows would otherwise die
-        # as a bare KeyError far from the cause (INV-1 pins the sync, this
-        # keeps the runtime failure actionable)
-        raise ValueError(
-            f"sga.{axis} plugin '{plugin_name}' lacks an attribution row in "
-            "_AXIS_PARAMS (validation.py); update the table when registering "
-            "plugins"
-        )
-    known = {suffix for suffix, _ in rows}
-    unknown = sorted(set(params) - known)
-    if unknown:
-        raise ValueError(
-            f"sga.{axis} ({plugin_name}): unknown params {unknown} "
-            f"(known: {sorted(known)})"
-        )
-    defaults = axis_param_defaults(axis, plugin_name)
-    for suffix in sorted(known):
-        if defaults[suffix] is None and suffix not in params:
-            raise ValueError(
-                f"sga.{axis} ({plugin_name}): param '{suffix}' is "
-                "required"
-            )
-    out = dict(defaults)
-    out.update(params)
-    for suffix in params:
-        _check_value(axis, plugin_name, f"sga_{axis}_{suffix}", suffix, out[suffix])
-    return out
-
-
-def guard_foreign_params(axis: str, plugin_name: str, params: dict) -> tuple:
-    """(foreign, own) under the equality guards, on an EXPLICIT
-    (pre-expansion) params dict: ``foreign`` are the present params whose
-    guard the dict does not satisfy (knobs of another sibling value —
-    silently dead where they are); ``own`` are the guarded params the
-    sibling value does unlock (for the refusal message)."""
-    guarded = [(suffix, requires) for suffix, requires
-               in _AXIS_PARAMS[axis][plugin_name] if requires]
-    foreign = sorted(suffix for suffix, (other, value) in guarded
-                     if suffix in params and params.get(other) != value)
-    own = sorted(suffix for suffix, (other, value) in guarded
-                 if params.get(other) == value)
-    return foreign, own
-
-
 def _param_kind(dest: str):
     """'bool' | 'int' | 'int_or_null' | 'float' | 'str' for one dest."""
     action = sga_actions()[dest]
@@ -182,43 +96,6 @@ def _param_kind(dest: str):
     if action.type is float:
         return "float"
     return "str"
-
-
-def _check_value(axis, plugin_name, dest, suffix, val) -> None:
-    """Validate one (param, value) pair: nullability, type, choices."""
-    kind = _param_kind(dest)
-    actions = sga_actions()
-    if val is None:
-        if kind == "int_or_null":
-            return
-        raise ValueError(
-            f"sga.{axis} ({plugin_name}): param '{suffix}' is not "
-            "nullable (got null)"
-        )
-    if kind == "bool":
-        ok = isinstance(val, bool)
-        typ = "bool"
-    elif kind in ("int", "int_or_null"):
-        # bool is an int subclass; yaml true/false must not pass as 1/0
-        ok = isinstance(val, int) and not isinstance(val, bool)
-        typ = "int"
-    elif kind == "float":
-        ok = isinstance(val, (int, float)) and not isinstance(val, bool)
-        typ = "float"
-    else:
-        ok = isinstance(val, str)
-        typ = "str"
-    if not ok:
-        raise ValueError(
-            f"sga.{axis} ({plugin_name}): param '{suffix}' must be "
-            f"{typ} (got {val!r})"
-        )
-    choices = tuple(getattr(actions[dest], "choices", None) or ())
-    if choices and val not in choices:
-        raise ValueError(
-            f"sga.{axis} ({plugin_name}): param '{suffix}' must be one "
-            f"of {list(choices)} (got {val!r})"
-        )
 
 
 def _coerce(dest: str, val):
@@ -325,62 +202,53 @@ def canonical_flat_json(canonical: dict) -> str:
 
 
 def validate_sga_flat(flat: dict, train_iters=None):
-    """Validate an explicit-key flat dict -> (engine_config, canonical),
-    or (None, None) when disabled-clean. Raises ValueError with the
-    specific offending key on any problem."""
+    """Validate an explicit-key flat dict -> the canonical flat dict, or
+    None when disabled-clean. Raises ValueError naming the offending key
+    on any problem."""
     actions = sga_actions()
     unknown = sorted(set(flat) - set(actions))
     if unknown:
         raise ValueError(
-            f"sga: unknown keys {unknown} (known: {sorted(actions)})"
-        )
+            f"sga: unknown keys {unknown} (known: {sorted(actions)})")
     typed = {dest: _coerce(dest, val) for dest, val in flat.items()}
     defaults = sga_defaults()
 
+    # --- enabled/disabled contract ---
     if typed.get("sga_enabled", defaults["sga_enabled"]) is not True:
-        # Disabled semantics: dense training; nothing else may be
-        # configured (an explicit sga_backend: dense is the documented
-        # dense spelling and passes).
+        # Disabled semantics: dense training; nothing else may be set
+        # (no other key has meaning while disabled).
         for dest in sorted(typed):
-            if dest == "sga_enabled":
-                continue
-            if dest == "sga_backend" and typed[dest] == "dense":
-                continue
-            raise ValueError(
-                f"{dest} is set but sga_enabled is false; either "
-                "enable SGA or remove the flag"
-            )
-        return None, None
+            if dest != "sga_enabled":
+                raise ValueError(
+                    f"{dest} is set but sga_enabled is false; either "
+                    "enable SGA or remove the flag")
+        return None
 
-    for dest in ("sga_score", "sga_optimizer", "sga_backend"):
+    # --- required when enabled ---
+    for dest in ("sga_score", "sga_optimizer"):
         if typed.get(dest) is None:
             raise ValueError(
                 f"{dest} is required when sga_enabled is true "
-                "(registered names are the choices)"
-            )
-    if typed["sga_backend"] == "dense":
+                "(registered names are the choices)")
+    if typed.get("sga_backend", defaults["sga_backend"]) == "dense":
         raise ValueError(
-            "sga_enabled is true but sga_backend is 'dense' — dense is "
-            "the SGA-off representation; pick a sparse backend."
-        )
+            "sga_enabled is true but sga_backend is still 'dense' (the "
+            "SGA-off default) — name a sparse backend")
 
     # --- cycle (incl. percent resolution and the decouple calendar) ---
     if typed.get("sga_cycle_start_iter_percent") is not None:
         if "sga_cycle_start_iter" in typed:
             raise ValueError(
-                "sga_cycle: set either sga_cycle_start_iter or "
-                "sga_cycle_start_iter_percent, not both."
-            )
+                "set either sga_cycle_start_iter or "
+                "sga_cycle_start_iter_percent, not both")
         if not train_iters or int(train_iters) <= 0:
             raise ValueError(
-                "sga_cycle_start_iter_percent requires train_iters > 0."
-            )
+                "sga_cycle_start_iter_percent requires train_iters > 0")
         pct = float(typed["sga_cycle_start_iter_percent"])
         if not 0.0 <= pct <= 100.0:
             raise ValueError(
                 "sga_cycle_start_iter_percent must be in [0, 100] "
-                f"(got {pct})."
-            )
+                f"(got {pct})")
         start_iter = max(0, int(round(pct / 100.0 * int(train_iters))))
     else:
         start_iter = int(typed.get("sga_cycle_start_iter",
@@ -399,48 +267,34 @@ def validate_sga_flat(flat: dict, train_iters=None):
                 f"sga_cycle_full_sync_interval is set ({interval}) but "
                 "sga_cycle_decouple_full_sync_interval_and_period is "
                 "false; every cycle boundary is already a full sync — "
-                "leave sga_cycle_full_sync_interval unset"
-            )
+                "leave sga_cycle_full_sync_interval unset")
     elif interval is None:
         raise ValueError(
             "sga_cycle_decouple_full_sync_interval_and_period is true "
             "but sga_cycle_full_sync_interval is unset — set a divisor "
-            f"of the period smaller than it (period={period})"
-        )
+            f"of the period smaller than it (period={period})")
     elif not (0 < int(interval) < period and period % int(interval) == 0):
         raise ValueError(
             f"decoupled sga_cycle_full_sync_interval ({interval}) must "
             f"satisfy 0 < full_sync_interval < period ({period}) and "
-            "period % full_sync_interval == 0"
-        )
-    engine_cycle = {
-        "start_iter": start_iter,
-        "period": period,
-        "decouple_full_sync_interval_and_period": decouple,
-        "full_sync_interval": None if interval is None else int(interval),
-    }
-
-    # --- checks ---
-    engine_checks = {"count_guard": bool(typed.get(
-        "sga_checks_count_guard", defaults["sga_checks_count_guard"]))}
+            "period % full_sync_interval == 0")
 
     # --- trace (setting any trace key activates the collector) ---
     trace_present = any(dest in typed for dest in actions
                         if dest.startswith("sga_trace_"))
-    engine_trace = None
+    branch_points = None
     if trace_present:
         tdir = typed.get("sga_trace_dir")
         if not isinstance(tdir, str) or not tdir:
             raise ValueError(
                 "sga_trace_dir is required and must be a non-empty string "
-                "(the trace output directory)."
-            )
+                "(the trace output directory)")
         # Lazy import: sga.trace -> sga.config (package __init__) -> this
         # module -> sga.trace is a cycle; sga.trace-first processes must
         # keep importing (only call site, so the deferral costs nothing).
         from sga.trace import parse_branch_points
         try:
-            branch = parse_branch_points(
+            branch_points = parse_branch_points(
                 typed.get("sga_trace_branch_points",
                           defaults["sga_trace_branch_points"]))
         except (TypeError, ValueError) as e:
@@ -448,22 +302,17 @@ def validate_sga_flat(flat: dict, train_iters=None):
         window = typed.get("sga_trace_window", defaults["sga_trace_window"])
         if not isinstance(window, int) or isinstance(window, bool) or window < 1:
             raise ValueError(
-                f"sga_trace_window must be an int >= 1 (got {window!r}).")
-        engine_trace = {"dir": tdir, "branch_points": branch,
-                        "window": int(window)}
+                f"sga_trace_window must be an int >= 1 (got {window!r})")
 
     # --- shadow ---
     shadow = bool(typed.get("sga_shadow", defaults["sga_shadow"]))
     if "sga_shadow_score" in typed and not shadow:
         raise ValueError(
             "sga_shadow_score is set but sga_shadow is not true; it only "
-            "modifies shadow runs."
-        )
-    shadow_score = bool(typed.get("sga_shadow_score",
-                                  defaults["sga_shadow_score"]))
+            "modifies shadow runs")
 
-    # --- plugin axes: registry membership, attribution, guards, float
-    # canonicalization ---
+    # --- plugin names must be registered (plain value checks: the
+    # registries own the name lists, nothing here restates them) ---
     from sga.plugins import (
         get_backend_plugin_decl,
         get_optimizer_decl,
@@ -474,91 +323,44 @@ def validate_sga_flat(flat: dict, train_iters=None):
     )
 
     register_default_plugins()
-    axis_names = {
-        "score": typed["sga_score"],
-        "selection": typed.get("sga_selection", defaults["sga_selection"]),
-        "optimizer": typed["sga_optimizer"],
-        "backend": typed["sga_backend"],
-    }
-    decls = {}
-    axes_cfg = {}
-    for axis, name in axis_names.items():
-        # Registry membership BEFORE the per-plugin vocab check: an unknown
-        # plugin name must surface as the registry's curated error (rename
-        # hints included), never as "unknown params (known: [])" against
-        # the unknown plugin's empty vocabulary.
-        if axis == "score":
-            decls[axis] = get_score_spec(name)
-        elif axis == "selection":
-            decls[axis] = get_selection_decl(name)
-        elif axis == "optimizer":
-            decls[axis] = get_optimizer_decl(name)
-        else:
-            decls[axis] = get_backend_plugin_decl(name)
-        prefix = f"sga_{axis}_"
-        params = {dest[len(prefix):]: typed[dest]
-                  for dest in typed if dest.startswith(prefix)}
-        union = {suffix for plugin in _AXIS_PARAMS.get(axis, {}).values()
-                 for suffix, _ in plugin}
-        unknown = sorted(set(params) - union)
-        if unknown:
-            raise ValueError(
-                f"sga.{axis}: unknown params {unknown} "
-                f"(known: {sorted(union)})"
-            )
-        vocab = {suffix for suffix, _ in
-                  _AXIS_PARAMS.get(axis, {}).get(name, ())}
-        notours = sorted(set(params) - vocab)
-        if notours:
-            raise ValueError(
-                f"sga.{axis} ({name}): unknown params {notours} "
-                f"(known: {sorted(vocab)})"
-            )
-        # Required-before-guards (the 0024 C1 lesson): a missing sibling
-        # must surface as the required error, never as a foreign-key
-        # refusal naming the raw value.
-        plugin_defaults = axis_param_defaults(axis, name)
-        for suffix in sorted(vocab):
-            if plugin_defaults[suffix] is None and suffix not in params:
-                raise ValueError(
-                    f"sga.{axis} ({name}): param '{suffix}' is required"
-                )
-        guarded = [(suffix, requires) for suffix, requires
-                   in _AXIS_PARAMS.get(axis, {}).get(name, ()) if requires]
-        if guarded:
-            sibling = guarded[0][1][0]
-            sib_val = params.get(
-                sibling, typed.get(prefix + sibling,
-                                   defaults.get(prefix + sibling)))
-            foreign, own = guard_foreign_params(axis, name, params)
-            if foreign:
-                raise ValueError(
-                    f"sga.{axis} ({name}): params {foreign} do not belong "
-                    f"to {sibling} '{sib_val}' (it takes "
-                    f"{own or 'no extra params'}) — under this {sibling} "
-                    "they would be silently dead; drop them or switch "
-                    f"the {sibling}"
-                )
-        # Canonicalize float params regardless of the yaml spelling
-        # (10 vs 10.0): the canonical print/resume form must be
-        # spelling-invariant.
-        for suffix in params:
-            if _param_kind(prefix + suffix) == "float":
-                params[suffix] = float(params[suffix])
-        axes_cfg[axis] = {"name": name, **params}
+    score = typed["sga_score"]
+    selection = typed.get("sga_selection", defaults["sga_selection"])
+    optimizer = typed["sga_optimizer"]
+    backend = typed["sga_backend"]
+    get_score_spec(score)
+    selection_decl = get_selection_decl(selection)
+    optimizer_decl = get_optimizer_decl(optimizer)
+    backend_decl = get_backend_plugin_decl(backend)
 
-    # --- cross-axis combination ---
-    validate_combination(axis_names["score"], decls["selection"],
-                         decls["optimizer"], decls["backend"])
+    # --- selection (topk): per-method rules over values ---
+    if selection == "topk":
+        if typed.get("sga_selection_method") is None:
+            raise ValueError(
+                "sga_selection_method is required by topk "
+                "(adaptive | exact | histogram)")
+        if "sga_selection_ratio_percent" not in typed:
+            raise ValueError(
+                "sga_selection_ratio_percent is required by topk")
+        method = typed["sga_selection_method"]
+        # dead config: a param another method owns is silently ignored
+        # where it is — refuse it instead
+        unlocks = {
+            "histogram": ("sga_selection_histogram_mode",),
+            "adaptive": ("sga_selection_adaptive_warmup_syncs",
+                         "sga_selection_adaptive_warmup_mode"),
+        }
+        method_params = unlocks.get(method, ())
+        dead = sorted(dest for dests in unlocks.values() for dest in dests
+                      if dest in typed and dest not in method_params)
+        if dead:
+            raise ValueError(
+                f"sga_selection (topk): params {dead} do not belong to "
+                f"method '{method}' (it takes "
+                f"{sorted(method_params) or 'no extra params'}) — under "
+                "this method they would be silently dead; drop them or "
+                "switch the method")
 
-    engine_config = {
-        "cycle": engine_cycle,
-        "checks": engine_checks,
-        "shadow": shadow,
-        "shadow_score": shadow_score,
-        **({"trace": engine_trace} if engine_trace is not None else {}),
-        **axes_cfg,
-    }
+    validate_combination(score, selection_decl, optimizer_decl, backend_decl)
 
     # --- canonical flat dict: every dest at its resolved value ---
     canonical = dict(defaults)
@@ -566,29 +368,30 @@ def validate_sga_flat(flat: dict, train_iters=None):
     canonical["sga_enabled"] = True
     canonical.pop("sga_cycle_start_iter_percent", None)  # resolved away
     canonical["sga_cycle_start_iter"] = start_iter
-    if engine_trace is not None:
-        canonical["sga_trace_branch_points"] = engine_trace["branch_points"]
-    return engine_config, canonical
+    if trace_present:
+        canonical["sga_trace_branch_points"] = branch_points
+    return canonical
 
 
-def validate_sga_args(args) -> dict:
+def validate_sga_args(args):
     """Training-side fail-fast entry: validate the parsed namespace's SGA
     configuration (also when disabled — the disabled-cleanliness contract
-    is enforced here). Returns the engine config or None when disabled."""
+    is enforced here). Returns the canonical flat dict, or None when
+    disabled."""
     return validate_sga_flat(explicit_from_args(args),
-                             train_iters=getattr(args, "train_iters", None))[0]
+                             train_iters=getattr(args, "train_iters", None))
 
 
 def validate_run_config(config):
     """Launcher-side entry on the whole run config: the ``sga:`` section
     (flat keys, validated fail-fast before any process is spawned) plus
-    the train-boundary assert. Returns (engine_config, canonical)."""
+    the train-boundary assert. Returns the canonical flat dict or None
+    when disabled."""
     sga = config.get("sga", None)
     if sga is None:
         raise ValueError(
-            "Config is missing the 'sga:' section (declare it with "
-            "sga_enabled: false and sga_backend: dense for pure dense "
-            "training)."
+            "Config is missing the 'sga:' section (declare it with just "
+            "sga_enabled: false for pure dense training)."
         )
     from omegaconf import DictConfig, OmegaConf
 

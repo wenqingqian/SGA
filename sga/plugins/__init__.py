@@ -9,14 +9,13 @@ class plugins that each declare their attributes. The combination validator
 checks legality from those declarations — there is NO hardcoded list of
 legal combinations and NO scheme names anywhere in the engine.
 
-Plugin PARAMS carry no declarations here: the flat flags live in
-``sga/config/arguments.py`` (plain add_argument lines) and the
-per-plugin attribution + equality guards in ``sga/config/validation.py``
-(``_AXIS_PARAMS``). Constructors expand their params through
-``sga.config.validation.expand_plugin_params`` — defaults come from the
-declarations, never restated. The registry↔attribution sync is pinned by
-tests (a registered plugin without attribution rows, or an attribution
-row for an unknown plugin, fails the invariant suite).
+Plugin PARAMS: the flat flags live in ``sga/config/arguments.py`` (plain
+add_argument lines); which params belong to which plugin is EACH PLUGIN'S
+OWN business — constructors expand their params through
+``expand_plugin_params`` below (defaults come from the flag declarations,
+never restated; unknown/missing params fail loud). There is no central
+plugin-param table anywhere; config-side validation checks values, never
+name attribution.
 
 Declaration facts used by the validator (see ``validate_combination``):
   - Optimizer.emittable_scores: the score names this template's full-step
@@ -59,6 +58,7 @@ __all__ = [
     "build_selection",
     "build_optimizer",
     "build_backend_plugin",
+    "expand_plugin_params",
     "register_default_plugins",
 ]
 
@@ -250,7 +250,7 @@ def _resolved(axis, name, params):
     """Curated unknown-plugin error + name strip; the CONSTRUCTOR stays the
     single resolver (defaults expand once, explicit-vs-default stays
     distinguishable for cross-param legality like topk's per-method
-    foreign-key refusal)."""
+    dead-config refusal)."""
     if axis == "backend":
         get_backend_plugin_decl(name)  # owns the _RENAMED_BACKENDS hints
     else:
@@ -259,6 +259,42 @@ def _resolved(axis, name, params):
     params = dict(params)
     params.pop("name", None)
     return params
+
+
+def expand_plugin_params(dest_prefix, param_names, params, owner):
+    """A plugin constructor's single read path: its suffix-keyed explicit
+    params -> full defaults. Defaults and value legality (type/choices)
+    come from the flag declarations (``sga.config.validation`` — single
+    source, never restated); a param whose declared default is None is
+    REQUIRED. Each plugin owns its own vocabulary — unknown params,
+    missing required ones and wrong-valued ones fail loud here, at
+    build time (an explicit-but-at-default foreign key may be diffed
+    away before the constructor — ``materialize_engine_config`` re-diffs
+    the canonical down to explicit non-defaults)."""
+    from sga.config.validation import _coerce, sga_defaults
+
+    names = tuple(param_names)
+    unknown = sorted(set(params) - set(names))
+    if unknown:
+        raise ValueError(
+            f"{owner}: unknown params {unknown} (known: {sorted(names)})")
+    defaults = sga_defaults()
+    full = {}
+    for name in names:
+        if dest_prefix + name not in defaults:
+            raise ValueError(
+                f"{owner}: unknown declaration destination "
+                f"{dest_prefix + name!r} (is the dest_prefix correct?)")
+        full[name] = defaults[dest_prefix + name]
+    for name in sorted(names):
+        if full[name] is None and name not in params:
+            raise ValueError(f"{owner}: param '{name}' is required")
+    full.update(params)
+    # the config route already coerced every explicit value; this re-run
+    # is idempotent there and guards direct construction (replay/tests)
+    for name in params:
+        full[name] = _coerce(dest_prefix + name, full[name])
+    return full
 
 
 def register_default_plugins() -> None:

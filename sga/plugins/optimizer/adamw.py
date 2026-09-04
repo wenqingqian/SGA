@@ -50,8 +50,7 @@ from typing import Optional
 
 import torch
 
-from sga.config.validation import expand_plugin_params
-from sga.plugins import OptimizerDecl
+from sga.plugins import OptimizerDecl, expand_plugin_params
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch
 from sga.plugins.scores import Score, emittable_score_names, get_score_spec
 
@@ -772,7 +771,9 @@ class SgaAdamW:
     decl = DECL
 
     def __init__(self, params: dict, emit_score: Optional[str] = None):
-        params = expand_plugin_params("optimizer", "adamw", dict(params))
+        params = expand_plugin_params(
+            "sga_optimizer_", ("residual_mean", "merge_join_dir"),
+            dict(params), "sga_optimizer (adamw)")
         self.params = params
         self.residual_mean = bool(params["residual_mean"])
         # Compact-path merge-join form: 'table' seeds both

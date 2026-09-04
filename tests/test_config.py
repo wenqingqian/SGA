@@ -28,7 +28,6 @@ experiment:
   runner: {type: ssh}
 sga:
   sga_enabled: false
-  sga_backend: dense
 train:
   system: {tensor_model_parallel_size: 1}
   model: {num_layers: 2}
@@ -51,6 +50,14 @@ def expect_error(fn, needle):
         assert needle in str(e), f"error missing '{needle}': {e}"
         return
     raise SystemExit(f"expected error containing '{needle}'")
+
+
+def _engine(cfg):
+    """The nested read shape the engine used to get from
+    validate_run_config; now assembled by the runtime."""
+    from sga.runtime import materialize_engine_config
+    canonical = validate_run_config(cfg)
+    return None if canonical is None else materialize_engine_config(canonical)
 
 
 def _enable_standard(cfg):
@@ -85,7 +92,7 @@ def test_enabled_field_named_in_error():
 def test_fourfield_combination_resolves():
     cfg, _ = make_base()
     _enable_standard(cfg)
-    engine_cfg, _ = validate_run_config(cfg)
+    engine_cfg = _engine(cfg)
     assert engine_cfg["selection"] == {"name": "topk", "method": "histogram",
                                        "ratio_percent": 30.0}
     assert engine_cfg["optimizer"] == {"name": "adamw"}
@@ -103,11 +110,11 @@ def test_checks_validation():
     the error, and any checks key is rejected when the engine is off."""
     cfg, _ = make_base()
     _enable_standard(cfg)
-    engine_cfg, _ = validate_run_config(cfg)
+    engine_cfg = _engine(cfg)
     assert engine_cfg["checks"] == {"count_guard": True}
 
     cfg.sga.sga_checks_count_guard = False
-    engine_cfg, _ = validate_run_config(cfg)
+    engine_cfg = _engine(cfg)
     assert engine_cfg["checks"] == {"count_guard": False}
 
     cfg.sga.sga_checks_count_guard = "no"
@@ -125,18 +132,18 @@ def test_trace_validation():
     off."""
     cfg, _ = make_base()
     _enable_standard(cfg)
-    engine_cfg, _ = validate_run_config(cfg)
+    engine_cfg = _engine(cfg)
     assert "trace" not in engine_cfg  # absent -> collector off
 
     cfg.sga.sga_trace_dir = "/tmp/sga-trace-x"
     cfg.sga.sga_trace_branch_points = "50, 10,50"
-    engine_cfg, _ = validate_run_config(cfg)
+    engine_cfg = _engine(cfg)
     assert engine_cfg["trace"] == {"dir": "/tmp/sga-trace-x",
                                    "branch_points": [10, 50],  # sorted, deduped
                                    "window": 100}
 
     cfg.sga.sga_trace_branch_points = [7, "3"]
-    engine_cfg, _ = validate_run_config(cfg)
+    engine_cfg = _engine(cfg)
     assert engine_cfg["trace"]["branch_points"] == [3, 7]
 
     cfg.sga.sga_trace_window = 0
@@ -158,7 +165,7 @@ def test_start_iter_percent_resolves():
     del cfg.sga.sga_cycle_start_iter
     cfg.sga.sga_cycle_start_iter_percent = 1.6  # of train_iters 2 below
     OmegaConf.update(cfg, "train.model.train_iters", 5000)
-    engine_cfg, _ = validate_run_config(cfg)
+    engine_cfg = _engine(cfg)
     assert engine_cfg["cycle"]["start_iter"] == 80  # round(0.016*5000)
 
     # both spellings at once is a conflict (explicit start_iter present)
@@ -195,7 +202,7 @@ def test_illegal_combination_rejected():
     expect_error(lambda: validate_run_config(cfg), "full_sync_interval")
     # the legal decoupled spelling round-trips
     cfg.sga.sga_cycle_full_sync_interval = 4
-    engine_cfg, _ = validate_run_config(cfg)
+    engine_cfg = _engine(cfg)
     assert engine_cfg["cycle"]["full_sync_interval"] == 4
     print("ok: illegal combinations rejected (unknown score / cycle rules)")
 
@@ -236,9 +243,11 @@ def test_disabled_rejects_any_other_explicit_key():
                        ("sga_trace_dir", "/tmp/x")):
         expect_error(lambda k=key, v=value: validate_sga_flat(
             {"sga_enabled": False, key: v}), "sga_enabled is false")
-    # dense spelling is the documented exception
-    assert validate_sga_flat({"sga_enabled": False, "sga_backend": "dense"}) \
-        == (None, None)
+    # no exception anymore: an explicit sga_backend key is set config
+    # while disabled, whatever its value (dense included)
+    expect_error(lambda: validate_sga_flat(
+        {"sga_enabled": False, "sga_backend": "dense"}),
+        "sga_enabled is false")
     print("ok: disabled config rejects every other explicit key")
 
 
@@ -289,8 +298,10 @@ def test_flatten_bool_semantics():
 
 
 def test_plugin_param_vocabulary():
-    """Unknown per-plugin params are loud on both routes: a key no plugin
-    of the axis declares, and a key of ANOTHER plugin of the axis."""
+    """A key no flag declares is loud at validation; a declared key of
+    ANOTHER plugin is the plugin's own business — validation (values
+    only, no name attribution) passes it, the owning constructor
+    rejects it at build time."""
     base = {"sga_enabled": True, "sga_score": "update",
             "sga_selection_method": "histogram",
             "sga_selection_ratio_percent": 10.0,
@@ -298,11 +309,15 @@ def test_plugin_param_vocabulary():
             "sga_backend": "torch_pipelined_index"}
     expect_error(lambda: validate_sga_flat({**base, "sga_selection_bogus": 1}),
                  "unknown keys")
-    expect_error(lambda: validate_sga_flat({**base, "sga_backend_num_slices": 3}),
-                 "unknown params")
     expect_error(lambda: validate_sga_flat({**base, "sga_score_extra": 1}),
                  "unknown keys")
-    print("ok: plugin param vocabulary enforced per axis/plugin")
+    canon = validate_sga_flat({**base, "sga_backend_num_slices": 3})
+    assert canon["sga_backend_num_slices"] == 3  # validation is silent
+    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
+
+    expect_error(lambda: TorchPipelinedIndexBackend({"num_slices": 3}),
+                 "unknown params ['num_slices']")
+    print("ok: declared-flag typos loud at validation, plugin vocab at build")
 
 
 def test_float_spelling_canonicalized():
@@ -312,7 +327,7 @@ def test_float_spelling_canonicalized():
             "sga_selection_ratio_percent": 10,
             "sga_optimizer": "adamw",
             "sga_backend": "torch_pipelined_index"}
-    _, canon = validate_sga_flat(dict(base))
+    canon = validate_sga_flat(dict(base))
     assert canon["sga_selection_ratio_percent"] == 10.0
     assert isinstance(canon["sga_selection_ratio_percent"], float)
     print("ok: float spellings canonicalize")

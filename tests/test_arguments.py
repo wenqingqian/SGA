@@ -135,9 +135,9 @@ def test_dual_form_equivalence():
     validation produces the SAME canonical flat dict as validating the
     section directly. The two spellings are one pipeline."""
     cfg = _cfg_with_sga(dict(ENABLED))
-    _, canon_direct = validate_sga_flat(
+    canon_direct = validate_sga_flat(
         OmegaConf.to_container(cfg.sga, resolve=True), train_iters=5000)
-    _, canon_ns = _canon_from_namespace(_flags_of(cfg))
+    canon_ns = _canon_from_namespace(_flags_of(cfg))
     assert canonical_flat_json(canon_direct) == canonical_flat_json(canon_ns)
     print("ok: yaml and hand-written flags canonicalize identically")
 
@@ -152,13 +152,13 @@ def test_dual_form_explicit_null_round_trip():
     adaptive = dict(ENABLED, sga_selection_method="adaptive",
                     sga_selection_adaptive_warmup_syncs=None)
     cfg = _cfg_with_sga(dict(adaptive))
-    _, canon_direct = validate_sga_flat(
+    canon_direct = validate_sga_flat(
         OmegaConf.to_container(cfg.sga, resolve=True), train_iters=5000)
     assert canon_direct["sga_selection_adaptive_warmup_syncs"] is None
     tokens = _flags_of(cfg)
     assert tokens[tokens.index("--sga-selection-adaptive-warmup-syncs") + 1] \
         == "null"
-    _, canon_ns = _canon_from_namespace(tokens)
+    canon_ns = _canon_from_namespace(tokens)
     assert canon_ns["sga_selection_adaptive_warmup_syncs"] is None
     assert canonical_flat_json(canon_direct) == canonical_flat_json(canon_ns)
     print("ok: explicit null round-trips through both spellings")
@@ -169,7 +169,7 @@ def test_decoupled_cycle_round_trip():
                 sga_cycle_decouple_full_sync_interval_and_period=True,
                 sga_cycle_full_sync_interval=4,
                 sga_cycle_period=8)
-    _, canon_direct = validate_sga_flat(dict(flat))
+    canon_direct = validate_sga_flat(dict(flat))
     args = _parse(["--sga-enabled", "true",
                    "--sga-cycle-start-iter", "20",
                    "--sga-cycle-period", "8",
@@ -180,7 +180,7 @@ def test_decoupled_cycle_round_trip():
                    "--sga-selection-ratio-percent", "10",
                    "--sga-optimizer", "adamw",
                    "--sga-backend", "torch_pipelined_index"])
-    _, canon_ns = validate_sga_flat(explicit_from_args(args))
+    canon_ns = validate_sga_flat(explicit_from_args(args))
     assert canonical_flat_json(canon_direct) == canonical_flat_json(canon_ns)
     print("ok: decoupled cycle round-trips through the flags")
 
@@ -191,8 +191,9 @@ def test_percent_resolves_train_side():
     flat = {k: v for k, v in ENABLED.items()
             if k != "sga_cycle_start_iter"}
     flat["sga_cycle_start_iter_percent"] = 0.4
-    eng, canon = validate_sga_flat(flat, train_iters=5000)
-    assert eng["cycle"]["start_iter"] == 20
+    canon = validate_sga_flat(flat, train_iters=5000)
+    from sga.runtime import materialize_engine_config
+    assert materialize_engine_config(canon)["cycle"]["start_iter"] == 20
     assert canon["sga_cycle_start_iter"] == 20
     assert "sga_cycle_start_iter_percent" not in canon  # resolved away
     print("ok: percent resolves train-side and leaves the canonical form")
@@ -203,18 +204,24 @@ def test_no_input_disabled_and_flags_inert():
     empty and validation reads disabled-clean (dense, byte-identical)."""
     args = _parse([])
     assert explicit_from_args(args) == {}
-    assert validate_sga_flat(explicit_from_args(args)) == (None, None)
+    assert validate_sga_flat(explicit_from_args(args)) is None
     # waist contract: inactive without sga_enabled
     assert getattr(args, "sga_enabled", False) is False
     print("ok: zero-flag run is dense-clean")
 
 
-def test_disabled_yaml_emits_dense_pair():
-    cfg = _cfg_with_sga({"sga_enabled": False, "sga_backend": "dense"})
+def test_disabled_yaml_emits_single_flag():
+    cfg = _cfg_with_sga({"sga_enabled": False})
     tokens = _flags_of(cfg)
-    assert tokens == ["--sga-backend", "dense", "--sga-enabled", "false"]
-    assert _canon_from_namespace(tokens) == (None, None)
-    print("ok: disabled yaml emits exactly the dense pair")
+    assert tokens == ["--sga-enabled", "false"]
+    assert _canon_from_namespace(tokens) is None
+    # an explicit sga_backend (even 'dense', the default) is a set key on
+    # the yaml route and errors while disabled
+    cfg2 = _cfg_with_sga({"sga_enabled": False, "sga_backend": "dense"})
+    expect_error(lambda: validate_sga_flat(
+        OmegaConf.to_container(cfg2.sga, resolve=True)),
+        "sga_backend is set but sga_enabled is false")
+    print("ok: disabled yaml emits exactly one flag; set keys error")
 
 
 def test_cli_disabled_with_extra_flags_rejected():
@@ -236,7 +243,7 @@ def test_config_cli_disabled_resolve_and_argc():
     yaml_path = os.path.join(tempfile.mkdtemp(prefix="sga-cli-"),
                              "dense.yaml")
     with open(yaml_path, "w") as f:
-        f.write("sga:\n  sga_enabled: false\n  sga_backend: dense\n"
+        f.write("sga:\n  sga_enabled: false\n"
                 "train:\n  system: {tensor_model_parallel_size: 1}\n"
                 "  model: {num_layers: 2}\n")
     env = dict(os.environ)
@@ -277,7 +284,7 @@ def test_explicit_false_and_null_spellings():
                    "--sga-selection-adaptive-warmup-syncs", "null"])
     explicit = explicit_from_args(args)
     assert explicit["sga_selection_adaptive_warmup_syncs"] is None
-    _, canon = validate_sga_flat(explicit)
+    canon = validate_sga_flat(explicit)
     assert canon["sga_selection_adaptive_warmup_syncs"] is None
     assert canon["sga_shadow"] is False
     print("ok: explicit false and null spellings survive the pipeline")
@@ -311,7 +318,7 @@ def test_schema_and_resolve_cli():
                          capture_output=True, text=True, cwd=REPO, env=env)
     assert out.returncode == 0, out.stderr
     resolved = json.loads(out.stdout)
-    _, canon = validate_sga_flat(dict(ENABLED), train_iters=5000)
+    canon = validate_sga_flat(dict(ENABLED), train_iters=5000)
     assert resolved == json.loads(canonical_flat_json(canon))
     print("ok: schema/resolve CLI match the declarations and canonical form")
 

@@ -142,6 +142,48 @@ def _assert_args_compatible() -> None:
                  "is decoupled AdamW)")
 
 
+def materialize_engine_config(canonical: dict) -> dict:
+    """The engine's internal NESTED read shape, assembled from the
+    validated canonical flat dict (engine.py's historical contract — the
+    rest of the pipeline is flat end to end). Axis sections carry the
+    explicit non-default params only; plugin constructors expand their
+    declared defaults through the plugins' ``expand_plugin_params``, so a
+    spelling equal to the default lands in the same final values either
+    way.
+    """
+    explicit = explicit_from_flat(canonical)
+
+    def _axis(axis):
+        prefix = f"sga_{axis}_"
+        params = {dest[len(prefix):]: explicit[dest]
+                  for dest in explicit if dest.startswith(prefix)}
+        return {"name": canonical[f"sga_{axis}"], **params}
+
+    engine_config = {
+        "cycle": {
+            "start_iter": canonical["sga_cycle_start_iter"],
+            "period": canonical["sga_cycle_period"],
+            "decouple_full_sync_interval_and_period":
+                canonical["sga_cycle_decouple_full_sync_interval_and_period"],
+            "full_sync_interval": canonical["sga_cycle_full_sync_interval"],
+        },
+        "checks": {"count_guard": canonical["sga_checks_count_guard"]},
+        "shadow": canonical["sga_shadow"],
+        "shadow_score": canonical["sga_shadow_score"],
+        "score": _axis("score"),
+        "selection": _axis("selection"),
+        "optimizer": _axis("optimizer"),
+        "backend": _axis("backend"),
+    }
+    if canonical["sga_trace_dir"] is not None:
+        engine_config["trace"] = {
+            "dir": canonical["sga_trace_dir"],
+            "branch_points": canonical["sga_trace_branch_points"],
+            "window": canonical["sga_trace_window"],
+        }
+    return engine_config
+
+
 def build_engine(flat: dict, api_version: int):
     """Validate + assemble the engine from the flat ``sga_*`` dict the
     fork waist collected off the parsed megatron namespace (flags ARE the
@@ -173,14 +215,15 @@ def build_engine(flat: dict, api_version: int):
     from megatron.training import get_args
 
     args = get_args()
-    engine_config, canonical = validate_sga_flat(
+    canonical = validate_sga_flat(
         explicit_from_flat(flat),
         train_iters=getattr(args, "train_iters", None))
-    if engine_config is None:
+    if canonical is None:
         raise ValueError(
             "build_engine called with a disabled/absent SGA configuration "
             "(the waist must key off sga_enabled)"
         )
+    engine_config = materialize_engine_config(canonical)
 
     _assert_args_compatible()
 

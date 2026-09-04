@@ -55,8 +55,7 @@ import torch
 
 from sga.backends import COMM_WARMUP_ENV, RESUME_OVERRIDE_ENV
 from sga.kernels import pack_selected
-from sga.config.validation import expand_plugin_params
-from sga.plugins import BackendDecl
+from sga.plugins import BackendDecl, expand_plugin_params
 
 DECL = BackendDecl(
     name="torch_pipelined_index",
@@ -90,8 +89,9 @@ class TorchPipelinedIndexBackend:
     decl = DECL
 
     def __init__(self, params: dict):
-        params = expand_plugin_params("backend", "torch_pipelined_index",
-                                       dict(params))
+        params = expand_plugin_params(
+            "sga_backend_", ("high_priority_group", "slices"), dict(params),
+            "sga_backend (torch_pipelined_index)")
         self._hiprio = bool(params["high_priority_group"])
         self._slices = int(params["slices"])
         if self._slices < 1:

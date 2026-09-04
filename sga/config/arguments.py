@@ -91,9 +91,9 @@ def _add_sga_core_args(parser: argparse.ArgumentParser):
         "--sga-enabled", type=sga_bool, default=False,
         help="master switch: true turns on the SGA engine; false (or a run "
              "with no --sga-* flags at all) is dense training, "
-             "byte-identical to stock megatron. When false, every other "
-             "sga flag must be left at its default (sga-backend may name "
-             "'dense').")
+             "byte-identical to stock megatron. When false no other sga "
+             "flag may be set (an at-default spelling errors in the yaml "
+             "sga: section, is silently dropped on the command line).")
     group.add_argument(
         "--sga-shadow", type=sga_bool, default=False,
         help="shadow mode: replicate the stock optimizer step literally and "
@@ -253,10 +253,10 @@ def _add_sga_backend_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group(
         "SGA backend", "the sparse allreduce transport")
     group.add_argument(
-        "--sga-backend", type=str, default=None,
-        help="backend plugin name, required with --sga-enabled true "
-             "(registered names are the choices; 'dense' is the "
-             "SGA-off representation and is rejected when enabled).")
+        "--sga-backend", type=str, default="dense",
+        help="backend plugin name; the default 'dense' is the SGA-off "
+             "representation — with --sga-enabled true a sparse backend "
+             "must be named (registered names are the choices).")
     group.add_argument(
         "--sga-backend-high-priority-group", type=sga_bool, default=False,
         help="torch_pipelined_index only: run sparse collectives on a twin "

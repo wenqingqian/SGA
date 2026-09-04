@@ -548,7 +548,9 @@ def _cfg_with(**sga_overrides):
 
 
 def _sga_section_to_config(cfg):
-    return validate_run_config(cfg)[0]
+    from sga.runtime import materialize_engine_config
+    canonical = validate_run_config(cfg)
+    return None if canonical is None else materialize_engine_config(canonical)
 
 
 def _expect_error(cfg, needle):

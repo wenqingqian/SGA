@@ -107,9 +107,11 @@ def _sga_resume_guard(args) -> None:
         train_iters = getattr(attrs_owner, "train_iters", None)
         if train_iters is None:
             train_iters = getattr(args, "train_iters", None)
-        _, canonical = validate_sga_flat(
+        canonical = validate_sga_flat(
             explicit_from_flat(collect_sga_flat(attrs_owner)),
             train_iters=train_iters)
+        # a disabled/None canonical serializes as "null" (the guard's
+        # dense-side spelling)
         return canonical_flat_json(canonical)
 
     same = False

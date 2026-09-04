@@ -44,7 +44,6 @@ experiment:
   runner: {type: ssh}
 sga:
   sga_enabled: false
-  sga_backend: dense
 train:
   system: {tensor_model_parallel_size: 1}
   model: {num_layers: 2}

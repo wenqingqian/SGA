@@ -26,9 +26,10 @@ Strict-ratio global topk over the optimizer-materialized score magnitudes:
 
 Params of one method are foreign keys under another and rejected at build
 time (their knobs have no effect there — a silently-dead knob is worse than
-a loud refusal); the per-method vocabularies are the equality
-guards on these params (sga/config/validation.py). Historical note: this
-subject was previously registered as ``circular_topk``.
+a loud refusal); the per-method vocabularies are this plugin's own (the
+literal UNLOCKS table in this module mirrors the config-side rule).
+Historical note: this subject was previously registered as
+``circular_topk``.
 
 "Circular" (the support is regenerated once per cycle period T at the
 full-sync boundary and persists unchanged in between; non-topk coordinates
@@ -37,17 +38,21 @@ next boundary) is ENGINE-CYCLE semantics, not a property of this selector —
 hence the bare registration name ``topk``.
 """
 
-from sga.config.validation import (
-    declared_choices,
-    expand_plugin_params,
-    guard_foreign_params,
-)
-from sga.plugins import SelectionDecl
+from sga.config.validation import declared_choices
+from sga.plugins import SelectionDecl, expand_plugin_params
 from sga.plugins.selection._adaptive import AdaptiveTau
 from sga.plugins.selection._exact import ExactKthvalue
 from sga.plugins.selection._histogram import HistogramSelect
 
 DECL = SelectionDecl(name="topk", output_form="mask")
+
+# topk's own vocabulary: which suffix params it takes (defaults and
+# required-ness live in the argparse declarations — a None default means
+# required); UNLOCKS says which method each guarded param belongs to.
+PARAMS = ("method", "ratio_percent", "histogram_mode",
+          "adaptive_warmup_syncs", "adaptive_warmup_mode")
+UNLOCKS = {"histogram": ("histogram_mode",),
+           "adaptive": ("adaptive_warmup_syncs", "adaptive_warmup_mode")}
 
 
 class TopkSelection:
@@ -57,22 +62,24 @@ class TopkSelection:
     def __init__(self, params: dict):
         raw = dict(params)  # pre-expansion view (explicit keys only)
         method = raw.get("method")
-        # Foreign-key check FIRST, gated on a KNOWN method: a missing or
+        # Dead-config check FIRST, gated on a KNOWN method: a missing or
         # invalid method must surface as the shared validator's
-        # required/choices error, not as a foreign-key refusal (which would
-        # name the raw value and mask the real problem). The per-method
-        # vocabularies live in the validation guards.
+        # required/choices error, not as a dead-config refusal (which would
+        # name the raw value and mask the real problem).
         methods = declared_choices("sga_selection_method")
         if method in methods:
-            foreign, own = guard_foreign_params("selection", "topk", raw)
-            if foreign:
+            own = UNLOCKS.get(method, ())
+            dead = sorted(p for ps in UNLOCKS.values() for p in ps
+                          if p in raw and p not in own)
+            if dead:
                 raise ValueError(
-                    f"sga.selection (topk): params {foreign} do not belong to "
-                    f"method '{method}' (it takes {own or 'no extra params'}) — "
+                    f"sga_selection (topk): params {dead} do not belong to "
+                    f"method '{method}' (it takes {sorted(own) or 'no extra params'}) — "
                     "under this method they would be silently dead; drop them "
                     "or switch the method"
                 )
-        params = expand_plugin_params("selection", "topk", raw)
+        params = expand_plugin_params("sga_selection_", PARAMS, raw,
+                                      "sga_selection (topk)")
         self.params = params
         self.method = method
         self.ratio_percent = float(params["ratio_percent"])

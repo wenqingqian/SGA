@@ -4,25 +4,28 @@
 The declarations file (sga/config/arguments.py) is the single source of
 the config surface; these tests make that STRUCTURAL, not disciplinary:
 
-  INV-1 no orphans, either direction: every registered plugin has
-       attribution rows in validation._AXIS_PARAMS and vice versa; the
-       fork-side waist registers exactly one non-config sga_ key (its
-       override switch) and no --sga-config remains anywhere.
+  INV-1 no central plugin table: validation owns no plugin vocabulary
+       (the rewrite deleted _AXIS_PARAMS and the expand/guard helpers
+       from it — each plugin's params are the plugin's own business);
+       the fork-side waist registers exactly one non-config sga_ key
+       (its override switch) and no --sga-config remains anywhere.
   INV-2 flags are exactly the declarations: the schema dump, the
        launcher's key check and the training entry's parser all derive
-       from sga_actions(); every sga_<axis>_* dest carries attribution
-       (no dead plugin flag); engine-side default reads equal
-       engine_section_defaults() for every section.
+       from sga_actions(); engine-side default reads equal
+       engine_section_defaults() for every section; the canonical flat
+       dict + runtime materialization carry every declared section key.
   INV-3 the declarations stay megatron-shaped: arguments.py contains
        only imports, the two type callables, add_argument_group and
        add_argument calls (AST-pinned — no validation logic grows in
        the file a developer reads for the knob list).
   INV-4 every knob is documented: help non-empty, kind known, default
        explicit; the historical surface is pinned as a golden table.
-  INV-5 guards resolve: every attribution guard names a same-axis param
-       whose declared choices contain the guarded value; topk's mode
-       choices stay synced with the kernel impls; the foreign-key and
-       unknown-method error paths are pinned byte-wise.
+  INV-5 value rules, pinned behaviorally: topk's mode choices stay
+       synced with the kernel impls; the dead-config (param of another
+       method) refusals name the own vocabulary on BOTH layers
+       (validation and the constructor); a missing/invalid method keeps
+       the plain required/choices error; each plugin's constructor
+       rejects foreign and missing params itself.
 """
 
 import ast
@@ -35,13 +38,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sga.config import validation as V
 from sga.config.arguments import add_sga_args, sga_bool, sga_int_or_null
 from sga.config.validation import (
-    _AXIS_PARAMS,
     _param_kind,
-    axis_param_defaults,
     declared_choices,
     engine_section_defaults,
-    expand_plugin_params,
-    guard_foreign_params,
     sga_actions,
     sga_defaults,
     validate_sga_flat,
@@ -67,17 +66,15 @@ def _fork_waist_path():
 
 
 # ---------------------------------------------------------------- INV-1
-def test_inv1_attribution_matches_registries():
-    """Registered plugin names == attribution keys, per axis, both ways."""
-    from sga.plugins import register_default_plugins, registered_names
-
-    register_default_plugins()
-    names = registered_names()
-    for axis in ("selection", "optimizer", "backend"):
-        assert sorted(_AXIS_PARAMS[axis]) == names[axis], axis
-    # the score axis is registry data with NO params: no dests may exist
-    assert not [d for d in sga_actions() if d.startswith("sga_score_")]
-    print("ok: attribution <-> registries, both directions")
+def test_inv1_validation_owns_no_plugin_vocabulary():
+    """No central plugin-param table exists: validation has neither the
+    attribution table nor the expand/guard helpers (a plugin's params
+    are the plugin's own business); the plugins package owns the shared
+    expansion path."""
+    assert not hasattr(V, "_AXIS_PARAMS")
+    assert not hasattr(V, "expand_plugin_params")
+    assert not hasattr(V, "guard_foreign_params")
+    print("ok: validation owns no plugin vocabulary")
 
 
 def test_inv1_fork_registers_exactly_the_override_switch():
@@ -96,32 +93,17 @@ def test_inv1_fork_registers_exactly_the_override_switch():
 # ---------------------------------------------------------------- INV-2
 def test_inv2_schema_and_launcher_derive_from_declarations():
     """The schema dump and the launcher's accepted keys ARE the parser's
-    dests — there is no second key table anywhere in the pipeline."""
-    import json
-
-    schema = json.loads(json.dumps({}))  # import shim
+    dests — there is no second key table anywhere in the pipeline (and
+    the schema no longer carries a plugin-attribution section)."""
     from sga.config.__main__ import _schema
 
     schema = _schema()
+    assert set(schema) == {"flags"}
     assert set(schema["flags"]) == set(sga_actions())
     # the launcher validates yaml keys against sga_actions via
     # validate_run_config: an unknown key is rejected with the dest list
     expect_error(lambda: validate_sga_flat({"sga_nope": 1}), "sga_nope")
     print("ok: schema/launcher/declaration vocabularies coincide")
-
-
-def test_inv2_every_plugin_dest_is_attributed():
-    """Every sga_<axis>_* dest belongs to some plugin's attribution rows
-    (a flag nobody attributes is a dead knob); and every attribution
-    suffix has a declared dest (a row without a flag is undeclarable)."""
-    for axis in ("selection", "optimizer", "backend"):
-        prefix = f"sga_{axis}_"
-        dest_suffixes = {d[len(prefix):] for d in sga_actions()
-                         if d.startswith(prefix) and d != prefix[:-1]}
-        row_suffixes = {s for rows in _AXIS_PARAMS[axis].values()
-                        for s, _ in rows}
-        assert dest_suffixes == row_suffixes, axis
-    print("ok: plugin dests <-> attribution rows, both directions")
 
 
 def test_inv2_engine_defaults_equal_declarations():
@@ -146,13 +128,17 @@ def test_inv2_engine_defaults_equal_declarations():
 
 
 def test_inv2_validation_materializes_every_section_key():
-    """A minimal enabled config materializes complete engine sections:
-    every engine-section dest appears in the canonical dict and the
-    engine config sections carry exactly the declared keys."""
-    eng, canon = validate_sga_flat({
+    """A minimal enabled config yields complete sections: every
+    engine-section dest appears in the canonical flat dict, and the
+    engine's nested read shape (assembled by
+    runtime.materialize_engine_config) carries exactly the declared
+    keys."""
+    from sga.runtime import materialize_engine_config
+    canon = validate_sga_flat({
         "sga_enabled": True, "sga_score": "update",
         "sga_selection_method": "exact", "sga_selection_ratio_percent": 5.0,
         "sga_optimizer": "adamw", "sga_backend": "torch_pipelined_index"})
+    eng = materialize_engine_config(canon)
     for section in ("cycle", "checks", "trace"):
         declared = engine_section_defaults(section)
         prefix = f"sga_{section}_"
@@ -254,7 +240,7 @@ def test_inv4_historical_surface_pinned():
         "sga_optimizer": (None, "str", ()),
         "sga_optimizer_residual_mean": (False, "bool", ()),
         "sga_optimizer_merge_join_dir": ("table", "str", ("table", "binary")),
-        "sga_backend": (None, "str", ()),
+        "sga_backend": ("dense", "str", ()),
         "sga_backend_high_priority_group": (False, "bool", ()),
         "sga_backend_slices": (2, "int", ()),
         "sga_backend_num_slices": (0, "int", ()),
@@ -269,21 +255,6 @@ def test_inv4_historical_surface_pinned():
 
 
 # ---------------------------------------------------------------- INV-5
-def test_inv5_guards_resolve_inside_the_axis():
-    for axis, plugins in _AXIS_PARAMS.items():
-        all_rows = {s for rows in plugins.values() for s, _ in rows}
-        for name, rows in plugins.items():
-            for suffix, requires in rows:
-                assert suffix in all_rows
-                if requires is None:
-                    continue
-                other, value = requires
-                dest = f"sga_{axis}_{other}"
-                assert other in all_rows, (axis, other)
-                assert value in declared_choices(dest), (axis, other, value)
-    print("ok: every guard resolves to a sibling choice")
-
-
 def test_inv5_topk_mode_choices_synced_with_kernel():
     """The method choices must stay sync'd with the impl classes topk
     dispatches to (a stale choice = a config-time lie): the declared
@@ -305,31 +276,76 @@ def test_inv5_topk_mode_choices_synced_with_kernel():
     print("ok: topk method choices synced with kernel impls")
 
 
-def test_inv5_foreign_key_refusal_names_own_vocabulary():
-    foreign, own = guard_foreign_params(
-        "selection", "topk", {"method": "histogram",
-                              "adaptive_warmup_mode": "exact"})
-    assert foreign == ["adaptive_warmup_mode"]
-    assert own == ["histogram_mode"]
-    params = expand_plugin_params("selection", "topk",
-                                  {"method": "histogram",
-                                   "ratio_percent": 10.0})
-    assert params["histogram_mode"] == "exact"  # default expanded
-    expect_error(
-        lambda: validate_sga_flat({
-            "sga_enabled": True, "sga_score": "update",
+def test_inv5_dead_config_refusal_names_own_vocabulary():
+    """A param of another method is refused on BOTH layers, naming what
+    the configured method does take; defaults expand from the
+    declarations."""
+    from sga.plugins.selection.topk import TopkSelection
+
+    base = {"sga_enabled": True, "sga_score": "update",
             "sga_selection_method": "histogram",
             "sga_selection_ratio_percent": 10.0,
-            "sga_selection_adaptive_warmup_mode": "exact",
             "sga_optimizer": "adamw",
-            "sga_backend": "torch_pipelined_index"}),
+            "sga_backend": "torch_pipelined_index"}
+    expect_error(
+        lambda: validate_sga_flat({**base,
+                                   "sga_selection_adaptive_warmup_mode": "exact"}),
         "do not belong to method 'histogram'")
-    print("ok: foreign-key refusal names the own vocabulary")
+    # constructor layer: same refusal, directly constructed
+    expect_error(
+        lambda: TopkSelection({"method": "exact", "ratio_percent": 10.0,
+                               "histogram_mode": "fast"}),
+        "do not belong to method 'exact'")
+    # constructor precedence: a missing or invalid method keeps the
+    # shared validator's required/choices error even with a guarded
+    # param present (the dead-config gate is method-gated)
+    expect_error(
+        lambda: TopkSelection({"ratio_percent": 10.0,
+                               "histogram_mode": "fast"}),
+        "param 'method' is required")
+    expect_error(
+        lambda: TopkSelection({"method": "hystogram", "ratio_percent": 10.0,
+                               "histogram_mode": "fast"}),
+        "must be one of")
+    # defaults expand from the declarations (single source)
+    sel = TopkSelection({"method": "histogram", "ratio_percent": 10.0})
+    assert sel.params["histogram_mode"] == "exact"
+    print("ok: dead-config refusal names the own vocabulary (both layers)")
+
+
+def test_inv5_unlock_tables_in_sync():
+    """Validation's dead-config refusal tracks the plugin's own UNLOCKS
+    table for EVERY (method, param) pair (the table is duplicated on the
+    two layers by design; a silent drift would move the yaml-route
+    refusal to per-rank build time): under the owning method the param
+    validates cleanly, under any other method it is refused."""
+    from sga.plugins.selection.topk import UNLOCKS
+
+    param_values = {"histogram_mode": "fast",
+                    "adaptive_warmup_syncs": 3,
+                    "adaptive_warmup_mode": "fast"}
+    base = {"sga_enabled": True, "sga_score": "update",
+            "sga_selection_ratio_percent": 10.0,
+            "sga_optimizer": "adamw",
+            "sga_backend": "torch_pipelined_index"}
+    for owner, params in UNLOCKS.items():
+        for method in declared_choices("sga_selection_method"):
+            for param in params:
+                flat = {**base, "sga_selection_method": method,
+                        f"sga_selection_{param}": param_values[param]}
+                if method == owner:
+                    canon = validate_sga_flat(flat)
+                    assert canon[f"sga_selection_{param}"] == \
+                        param_values[param]
+                else:
+                    expect_error(lambda f=flat: validate_sga_flat(f),
+                                 "do not belong to method")
+    print("ok: validation refusal tracks the plugin UNLOCKS table")
 
 
 def test_inv5_topk_unknown_method_keeps_validator_error():
     """A missing or invalid method surfaces as the required/choices error,
-    never as a foreign-key refusal naming the raw value (0024 C1)."""
+    never as a dead-config refusal naming the raw value (0024 C1)."""
     expect_error(
         lambda: validate_sga_flat({
             "sga_enabled": True, "sga_score": "update",
@@ -337,16 +353,41 @@ def test_inv5_topk_unknown_method_keeps_validator_error():
             "sga_selection_histogram_mode": "fast",
             "sga_optimizer": "adamw",
             "sga_backend": "torch_pipelined_index"}),
-        "param 'method' is required")
+        "sga_selection_method is required")
     expect_error(
         lambda: validate_sga_flat({
             "sga_enabled": True, "sga_score": "update",
             "sga_selection_method": "hystogram",
             "sga_selection_ratio_percent": 10.0,
+            "sga_selection_histogram_mode": "fast",
             "sga_optimizer": "adamw",
             "sga_backend": "torch_pipelined_index"}),
         "must be one of ['adaptive', 'exact', 'histogram']")
     print("ok: unknown method keeps the validator error")
+
+
+def test_inv5_plugin_vocabularies_are_plugin_owned():
+    """Each plugin's constructor enforces its OWN vocabulary: foreign
+    params (declared flags of another plugin) and missing required ones
+    fail loud at build time — the only place plugin params are known."""
+    from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
+    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
+    from sga.plugins.selection.topk import TopkSelection
+
+    expect_error(lambda: TorchPipelinedIndexBackend({"num_slices": 3}),
+                 "unknown params ['num_slices']")
+    expect_error(lambda: NcclPipelinedIndexBackend({"slices": 3}),
+                 "unknown params ['slices']")
+    expect_error(lambda: TopkSelection({"ratio_percent": 10.0}),
+                 "param 'method' is required")
+    # and validation itself stays silent on foreign-but-declared params
+    # (values only — it does not know plugin vocabularies)
+    base = {"sga_enabled": True, "sga_score": "update",
+            "sga_selection_method": "exact", "sga_selection_ratio_percent": 5.0,
+            "sga_optimizer": "adamw", "sga_backend": "torch_pipelined_index",
+            "sga_backend_num_slices": 3}
+    assert validate_sga_flat(base)["sga_backend_num_slices"] == 3
+    print("ok: plugin vocabularies are plugin-owned (build-time)")
 
 
 def _run_all():

@@ -3,9 +3,8 @@
 
 - ``schema``: the full config surface, introspected from the declarations
   (sga/config/arguments.py): every flag with its dest/default/choices/
-  help, plus the per-axis plugin attribution (which params belong to
-  which plugin, and their equality guards) and the registered plugin
-  names.
+  help. (Which params belong to which plugin is the plugins' own
+  business — there is no central attribution table to dump.)
 - ``resolve <run.yaml>``: load a run config, validate the ``sga:``
   section, and dump the RESOLVED canonical flat dict — the exact form
   the engine prints at build time (percent resolved away, defaults
@@ -18,7 +17,6 @@ import json
 import sys
 
 from sga.config.validation import (
-    _AXIS_PARAMS,
     _param_kind,
     sga_actions,
     validate_run_config,
@@ -39,16 +37,7 @@ def _schema() -> dict:
             **({"choices": list(action.choices)} if action.choices else {}),
             "help": action.help,
         }
-    return {
-        "flags": flags,
-        "axis_attribution": {
-            axis: {name: [{"param": suffix,
-                          **({"requires": list(requires)} if requires else {})}
-                         for suffix, requires in rows]
-                   for name, rows in sorted(plugins.items())}
-            for axis, plugins in _AXIS_PARAMS.items()
-        },
-    }
+    return {"flags": flags}
 
 
 def _resolved(path: str) -> dict:
@@ -58,7 +47,7 @@ def _resolved(path: str) -> dict:
         cfg = OmegaConf.load(path)
     except Exception as e:  # a raw OmegaConf traceback helps nobody
         raise SystemExit(f"sga.config: cannot load {path}: {e}") from None
-    _, canonical = validate_run_config(cfg)
+    canonical = validate_run_config(cfg)
     if canonical is None:
         return {"sga": "disabled (dense)"}
     return canonical

@@ -377,11 +377,8 @@ def test_nccl_pipelined_index_decl_and_loud_gates():
     assert be.decl is DECL and DECL.name == "nccl_pipelined_index"
     assert be.decl.consumes == "idx"  # engine routes by this attribute
     # single launch per sync (each extra slice = one more full kernel
-    # invocation): no slicing vocabulary remains (the catalog row is empty),
-    # and a stale config carrying it fails loud
-    from sga.config.validation import _AXIS_PARAMS
-
-    assert _AXIS_PARAMS["backend"]["nccl_pipelined_index"] == ()
+    # invocation): no slicing vocabulary remains (the plugin takes no
+    # params), and a stale config carrying it fails loud
     try:
         NcclPipelinedIndexBackend({"slices": 3})
         raise AssertionError("removed `slices` param accepted")
