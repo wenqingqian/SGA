@@ -54,21 +54,28 @@ hydra:
     dir: ${experiment.exp_dir}/hydra
 
 sga:
-  enabled: true
-  cycle:
-    start_iter: 20
-    period: 8
-  score:
-    name: update
-  selection:
-    name: topk
-    method: histogram
-    ratio_percent: 10.0
-  optimizer:
-    name: adamw
-    residual_mean: false
-  backend:
-    name: torch_pipelined_index
+  # Flat SGA arguments — the same vocabulary as the --sga-* flags
+  # (underscores instead of hyphens). See sga/config/arguments.py for
+  # every knob, its default and its semantics.
+  sga_enabled: true
+
+  # cycle: the reselection calendar
+  sga_cycle_start_iter: 20
+  sga_cycle_period: 8
+
+  # score: the boundary score (registry data, no params)
+  sga_score: update
+
+  # selection (topk): method + its params
+  sga_selection_method: histogram
+  sga_selection_ratio_percent: 10
+
+  # optimizer (adamw)
+  sga_optimizer: adamw
+  sga_optimizer_residual_mean: false
+
+  # backend: sparse allreduce transport
+  sga_backend: torch_pipelined_index
 
 #### model ####
 

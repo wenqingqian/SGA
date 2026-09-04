@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Fork-side inertness tests: without --sga-config the waist is a no-op.
+"""Fork-side inertness tests: without sga_enabled the waist is a no-op.
 
-The megatron fork's contract: the unified plugin
-interface must be invisible to pure dense runs. Verifies on the real fork
-source (PYTHONPATH includes Megatron-LM):
+The megatron fork's contract: the unified plugin interface must be
+invisible to pure dense runs. Verifies on the real fork source (PYTHONPATH
+includes Megatron-LM):
 
-- add_sga_args adds exactly the two reserved flags, default-inactive;
-- without a config the waist never builds an engine, never imports ``sga``,
-  and attach/grad_sync/optimizer_step are inert;
-- _config_from_args parses the canonical JSON string (never a filesystem
-  path) and rejects malformed payloads with the offending input named.
+- add_sga_args registers exactly ONE fork-owned flag (the resume override);
+  the --sga-config JSON transport is retired (flags are the transport);
+- without sga_enabled=true (including a stock namespace that carries no
+  sga_* attributes at all) the waist never builds an engine, never imports
+  ``sga``, and attach/grad_sync/optimizer_step are inert;
+- _config_from_args collects the sga_* attributes (its own override switch
+  excluded) and keys off sga_enabled alone.
 
 Run in the container: PYTHONPATH=SGA:Megatron-LM python tests/test_waist_inert.py
 """
@@ -83,7 +85,7 @@ def _with_args(**kw):
 def test_add_sga_args_flags():
     parser = sga_waist.add_sga_args(_StubParser())
     flags = [f for _, g in parser.groups for f in g.flags]
-    assert sorted(flags) == ["--sga-allow-config-override", "--sga-config"]
+    assert flags == ["--sga-allow-config-override"]
     titles = [t for t, _ in parser.groups]
     assert titles == ["SGA"]
 
@@ -92,7 +94,9 @@ def test_inactive_without_config():
     _reset_waist()
     snapshot = dict(sys.modules)
     _purge_sga_modules()
-    saved = _with_args(sga_config="", sga_allow_config_override=False)
+    # a stock namespace carries no sga_* attributes at all; a dense SGA
+    # run carries sga_enabled=false — both must be inert
+    saved = _with_args(sga_allow_config_override=False, sga_enabled=False)
     try:
         assert sga_waist._config_from_args() is None
         assert sga_waist._get_engine() is None
@@ -101,6 +105,8 @@ def test_inactive_without_config():
         assert sga_waist.grad_sync(_Any(), force_all_reduce=False) is False
         assert sga_waist.optimizer_step(_Any(), [_Any()], 1) is None
         assert "sga.runtime" not in sys.modules  # never imported when inert
+        _mt.get_args = lambda: SimpleNamespace(x=1)  # stock: no sga_* at all
+        assert sga_waist._config_from_args() is None
     finally:
         _mt.get_args = saved
         _restore_modules(snapshot)
@@ -108,13 +114,12 @@ def test_inactive_without_config():
 
 
 def test_fail_fast_when_sga_unimportable():
-    """--sga-config set but the sga package unimportable: the failure must
+    """sga_enabled but the sga package unimportable: the failure must
     surface at engine-build time with an actionable message, never at the
     first optimizer step."""
     _reset_waist()
     snapshot = dict(sys.modules)
-    canonical = '{"cycle": {"start_iter": 0, "period": 1}}'
-    saved = _with_args(sga_config=canonical, sga_allow_config_override=False)
+    saved = _with_args(sga_enabled=True, sga_allow_config_override=False)
     # Block the submodule import: a None entry in sys.modules makes any
     # import of it raise ImportError ("halted"), simulating a missing package.
     sys.modules["sga.runtime"] = None
@@ -123,7 +128,7 @@ def test_fail_fast_when_sga_unimportable():
             sga_waist._get_engine()
             raise AssertionError("unimportable sga did not fail fast")
         except ImportError as e:
-            assert "--sga-config" in str(e) and "PYTHONPATH" in str(e), e
+            assert "sga_enabled" in str(e) and "PYTHONPATH" in str(e), e
         assert sga_waist._engine_failed is True  # never retried silently
         assert sga_waist.active() is False
     finally:
@@ -141,15 +146,9 @@ def test_api_version_mismatch_rejected_at_build():
     try:
         from sga.runtime import SGA_API_VERSION, build_engine
 
-        config = {
-            "score": {"name": "abs_m"},
-            "selection": {"name": "topk"},
-            "optimizer": {"name": "adamw"},
-            "backend": {"name": "torch_pipelined_mask"},
-            "cycle": {},
-        }
+        flat = {"sga_enabled": True}
         try:
-            build_engine(config, api_version=SGA_API_VERSION + 1)
+            build_engine(flat, api_version=SGA_API_VERSION + 1)
             raise AssertionError("API-version mismatch was not rejected")
         except ValueError as e:
             assert "version" in str(e), e
@@ -157,23 +156,17 @@ def test_api_version_mismatch_rejected_at_build():
         _restore_modules(snapshot)
 
 
-def test_config_from_args_parses_json_string_not_path():
+def test_config_from_args_collects_flat_attrs():
     _reset_waist()
-    canonical = ('{"cycle": {"period": 8, '
-                 '"decouple_full_sync_interval_and_period": true, '
-                 '"full_sync_interval": 4}}')
-    saved = _with_args(sga_config=canonical, sga_allow_config_override=False)
+    saved = _with_args(sga_enabled=True, sga_cycle_period=8,
+                       sga_allow_config_override=False, unrelated=42)
     try:
         cfg = sga_waist._config_from_args()
-        assert isinstance(cfg, dict) and cfg["cycle"]["period"] == 8
-        # a filesystem path is not a JSON payload
+        assert cfg == {"sga_enabled": True, "sga_cycle_period": 8}, cfg
+        # disabled runs never reach the sga package
         _mt.get_args = lambda: SimpleNamespace(
-            sga_config="/tmp/nonexistent.json", sga_allow_config_override=False)
-        try:
-            sga_waist._config_from_args()
-            raise AssertionError("a path was accepted as the config payload")
-        except ValueError:
-            pass
+            sga_enabled=False, sga_cycle_period=8)
+        assert sga_waist._config_from_args() is None
     finally:
         _mt.get_args = saved
         _reset_waist()

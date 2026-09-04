@@ -26,8 +26,8 @@ Strict-ratio global topk over the optimizer-materialized score magnitudes:
 
 Params of one method are foreign keys under another and rejected at build
 time (their knobs have no effect there — a silently-dead knob is worse than
-a loud refusal); the per-method vocabularies are the catalog's equality
-guards on these params (sga/config/arguments.py). Historical note: this
+a loud refusal); the per-method vocabularies are the equality
+guards on these params (sga/config/validation.py). Historical note: this
 subject was previously registered as ``circular_topk``.
 
 "Circular" (the support is regenerated once per cycle period T at the
@@ -37,12 +37,12 @@ next boundary) is ENGINE-CYCLE semantics, not a property of this selector —
 hence the bare registration name ``topk``.
 """
 
-from sga.plugins import (
-    SelectionDecl,
-    guard_foreign_keys,
-    plugin_params,
-    resolve_plugin_params,
+from sga.config.validation import (
+    declared_choices,
+    expand_plugin_params,
+    guard_foreign_params,
 )
+from sga.plugins import SelectionDecl
 from sga.plugins.selection._adaptive import AdaptiveTau
 from sga.plugins.selection._exact import ExactKthvalue
 from sga.plugins.selection._histogram import HistogramSelect
@@ -55,17 +55,16 @@ class TopkSelection:
     decl = DECL
 
     def __init__(self, params: dict):
-        raw = dict(params)  # pre-resolution view (explicit keys only)
+        raw = dict(params)  # pre-expansion view (explicit keys only)
         method = raw.get("method")
         # Foreign-key check FIRST, gated on a KNOWN method: a missing or
         # invalid method must surface as the shared validator's
         # required/choices error, not as a foreign-key refusal (which would
         # name the raw value and mask the real problem). The per-method
-        # vocabularies live in the catalog's guards.
-        methods = next(p for p in plugin_params("selection", "topk")
-                       if p.name == "method").choices
+        # vocabularies live in the validation guards.
+        methods = declared_choices("sga_selection_method")
         if method in methods:
-            foreign, own = guard_foreign_keys("selection", "topk", raw)
+            foreign, own = guard_foreign_params("selection", "topk", raw)
             if foreign:
                 raise ValueError(
                     f"sga.selection (topk): params {foreign} do not belong to "
@@ -73,7 +72,7 @@ class TopkSelection:
                     "under this method they would be silently dead; drop them "
                     "or switch the method"
                 )
-        params = resolve_plugin_params("selection", "topk", raw)
+        params = expand_plugin_params("selection", "topk", raw)
         self.params = params
         self.method = method
         self.ratio_percent = float(params["ratio_percent"])

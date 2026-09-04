@@ -43,10 +43,8 @@ experiment:
   task: {type: train, backend: megatron, entrypoint: ./sga/train_gpt.py}
   runner: {type: ssh}
 sga:
-  score: {enabled: false}
-  selection: {enabled: false}
-  optimizer: {enabled: false}
-  backend: {name: dense}
+  sga_enabled: false
+  sga_backend: dense
 train:
   system: {tensor_model_parallel_size: 1}
   model: {num_layers: 2}
@@ -253,7 +251,7 @@ def test_entry_args_provider_returns_parser():
     assert out is parser, "extra_args_provider must return the parser"
     # the SGA flat vocabulary actually registered on it
     table = audit_megatron_args.dump_table(out)
-    assert "--sga-enabled" in table and "--sga-score-name" in table
+    assert "--sga-enabled" in table and "--sga-score" in table
     print("ok: entry extra_args_provider returns the parser with --sga-* flags")
 
 

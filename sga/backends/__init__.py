@@ -4,9 +4,10 @@
 Backend classes live in this package; their declarations, registration, and
 construction go through the single plugin registry in ``sga.plugins``
 (``register_default_plugins`` / ``build_backend_plugin``) — there is no
-separate registry here. "dense" is not a backend class: the config loader
-treats the name as the SGA-off representation, and the engine's full-sync
-steps delegate to the fork's dense allreduce directly.
+separate registry here. "dense" is not a backend class: the config
+validation core (sga/config/validation.py) treats the name as the
+SGA-off representation, and the engine's full-sync steps delegate to the
+fork's dense allreduce directly.
 """
 
 # The pipelined backends' single operator knobs — the resume fail-closed

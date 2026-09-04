@@ -1,292 +1,275 @@
 # Copyright (c) 2026, SGA framework contributors.
-"""THE sga parameter catalog — the single declaration source.
+"""The SGA arguments — a plain megatron-style declaration file.
 
-This file is a PURE DATA TABLE: every sga config item — the engine sections
-(top level / cycle / checks / trace) AND every plugin axis' params — is
-declared HERE and nowhere else, with its type, default, choices and doc.
-Read it top to bottom and you have seen the entire controllable surface of
-SGA. It is the megatron ``arguments.py`` analog: the place you open to
-answer "what can I configure?".
+This is the ONE file a developer reads to see every SGA knob: each
+``add_argument`` line carries the flag, the type, the default and the
+semantics. There are no classes and no tables — declarations only; the
+validation that needs cross-argument context lives in
+``sga/config/validation.py`` and derives its vocabulary from THIS file
+by parser introspection (never restated).
 
-Everything else DERIVES from this table; nothing may restate a declaration:
+The same flat vocabulary is the whole user-facing config surface, 1:1:
 
-  - the ``--sga-*`` flat-flag vocabulary, the nested-yaml -> flag
-    translation and the flag -> canonical-JSON assembly
-    (``sga/config/flatargs.py``)
-  - the loader's key allowlists and the plugin-param checks
-    (``sga/config/loader.py``, ``sga/plugins/__init__.py``)
-  - engine-side ``.get(key, default)`` fallbacks (engine.py / trace.py /
-    runtime.py) — the catalog default is the only default
-  - the schema/resolve inspection CLI (``python -m sga.config``)
+    yaml ``sga:`` section key == flag with ``-`` spelled ``_`` == the
+    ``sga_*`` attribute the megatron namespace (and every checkpoint)
+    carries.  There is no second form, no nested section, no JSON blob.
 
-Adding a plugin or a param means adding a row here (the registry join in
-``sga/plugins`` fails loud at registration when either side is missing).
-The table must stay mechanically pure — no imports of sga code, no
-functions, data assignments only — pinned by tests/test_config_catalog.py.
+Pipeline (flags ARE the transport — nothing is re-serialized on the
+way in):
 
-Guard metadata (``requires``) carries same-plugin conditional legality: a
-param with ``requires=("method", "histogram")`` is only legal when the
-sibling param ``method`` equals ``histogram`` (topk's per-method
-vocabularies). Equality guards only — cross-axis conditions and numeric
-relations stay in the code validators (``validate_combination``).
+    yaml ``sga:`` keys --launcher--> ``--sga-*`` flags
+                                        |
+    hand-written flags ----------------> megatron argparse (this file)
+                                        |
+                             args namespace (``sga_*`` attrs)
+                                        |
+              fork waist collects ``sga_*`` attrs -> ``build_engine``
+                                        |
+              ``sga/config/validation.py`` -> engine config (internal)
+
+Conventions (single-sourced here, consumed by introspection):
+  - booleans use the ``sga_bool`` string type ("true"/"false", any
+    case) so the namespace carries real bools; the launcher emits the
+    same spelling.
+  - ``sga_selection_adaptive_warmup_syncs`` additionally accepts the
+    explicit ``null`` spelling (``sga_int_or_null``): "null" disables
+    the warmup gate, which is distinct from the default 5.
+  - ``sga_trace_branch_points`` rides as one comma-joined token
+    (megatron list style); ``sga_cycle_start_iter_percent`` is resolved
+    against ``train_iters`` during validation.
+
+Axis-identity flags (``--sga-score``/``--sga-selection``/...) take
+registered plugin names; the registries are runtime data, so the value
+check happens in validation against ``sga.plugins.registered_names()``,
+not as argparse ``choices``. "Required" below means required when
+``--sga-enabled true`` (a dense run passes no SGA flags at all).
 """
 
-from dataclasses import dataclass
+import argparse
 
 
-@dataclass(frozen=True)
-class Param:
-    """One config-item declaration (the catalog's only type).
-
-    ``type`` is the yaml-side scalar type (bool/int/float/str; ``list``
-    rides as one comma-joined flat-flag token); ``choices`` (non-empty)
-    restricts str params; ``nullable`` admits an explicit null (flat-flag
-    spelling ``null``); required params carry no default; ``requires`` is
-    an equality guard (sibling name, sibling value) under which alone the
-    param is legal; ``yaml_only`` params get no flat flag (they need
-    context only the launcher-side translation has).
-
-    Input-semantics convention: ``required`` means required in the
-    canonical enabled-form engine config (the loader may still accept the
-    key absent — such a row's doc says so); ``default=None`` on an
-    optional row marks an ABSENCE sentinel (absent == unset), not a null
-    default, unless the row's doc says the null default is meaningful
-    (branch_points).
-    """
-
-    name: str
-    type: object
-    required: bool = False
-    default: object = None
-    doc: str = ""
-    choices: tuple = ()
-    nullable: bool = False
-    requires: tuple = ()
-    yaml_only: bool = False
+def sga_bool(text):
+    """Argparse type for SGA booleans: "true"/"false" (any case) -> bool."""
+    if isinstance(text, bool):
+        return text
+    t = str(text).strip().lower()
+    if t == "true":
+        return True
+    if t == "false":
+        return False
+    raise argparse.ArgumentTypeError(
+        f"must be 'true' or 'false' (got {text!r})")
 
 
-# ====================================================================
-# engine top level (sga.enabled / sga.shadow / ...)
-# ====================================================================
+def sga_int_or_null(text):
+    """Argparse type for a nullable int: "null" -> None, else int."""
+    if text is None:
+        return None
+    if isinstance(text, str) and text.strip().lower() == "null":
+        return None
+    return int(text)
 
-TOP = (
-    Param(
-        "enabled", bool, required=True,
-        doc="master switch: true turns on the SGA engine; false (or a run "
-            "with no sga config at all) is dense training, byte-identical "
-            "to stock megatron — then the section may only name "
-            "backend: dense. The loader accepts an absent enabled and "
-            "treats it as false; required refers to the enabled form",
-    ),
-    Param(
-        "shadow", bool, default=False,
-        doc="shadow mode: replicate the stock optimizer step literally and "
-            "only READ state at cycle boundaries (dense numerics "
-            "invariant); the score is still computed read-only at "
-            "boundaries for offline analysis",
-    ),
-    Param(
-        "shadow_score", bool, default=True,
-        doc="false strips even the read-only boundary scoring from a "
-            "shadow run (the pure stock-replication probe); only "
-            "meaningful with shadow: true",
-    ),
-)
 
-# ====================================================================
-# engine cycle (sga.cycle.*) — the reselection calendar
-# ====================================================================
+def add_sga_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Register every SGA flag (called from the training entry's
+    ``extra_args_provider`` chain). Groups mirror the config axes."""
+    _add_sga_core_args(parser)
+    _add_sga_cycle_args(parser)
+    _add_sga_checks_args(parser)
+    _add_sga_trace_args(parser)
+    _add_sga_score_args(parser)
+    _add_sga_selection_args(parser)
+    _add_sga_optimizer_args(parser)
+    _add_sga_backend_args(parser)
+    return parser
 
-CYCLE = (
-    Param(
-        "start_iter", int, default=0,
-        doc="engine step the cycle calendar anchors at; the first "
-            "reselection happens at start_iter + period (before that the "
-            "run is dense warmup)",
-    ),
-    Param(
-        "start_iter_percent", float, yaml_only=True,
-        doc="alternative spelling of start_iter as a percent of "
-            "train.model.train_iters, resolved to the absolute step in "
-            "the loader before anything is serialized (needs the "
-            "train_iters context, hence yaml-only and absent from the "
-            "canonical config); mutually exclusive with start_iter",
-    ),
-    Param(
-        "period", int, default=1,
-        doc="reselection period T (>= 1): the support is regenerated at "
-            "full-sync boundaries every T steps and persists unchanged in "
-            "between; residual accumulates on unselected coordinates",
-    ),
-    Param(
-        "decouple_full_sync_interval_and_period", bool, default=False,
-        doc="decouple the full-sync (residual fold + score emission) "
-            "interval from the reselection period; true requires "
-            "full_sync_interval to be set to a strict divisor of period",
-    ),
-    Param(
-        "full_sync_interval", int,
-        doc="full sync every N steps, N a strict divisor of period with "
-            "N < period; only legal alongside "
-            "decouple_full_sync_interval_and_period: true — absent means "
-            "every cycle boundary is a full sync",
-    ),
-)
 
-# ====================================================================
-# engine checks (sga.checks.*) — consistency machinery toggles
-# ====================================================================
+def _add_sga_core_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(
+        "SGA core", "master switch and engine modes")
+    group.add_argument(
+        "--sga-enabled", type=sga_bool, default=False,
+        help="master switch: true turns on the SGA engine; false (or a run "
+             "with no --sga-* flags at all) is dense training, "
+             "byte-identical to stock megatron. When false, every other "
+             "sga flag must be left at its default (sga-backend may name "
+             "'dense').")
+    group.add_argument(
+        "--sga-shadow", type=sga_bool, default=False,
+        help="shadow mode: replicate the stock optimizer step literally and "
+             "only READ state at cycle boundaries (dense numerics "
+             "invariant); the score is still computed read-only at "
+             "boundaries for offline analysis.")
+    group.add_argument(
+        "--sga-shadow-score", type=sga_bool, default=True,
+        help="false strips even the read-only boundary scoring from a "
+             "shadow run (the pure stock-replication probe); only "
+             "meaningful with --sga-shadow true.")
 
-CHECKS = (
-    Param(
-        "count_guard", bool, default=True,
-        doc="layer-1 consistency guard: cross-rank element-count check of "
-            "the selected support at each activation (runs once per cycle "
-            "on cached counts); off is a research escape hatch, not a "
-            "production setting",
-    ),
-)
 
-# ====================================================================
-# engine trace (sga.trace.*) — offline replay data collection
-# ====================================================================
+def _add_sga_cycle_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(
+        "SGA cycle", "the reselection calendar")
+    group.add_argument(
+        "--sga-cycle-start-iter", type=int, default=0,
+        help="engine step the cycle calendar anchors at; the first "
+             "reselection happens at start_iter + period (before that "
+             "the run is dense warmup). Default 0. Mutually exclusive "
+             "with --sga-cycle-start-iter-percent when both are "
+             "explicitly set; on this flag route a value equal to the "
+             "default 0 counts as unset.")
+    group.add_argument(
+        "--sga-cycle-start-iter-percent", type=float, default=None,
+        help="alternative spelling of --sga-cycle-start-iter as a percent "
+             "of train-iters, resolved to the absolute step during "
+             "validation (range [0, 100]); mutually exclusive with an "
+             "explicitly set --sga-cycle-start-iter (a flag value equal "
+             "to the default 0 counts as unset; on the yaml route an "
+             "explicit sga_cycle_start_iter: 0 key counts as set).")
+    group.add_argument(
+        "--sga-cycle-period", type=int, default=1,
+        help="reselection period T (>= 1): the support is regenerated at "
+             "full-sync boundaries every T steps and persists unchanged "
+             "in between; residual accumulates on unselected "
+             "coordinates. Default 1.")
+    group.add_argument(
+        "--sga-cycle-decouple-full-sync-interval-and-period",
+        type=sga_bool, default=False,
+        help="decouple the full-sync (residual fold + score emission) "
+             "interval from the reselection period; true requires "
+             "--sga-cycle-full-sync-interval to be a strict divisor of "
+             "the period. Default false.")
+    group.add_argument(
+        "--sga-cycle-full-sync-interval", type=int, default=None,
+        help="full sync every N steps, N a strict divisor of the period "
+             "with N < period; only legal alongside --sga-cycle-decouple-"
+             "full-sync-interval-and-period true — unset means every "
+             "cycle boundary is a full sync.")
 
-TRACE = (
-    Param(
-        "dir", str, required=True,
-        doc="trace output directory; setting the sga.trace section at all "
-            "activates the collector (an engine-side service — rejected "
-            "when sga.enabled is false)",
-    ),
-    Param(
-        "branch_points", list, default=None,
-        doc="engine steps to dump full optimizer state at (comma string "
-            "or int list; sorted, deduped, >= 0); none = no state dumps",
-    ),
-    Param(
-        "window", int, default=100,
-        doc="gradient-capture window length after each branch point "
-            "(>= 1)",
-    ),
-)
 
-ENGINE_SECTIONS = {"cycle": CYCLE, "checks": CHECKS, "trace": TRACE}
+def _add_sga_checks_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(
+        "SGA checks", "consistency-machinery toggles (research escape hatches)")
+    group.add_argument(
+        "--sga-checks-count-guard", type=sga_bool, default=True,
+        help="layer-1 consistency guard: cross-rank element-count check of "
+             "the selected support at each activation (runs once per "
+             "cycle on cached counts); off is a research escape hatch, "
+             "not a production setting. Default true.")
 
-# ====================================================================
-# score axis (sga.score.name) — registry DATA, no tunable params
-# ====================================================================
-# The score formulas themselves are registry data with their own docs in
-# sga/plugins/scores.py (name -> formula + emission mode + doc); the name
-# list below mirrors the registry and is kept in sync by the no-orphan
-# invariant test. Any key besides `name` on this axis is a typo.
 
-SCORE_NAMES = ("abs_g", "abs_m", "coi", "update")
+def _add_sga_trace_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(
+        "SGA trace", "offline replay data collection (engine-side service)")
+    group.add_argument(
+        "--sga-trace-dir", type=str, default=None,
+        help="trace output directory; setting it at all activates the "
+             "collector (rejected when --sga-enabled false — dense "
+             "replay-grade traces come from shadow runs).")
+    group.add_argument(
+        "--sga-trace-branch-points", type=str, default=None,
+        help="engine steps to dump full optimizer state at, as one "
+             "comma-joined token (or a yaml int list); sorted, deduped, "
+             ">= 0. Leave the flag unset for no state dumps — an explicit "
+             "null is NOT the unset spelling (it is rejected; only "
+             "--sga-selection-adaptive-warmup-syncs accepts null).")
+    group.add_argument(
+        "--sga-trace-window", type=int, default=100,
+        help="gradient-capture window length after each branch point "
+             "(>= 1). Default 100.")
 
-# ====================================================================
-# selection axis (sga.selection.*) — one registered subject: topk
-# ====================================================================
 
-SELECTION_PARAMS = {
-    "topk": (
-        Param(
-            "method", str, required=True,
-            choices=("adaptive", "exact", "histogram"),
-            doc="selection algorithm: adaptive = persistent tau controller; "
-                "exact = kthvalue + OR-merge; histogram = bit-pattern "
-                "histogram select",
-        ),
-        Param(
-            "ratio_percent", float, required=True,
-            doc="topk mask ratio in percent, strictly inside (0, 100)",
-        ),
-        Param(
-            "histogram_mode", str, default="exact",
-            choices=("balanced", "exact", "fast"),
-            requires=("method", "histogram"),
-            doc="method=histogram: geometry tier exact / balanced / fast",
-        ),
-        Param(
-            "adaptive_warmup_syncs", int, default=5, nullable=True,
-            requires=("method", "adaptive"),
-            doc="method=adaptive: gated warmup selects before the "
-                "persistent tau takes over (null disables the warmup "
-                "gate)",
-        ),
-        Param(
-            "adaptive_warmup_mode", str, default="fast",
-            choices=("balanced", "exact", "fast"),
-            requires=("method", "adaptive"),
-            doc="method=adaptive: histogram tier used to bootstrap/steer "
-                "the adaptive tau",
-        ),
-    ),
-}
+def _add_sga_score_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(
+        "SGA score", "the boundary score (registry data, no params)")
+    group.add_argument(
+        "--sga-score", type=str, default=None,
+        help="score plugin name (required with --sga-enabled true). "
+             "Registered names are the choices; there are no score "
+             "params — any --sga-score-* flag is a typo.")
 
-# ====================================================================
-# optimizer axis (sga.optimizer.*) — one registered template: adamw
-# ====================================================================
 
-OPTIMIZER_PARAMS = {
-    "adamw": (
-        Param(
-            "residual_mean", bool, default=False,
-            doc="pre-fold the accumulated residual by the fold window "
-                "(the accumulation span between full syncs) at full-sync "
-                "boundaries (residual-mean semantics)",
-        ),
-        Param(
-            "merge_join_dir", str, default="table",
-            choices=("table", "binary"),
-            doc="compact-path merge-join bracket source: 'table' builds a "
-                "1024-stride directory table of lower_bound(idx, j*1024) "
-                "once per selection cycle (the bucket idx is frozen "
-                "within a cycle, so the table cannot go stale) and "
-                "brackets both lower_bounds to <=1024 candidates "
-                "(~0.5ms build, amortized over the cycle's sparse steps); "
-                "'binary' keeps the plain full-depth bisection (the "
-                "historical form). Silently ignored on writeback "
-                "backends and the torch fallback path (no compact "
-                "merge-join there)",
-        ),
-    ),
-}
+def _add_sga_selection_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(
+        "SGA selection", "the support-selection subject (topk)")
+    group.add_argument(
+        "--sga-selection", type=str, default="topk",
+        help="selection plugin name (registered names are the choices). "
+             "Default topk — currently the only subject, so the flag is "
+             "omittable.")
+    group.add_argument(
+        "--sga-selection-method", type=str, default=None,
+        choices=("adaptive", "exact", "histogram"),
+        help="selection algorithm (required with --sga-enabled true): "
+             "adaptive = persistent tau controller; exact = kthvalue + "
+             "OR-merge; histogram = bit-pattern histogram select.")
+    group.add_argument(
+        "--sga-selection-ratio-percent", type=float, default=None,
+        help="topk mask ratio in percent, strictly inside (0, 100) "
+             "(required with --sga-enabled true).")
+    group.add_argument(
+        "--sga-selection-histogram-mode", type=str, default="exact",
+        choices=("balanced", "exact", "fast"),
+        help="method=histogram only: geometry tier. Default exact.")
+    group.add_argument(
+        "--sga-selection-adaptive-warmup-syncs", type=sga_int_or_null,
+        default=5,
+        help="method=adaptive only: gated warmup selects before the "
+             "persistent tau takes over; 'null' disables the warmup "
+             "gate. Default 5.")
+    group.add_argument(
+        "--sga-selection-adaptive-warmup-mode", type=str, default="fast",
+        choices=("balanced", "exact", "fast"),
+        help="method=adaptive only: histogram tier used to bootstrap/steer "
+             "the adaptive tau. Default fast.")
 
-# ====================================================================
-# backend axis (sga.backend.*) — sparse allreduce transport selection
-# ====================================================================
 
-BACKEND_PARAMS = {
-    "torch_pipelined_index": (
-        Param(
-            "high_priority_group", bool, default=False,
-            doc="run sparse collectives on a twin high-priority NCCL "
-                "group (true selects the legacy pipelined_idx_sorted "
-                "TRANSPORT MODE only — reproducing that former "
-                "configuration also needs slices: 3; false: legacy "
-                "indexed_sparse on the training world's own group)",
-        ),
-        Param(
-            "slices", int, default=2,
-            doc="number of idx slices pipelined against the allreduces "
-                "(enforced >= 1)",
-        ),
-    ),
-    "torch_pipelined_mask": (
-        Param(
-            "num_slices", int, default=0,
-            doc="mask slices pipelined against NCCL ops (0 = auto, i.e. 2)",
-        ),
-    ),
-    "nccl_pipelined_index": (),
-}
+def _add_sga_optimizer_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(
+        "SGA optimizer", "the optimizer template (adamw)")
+    group.add_argument(
+        "--sga-optimizer", type=str, default=None,
+        help="optimizer plugin name, required with --sga-enabled true "
+             "(registered names are the choices).")
+    group.add_argument(
+        "--sga-optimizer-residual-mean", type=sga_bool, default=False,
+        help="pre-fold the accumulated residual by the fold window (the "
+             "accumulation span between full syncs) at full-sync "
+             "boundaries (residual-mean semantics). Default false.")
+    group.add_argument(
+        "--sga-optimizer-merge-join-dir", type=str, default="table",
+        choices=("table", "binary"),
+        help="compact-path merge-join bracket source: 'table' builds a "
+             "1024-stride directory table of lower_bound(idx, j*1024) "
+             "once per selection cycle (the bucket idx is frozen within "
+             "a cycle, so the table cannot go stale) and brackets both "
+             "lower_bounds to <=1024 candidates; 'binary' keeps the "
+             "plain full-depth bisection (the historical form). "
+             "Silently ignored on writeback backends and the torch "
+             "fallback path. Default table.")
 
-# No mutation after import: plugin_params()/the registration join read this
-# dict live while flatargs caches its flag table with no invalidation — a
-# post-import edit desynchronizes parser choices, the join and unknown-dest
-# rejection (loudly, but confusingly). Test scaffolds must restore any row
-# they add.
-PLUGIN_PARAMS = {
-    "selection": SELECTION_PARAMS,
-    "optimizer": OPTIMIZER_PARAMS,
-    "backend": BACKEND_PARAMS,
-}
+
+def _add_sga_backend_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(
+        "SGA backend", "the sparse allreduce transport")
+    group.add_argument(
+        "--sga-backend", type=str, default=None,
+        help="backend plugin name, required with --sga-enabled true "
+             "(registered names are the choices; 'dense' is the "
+             "SGA-off representation and is rejected when enabled).")
+    group.add_argument(
+        "--sga-backend-high-priority-group", type=sga_bool, default=False,
+        help="torch_pipelined_index only: run sparse collectives on a twin "
+             "high-priority NCCL group (true selects the legacy "
+             "pipelined_idx_sorted TRANSPORT MODE only — reproducing that "
+             "former configuration also needs slices 3; false: legacy "
+             "indexed_sparse on the training world's own group). "
+             "Default false.")
+    group.add_argument(
+        "--sga-backend-slices", type=int, default=2,
+        help="torch_pipelined_index only: number of idx slices pipelined "
+             "against the allreduces (enforced >= 1). Default 2.")
+    group.add_argument(
+        "--sga-backend-num-slices", type=int, default=0,
+        help="torch_pipelined_mask only: mask slices pipelined against "
+             "NCCL ops (0 = auto, i.e. 2). Default 0.")

@@ -1,26 +1,27 @@
 # Copyright (c) 2026, SGA framework contributors.
 """Engine builder — the single entry the fork's sga_waist imports.
 
-``build_engine(config, api_version)`` validates the four-field config against
-the plugin registries (declaration-based, no scheme names), enforces the v1
-config-time assertion set against the megatron args, constructs the four
-plugin objects and returns the SGAEngine. Failures surface HERE (during model
-construction), never at the first optimizer step.
+``build_engine(config, api_version)`` validates the flat ``sga_*`` config
+against the plugin registries (declaration-based, no scheme names),
+enforces the config-time assertion set against the megatron args,
+constructs the four plugin objects and returns the SGAEngine. Failures
+surface HERE (during model construction), never at the first optimizer
+step.
 """
-
-import json
 
 import torch
 
-from sga.config.arguments import CYCLE
+from sga.config.validation import (
+    canonical_flat_json,
+    explicit_from_flat,
+    validate_sga_flat,
+)
 
-SGA_API_VERSION = 1
-
-_CYCLE_DEFAULTS = {p.name: p.default for p in CYCLE if not p.required}
+SGA_API_VERSION = 2
 
 
 def _assert_args_compatible() -> None:
-    """v1 config-time assertion set.
+    """Config-time assertion set (the v2 flat-args contract).
 
     Backend-specific requirements do NOT live here as name branches — a
     backend plugin may expose an optional ``validate_runtime(args)`` hook
@@ -33,11 +34,11 @@ def _assert_args_compatible() -> None:
 
     def _require(cond, why):
         if not cond:
-            raise ValueError(f"SGA v1 is incompatible with this configuration: {why}")
+            raise ValueError(f"SGA is incompatible with this configuration: {why}")
 
     _require(not getattr(args, "use_distributed_optimizer", False),
-             "--use-distributed-optimizer must be off (v1 supports the "
-             "allreduce 'replicated world' path only)")
+             "--use-distributed-optimizer must be off (only the "
+             "allreduce 'replicated world' path is supported)")
     _require(not getattr(args, "overlap_grad_reduce", False),
              "--overlap-grad-reduce must be off (future-work axis)")
     _require(not getattr(args, "calculate_per_token_loss", False),
@@ -47,30 +48,30 @@ def _assert_args_compatible() -> None:
              "--reuse-grad-buf-for-mxfp8-param-ag must be off (its eval path "
              "calls zero_grad_buffer unconditionally)")
     _require(getattr(args, "tensor_model_parallel_size", 1) == 1,
-             "tensor_model_parallel_size must be 1 in v1 (sequence-parallel "
+             "tensor_model_parallel_size must be 1 (sequence-parallel "
              "non-tensor grads allreduce would write residual coordinates)")
     # megatron leaves vpp either unset or None when the feature is off
     # (arguments.py picks per config path), so normalize before comparing.
     _require((getattr(args, "virtual_pipeline_model_parallel_size", None) or 1) == 1,
-             "virtual-pipeline model parallelism is excluded in v1 "
+             "virtual-pipeline model parallelism is excluded "
              "(multiple local chunks per rank consume the per-step full/"
              "sparse phase latch independently and would mix dense and "
              "sparse sync within one step)")
     _require(
         getattr(args, "expert_model_parallel_size", 1) == 1,
-        "expert_model_parallel_size must be 1 in v1 (expert params create a "
+        "expert_model_parallel_size must be 1 (expert params create a "
         "second inner optimizer behind the chain-of-1 assert, and the "
         "ranked-selection world-scaling assumes dp_cp replication)",
     )
     _require(
         not getattr(args, "num_experts", None),
-        "num_experts must be unset in v1 (expert routing creates the same "
+        "num_experts must be unset (expert routing creates the same "
         "second-inner-optimizer / non-replicated-world problems as EP)",
     )
     _require(
         getattr(args, "pipeline_model_parallel_size", 1) == 1
         or getattr(args, "untie_embeddings_and_output_weights", False),
-        "tied embeddings with pipeline parallelism are excluded in v1 "
+        "tied embeddings with pipeline parallelism are excluded "
         "(embedding grads allreduce touches the shared buffer)",
     )
     _require(
@@ -90,13 +91,13 @@ def _assert_args_compatible() -> None:
     # each unscale also multiplies the uncommunicated residual accumulated
     # across sparse steps, which decays by ~inv_scale per step and mixes
     # scaled/unscaled units under dynamic scaling. Proper fp16 support
-    # (unscale at accumulation) is out of v1 scope; bf16 runs scaler-free.
+    # (unscale at accumulation) is out of scope; bf16 runs scaler-free.
     _require(not getattr(args, "fp16", False),
-             "--fp16 is unsupported in v1 (the dynamic-loss-scaling unscale "
+             "--fp16 is unsupported (the dynamic-loss-scaling unscale "
              "decays the uncommunicated residual through its aliased fp32 "
              "bucket buffer)")
     _require(bool(getattr(args, "bf16", False)),
-             "SGA v1 expects bf16 mixed-precision training (fp32 main grads); "
+             "SGA expects bf16 mixed-precision training (fp32 main grads); "
              "fp16 and fp32 paths are rejected (see the fp16 note above)")
     # The unscale hazard is NOT fp16-only: megatron builds a
     # ConstantGradScaler for bf16 too whenever --loss-scale is set
@@ -125,7 +126,7 @@ def _assert_args_compatible() -> None:
     except ImportError:
         pass
 
-    # check_grads nan/large check inside start_grad_sync (v1 sparse path
+    # check_grads nan/large check inside start_grad_sync (the sparse path
     # skips the dense start_grad_sync; keep the flags off for parity).
     _require(not getattr(args, "check_for_nan_in_grad", False),
              "--check-for-nan-in-grad must be off")
@@ -141,8 +142,10 @@ def _assert_args_compatible() -> None:
                  "is decoupled AdamW)")
 
 
-def build_engine(config: dict, api_version: int):
-    """Validate + assemble the engine from the four-field config dict."""
+def build_engine(flat: dict, api_version: int):
+    """Validate + assemble the engine from the flat ``sga_*`` dict the
+    fork waist collected off the parsed megatron namespace (flags ARE the
+    transport — there is no JSON form anymore)."""
     from sga.plugins import (
         build_backend_plugin,
         build_optimizer,
@@ -155,44 +158,55 @@ def build_engine(config: dict, api_version: int):
         validate_combination,
     )
 
+    # Hard-coupled to megatron's get_args() by design: the fork waist is
+    # this builder's only caller. The version check deliberately precedes
+    # the megatron import so a mismatch raises even without megatron
+    # importable.
     if api_version != SGA_API_VERSION:
         raise ValueError(
             f"SGA API version mismatch: fork waist speaks v{api_version}, "
             f"sga package speaks v{SGA_API_VERSION}"
         )
 
-    register_default_plugins()
+    # The waist hands the RAW namespace collection (argparse defaults
+    # included); validation consumes the explicit diff.
+    from megatron.training import get_args
+
+    args = get_args()
+    engine_config, canonical = validate_sga_flat(
+        explicit_from_flat(flat),
+        train_iters=getattr(args, "train_iters", None))
+    if engine_config is None:
+        raise ValueError(
+            "build_engine called with a disabled/absent SGA configuration "
+            "(the waist must key off sga_enabled)"
+        )
+
     _assert_args_compatible()
 
-    for axis in ("score", "selection", "optimizer", "backend"):
-        if not isinstance(config.get(axis), dict) or "name" not in config[axis]:
-            raise ValueError(
-                f"SGA config: axis '{axis}' must be a dict with a 'name' field"
-            )
-    cycle = config.get("cycle", {})
-    if int(cycle.get("period", _CYCLE_DEFAULTS["period"])) < 1:
-        raise ValueError("SGA config: cycle.period must be >= 1")
+    # Defensive re-derivation (validation already checked membership and
+    # the cross-axis rules; the decls are needed for construction anyway).
+    score_name = engine_config["score"]["name"]
+    selection_name = engine_config["selection"]["name"]
+    optimizer_name = engine_config["optimizer"]["name"]
+    backend_name = engine_config["backend"]["name"]
 
-    score_name = config["score"]["name"]
-    selection_name = config["selection"]["name"]
-    optimizer_name = config["optimizer"]["name"]
-    backend_name = config["backend"]["name"]
-
+    register_default_plugins()
     get_score_spec(score_name)  # unknown score fails with the registered list
     selection_decl = get_selection_decl(selection_name)
     optimizer_decl = get_optimizer_decl(optimizer_name)
     backend_decl = get_backend_plugin_decl(backend_name)
 
     validate_combination(score_name, selection_decl, optimizer_decl,
-                         backend_decl, cycle)
+                         backend_decl)
 
-    selection = build_selection(selection_name, dict(config["selection"]))
+    selection = build_selection(selection_name, dict(engine_config["selection"]))
     # Scores are materialized by the optimizer template on full steps; inject
     # WHICH score to emit so the kernel picks the right mode (the validator
     # above already proved the template can emit it).
-    opt = build_optimizer(optimizer_name, dict(config["optimizer"]),
+    opt = build_optimizer(optimizer_name, dict(engine_config["optimizer"]),
                           emit_score=score_name)
-    backend = build_backend_plugin(backend_name, dict(config["backend"]))
+    backend = build_backend_plugin(backend_name, dict(engine_config["backend"]))
 
     # Optional backend-owned runtime validation, probed generically (the
     # same optional-hook discipline as adapt()/wants_force_full()): topology
@@ -205,14 +219,9 @@ def build_engine(config: dict, api_version: int):
 
     from sga.engine import SGAEngine
 
-    engine = SGAEngine(config, score_name, selection, opt, backend)
+    engine = SGAEngine(engine_config, score_name, selection, opt, backend)
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        canonical = json.dumps(config, sort_keys=True)
-        print(f"[SGA] engine built (API v{api_version}); config: {canonical}", flush=True)
+        print(f"[SGA] engine built (API v{api_version}); config: "
+              f"{canonical_flat_json(canonical)}", flush=True)
     return engine
-
-
-def canonical_config_json(config: dict) -> str:
-    """Canonical (sorted-key) resolved JSON — the ONLY form --sga-config takes."""
-    return json.dumps(config, sort_keys=True)

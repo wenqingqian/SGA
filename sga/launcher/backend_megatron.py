@@ -15,6 +15,7 @@ import shlex
 
 from omegaconf import DictConfig, OmegaConf
 
+from sga.config import validate_run_config
 from sga.launcher.backend_base import BackendBase
 from sga.launcher.utils import (
     flatten_dict_to_args,
@@ -45,18 +46,27 @@ def _get_args_megatron(config: DictConfig):
     # Flatten the dictionary to a list of arguments
     args = flatten_dict_to_args(new_config_dict, ignore_keys)
 
-    # The sga: section becomes VISIBLE flat flags (--sga-*; validated and
-    # percent-resolved by sga_section_to_config here, at launch time). The
-    # training entry re-assembles them into the canonical args.sga_config
-    # JSON the waist reads — the opaque single-JSON injection is gone, but
-    # the fork-side contract (ckpt-self-contained via args, no file paths)
-    # is preserved: the JSON rides INSIDE the checkpointed args namespace.
-    from sga.config.flatargs import sga_config_to_flags
-    from sga.config.loader import sga_section_to_config
+    # The sga: section (FLAT keys — the same vocabulary as the --sga-*
+    # flags, underscores instead of hyphens) becomes the visible flags
+    # themselves: validated here at launch time (fail-fast before any
+    # process is spawned; the training entry re-validates on its parsed
+    # namespace). There is no translation layer and no JSON form.
+    from sga.config.validation import sga_actions
 
-    sga_engine_config = sga_section_to_config(config)
-    if sga_engine_config is not None:
-        args += sga_config_to_flags(sga_engine_config)
+    validate_run_config(config)
+    sga = OmegaConf.to_container(config.sga, resolve=True)
+    for dest in sorted(sga):
+        value = sga[dest]
+        action = sga_actions()[dest]  # unknown keys already rejected above
+        if value is None:
+            value = "null"  # the explicit-null spelling (sga_int_or_null)
+        elif isinstance(value, bool):
+            value = "true" if value else "false"
+        elif isinstance(value, (list, tuple)):
+            value = ",".join(str(v) for v in value)
+        else:
+            value = str(value)
+        args.extend([action.option_strings[0], value])
 
     return args
 

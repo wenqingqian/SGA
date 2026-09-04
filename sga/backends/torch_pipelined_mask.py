@@ -19,7 +19,8 @@ synchronous).
 
 import torch
 
-from sga.plugins import BackendDecl, resolve_plugin_params
+from sga.config.validation import expand_plugin_params
+from sga.plugins import BackendDecl
 
 DECL = BackendDecl(
     name="torch_pipelined_mask",
@@ -33,7 +34,7 @@ class TorchPipelinedMaskBackend:
     decl = DECL
 
     def __init__(self, params: dict):
-        params = resolve_plugin_params("backend", "torch_pipelined_mask",
+        params = expand_plugin_params("backend", "torch_pipelined_mask",
                                        dict(params))
         self.num_slices = int(params["num_slices"]) or 2
 

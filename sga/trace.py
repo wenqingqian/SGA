@@ -60,9 +60,9 @@ from typing import Dict, List, Optional
 
 import torch
 
-from sga.config.arguments import TRACE
+from sga.config.validation import engine_section_defaults
 
-_TRACE_DEFAULTS = {p.name: p.default for p in TRACE if not p.required}
+_TRACE_DEFAULTS = engine_section_defaults("trace")
 
 
 def parse_branch_points(spec) -> List[int]:

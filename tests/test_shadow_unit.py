@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omegaconf import OmegaConf
 
-from sga.config import sga_section_to_config
+from sga.config import validate_run_config
 from sga.engine import SGAEngine
 from sga.plugins import (
     Score,
@@ -525,12 +525,14 @@ _BASE = {
                             "entrypoint": "./sga/train_gpt.py"},
                    "runner": {"type": "ssh"}},
     "sga": {
-        "enabled": True,
-        "cycle": {"start_iter": 0, "period": 8},
-        "score": {"name": "abs_m"},
-        "selection": {"name": "topk", "method": "histogram", "ratio_percent": 30.0},
-        "optimizer": {"name": "adamw"},
-        "backend": {"name": "torch_pipelined_index"},
+        "sga_enabled": True,
+        "sga_cycle_start_iter": 0,
+        "sga_cycle_period": 8,
+        "sga_score": "abs_m",
+        "sga_selection_method": "histogram",
+        "sga_selection_ratio_percent": 30.0,
+        "sga_optimizer": "adamw",
+        "sga_backend": "torch_pipelined_index",
     },
     "train": {"system": {"tensor_model_parallel_size": 1},
               "model": {"num_layers": 2},
@@ -541,13 +543,17 @@ _BASE = {
 def _cfg_with(**sga_overrides):
     cfg = OmegaConf.create(_BASE)
     for k, v in sga_overrides.items():
-        cfg.sga[k] = v
+        cfg.sga["sga_" + k] = v
     return cfg
+
+
+def _sga_section_to_config(cfg):
+    return validate_run_config(cfg)[0]
 
 
 def _expect_error(cfg, needle):
     try:
-        sga_section_to_config(cfg)
+        _sga_section_to_config(cfg)
     except (ValueError, AssertionError) as e:
         assert needle in str(e), f"missing '{needle}': {e}"
         return
@@ -555,27 +561,25 @@ def _expect_error(cfg, needle):
 
 
 def test_loader_shadow_validation():
-    out = sga_section_to_config(_cfg_with(shadow=True))
-    assert out["shadow"] is True and "shadow_score" not in out  # default on
+    # sections materialize complete: shadow defaults carry real values
+    # (False == the old absent-by-meaning key; engine .get defaults match)
+    out = _sga_section_to_config(_cfg_with(shadow=True))
+    assert out["shadow"] is True and out["shadow_score"] is True
 
-    out = sga_section_to_config(_cfg_with(shadow=False))
-    assert "shadow" not in out  # explicit false = plain live, no shadow key
+    out = _sga_section_to_config(_cfg_with(shadow=False))
+    assert out["shadow"] is False  # plain live
 
-    out = sga_section_to_config(_cfg_with(shadow=True, shadow_score=False))
+    out = _sga_section_to_config(_cfg_with(shadow=True, shadow_score=False))
     assert out["shadow_score"] is False
 
-    _expect_error(_cfg_with(shadow="yes"), "boolean")
-    _expect_error(_cfg_with(shadow_score=False), "sga.shadow is not true")
-    _expect_error(_cfg_with(shadow=True, shadow_score="no"), "boolean")
+    _expect_error(_cfg_with(shadow="yes"), "bool")
+    _expect_error(_cfg_with(shadow_score=False), "sga_shadow is not true")
+    _expect_error(_cfg_with(shadow=True, shadow_score="no"), "bool")
 
     cfg = OmegaConf.create(_BASE)
-    cfg.sga.enabled = False
-    cfg.sga.score = None
-    cfg.sga.selection = None
-    cfg.sga.optimizer = None
-    cfg.sga.backend = {"name": "dense"}
-    cfg.sga.shadow = True
-    _expect_error(cfg, "enabled is false")
+    cfg.sga = {"sga_enabled": False, "sga_backend": "dense",
+               "sga_shadow": True}
+    _expect_error(cfg, "sga_enabled is false")
     print("PASS test_loader_shadow_validation")
 
 

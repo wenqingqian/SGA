@@ -1,5 +1,19 @@
-"""Single-layer yaml config loading and SGA-section validation."""
+# Copyright (c) 2026, SGA framework contributors.
+"""Flat SGA config surface: declarations in arguments.py, validation here.
 
-from sga.config.loader import sga_section_to_config, validate_config, validate_sga_section
+See sga/config/arguments.py (the developer-facing file) and
+sga/config/validation.py (the validation core)."""
 
-__all__ = ["sga_section_to_config", "validate_config", "validate_sga_section"]
+from sga.config.validation import (
+    canonical_flat_json,
+    validate_run_config,
+    validate_sga_args,
+    validate_sga_flat,
+)
+
+__all__ = [
+    "canonical_flat_json",
+    "validate_run_config",
+    "validate_sga_args",
+    "validate_sga_flat",
+]

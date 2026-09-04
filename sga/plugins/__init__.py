@@ -9,17 +9,14 @@ class plugins that each declare their attributes. The combination validator
 checks legality from those declarations — there is NO hardcoded list of
 legal combinations and NO scheme names anywhere in the engine.
 
-Every plugin's PARAMETER VOCABULARY is declared in ONE place: the catalog
-(``sga/config/arguments.py`` — open it to see every config item, default
-and doc). Plugin DECLs carry NO params; this registry joins the catalog by
-(axis, plugin name) — a registered plugin without a catalog row (or a
-catalog row without a plugin) fails loud, at registration for the former
-and in tests/test_config_catalog.py for the latter. The loader rejects
-unknown keys against the catalog (a typo'd param fails at launch instead
-of being silently swallowed by ``params.get``), the flat-flag vocabulary
-(sga/config/flatargs.py) is generated from the same table, and
-constructors read their defaults through ``resolve_plugin_params`` instead
-of restating them.
+Plugin PARAMS carry no declarations here: the flat flags live in
+``sga/config/arguments.py`` (plain add_argument lines) and the
+per-plugin attribution + equality guards in ``sga/config/validation.py``
+(``_AXIS_PARAMS``). Constructors expand their params through
+``sga.config.validation.expand_plugin_params`` — defaults come from the
+declarations, never restated. The registry↔attribution sync is pinned by
+tests (a registered plugin without attribution rows, or an attribution
+row for an unknown plugin, fails the invariant suite).
 
 Declaration facts used by the validator (see ``validate_combination``):
   - Optimizer.emittable_scores: the score names this template's full-step
@@ -34,26 +31,20 @@ Declaration facts used by the validator (see ``validate_combination``):
     hands (idx, values) back; the optimizer must declare that its sparse
     path consumes that handoff, or the combination is rejected.
 
-Cycle-calendar legality is engine-level (not optimizer-declared): reselection
-boundaries are structurally full syncs, so the residual fold contract holds
-for any decoupled full-sync interval that divides the period.
+Cycle-calendar legality is engine-level and lives in
+sga.config.validation (flat keys).
 """
 
 from dataclasses import dataclass
 from typing import Literal
 
-from sga.config.arguments import CYCLE, Param, PLUGIN_PARAMS
 from sga.plugins.scores import Score, ScoreSpec, get_score_spec, score_names
 
 __all__ = [
     "Score",
     "ScoreSpec",
-    "Param",
     "get_score_spec",
     "score_names",
-    "plugin_params",
-    "guard_foreign_keys",
-    "effective_param_names",
     "SelectionDecl",
     "OptimizerDecl",
     "BackendDecl",
@@ -64,134 +55,12 @@ __all__ = [
     "get_optimizer_decl",
     "get_backend_plugin_decl",
     "registered_names",
-    "check_plugin_params",
-    "resolve_plugin_params",
     "validate_combination",
     "build_selection",
     "build_optimizer",
     "build_backend_plugin",
     "register_default_plugins",
 ]
-
-# Cycle defaults derive from the catalog once at import (same pattern as the
-# loader's _ENGINE_DEFAULTS; recomputing per validate_combination call would
-# only re-derive a constant).
-_CYCLE_DEFAULTS = {p.name: p.default for p in CYCLE if not p.required}
-
-
-def plugin_params(axis: str, plugin_name: str) -> tuple:
-    """The plugin's catalog param rows (sga/config/arguments.py — the only
-    place params are declared). The registration-time join assertion makes
-    a missing row impossible for registered plugins; this raises loud for
-    direct callers that bypass registration."""
-    try:
-        return PLUGIN_PARAMS[axis][plugin_name]
-    except KeyError:
-        raise ValueError(
-            f"plugin '{plugin_name}' ({axis} axis) has no param row in "
-            "sga/config/arguments.py — every plugin's vocabulary is "
-            "declared there; add the row (empty tuple for no params)"
-        ) from None
-
-
-def check_plugin_params(axis: str, plugin_name: str, params: dict) -> None:
-    """Fail loud on unknown keys / missing required / wrong types.
-
-    The single param-validation entry shared by the loader (config time) and
-    ``resolve_plugin_params`` (build time): an unknown key here is a typo in
-    a config that ``params.get`` would otherwise silently swallow.
-    """
-    known = {p.name for p in plugin_params(axis, plugin_name)}
-    unknown = sorted(set(params) - known)
-    if unknown:
-        raise ValueError(
-            f"sga.{axis} ({plugin_name}): unknown params {unknown} "
-            f"(known: {sorted(known)})"
-        )
-    for p in plugin_params(axis, plugin_name):
-        if p.name not in params:
-            if p.required:
-                raise ValueError(
-                    f"sga.{axis} ({plugin_name}): param '{p.name}' is "
-                    "required"
-                )
-            continue
-        _check_value(axis, plugin_name, p, params[p.name])
-
-
-def _check_value(axis: str, plugin_name: str, p: "Param", val) -> None:
-    """Validate one (param, value) pair: nullability, type, choices."""
-    if val is None:
-        if p.nullable:
-            return
-        raise ValueError(
-            f"sga.{axis} ({plugin_name}): param '{p.name}' is not "
-            "nullable (got null)"
-        )
-    if p.type is bool:
-        ok = isinstance(val, bool)
-    elif p.type is int:
-        # bool is an int subclass; yaml true/false must not pass as 1/0
-        ok = isinstance(val, int) and not isinstance(val, bool)
-    elif p.type is float:
-        ok = (isinstance(val, (int, float)) and not isinstance(val, bool))
-    else:
-        ok = isinstance(val, p.type)
-    if not ok:
-        raise ValueError(
-            f"sga.{axis} ({plugin_name}): param '{p.name}' must be "
-            f"{p.type.__name__} (got {val!r})"
-        )
-    if p.choices and val not in p.choices:
-        raise ValueError(
-            f"sga.{axis} ({plugin_name}): param '{p.name}' must be one "
-            f"of {list(p.choices)} (got {val!r})"
-        )
-
-
-def resolve_plugin_params(axis: str, plugin_name: str,
-                          params: dict) -> dict:
-    """Validate and expand a params dict to its full defaulted form.
-
-    The constructors' single read path: defaults come from the CATALOG,
-    never from a restated ``params.get(name, default)``.
-    """
-    check_plugin_params(axis, plugin_name, params)
-    out = {p.name: p.default for p in plugin_params(axis, plugin_name)
-           if not p.required}
-    out.update(params)
-    return out
-
-
-def _guard_met(p: "Param", params: dict) -> bool:
-    """Is p's equality guard satisfied by this (explicit or resolved)
-    params dict? A missing/unconfigured sibling never satisfies."""
-    other, value = p.requires
-    return params.get(other) == value
-
-
-def guard_foreign_keys(axis: str, plugin_name: str, params: dict) -> tuple:
-    """(foreign, own) under the catalog's equality guards, on an EXPLICIT
-    (pre-resolution) params dict: ``foreign`` are the present params whose
-    guard the dict does not satisfy (knobs of another method — silently
-    dead where they are); ``own`` are the guarded params the sibling value
-    does unlock (for the refusal message). Both derive from the catalog
-    rows; plugins never restate their method vocabularies."""
-    guarded = [p for p in plugin_params(axis, plugin_name) if p.requires]
-    foreign = sorted(p.name for p in guarded
-                     if p.name in params and not _guard_met(p, params))
-    own = sorted(p.name for p in guarded if _guard_met(p, params))
-    return foreign, own
-
-
-def effective_param_names(axis: str, plugin_name: str,
-                          resolved: dict) -> list:
-    """The params a RESOLVED dict should keep for a method-aware view:
-    unguarded params plus those whose equality guard the resolved dict
-    satisfies (the union's other defaults would be foreign keys — the
-    view's own output must reconstruct through the constructor)."""
-    return [p.name for p in plugin_params(axis, plugin_name)
-            if not p.requires or _guard_met(p, resolved)]
 
 
 @dataclass(frozen=True)
@@ -230,7 +99,8 @@ class BackendDecl:
     # and the return value is that values view (empty tensor when nothing
     # was selected) — the engine's clip/grad_correct then consume
     # (idx, values) directly. SGA-internal contract (the waist's three call
-    # points and registries are unchanged), so no SGA_API_VERSION bump.
+    # points and registries are unchanged — folded into the v2 flat-args
+    # API rather than bumping it).
     emission: Literal["writeback", "compact"] = "writeback"
 
 
@@ -266,14 +136,6 @@ def register_backend_plugin(name, decl):
 def _register(axis, registry, name, decl):
     if name in registry:
         raise ValueError(f"Duplicate plugin registration for '{name}'")
-    # THE join: a plugin without a catalog row is undeclarable — refuse at
-    # registration (import time), not at first config read.
-    params = plugin_params(axis, name)
-    # A misdeclared default (wrong type/choices, or None on a non-nullable
-    # param) would otherwise sail through every constructor gate.
-    for p in params:
-        if not p.required:
-            _check_value(axis, name, p, p.default)
     # The engine routes emission by EXACT equality, so a typo'd declaration
     # would silently behave as writeback while the backend skips the
     # writeback scatter. Only backend decls carry the field; the getattr
@@ -323,16 +185,15 @@ def registered_names() -> dict:
 
 
 def validate_combination(score_name: str, selection: SelectionDecl,
-                         optimizer: OptimizerDecl, backend, cycle: dict) -> None:
-    """Declaration-based combination validation (config time, no scheme names).
+                         optimizer: OptimizerDecl, backend) -> None:
+    """Declaration-based CROSS-AXIS combination validation (config time,
+    no scheme names).
 
-    ``backend`` is a BackendDecl; ``cycle`` is the engine cycle config dict
-    (start_iter / period / decouple_full_sync_interval_and_period /
-    full_sync_interval). ``selection`` is accepted for interface
-    completeness only; the cross-axis legality rules live on the
-    optimizer/backend decls (emittable scores; compact emission requires
-    an optimizer that consumes the compact handoff) and the
-    cycle-calendar rules are engine-level (checked below).
+    ``backend`` is a BackendDecl. ``selection`` is accepted for interface
+    completeness only; the rules checked here are the ones the decls
+    declare (emittable scores; compact emission requires an optimizer
+    that consumes the compact handoff). The cycle-calendar rules are
+    engine-level and live in sga.config.validation (flat keys).
     """
     problems = []
     get_score_spec(score_name)  # unknown score fails with the registered list
@@ -350,30 +211,6 @@ def validate_combination(score_name: str, selection: SelectionDecl,
             "(idx, values) handoff (consumes_compact=false) — the "
             "communicated values would never reach the m/v commit and "
             "every sparse step would silently drop them"
-        )
-    period = int(cycle.get("period", _CYCLE_DEFAULTS["period"]))
-    decouple = bool(cycle.get("decouple_full_sync_interval_and_period",
-                              _CYCLE_DEFAULTS["decouple_full_sync_interval_and_period"]))
-    interval = cycle.get("full_sync_interval", None)
-    if not decouple:
-        if interval is not None:
-            problems.append(
-                f"sga.cycle.full_sync_interval is set ({interval}) but "
-                "decouple_full_sync_interval_and_period is false; every "
-                "cycle boundary is already a full sync — leave "
-                "full_sync_interval unset"
-            )
-    elif interval is None:
-        problems.append(
-            "decouple_full_sync_interval_and_period is true but "
-            "sga.cycle.full_sync_interval is unset — set a divisor of the "
-            f"period smaller than it (period={period})"
-        )
-    elif not (0 < int(interval) < period and period % int(interval) == 0):
-        problems.append(
-            f"decoupled full_sync_interval ({interval}) must satisfy "
-            f"0 < full_sync_interval < period ({period}) and "
-            f"period % full_sync_interval == 0"
         )
     if problems:
         raise ValueError("Illegal SGA plugin combination: " + "; ".join(problems))

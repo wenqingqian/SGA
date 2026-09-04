@@ -63,24 +63,19 @@ hydra:
     dir: ${experiment.exp_dir}/hydra
 
 sga:
-  enabled: true
-  cycle:
-    start_iter: 4
-    period: 4
-  score:
-    name: abs_m
-  selection:
-    name: topk
-    method: adaptive
-    ratio_percent: 40.0
-    adaptive_warmup_syncs: 5
-  optimizer:
-    name: adamw
-    residual_mean: false
-  backend:
-    name: torch_pipelined_index
-    high_priority_group: true
-    slices: 3
+  # Flat SGA arguments — the production preset shipped with the repo.
+  sga_enabled: true
+  sga_cycle_start_iter: 4
+  sga_cycle_period: 4
+  sga_score: abs_m
+  sga_selection_method: adaptive
+  sga_selection_ratio_percent: 40.0
+  sga_selection_adaptive_warmup_syncs: 5
+  sga_optimizer: adamw
+  sga_optimizer_residual_mean: false
+  sga_backend: torch_pipelined_index
+  sga_backend_high_priority_group: true
+  sga_backend_slices: 3
 
 #### model ####
 

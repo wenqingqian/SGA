@@ -379,9 +379,9 @@ def test_nccl_pipelined_index_decl_and_loud_gates():
     # single launch per sync (each extra slice = one more full kernel
     # invocation): no slicing vocabulary remains (the catalog row is empty),
     # and a stale config carrying it fails loud
-    from sga.config.arguments import PLUGIN_PARAMS
+    from sga.config.validation import _AXIS_PARAMS
 
-    assert PLUGIN_PARAMS["backend"]["nccl_pipelined_index"] == ()
+    assert _AXIS_PARAMS["backend"]["nccl_pipelined_index"] == ()
     try:
         NcclPipelinedIndexBackend({"slices": 3})
         raise AssertionError("removed `slices` param accepted")

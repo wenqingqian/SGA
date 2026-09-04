@@ -63,7 +63,8 @@ import torch
 
 from sga.backends import COMM_WARMUP_ENV, RESUME_OVERRIDE_ENV
 from sga.kernels import scatter_selected
-from sga.plugins import BackendDecl, resolve_plugin_params
+from sga.config.validation import expand_plugin_params
+from sga.plugins import BackendDecl
 
 DECL = BackendDecl(
     name="nccl_pipelined_index",
@@ -110,8 +111,8 @@ class NcclPipelinedIndexBackend:
     def __init__(self, params: dict):
         # Validation-only (the decl declares no vocabulary): unknown keys
         # fail here, loudly.
-        resolve_plugin_params("backend", "nccl_pipelined_index",
-                              dict(params))
+        expand_plugin_params("backend", "nccl_pipelined_index",
+                             dict(params))
         # comm_group -> _RawComm. Keyed by the group OBJECT with a strong
         # reference held on both sides (an id() key could collide after a
         # source group is released and Python reuses its id). Populated

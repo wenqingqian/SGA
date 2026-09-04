@@ -51,16 +51,10 @@ hydra:
     dir: ${experiment.exp_dir}/hydra
 
 sga:
-  # Reserved SGA algorithm section (all off = pure dense).
-  # Validated by sga.config.loader before the launcher flattens train.*.
-  score:
-    enabled: false
-  selection:
-    enabled: false
-  optimizer:
-    enabled: false
-  backend:
-    name: dense
+  # Reserved SGA algorithm section: all off = pure dense.
+  # Validated by sga.config before the launcher flattens train.*.
+  sga_enabled: false
+  sga_backend: dense
 
 #### model ####
 

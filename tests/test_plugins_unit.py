@@ -46,15 +46,15 @@ from sga.plugins.selection._histogram import (
     select_masks_histogram,
 )
 from sga.plugins.selection.topk import TopkSelection
-from sga.plugins import plugin_params
+from sga.config.validation import _AXIS_PARAMS
 
 
 def _method_allows(method: str, key: str) -> bool:
     """Is `key` a legal topk param under `method`? Derived from the
-    catalog's equality guards (the per-method vocabularies)."""
-    for p in plugin_params("selection", "topk"):
-        if p.name == key:
-            return not p.requires or p.requires[1] == method
+    validation guards (the per-method vocabularies)."""
+    for suffix, requires in _AXIS_PARAMS["selection"]["topk"]:
+        if suffix == key:
+            return not requires or requires[1] == method
     return False
 
 torch.manual_seed(0)
@@ -801,17 +801,14 @@ def test_combination_validator_and_build_injection():
 
     register_default_plugins()
     opt_decl = get_optimizer_decl("adamw")
-    cycle = {"period": 8}
     for name in ("update", "coi", "abs_g", "abs_m"):
         assert name in opt_decl.emittable_scores
         validate_combination(name, get_selection_decl("topk"),
-                             opt_decl, get_backend_plugin_decl("torch_pipelined_index"),
-                             cycle)
+                             opt_decl, get_backend_plugin_decl("torch_pipelined_index"))
     # an unknown score name is rejected with the registered list
     try:
         validate_combination("nope", get_selection_decl("topk"),
-                             opt_decl, get_backend_plugin_decl("torch_pipelined_index"),
-                             cycle)
+                             opt_decl, get_backend_plugin_decl("torch_pipelined_index"))
         raise AssertionError("unknown score accepted")
     except ValueError as e:
         assert "nope" in str(e) and "abs_g" in str(e), e
@@ -823,31 +820,12 @@ def test_combination_validator_and_build_injection():
     try:
         validate_combination("abs_m", get_selection_decl("topk"),
                              non_emitting,
-                             get_backend_plugin_decl("torch_pipelined_index"), cycle)
+                             get_backend_plugin_decl("torch_pipelined_index"))
         raise AssertionError("offline-only score accepted")
     except ValueError as e:
         assert "emittable" in str(e), e
-    # cycle-calendar legality is engine-level: an explicit
-    # full_sync_interval is illegal without the decouple switch, and the
-    # decoupled interval must be a strict divisor of the period
-    for bad in ({"period": 8, "full_sync_interval": 4},
-                {"period": 8, "full_sync_interval": 8},
-                {"period": 8, "decouple_full_sync_interval_and_period": True},
-                {"period": 8, "decouple_full_sync_interval_and_period": True,
-                 "full_sync_interval": 16},
-                {"period": 8, "decouple_full_sync_interval_and_period": True,
-                 "full_sync_interval": 3}):
-        try:
-            validate_combination("abs_m", get_selection_decl("topk"),
-                                 opt_decl,
-                                 get_backend_plugin_decl("torch_pipelined_index"), bad)
-            raise AssertionError(f"cycle {bad} accepted")
-        except ValueError as e:
-            assert "full_sync" in str(e) or "decouple" in str(e), e
-    validate_combination("abs_m", get_selection_decl("topk"),
-                         opt_decl, get_backend_plugin_decl("torch_pipelined_index"),
-                         {"period": 8, "decouple_full_sync_interval_and_period": True,
-                          "full_sync_interval": 4})
+    # (the cycle-calendar legality rules moved to sga.config.validation
+    # with the flat keys — pinned in test_config.py)
 
     # build injection: the optimizer instance carries the requested emission
     opt = build_optimizer("adamw", {}, emit_score="abs_m")
@@ -886,9 +864,6 @@ def test_emission_declaration_and_compact_capability():
     time (the communicated values would never reach the m/v commit)."""
 
     seen = {}
-    from sga.config.arguments import PLUGIN_PARAMS
-
-    PLUGIN_PARAMS["backend"]["stub"] = ()  # test-scaffold catalog row
     try:
         for bad in ("comapct", "write", "", None):
             try:
@@ -901,29 +876,28 @@ def test_emission_declaration_and_compact_capability():
                   BackendDecl(name="stub", emission="compact"))  # legal passes
         assert isinstance(seen["stub"].emission, str)
     finally:
-        del PLUGIN_PARAMS["backend"]["stub"]
+        pass
 
     register_default_plugins()
-    cycle = {"period": 8}
     compact = get_backend_plugin_decl("torch_pipelined_index")
     assert compact.emission == "compact"
     assert get_optimizer_decl("adamw").consumes_compact is True
     # the shipped pair is legal (also covered by the emittable-scores loop
     # above, restated here so the capability rule's PASS case is explicit)
     validate_combination("update", get_selection_decl("topk"),
-                         get_optimizer_decl("adamw"), compact, cycle)
+                         get_optimizer_decl("adamw"), compact)
     # an optimizer WITHOUT the compact commit: refused on the compact
     # backend, fine on writeback backends
     stub = OptimizerDecl(name="stub", emittable_scores=frozenset({"update"}))
     try:
         validate_combination("update", get_selection_decl("topk"), stub,
-                             compact, cycle)
+                             compact)
         raise AssertionError("compact backend without consumes_compact accepted")
     except ValueError as e:
         assert "consumes_compact" in str(e), e
         assert "m/v commit" in str(e), e
     validate_combination("update", get_selection_decl("topk"), stub,
-                         get_backend_plugin_decl("torch_pipelined_mask"), cycle)
+                         get_backend_plugin_decl("torch_pipelined_mask"))
     print("ok: emission registration gate + compact capability rule")
 
 

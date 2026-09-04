@@ -5,10 +5,14 @@ Stub legacy checkpoints under temp dirs; verifies the fail-closed cluster:
 
 - rank resolution comes from the RANK env var (pre-distributed-init), and
   non-zero ranks never load anything;
-- identical configs pass even when the saved JSON has a different key
-  order (canonical comparison);
-- differing / absent / empty saved sga_config refuse the resume (SystemExit);
-  a legacy DENSE checkpoint cannot silently resume under active SGA;
+- identical configs pass even under spelling variance (percent vs
+  absolute start_iter, int vs float ratio — canonical comparison);
+- differing / absent saved sga arguments refuse the resume (SystemExit);
+  a legacy DENSE checkpoint cannot silently resume under active SGA, a
+  JSON-era checkpoint (retired --sga-config string) is refused with a
+  pointed message, and so is a flatargs-era v1 namespace (the same
+  string alongside the all-None sga_* attrs its default=None flags
+  saved);
 - unreadable/incomplete checkpoints and unsupported layouts fail CLOSED
   (refuse) instead of proceeding -- --sga-allow-config-override is the only
   escape hatch, and it exempts every case;
@@ -18,7 +22,6 @@ Stub legacy checkpoints under temp dirs; verifies the fail-closed cluster:
 Run: python tests/test_resume_guard.py  (or pytest tests/test_resume_guard.py)
 """
 
-import json
 import logging
 import os
 import sys
@@ -41,21 +44,42 @@ from model_provider import model_provider as root_model_provider
 import sga.train_gpt as train_gpt
 from sga.train_gpt import _sga_resume_guard
 
-CURRENT = {"score": {"name": "abs_g"}, "cycle": {"period": 2}}
-CURRENT_JSON = json.dumps(CURRENT, sort_keys=True)
+CURRENT = {
+    "sga_enabled": True, "sga_cycle_start_iter": 20, "sga_cycle_period": 2,
+    "sga_score": "abs_g", "sga_selection_method": "exact",
+    "sga_selection_ratio_percent": 10.0, "sga_optimizer": "adamw",
+    "sga_backend": "torch_pipelined_index",
+}
+
+# What a flatargs-era v1 run saved alongside its sga_config string: every
+# flag registered with default=None, so the attrs exist but carry None.
+V1_FLAT_DEFAULTS = {
+    "sga_enabled": None, "sga_shadow": None, "sga_score": None,
+    "sga_selection": None, "sga_selection_method": None,
+    "sga_selection_ratio_percent": None, "sga_optimizer": None,
+    "sga_backend": None, "sga_cycle_period": None,
+}
 
 EXPECTED_EXIT = "expected SystemExit(1) from the resume guard"
 
 
 class _Args(SimpleNamespace):
-    def __init__(self, load=None, config=CURRENT_JSON, override=False):
-        super().__init__(sga_config=config, load=load,
-                         sga_allow_config_override=override)
+    def __init__(self, load=None, config=None, override=False,
+                 train_iters=5000):
+        base = dict(CURRENT if config is None else config)
+        super().__init__(load=load, sga_allow_config_override=override,
+                         train_iters=train_iters, **base)
 
 
-def make_ckpt(load_dir, saved_attr="sga_config", saved_value=CURRENT_JSON,
-              shard_name="mp_rank_00/model_optim_rng.pt", garbage=False):
-    """Legacy-style checkpoint: latest tracker + one rank shard."""
+def make_ckpt(load_dir, saved_config=CURRENT, legacy_json=None,
+              shard_name="mp_rank_00/model_optim_rng.pt", garbage=False,
+              legacy_attrs=None, saved_train_iters=5000):
+    """Flat-era checkpoint: latest tracker + one rank shard carrying the
+    saved args namespace. ``legacy_json`` simulates a pre-flat checkpoint
+    (only the retired sga_config string, no sga_* attributes);
+    ``legacy_attrs`` adds the all-None sga_* attrs a flatargs-era v1 run
+    saved alongside that string. ``saved_train_iters`` rides the saved
+    namespace like megatron's full-args checkpointing does."""
     iter_dir = os.path.join(load_dir, "iter_0000500")
     shard_path = os.path.join(iter_dir, shard_name)
     os.makedirs(os.path.dirname(shard_path), exist_ok=True)
@@ -65,9 +89,14 @@ def make_ckpt(load_dir, saved_attr="sga_config", saved_value=CURRENT_JSON,
         with open(shard_path, "wb") as f:
             f.write(b"NOT-A-CHECKPOINT")
     else:
-        saved = SimpleNamespace(source=42)
-        if saved_value is not None:
-            setattr(saved, saved_attr, saved_value)
+        saved = SimpleNamespace(source=42, train_iters=saved_train_iters)
+        if legacy_json is not None:
+            saved.sga_config = legacy_json
+            for key, value in (legacy_attrs or {}).items():
+                setattr(saved, key, value)
+        elif saved_config is not None:
+            for key, value in saved_config.items():
+                setattr(saved, key, value)
         torch.save({"args": saved}, shard_path)
     return load_dir
 
@@ -122,20 +151,58 @@ def test_model_build_chain_is_stock():
     print("ok: model build chain is stock (model_provider/gpt_builder)")
 
 
-def test_identical_and_reordered_configs_pass():
+def test_identical_and_spelling_variant_configs_pass():
     tmp = tempfile.mkdtemp(prefix="sga-resume-ok-")
-    reordered = json.dumps(dict(reversed(list(CURRENT.items()))),
-                           sort_keys=False)
-    make_ckpt(tmp, saved_value=reordered)
+    make_ckpt(tmp)  # exact same flat attrs
     _with_rank(0, lambda: _sga_resume_guard(_Args(load=tmp)))  # must not raise
-    print("ok: identical + key-reordered saved config passes")
+    # spelling variants canonicalize equal: percent vs absolute start_iter
+    # and int vs float ratio
+    variant = dict(CURRENT)
+    del variant["sga_cycle_start_iter"]
+    variant["sga_cycle_start_iter_percent"] = 0.4  # of 5000 -> 20
+    variant["sga_selection_ratio_percent"] = 10    # int spelling
+    tmp2 = tempfile.mkdtemp(prefix="sga-resume-ok2-")
+    make_ckpt(tmp2, saved_config=variant)
+    _with_rank(0, lambda: _sga_resume_guard(
+        _Args(load=tmp2, config=variant)))
+    print("ok: identical + spelling-variant saved configs pass")
+
+
+def test_cross_spelling_sides_pass_and_train_iters_drift_refuses():
+    """R4: percent-vs-absolute canonicalization across SIDES — the
+    checkpoint carries one spelling, the resume flags the other — plus
+    the R1 pin: a percent spelling saved under train_iters=5000 refuses
+    when the resume extends train_iters (the effective cycle anchor
+    moves 20 -> 40; the guard must be fail-closed, not re-anchor)."""
+    abs_config = dict(CURRENT)  # sga_cycle_start_iter: 20
+    pct_config = dict(CURRENT)
+    del pct_config["sga_cycle_start_iter"]
+    pct_config["sga_cycle_start_iter_percent"] = 0.4  # of 5000 -> 20
+    # (a) saved absolute, resumed percent
+    tmp = tempfile.mkdtemp(prefix="sga-resume-xabs-")
+    make_ckpt(tmp, saved_config=abs_config)
+    _with_rank(0, lambda: _sga_resume_guard(
+        _Args(load=tmp, config=pct_config)))  # must not raise
+    # (b) reverse direction: saved percent, resumed absolute
+    tmp2 = tempfile.mkdtemp(prefix="sga-resume-xpct-")
+    make_ckpt(tmp2, saved_config=pct_config)
+    _with_rank(0, lambda: _sga_resume_guard(
+        _Args(load=tmp2, config=abs_config)))  # must not raise
+    # (c) same percent spelling on both sides, but the saved namespace's
+    # own train_iters=5000 vs the resume's 10000: refuse with "differs"
+    tmp3 = tempfile.mkdtemp(prefix="sga-resume-tidrift-")
+    make_ckpt(tmp3, saved_config=pct_config, saved_train_iters=5000)
+    expect_exit(lambda: _with_rank(
+        0, lambda: _sga_resume_guard(
+            _Args(load=tmp3, config=pct_config, train_iters=10000))),
+        "differs")
+    print("ok: cross-spelling sides pass; changed train_iters refuses")
 
 
 def test_differing_config_refuses():
     tmp = tempfile.mkdtemp(prefix="sga-resume-diff-")
-    other = json.dumps({"score": {"name": "update"},
-                        "cycle": {"period": 2}}, sort_keys=True)
-    make_ckpt(tmp, saved_value=other)
+    other = dict(CURRENT, sga_score="update")
+    make_ckpt(tmp, saved_config=other)
     expect_exit(lambda: _with_rank(
         0, lambda: _sga_resume_guard(_Args(load=tmp))), "differs")
     print("ok: differing saved config refuses (SystemExit 1)")
@@ -143,18 +210,35 @@ def test_differing_config_refuses():
 
 def test_absent_saved_config_refuses():
     tmp = tempfile.mkdtemp(prefix="sga-resume-absent-")
-    make_ckpt(tmp, saved_attr="irrelevant", saved_value=None)
+    make_ckpt(tmp, saved_config=None)
     expect_exit(lambda: _with_rank(
-        0, lambda: _sga_resume_guard(_Args(load=tmp))), "no saved sga_config")
-    print("ok: legacy DENSE checkpoint (absent attr) refuses")
+        0, lambda: _sga_resume_guard(_Args(load=tmp))),
+        "no saved sga arguments")
+    print("ok: legacy DENSE checkpoint (no sga attrs) refuses")
 
 
-def test_empty_saved_config_refuses():
-    tmp = tempfile.mkdtemp(prefix="sga-resume-empty-")
-    make_ckpt(tmp, saved_value="")
+def test_json_era_checkpoint_refuses_pointedly():
+    tmp = tempfile.mkdtemp(prefix="sga-resume-legacy-")
+    make_ckpt(tmp, legacy_json='{"cycle": {"period": 2}}')
     expect_exit(lambda: _with_rank(
-        0, lambda: _sga_resume_guard(_Args(load=tmp))), "no saved sga_config")
-    print("ok: empty saved sga_config refuses")
+        0, lambda: _sga_resume_guard(_Args(load=tmp))),
+        "predates the flat sga arguments")
+    print("ok: JSON-era checkpoint refused with the pointed message")
+
+
+def test_v1_flatargs_era_checkpoint_refuses_pointedly():
+    """A flatargs-era v1 checkpoint carries BOTH the retired sga_config
+    string and all-None sga_* attrs (its flags registered default=None):
+    the legacy string alone must fire the pointed refusal (a v2
+    namespace never carries the string)."""
+    tmp = tempfile.mkdtemp(prefix="sga-resume-legacy-v1flat-")
+    make_ckpt(tmp, legacy_json='{"cycle": {"period": 2}}',
+              legacy_attrs=dict(V1_FLAT_DEFAULTS))
+    expect_exit(lambda: _with_rank(
+        0, lambda: _sga_resume_guard(_Args(load=tmp))),
+        "predates the flat sga arguments")
+    print("ok: flatargs-era v1 checkpoint (sga_config + None attrs) "
+          "refused with the pointed message")
 
 
 def test_unreadable_shard_fails_closed():
@@ -209,10 +293,12 @@ def test_nonzero_rank_never_loads():
 
 if __name__ == "__main__":
     test_model_build_chain_is_stock()
-    test_identical_and_reordered_configs_pass()
+    test_identical_and_spelling_variant_configs_pass()
+    test_cross_spelling_sides_pass_and_train_iters_drift_refuses()
     test_differing_config_refuses()
     test_absent_saved_config_refuses()
-    test_empty_saved_config_refuses()
+    test_json_era_checkpoint_refuses_pointedly()
+    test_v1_flatargs_era_checkpoint_refuses_pointedly()
     test_unreadable_shard_fails_closed()
     test_missing_tracker_passes_cold_start()
     test_override_exempt_everything()

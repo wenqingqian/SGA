@@ -50,7 +50,7 @@ import os
 
 import torch
 
-from sga.config.arguments import CYCLE, CHECKS, TOP
+from sga.config.validation import engine_section_defaults, sga_defaults
 from sga.kernels import (
     compact_norm_sq_contribution,
     masked_norm_sq_contribution,
@@ -71,9 +71,10 @@ class SGAEngineError(RuntimeError):
 
 # Catalog defaults (the ONLY defaults — engine-side .get fallbacks read
 # these, never a restated literal; sga/config/arguments.py).
-_CYCLE_DEFAULTS = {p.name: p.default for p in CYCLE if not p.required}
-_CHECKS_DEFAULTS = {p.name: p.default for p in CHECKS if not p.required}
-_TOP_DEFAULTS = {p.name: p.default for p in TOP if not p.required}
+_CYCLE_DEFAULTS = engine_section_defaults("cycle")
+_CHECKS_DEFAULTS = engine_section_defaults("checks")
+_TOP_DEFAULTS = {"shadow": sga_defaults()["sga_shadow"],
+                 "shadow_score": sga_defaults()["sga_shadow_score"]}
 
 
 

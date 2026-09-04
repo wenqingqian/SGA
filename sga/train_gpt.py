@@ -42,33 +42,44 @@ except ImportError:
 
 
 def _sga_resume_guard(args) -> None:
-    """Refuse resuming a checkpoint whose saved sga_config differs from the
-    current one unless --sga-allow-config-override is set. Fail-closed
-    semantics: an absent/empty saved config counts as a mismatch too (a
-    legacy DENSE checkpoint must not silently resume under an active SGA
-    config), and any load/parse failure refuses the resume instead of
-    proceeding — the override flag is the single sanctioned escape hatch.
-    A MISSING tracker file passes: mirroring megatron's load_checkpoint,
-    no saved state under --load means a cold start, not a resume.
+    """Refuse resuming a checkpoint whose saved SGA configuration differs
+    from the current one unless --sga-allow-config-override is set.
+    Fail-closed semantics: an absent saved configuration counts as a
+    mismatch too (a legacy DENSE checkpoint must not silently resume
+    under an active SGA config), and any load/parse failure refuses the
+    resume instead of proceeding — the override flag is the single
+    sanctioned escape hatch. A MISSING tracker file passes: mirroring
+    megatron's load_checkpoint, no saved state under --load means a cold
+    start, not a resume.
 
-    SGA-repo-side guard (no 6th fork site): rank 0 peeks the checkpoint's
-    saved args BEFORE pretrain(). torch.distributed is not initialized at
-    this point, so the rank comes from the RANK env var (torchrun exports
-    it before process launch; bare single-process runs default to 0) — this
-    also means only rank 0 pays the checkpoint-load cost instead of every
-    rank. On refusal rank 0 exits non-zero and torchrun's elastic agent
-    tears down the whole job, so no distributed handshake is needed here.
+    Both sides canonicalize through the shared validator: the current
+    namespace and the checkpoint's saved namespace are collected as flat
+    ``sga_*`` dicts, diffed to their explicit keys, validated and
+    serialized identically — percent-vs-absolute spellings and float
+    spellings (10 vs 10.0) compare equal, and each side's percent
+    spelling resolves against its OWN saved train_iters (a changed
+    train_iters is a difference, not a silent re-anchor). Checkpoints
+    from the retired --sga-config JSON era are recognized by their saved
+    ``sga_config`` string and refused with a pointed message (they
+    predate the flat arguments; the override flag bridges them).
+
+    SGA-repo-side guard (no extra fork site): rank 0 peeks the
+    checkpoint's saved args BEFORE pretrain(). torch.distributed is not
+    initialized at this point, so the rank comes from the RANK env var
+    (torchrun exports it before process launch; bare single-process runs
+    default to 0) — this also means only rank 0 pays the checkpoint-load
+    cost instead of every rank. On refusal rank 0 exits non-zero and
+    torchrun's elastic agent tears down the whole job, so no distributed
+    handshake is needed here.
 
     Deserialization keeps torch.load's default weights_only=True; legacy
     checkpoints deserialize because importing megatron.core above (via
     pretrain_gpt / megatron.training) registered argparse.Namespace etc.
     through register_safe_globals() at import time.
     """
-    import json
     import logging
 
-    sga_config = getattr(args, "sga_config", "")
-    if not sga_config or not getattr(args, "load", None):
+    if not getattr(args, "sga_enabled", False) or not getattr(args, "load", None):
         return
     if getattr(args, "sga_allow_config_override", False):
         return
@@ -81,11 +92,25 @@ def _sga_resume_guard(args) -> None:
     if rank != 0:
         return
 
-    def _canonical(text):
-        payload = json.loads(text)
-        if not isinstance(payload, dict):
-            raise ValueError("sga_config is not a JSON object")
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    from sga.config.validation import (
+        canonical_flat_json,
+        collect_sga_flat,
+        explicit_from_flat,
+        validate_sga_flat,
+    )
+
+    def _canonical(attrs_owner):
+        # Each side resolves its percent spelling with its OWN train_iters
+        # (megatron checkpoints the full args, so the saved namespace
+        # carries it): a changed train_iters must count as a difference,
+        # not silently re-anchor the saved percent.
+        train_iters = getattr(attrs_owner, "train_iters", None)
+        if train_iters is None:
+            train_iters = getattr(args, "train_iters", None)
+        _, canonical = validate_sga_flat(
+            explicit_from_flat(collect_sga_flat(attrs_owner)),
+            train_iters=train_iters)
+        return canonical_flat_json(canonical)
 
     same = False
     detail = ""
@@ -122,16 +147,27 @@ def _sga_resume_guard(args) -> None:
         if not shards:
             raise OSError(f"no model_optim_rng.pt rank shard under {iter_dir}")
         state = torch.load(shards[0], map_location="cpu")
-        saved = getattr(state.get("args", None), "sga_config", "")
-        if isinstance(saved, str) and saved:
-            same = _canonical(saved) == _canonical(sga_config)
-            if not same:
-                detail = "checkpoint sga_config differs from the current --sga-config"
+        saved_args = state.get("args", None)
+        legacy = getattr(saved_args, "sga_config", "") if saved_args else ""
+        saved_flat = collect_sga_flat(saved_args) if saved_args is not None else {}
+        # Any saved --sga-config string marks the retired v1 transport:
+        # flatargs-era v1 namespaces carry BOTH the JSON string and sga_*
+        # attrs (default=None flags), while v2 namespaces never carry the
+        # string (arguments.py registers no such dest and collect_sga_flat
+        # excludes it) — so the string alone is the reliable legacy marker.
+        if legacy:
+            detail = ("checkpoint predates the flat sga arguments (it saved "
+                      "the retired --sga-config JSON string)")
+        elif not saved_flat:
+            detail = "checkpoint carries no saved sga arguments"
         else:
-            detail = "checkpoint carries no saved sga_config"
+            same = _canonical(saved_args) == _canonical(args)
+            if not same:
+                detail = ("checkpoint sga configuration differs from the "
+                          "current --sga-* arguments")
     except (OSError, AttributeError, KeyError, TypeError, ValueError,
             RuntimeError, pickle.UnpicklingError) as e:
-        detail = f"could not verify the checkpoint's saved sga_config ({e})"
+        detail = f"could not verify the checkpoint's saved sga configuration ({e})"
     if not same:
         logger.error(
             "%s; refusing the SGA resume (pass --sga-allow-config-override "
@@ -143,16 +179,17 @@ def _sga_resume_guard(args) -> None:
 def _extra_args_provider(parser):
     """Megatron's extra-args contract: add and RETURN the parser.
 
-    modelopt first (upstream order), then the SGA flat vocabulary — all
-    default-inert: without any --sga-* flag the parser surface is
-    stock-identical. (The return is load-bearing: megatron's parse_args
-    rebinds ``parser = extra_args_provider(parser)``.)
+    modelopt first (upstream order), then the SGA flat declarations
+    (sga/config/arguments.py — the single config surface). Without any
+    --sga-* flag every argument sits at its default, which IS the
+    dense/stock configuration. (The return is load-bearing: megatron's
+    parse_args rebinds ``parser = extra_args_provider(parser)``.)
     """
     if has_nvidia_modelopt:
         add_modelopt_args(parser)
-    from sga.config.flatargs import add_sga_flat_args
+    from sga.config.arguments import add_sga_args
 
-    add_sga_flat_args(parser)
+    add_sga_args(parser)
     return parser
 
 
@@ -171,11 +208,16 @@ if __name__ == "__main__":
         extra_args_provider=_extra_args_provider,
         args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
     )
-    # Fold the flat flags into the canonical args.sga_config BEFORE anyone
-    # reads it (resume guard here; the waist's first attach inside pretrain).
-    from sga.config.flatargs import assemble_sga_args
+    # Fail-fast SGA validation (also when disabled: the disabled-cleanliness
+    # contract — nothing but the switch — is enforced here, before the
+    # resume guard and the waist's first attach inside pretrain). The flags
+    # already live on the namespace; there is nothing to assemble. The
+    # sga_* attributes cannot be silently overwritten afterwards:
+    # megatron's --use-checkpoint-args path (load_args_from_checkpoint)
+    # only sets an explicit architecture allowlist, never sga_* keys.
+    from sga.config.validation import validate_sga_args
 
-    assemble_sga_args(args)
+    validate_sga_args(args)
     _sga_resume_guard(args)
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(
