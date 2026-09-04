@@ -13,6 +13,10 @@ Stub legacy checkpoints under temp dirs; verifies the fail-closed cluster:
   pointed message, and so is a flatargs-era v1 namespace (the same
   string alongside the all-None sga_* attrs its default=None flags
   saved);
+- a checkpoint saved before a parameter rename carries retired keys;
+  since explicit_from_flat drops them before the comparison, the guard
+  detects them directly and refuses with a pointed message instead of
+  letting both sides canonicalize to the current defaults;
 - unreadable/incomplete checkpoints and unsupported layouts fail CLOSED
   (refuse) instead of proceeding -- --sga-allow-config-override is the only
   escape hatch, and it exempts every case;
@@ -212,6 +216,20 @@ def test_differing_config_refuses():
     print("ok: differing saved config refuses (SystemExit 1)")
 
 
+def test_retired_key_checkpoint_refuses_pointedly():
+    """A checkpoint saved before a parameter rename carries keys no
+    current flag declares (here the slice params' pre-rename spelling).
+    explicit_from_flat drops them before the comparison, which would
+    canonicalize both sides to the current defaults and accept — the
+    guard must detect the retired keys and refuse instead."""
+    tmp = tempfile.mkdtemp(prefix="sga-resume-renamed-")
+    make_ckpt(tmp, saved_config=dict(CURRENT, sga_backend_slices=3))
+    expect_exit(lambda: _with_rank(
+        0, lambda: _sga_resume_guard(_Args(load=tmp))),
+        "retired sga keys")
+    print("ok: pre-rename checkpoint (retired key) refused pointedly")
+
+
 def test_absent_saved_config_refuses():
     tmp = tempfile.mkdtemp(prefix="sga-resume-absent-")
     make_ckpt(tmp, saved_config=None)
@@ -300,6 +318,7 @@ if __name__ == "__main__":
     test_identical_and_spelling_variant_configs_pass()
     test_cross_spelling_sides_pass_and_train_iters_drift_refuses()
     test_differing_config_refuses()
+    test_retired_key_checkpoint_refuses_pointedly()
     test_absent_saved_config_refuses()
     test_json_era_checkpoint_refuses_pointedly()
     test_v1_flatargs_era_checkpoint_refuses_pointedly()

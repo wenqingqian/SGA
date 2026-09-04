@@ -40,9 +40,12 @@ Conventions (single-sourced here, consumed by introspection):
 
 Axis-identity flags (``--sga-score``/``--sga-selection``/...) take
 registered plugin names; the registries are runtime data, so the value
-check happens in validation against ``sga.plugins.registered_names()``,
-not as argparse ``choices``. "Required" below means required when
-``--sga-enabled true`` (a dense run passes no SGA flags at all).
+check happens in validation against ``sga.plugins.registered_names()``.
+The one exception is ``--sga-score``, whose closed vocabulary is also
+declared as argparse ``choices`` and kept synced with the registry by
+``test_inv4_score_choices_synced_with_registry``. "Required" below
+means required when ``--sga-enabled true`` (a dense run passes no SGA
+flags at all).
 """
 
 import argparse
@@ -184,9 +187,10 @@ def _add_sga_score_args(parser: argparse.ArgumentParser):
         "SGA score", "the boundary score (registry data, no params)")
     group.add_argument(
         "--sga-score", type=str, default=None,
-        help="score plugin name (required with --sga-enabled true). "
-             "Registered names are the choices; there are no score "
-             "params — any --sga-score-* flag is a typo.")
+        choices=("abs_g", "abs_m", "coi", "update"),
+        help="score name (required with --sga-enabled true; the choices "
+             "are the registered scores). There are no score params — "
+             "any --sga-score-* flag is a typo.")
 
 
 def _add_sga_selection_args(parser: argparse.ArgumentParser):
@@ -228,9 +232,8 @@ def _add_sga_optimizer_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group(
         "SGA optimizer", "the optimizer template (adamw)")
     group.add_argument(
-        "--sga-optimizer", type=str, default=None,
-        help="optimizer plugin name, required with --sga-enabled true "
-             "(registered names are the choices).")
+        "--sga-optimizer", type=str, default="adamw",
+        help="optimizer template name (adamw, the only template).")
     group.add_argument(
         "--sga-optimizer-residual-mean", type=sga_bool, default=False,
         help="pre-fold the accumulated residual by the fold window (the "
@@ -277,14 +280,14 @@ def _add_sga_backend_args(parser: argparse.ArgumentParser):
         help="torch_pipelined_index only: run sparse collectives on a twin "
              "high-priority NCCL group (true selects the legacy "
              "pipelined_idx_sorted TRANSPORT MODE only — reproducing that "
-             "former configuration also needs slices 3; false: legacy "
+             "former configuration also needs index_slices 3; false: legacy "
              "indexed_sparse on the training world's own group). "
              "Default false.")
     group.add_argument(
-        "--sga-backend-slices", type=int, default=2,
+        "--sga-backend-index-slices", type=int, default=2,
         help="torch_pipelined_index only: number of idx slices pipelined "
              "against the allreduces (enforced >= 1). Default 2.")
     group.add_argument(
-        "--sga-backend-num-slices", type=int, default=0,
+        "--sga-backend-mask-slices", type=int, default=0,
         help="torch_pipelined_mask only: mask slices pipelined against "
              "NCCL ops (0 = auto, i.e. 2). Default 0.")

@@ -116,7 +116,7 @@ _RENAMED_BACKENDS = {
     "indexed_sparse": "torch_pipelined_index (high_priority_group: false, "
                       "the default, reproduces indexed_sparse)",
     "pipelined_idx_sorted": "torch_pipelined_index (high_priority_group: "
-                            "true, slices: 3 reproduces pipelined_idx_sorted)",
+                            "true, index_slices: 3 reproduces pipelined_idx_sorted)",
     "masked_pipelined": "torch_pipelined_mask",
 }
 

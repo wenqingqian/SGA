@@ -148,7 +148,7 @@ def test_payload_scaling_preserves_residual_bitwise():
     grad = grad0.clone()
     factor = 0.125  # power of two -> scaling is exact, comparison bitwise
 
-    backend = TorchPipelinedMaskBackend({"num_slices": 2})
+    backend = TorchPipelinedMaskBackend({"mask_slices": 2})
     with _ReplicaWorld(world=4):
         backend.allreduce_sparse(grad, support, None, factor,
                                  torch.distributed.ReduceOp.SUM, key=0)
@@ -215,7 +215,7 @@ def test_torch_pipelined_index_modes_and_mechanics():
     twin-mode-gated, and validate_runtime only constrains twin mode."""
     plain = TorchPipelinedIndexBackend({})          # hiprio=False, S=2
     twin = TorchPipelinedIndexBackend({"high_priority_group": True,
-                                       "slices": 3})
+                                       "index_slices": 3})
     assert plain.decl.consumes == "idx"  # engine activates by this attribute
     assert plain.decl.name == "torch_pipelined_index"
 
@@ -245,7 +245,7 @@ def test_torch_pipelined_index_modes_and_mechanics():
     assert plain._bounds(support, k) == [(0, support.split), (support.split, k)]
     assert twin._bounds(support, k) == [(i * k // 3, (i + 1) * k // 3)
                                         for i in range(3)]
-    assert TorchPipelinedIndexBackend({"slices": 3})._bounds(support, k) == \
+    assert TorchPipelinedIndexBackend({"index_slices": 3})._bounds(support, k) == \
         [(i * k // 3, (i + 1) * k // 3) for i in range(3)]
 
     # grow-only discipline: a smaller second cycle keeps the same capacity
@@ -274,10 +274,10 @@ def test_torch_pipelined_index_modes_and_mechanics():
     assert twin._group_for(sentinel) is sentinel
     assert twin._group_for(None) is None
     try:
-        TorchPipelinedIndexBackend({"slices": 0})
-        raise AssertionError("slices=0 accepted")
-    except ValueError:
-        pass
+        TorchPipelinedIndexBackend({"index_slices": 0})
+        raise AssertionError("index_slices=0 accepted")
+    except ValueError as e:
+        assert "index_slices must be >= 1" in str(e), e
 
     # validate_runtime constrains TWIN mode only: single pipeline phase +
     # exactly one DP-CP group covering the world (multi-DP-CP / tensor /
@@ -380,8 +380,8 @@ def test_nccl_pipelined_index_decl_and_loud_gates():
     # invocation): no slicing vocabulary remains (the plugin takes no
     # params), and a stale config carrying it fails loud
     try:
-        NcclPipelinedIndexBackend({"slices": 3})
-        raise AssertionError("removed `slices` param accepted")
+        NcclPipelinedIndexBackend({"index_slices": 3})
+        raise AssertionError("stale slicing param accepted")
     except ValueError:
         pass
 
@@ -642,7 +642,7 @@ _UPDATE = {
     "opt": "adamw",
     "opt_params": {"residual_mean": False},
     "cycle": {"start_iter": 0, "period": 3},
-    "backend": TorchPipelinedMaskBackend({"num_slices": 2}),
+    "backend": TorchPipelinedMaskBackend({"mask_slices": 2}),
 }
 
 # The named-score combo: abs_m materializes into the grad buffer with the

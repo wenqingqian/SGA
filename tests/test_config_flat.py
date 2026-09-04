@@ -9,8 +9,8 @@ the config surface; these tests make that STRUCTURAL, not disciplinary:
        from it — each plugin's params are the plugin's own business);
        the fork-side waist registers exactly one non-config sga_ key
        (its override switch) and no --sga-config remains anywhere.
-  INV-2 flags are exactly the declarations: the schema dump, the
-       launcher's key check and the training entry's parser all derive
+  INV-2 flags are exactly the declarations: the launcher's key
+       check and the training entry's parser all derive
        from sga_actions(); engine-side default reads equal
        engine_section_defaults() for every section; the canonical flat
        dict + runtime materialization carry every declared section key.
@@ -91,19 +91,11 @@ def test_inv1_fork_registers_exactly_the_override_switch():
 
 
 # ---------------------------------------------------------------- INV-2
-def test_inv2_schema_and_launcher_derive_from_declarations():
-    """The schema dump and the launcher's accepted keys ARE the parser's
-    dests — there is no second key table anywhere in the pipeline (and
-    the schema no longer carries a plugin-attribution section)."""
-    from sga.config.__main__ import _schema
-
-    schema = _schema()
-    assert set(schema) == {"flags"}
-    assert set(schema["flags"]) == set(sga_actions())
-    # the launcher validates yaml keys against sga_actions via
-    # validate_run_config: an unknown key is rejected with the dest list
+def test_inv2_launcher_keys_derive_from_declarations():
+    """The launcher's accepted yaml keys ARE the parser's dests — there
+    is no second key table anywhere in the pipeline."""
     expect_error(lambda: validate_sga_flat({"sga_nope": 1}), "sga_nope")
-    print("ok: schema/launcher/declaration vocabularies coincide")
+    print("ok: launcher/declaration vocabularies coincide")
 
 
 def test_inv2_engine_defaults_equal_declarations():
@@ -206,7 +198,7 @@ def test_inv4_every_knob_documented_and_typed():
         assert isinstance(action.help, str) and action.help.strip(), dest
         assert action.default is not None or dest in (
             "sga_score", "sga_selection_method", "sga_selection_ratio_percent",
-            "sga_optimizer", "sga_backend", "sga_trace_dir",
+            "sga_backend", "sga_trace_dir",
             "sga_trace_branch_points", "sga_cycle_start_iter_percent",
             "sga_cycle_full_sync_interval"), dest
         assert _param_kind(dest) in ("bool", "int", "int_or_null",
@@ -230,21 +222,21 @@ def test_inv4_historical_surface_pinned():
         "sga_trace_dir": (None, "str", ()),
         "sga_trace_branch_points": (None, "str", ()),
         "sga_trace_window": (100, "int", ()),
-        "sga_score": (None, "str", ()),
+        "sga_score": (None, "str", ("abs_g", "abs_m", "coi", "update")),
         "sga_selection": ("topk", "str", ()),
         "sga_selection_method": (None, "str", ("adaptive", "exact", "histogram")),
         "sga_selection_ratio_percent": (None, "float", ()),
         "sga_selection_histogram_mode": ("exact", "str", ("balanced", "exact", "fast")),
         "sga_selection_adaptive_warmup_syncs": (5, "int_or_null", ()),
         "sga_selection_adaptive_warmup_mode": ("fast", "str", ("balanced", "exact", "fast")),
-        "sga_optimizer": (None, "str", ()),
+        "sga_optimizer": ("adamw", "str", ()),
         "sga_optimizer_residual_mean": (False, "bool", ()),
         "sga_optimizer_compact_search": ("table", "str", ("table", "bisection")),
         "sga_backend": ("dense", "str", ()),
         "sga_backend_emission": ("auto", "str", ("auto", "compact", "writeback")),
         "sga_backend_high_priority_group": (False, "bool", ()),
-        "sga_backend_slices": (2, "int", ()),
-        "sga_backend_num_slices": (0, "int", ()),
+        "sga_backend_index_slices": (2, "int", ()),
+        "sga_backend_mask_slices": (0, "int", ()),
     }
     actions = sga_actions()
     assert set(pin) == set(actions), set(pin) ^ set(actions)
@@ -253,6 +245,15 @@ def test_inv4_historical_surface_pinned():
         assert _param_kind(dest) == kind, dest
         assert tuple(getattr(actions[dest], "choices", None) or ()) == choices, dest
     print("ok: 27-row golden pin holds")
+
+
+def test_inv4_score_choices_synced_with_registry():
+    """--sga-score choices are the registered score names (the registry
+    is data; the declared choices must not drift from it)."""
+    from sga.plugins.scores import score_names
+
+    assert declared_choices("sga_score") == tuple(sorted(score_names()))
+    print("ok: score choices synced with the registry")
 
 
 # ---------------------------------------------------------------- INV-5
@@ -375,10 +376,10 @@ def test_inv5_plugin_vocabularies_are_plugin_owned():
     from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
     from sga.plugins.selection.topk import TopkSelection
 
-    expect_error(lambda: TorchPipelinedIndexBackend({"num_slices": 3}),
-                 "unknown params ['num_slices']")
-    expect_error(lambda: NcclPipelinedIndexBackend({"slices": 3}),
-                 "unknown params ['slices']")
+    expect_error(lambda: TorchPipelinedIndexBackend({"mask_slices": 3}),
+                 "unknown params ['mask_slices']")
+    expect_error(lambda: NcclPipelinedIndexBackend({"index_slices": 3}),
+                 "unknown params ['index_slices']")
     expect_error(lambda: TopkSelection({"ratio_percent": 10.0}),
                  "param 'method' is required")
     # and validation itself stays silent on foreign-but-declared params
@@ -386,8 +387,8 @@ def test_inv5_plugin_vocabularies_are_plugin_owned():
     base = {"sga_enabled": True, "sga_score": "update",
             "sga_selection_method": "exact", "sga_selection_ratio_percent": 5.0,
             "sga_optimizer": "adamw", "sga_backend": "torch_pipelined_index",
-            "sga_backend_num_slices": 3}
-    assert validate_sga_flat(base)["sga_backend_num_slices"] == 3
+            "sga_backend_mask_slices": 3}
+    assert validate_sga_flat(base)["sga_backend_mask_slices"] == 3
     print("ok: plugin vocabularies are plugin-owned (build-time)")
 
 
@@ -403,9 +404,10 @@ def test_inv2_emission_switch_flat_rules():
     the plugin constructors' business); explicit 'compact' is a
     torch_pipelined_index capability only; explicit values survive the
     canonical round-trip and the engine-config slicing; the retired
-    merge_join_dir dest fails closed on the flat/yaml route only (the
-    resume route maps it silently — LEG-1 pins the end states
-    bitwise-identical)."""
+    merge_join_dir dest fails closed on the flat/yaml route (unknown
+    key) and the resume route refuses retired keys outright
+    (--sga-allow-config-override is the escape hatch; LEG-1 pins the
+    kernel end states bitwise-identical)."""
     base = {"sga_enabled": True, "sga_score": "update",
             "sga_selection_method": "histogram",
             "sga_selection_ratio_percent": 10.0,
@@ -444,9 +446,9 @@ def test_inv2_emission_switch_flat_rules():
                 {**base, "sga_backend": wb,
                  "sga_backend_emission": "compact"}),
             "only supported by torch_pipelined_index")
-    # the retired rename fails closed on the flat route only (the resume
-    # guard canonicalizes it away silently — LEG-1 pins the end states
-    # bitwise-identical)
+    # the retired rename fails closed on both routes: unknown key flat,
+    # and the resume guard refuses checkpoints carrying retired keys
+    # (--sga-allow-config-override is the escape hatch)
     expect_error(lambda: validate_sga_flat(
         {**base, "sga_optimizer_merge_join_dir": "table"}), "unknown keys")
 

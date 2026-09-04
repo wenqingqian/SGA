@@ -6,16 +6,13 @@ the hand-written ``--sga-*`` flags are two spellings of ONE flat
 vocabulary declared in sga/config/arguments.py. The launcher emits
 flags; megatron's argparse parses them onto the namespace; validation
 reads the namespace's explicit diff. Canonical flat-dict equality is
-the contract (the engine print, the resume guard and `python -m sga.config
-resolve` all speak it).
+the contract (the engine print and the resume guard both speak it).
 
 Run: python tests/test_arguments.py
 """
 
 import argparse
-import json
 import os
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,8 +28,6 @@ from sga.config.validation import (
     validate_sga_flat,
 )
 from sga.launcher.backend_megatron import _get_args_megatron
-
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 ENABLED = {
     "sga_enabled": True,
@@ -126,7 +121,7 @@ def test_flag_table_declared_in_arguments_py():
         "sga_optimizer_compact_search",
         "sga_backend", "sga_backend_emission",
         "sga_backend_high_priority_group",
-        "sga_backend_slices", "sga_backend_num_slices",
+        "sga_backend_index_slices", "sga_backend_mask_slices",
     }
     print("ok: 27 flat flags declared, hyphenation 1:1")
 
@@ -235,32 +230,6 @@ def test_cli_disabled_with_extra_flags_rejected():
     print("ok: CLI disabled + extra flags rejected loud")
 
 
-def test_config_cli_disabled_resolve_and_argc():
-    """`python -m sga.config resolve` on a disabled yaml prints exactly
-    the dense note; the subcommand grammar is argc-strict (wrong argc
-    exits 2 with the usage error)."""
-    import tempfile
-
-    yaml_path = os.path.join(tempfile.mkdtemp(prefix="sga-cli-"),
-                             "dense.yaml")
-    with open(yaml_path, "w") as f:
-        f.write("sga:\n  sga_enabled: false\n"
-                "train:\n  system: {tensor_model_parallel_size: 1}\n"
-                "  model: {num_layers: 2}\n")
-    env = dict(os.environ)
-    out = subprocess.run([sys.executable, "-m", "sga.config", "resolve",
-                          yaml_path],
-                         capture_output=True, text=True, cwd=REPO, env=env)
-    assert out.returncode == 0, out.stderr
-    assert json.loads(out.stdout) == {"sga": "disabled (dense)"}
-    out = subprocess.run([sys.executable, "-m", "sga.config", "schema",
-                          "extra"],
-                         capture_output=True, text=True, cwd=REPO, env=env)
-    assert out.returncode == 2, out.returncode
-    assert "Usage: python -m sga.config" in out.stderr, out.stderr
-    print("ok: sga.config CLI resolve/argc pins hold")
-
-
 def test_unknown_flat_values_rejected():
     expect_error(lambda: _parse(["--sga-enabled", "true",
                                  "--sga-score", "update",
@@ -299,29 +268,6 @@ def test_legacy_nested_keys_are_unknown():
         flat[legacy] = {"start_iter": 1}
         expect_error(lambda l=legacy: validate_sga_flat(flat), "unknown keys")
     print("ok: legacy nested keys rejected as unknown")
-
-
-def test_schema_and_resolve_cli():
-    """python -m sga.config: schema lists every flag with default+help;
-    resolve prints the canonical flat dict the engine prints."""
-    env = dict(os.environ)
-    out = subprocess.run([sys.executable, "-m", "sga.config", "schema"],
-                         capture_output=True, text=True, cwd=REPO, env=env)
-    assert out.returncode == 0, out.stderr
-    schema = json.loads(out.stdout)
-    assert set(schema["flags"]) == set(sga_actions())
-    for dest, row in schema["flags"].items():
-        assert row["help"], dest
-        assert row["flag"] == "--" + dest.replace("_", "-")
-
-    yaml = os.path.join(REPO, "examples", "llama3", "train_1b_adamw.yaml")
-    out = subprocess.run([sys.executable, "-m", "sga.config", "resolve", yaml],
-                         capture_output=True, text=True, cwd=REPO, env=env)
-    assert out.returncode == 0, out.stderr
-    resolved = json.loads(out.stdout)
-    canon = validate_sga_flat(dict(ENABLED), train_iters=5000)
-    assert resolved == json.loads(canonical_flat_json(canon))
-    print("ok: schema/resolve CLI match the declarations and canonical form")
 
 
 def test_typo_plugin_param_rejected():

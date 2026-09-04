@@ -5,7 +5,7 @@ One backend, two transport modes chosen by ``high_priority_group``:
 
 - ``false`` (default): collectives run on the training world's existing
   DP-CP group — the legacy ``indexed_sparse`` transport. With the default
-  ``slices: 2`` the split is the bucket-midpoint partition
+  ``index_slices: 2`` the split is the bucket-midpoint partition
   (``support.split``).
 - ``true``: collectives run on a twin NCCL process group over the same
   ranks created with ``ProcessGroupNCCL.Options(is_high_priority_stream=
@@ -87,9 +87,9 @@ _WARMUP_ENV = COMM_WARMUP_ENV
 # 8M fp32 elements = 32MB: at/above the largest single-slice allreduce in
 # production (buckets ~40M elements × 40% support / 2 slices ≈ 8M), so the
 # warmup connects every NCCL channel the real path will ever use. Assumed
-# geometry — NOT scaled with self._slices (sized for the default slices=2):
-# with slices: 1 the largest production slice is ~16M elems and the first
-# real allreduce exceeds this warmup op.
+# geometry — NOT scaled with self._slices (sized for the default
+# index_slices=2): with index_slices=1 the largest production slice is
+# ~16M elems and the first real allreduce exceeds this warmup op.
 _TWIN_WARMUP_ELEMS = 8 << 20
 
 
@@ -100,7 +100,7 @@ class TorchPipelinedIndexBackend:
 
     def __init__(self, params: dict):
         params = expand_plugin_params(
-            "sga_backend_", ("high_priority_group", "slices", "emission"),
+            "sga_backend_", ("high_priority_group", "index_slices", "emission"),
             dict(params), "sga_backend (torch_pipelined_index)")
         # Emission switch: how the sparse allreduce hands its result to
         # the optimizer. 'auto' (the flag default) resolves to this
@@ -113,9 +113,9 @@ class TorchPipelinedIndexBackend:
         if self.emission == "auto":
             self.emission = "compact"
         self._hiprio = bool(params["high_priority_group"])
-        self._slices = int(params["slices"])
+        self._slices = int(params["index_slices"])
         if self._slices < 1:
-            raise ValueError(f"slices must be >= 1, got {self._slices}")
+            raise ValueError(f"index_slices must be >= 1, got {self._slices}")
         self._gather_bufs: dict = {}  # bucket key -> persistent compact buffer
         # comm_group -> twin high-priority group. Keyed by the group OBJECT
         # with a strong reference held on both sides (an id() key could

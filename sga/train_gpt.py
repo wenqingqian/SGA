@@ -96,6 +96,7 @@ def _sga_resume_guard(args) -> None:
         canonical_flat_json,
         collect_sga_flat,
         explicit_from_flat,
+        sga_defaults,
         validate_sga_flat,
     )
 
@@ -163,10 +164,21 @@ def _sga_resume_guard(args) -> None:
         elif not saved_flat:
             detail = "checkpoint carries no saved sga arguments"
         else:
-            same = _canonical(saved_args) == _canonical(args)
-            if not same:
-                detail = ("checkpoint sga configuration differs from the "
-                          "current --sga-* arguments")
+            retired = sorted(set(saved_flat) - set(sga_defaults()))
+            if retired:
+                # A retired key (renamed or removed since the checkpoint
+                # was saved) is dropped by explicit_from_flat before the
+                # comparison, which would make both sides canonicalize to
+                # the current defaults — refuse instead of comparing a
+                # config the checkpoint never ran with.
+                detail = (f"checkpoint carries retired sga keys {retired} "
+                          "(removed or renamed since it was saved); "
+                          "re-spell the configuration with current names")
+            else:
+                same = _canonical(saved_args) == _canonical(args)
+                if not same:
+                    detail = ("checkpoint sga configuration differs from the "
+                              "current --sga-* arguments")
     except (OSError, AttributeError, KeyError, TypeError, ValueError,
             RuntimeError, pickle.UnpicklingError) as e:
         detail = f"could not verify the checkpoint's saved sga configuration ({e})"

@@ -34,7 +34,7 @@ class TorchPipelinedMaskBackend:
 
     def __init__(self, params: dict):
         params = expand_plugin_params(
-            "sga_backend_", ("num_slices", "emission"), dict(params),
+            "sga_backend_", ("mask_slices", "emission"), dict(params),
             "sga_backend (torch_pipelined_mask)")
         # Emission is inherent here (writeback): the communicated values
         # are scattered back into the dense grad buffer for the masked
@@ -52,7 +52,8 @@ class TorchPipelinedMaskBackend:
                 "writeback-inherent (set sga_backend: "
                 "torch_pipelined_index to switch emission)")
         self.emission = "writeback"
-        self.num_slices = int(params["num_slices"]) or 2
+        # 0 (the declared default) normalizes to 2 slices
+        self._mask_slices = int(params["mask_slices"]) or 2
 
     def allreduce_sparse(self, grad_data: torch.Tensor, support,
                          comm_group, gradient_scaling_factor: float,
@@ -70,7 +71,7 @@ class TorchPipelinedMaskBackend:
         mask_u8 = support.mask_u8
         element_mask = mask_u8 > 0
         numel = grad_data.numel()
-        num_slices = self.num_slices
+        num_slices = self._mask_slices
         if num_slices <= 1 or numel == 0:
             selected = grad_data[element_mask]
             if selected.numel() > 0:

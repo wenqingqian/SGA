@@ -67,7 +67,7 @@ def main():
 
     # --- masked backend (writeback emission) -------------------------------
     g_mask = local.clone()
-    ret_mask = TorchPipelinedMaskBackend({"num_slices": 2}).allreduce_sparse(
+    ret_mask = TorchPipelinedMaskBackend({"mask_slices": 2}).allreduce_sparse(
         g_mask, support, group, factor, op, key=0)
     active = support.mask_u8 > 0
     assert ret_mask is None, "writeback backend must return None"
@@ -146,7 +146,7 @@ def main():
     # --- empty support is a clean no-op ------------------------------------
     empty = BucketSupport(torch.zeros(n, dtype=torch.uint8, device=device))
     g_empty = local.clone()
-    ret_m = TorchPipelinedMaskBackend({"num_slices": 2}).allreduce_sparse(
+    ret_m = TorchPipelinedMaskBackend({"mask_slices": 2}).allreduce_sparse(
         g_empty, empty, group, factor, op, key=1)
     ret_i = TorchPipelinedIndexBackend({}).allreduce_sparse(
         g_empty, empty, group, factor, op, key=1)

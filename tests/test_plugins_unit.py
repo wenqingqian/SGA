@@ -88,7 +88,7 @@ def test_old_backend_name_fails_loud():
     from sga.plugins import get_backend_plugin_decl
     for old, hint in (
         ("indexed_sparse", "high_priority_group: false"),
-        ("pipelined_idx_sorted", "high_priority_group: true, slices: 3"),
+        ("pipelined_idx_sorted", "high_priority_group: true, index_slices: 3"),
         ("masked_pipelined", "torch_pipelined_mask"),
     ):
         try:

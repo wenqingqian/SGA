@@ -75,7 +75,7 @@ sga:
   sga_optimizer_residual_mean: false
   sga_backend: torch_pipelined_index
   sga_backend_high_priority_group: true
-  sga_backend_slices: 3
+  sga_backend_index_slices: 3
 
 #### model ####
 

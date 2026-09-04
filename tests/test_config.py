@@ -185,7 +185,8 @@ def test_illegal_combination_rejected():
     cfg, _ = make_base()
     _enable_standard(cfg)
     cfg.sga.sga_score = "update_ratio"  # the pre-rename name must fail
-    expect_error(lambda: validate_run_config(cfg), "Unknown SGA score")
+    expect_error(lambda: validate_run_config(cfg),
+                 "must be one of ['abs_g', 'abs_m', 'coi', 'update']")
     # cycle-calendar legality: an explicit full_sync_interval is illegal
     # without the decouple switch (including the exact legacy fsi=0
     # spelling); decoupled values must be strict divisors
@@ -311,12 +312,12 @@ def test_plugin_param_vocabulary():
                  "unknown keys")
     expect_error(lambda: validate_sga_flat({**base, "sga_score_extra": 1}),
                  "unknown keys")
-    canon = validate_sga_flat({**base, "sga_backend_num_slices": 3})
-    assert canon["sga_backend_num_slices"] == 3  # validation is silent
+    canon = validate_sga_flat({**base, "sga_backend_mask_slices": 3})
+    assert canon["sga_backend_mask_slices"] == 3  # validation is silent
     from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 
-    expect_error(lambda: TorchPipelinedIndexBackend({"num_slices": 3}),
-                 "unknown params ['num_slices']")
+    expect_error(lambda: TorchPipelinedIndexBackend({"mask_slices": 3}),
+                 "unknown params ['mask_slices']")
     print("ok: declared-flag typos loud at validation, plugin vocab at build")
 
 
@@ -346,8 +347,8 @@ def test_wrong_types_fail_loud():
             "sga_backend": "torch_pipelined_index"}
     expect_error(lambda: validate_sga_flat({**base, "sga_cycle_period": True}),
                  "sga_cycle_period must be a valid int (got True)")
-    expect_error(lambda: validate_sga_flat({**base, "sga_backend_slices": 3.9}),
-                 "sga_backend_slices must be a valid int (got 3.9)")
+    expect_error(lambda: validate_sga_flat({**base, "sga_backend_index_slices": 3.9}),
+                 "sga_backend_index_slices must be a valid int (got 3.9)")
     expect_error(lambda: validate_sga_flat({**base, "sga_cycle_period": "8"}),
                  "sga_cycle_period must be a valid int (got '8')")
     expect_error(lambda: validate_sga_flat(
@@ -363,9 +364,25 @@ def test_wrong_types_fail_loud():
         {**base, "sga_selection_ratio_percent": float("nan")}),
         "sga_selection_ratio_percent must be a finite float (got nan)")
     # integral floats are still rejected for int dests (8.0 is a float)
-    expect_error(lambda: validate_sga_flat({**base, "sga_backend_slices": 3.0}),
-                 "sga_backend_slices must be a valid int (got 3.0)")
+    expect_error(lambda: validate_sga_flat({**base, "sga_backend_index_slices": 3.0}),
+                 "sga_backend_index_slices must be a valid int (got 3.0)")
     print("ok: wrong-typed yaml values fail loud (bool/float/str/nan)")
+
+
+def test_shipped_examples_validate():
+    """Every shipped example yaml passes validation as-is (a renamed or
+    removed flag left behind in an example would otherwise surface only
+    at a user's launch)."""
+    import glob
+
+    examples = sorted(glob.glob(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "examples", "llama3", "*.yaml")))
+    assert examples, "no shipped examples found"
+    for path in examples:
+        cfg = OmegaConf.load(path)
+        validate_run_config(cfg)  # must not raise (None = dense example)
+    print(f"ok: all {len(examples)} shipped examples validate")
 
 
 def _run_all():

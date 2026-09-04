@@ -31,8 +31,8 @@ real defaults filled in by argparse, "flag absent" is indistinguishable
 from "flag at default", and the two are semantically identical anyway).
 
 Output: the canonical FLAT dict (every dest at its resolved, typed
-value; percent resolved away) used for the engine's config print, the
-resume guard comparison and ``python -m sga.config resolve``. The
+value; percent resolved away) used for the engine's config print and the
+resume guard comparison. The
 engine's internal NESTED read shape is assembled from the canonical by
 ``sga.runtime.materialize_engine_config`` — validation itself is flat
 in, flat out.
@@ -225,11 +225,10 @@ def validate_sga_flat(flat: dict, train_iters=None):
         return None
 
     # --- required when enabled ---
-    for dest in ("sga_score", "sga_optimizer"):
-        if typed.get(dest) is None:
-            raise ValueError(
-                f"{dest} is required when sga_enabled is true "
-                "(registered names are the choices)")
+    if typed.get("sga_score") is None:
+        raise ValueError(
+            "sga_score is required when sga_enabled is true "
+            "(the choices are the registered scores)")
     if typed.get("sga_backend", defaults["sga_backend"]) == "dense":
         raise ValueError(
             "sga_enabled is true but sga_backend is still 'dense' (the "
@@ -325,7 +324,7 @@ def validate_sga_flat(flat: dict, train_iters=None):
     register_default_plugins()
     score = typed["sga_score"]
     selection = typed.get("sga_selection", defaults["sga_selection"])
-    optimizer = typed["sga_optimizer"]
+    optimizer = typed.get("sga_optimizer", defaults["sga_optimizer"])
     backend = typed["sga_backend"]
     emission = typed.get("sga_backend_emission",
                          defaults["sga_backend_emission"])
