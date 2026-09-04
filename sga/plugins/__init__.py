@@ -109,7 +109,7 @@ _OPTIMIZERS: dict = {}
 _BACKEND_PLUGINS: dict = {}
 
 # Absorbed backend names -> the migration hint raised on lookup. The
-# unification  merged indexed_sparse + pipelined_idx_sorted
+# unification merged indexed_sparse + pipelined_idx_sorted
 # into torch_pipelined_index (its high_priority_group param selects the
 # legacy behavior) and renamed masked_pipelined -> torch_pipelined_mask.
 _RENAMED_BACKENDS = {

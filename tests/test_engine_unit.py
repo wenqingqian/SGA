@@ -167,8 +167,8 @@ def test_adamw_reset_folds_residual_by_decoupled_fold_window():
     grad-correct fused pass folds the residual at the UNCOMMUNICATED
     positions by ctx.fold_window — the decoupled full_sync_interval (4), NOT
     the period (8) — and clears the communicated positions; reset()
-    afterwards must leave the folded residual intact (moved both
-    the clear and the fold INTO the kernel pass). A revert to the period
+    afterwards must leave the folded residual intact (the fused pass now
+    does both the clear and the fold). A revert to the period
     divisor would leave every residual coordinate 2x too large on the
     decoupled calendar."""
     opt = build_optimizer("adamw", {"residual_mean": True})
@@ -839,7 +839,7 @@ def test_reselect_boundary_orders_reset_before_activation():
     successful reselection boundary: optimizer full step -> model copy ->
     selection (reads the materialized score views) -> reset (zeroes the
     consumed grad buffers — captured here while the OLD support is still
-    the active one on the buckets; an earlier round reset no longer reads the
+    the active one on the buckets; reset no longer reads the
     masks itself) -> activate(new support) -> host reset. The stub
     selection's consecutive masks are DISJOINT, so 'reset ran under the old
     support' is falsifiable: a refactor that activated the new support

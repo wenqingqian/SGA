@@ -429,7 +429,7 @@ def test_meta_carries_engine_phase():
 
 
 def test_sparse_dump_dualpath_content():
-    """dual-path, content level: on a DUMPING sparse step (trace
+    """Dual-path, content level: on a DUMPING sparse step (trace
     window active) the engine applies the clip explicitly engine-side —
     payload = where(mask, g*coeff, g), inactives raw — and hands the
     optimizer apply_coeff == 1.0 (no double scale). A regression that

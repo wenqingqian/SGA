@@ -42,7 +42,7 @@ def grad_correct_torch(param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
     and dies in the registry lookup with the misleading "Unknown SGA score
     'OFFLINE'" message.
 
-    Sparse-fusion knobs (mirror the kernel): ``coeff`` multiplies
+    Sparse-fusion knobs (mirroring the kernel): ``coeff`` multiplies
     the working gradient at mask-active positions, ``clear`` zeroes the
     active positions of ``grad`` after use, ``fold`` divides ``grad`` by
     ``interval`` (actives are 0 by then — 0/T == 0 exact, the same op

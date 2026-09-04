@@ -258,7 +258,7 @@ def test_update_formula_wd_free_variant():
     assert float(diff.abs().max()) <= 1e-6 * scale
 
 
-# ------------------------------------------- sparse fusion (, CPU)
+# ------------------------------------------- sparse fusion (CPU)
 
 def test_grad_correct_sparse_fusion_semantics():
     """grad_correct_torch fusion knobs == the standalone sequence: coeff is
@@ -618,7 +618,7 @@ def test_score_emission_matches_oracles():
     print("ok: score emission matches oracles (coi/abs_g/abs_m)")
 
 
-# ------------------------------------- sparse end-state (, CPU)
+# ------------------------------------- sparse end-state (CPU)
 
 class _SparseRec(_Rec):
     """_Rec with a realizable mask for the sparse step."""
@@ -639,7 +639,7 @@ class _Bucket:
 
 
 def test_sparse_step_end_state_invariant():
-    """The an earlier round contract pinned end-to-end at SgaAdamW level: after
+    """The sparse-fusion contract pinned end-to-end at SgaAdamW level: after
     sparse_step + reset, mask-active coords are bitwise 0 and mask-inactive
     coords keep the accumulating residual (folded by the window only on the
     pre-boundary step with residual_mean); reset() on a sparse step must

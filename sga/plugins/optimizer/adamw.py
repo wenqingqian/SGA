@@ -265,7 +265,7 @@ if _HAS_TRITON:
         # Block-subset upper bound: dedup + the BLOCK-wide coordinate window
         # cap q - p at BLOCK, so ~log2(BLOCK) active rounds converge here.
         # Do NOT widen back to k_total — a pure performance regression
-        # (cut ~28 active scalar rounds to <= 10) that stays
+        # (the bound cut ~28 active scalar rounds to <= 10) that stays
         # mathematically correct, so no test would catch it.
         b = tl.minimum(k_total, p + BLOCK_SIZE)
         for _ in tl.static_range(SEARCH_DEPTH):

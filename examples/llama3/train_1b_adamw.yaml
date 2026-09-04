@@ -1,4 +1,4 @@
-# SGA "radius" named preset : topk scheme (method=histogram) as a pure
+# SGA "radius" named preset: topk scheme (method=histogram) as a pure
 # four-field config combination. Everything outside the sga: section mirrors
 # examples/llama3/train_1b_dense.yaml so runs are directly comparable.
 #

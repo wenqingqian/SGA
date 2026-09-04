@@ -839,7 +839,7 @@ class SGAEngine:
         ulp jitter diverges clip coefficients, then masks, then deadlocks the
         sparse allreduce.
 
-        The coeff application routes three ways : full steps
+        The coeff application routes three ways: full steps
         scale in place and return 1.0; sparse steps with a materializing
         trace dump this step scale explicitly (rank-consistently — the dump
         slot reads the post-clip view) and return 1.0; all other sparse
