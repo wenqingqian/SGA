@@ -682,7 +682,7 @@ def dense_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons,
 
 def sparse_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
                   sel, snap_d, replay_dtype, chunk_mb, device,
-                  upcast_bf16=False):
+                  upcast_bf16=False, norm_fp32=False):
     """Sparse replay with a fixed support ``sel`` (flat bool, catalog order).
 
     Per window step the pre-clip gradient is reconstructed
@@ -719,7 +719,10 @@ def sparse_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
             for a in range(0, n, chunk_n):
                 b = min(n, a + chunk_n)
                 q_pre = (g[a:b] / coef_dense) * sel[o + a: o + b].to(torch.bool)
-                qn2 += float((q_pre.double() ** 2).sum())
+                if norm_fp32:
+                    qn2 += float((q_pre * q_pre).sum())
+                else:
+                    qn2 += float((q_pre.double() ** 2).sum())
         qnorm = math.sqrt(qn2)
         clip_grad = float(gmeta.get("clip_grad", 0.0))
         coef_sparse = 1.0
@@ -769,7 +772,7 @@ def sparse_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
 
 def sparse_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons,
                       sel, snap_d, replay_dtype, chunk_mb, device,
-                      upcast_bf16=False):
+                      upcast_bf16=False, norm_fp32=False):
     """Device-resident sparse replay; semantics identical to sparse_replay."""
     (names, offs, N) = _replay_meta(params, base_meta)
     chunk_n = _chunk_elems(chunk_mb, torch.finfo(replay_dtype).bits // 8)
@@ -795,7 +798,10 @@ def sparse_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons
             for a in range(0, n, chunk_n):
                 b = min(n, a + chunk_n)
                 q_pre = (g[a:b].to(dev) / coef_dense) * sel[o + a: o + b].to(dev)
-                qn2 += float((q_pre.double() ** 2.0).sum())
+                if norm_fp32:
+                    qn2 += float((q_pre * q_pre).sum())
+                else:
+                    qn2 += float((q_pre.double() ** 2.0).sum())
         qnorm = math.sqrt(qn2)
         clip_grad = float(gmeta.get("clip_grad", 0.0))
         coef_sparse = 1.0
@@ -855,7 +861,7 @@ def _fresh_state(t, dev):
 def sparse_replay_cycle(params, g_files, window_steps, base_meta, t0,
                         eff_horizons, score_name, k, cycle_len, sel0, snap_d,
                         replay_dtype, chunk_mb, device, sel_trace=None,
-                        upcast_bf16=False):
+                        upcast_bf16=False, norm_fp32=False):
     """Sparse replay with residual accumulation and cycle-boundary mask
     re-selection — the offline twin of the online cyclic semantics:
 
@@ -913,7 +919,14 @@ def sparse_replay_cycle(params, g_files, window_steps, base_meta, t0,
                     q_pre = g_pre + prm["res"][a:b]
                 else:
                     q_pre = g_pre * sel[o + a: o + b].to(dev)
-                qn2 += float((q_pre.double() ** 2.0).sum())
+                if norm_fp32:
+                    # res may live in replay_dtype (fp64) — the fp32-norm
+                    # variant quantizes q_pre to fp32 BEFORE squaring, by
+                    # design (that quantization IS the perturbation).
+                    q32 = q_pre.to(torch.float32)
+                    qn2 += float((q32 * q32).sum())
+                else:
+                    qn2 += float((q_pre.double() ** 2.0).sum())
         qnorm = math.sqrt(qn2)
         coef = 1.0
         if clip_grad > 0.0:
@@ -1171,6 +1184,7 @@ def process_branch(t0, ctx, args):
     # created — the sparse replays below only need w0/m0/v0.)
     use_dev = args.device != "cpu"
     upcast_bf16 = args.trace_dtype == "bf16"
+    norm_fp32 = args.norm_dtype == "fp32"
     cached = None
     if args.dense_cache:
         ident = _dense_cache_ident(trace_dir, t0, window_steps, eff_horizons,
@@ -1239,19 +1253,19 @@ def process_branch(t0, ctx, args):
                     params, g_files, window_steps, meta, t0, eff_horizons,
                     sname, k, args.cycle_len, sel, snap_d, replay_dtype,
                     args.chunk_mb, args.device,
-                    upcast_bf16=upcast_bf16,
+                    upcast_bf16=upcast_bf16, norm_fp32=norm_fp32,
                 )
             elif use_dev:
                 num_at = sparse_replay_dev(
                     params, g_files, window_steps, meta, t0, eff_horizons, sel,
                     snap_d, replay_dtype, args.chunk_mb, args.device,
-                    upcast_bf16=upcast_bf16,
+                    upcast_bf16=upcast_bf16, norm_fp32=norm_fp32,
                 )
             else:
                 num_at = sparse_replay(
                     params, g_files, window_steps, meta, t0, eff_horizons, sel,
                     snap_d, replay_dtype, args.chunk_mb, args.device,
-                    upcast_bf16=upcast_bf16,
+                    upcast_bf16=upcast_bf16, norm_fp32=norm_fp32,
                 )
             if args.verbose:
                 print(f"  [t0={t0}] {sname}@{r}% sparse replay done "
@@ -1519,6 +1533,12 @@ def main(argv=None):
                     help="per-chunk working-set budget for large params, MB")
     ap.add_argument("--replay-dtype", default="fp64", choices=["fp64", "fp32"],
                     help="dtype for the AdamW replay arithmetic")
+    ap.add_argument("--norm-dtype", default="fp64", choices=["fp64", "fp32"],
+                    help="accumulation dtype of the per-step clip-norm pass "
+                         "(the sparse pass-1 reductions): fp64 (default, "
+                         "oracle semantics) or fp32 (per-chunk fp32 "
+                         "reduction, chunk sums promoted to fp64; the "
+                         "deviation is gated by the frozen fp32-norm band)")
     ap.add_argument("--trace-dtype", default="fp32", choices=["fp32", "bf16"],
                     help="g payload dtype in the trace: fp32 (original "
                          "dumps) or bf16 (screening copies built by "
@@ -1541,6 +1561,23 @@ def main(argv=None):
                     help="T: full-sync / mask re-selection interval for "
                          "--replay-mode cycle (window boundary si=0 is always "
                          "a full-sync step)")
+    ap.add_argument("--fused", action="store_true",
+                    help="fused single-pass engine (requires --replay-mode "
+                         "cycle + --dense-cache): all score x ratio arms "
+                         "advance the window in lockstep — one window read "
+                         "per config group — sharded across --fused-shards "
+                         "processes. Single-shard runs reproduce the classic "
+                         "report bitwise; multi-shard runs deviate only by "
+                         "cross-shard fp64 scalar-sum reordering (the frozen "
+                         "pure-reorder band)")
+    ap.add_argument("--fused-shards", type=int, default=8,
+                    help="shard process count for --fused (shard r uses "
+                         "cuda:r; the window read, the streaming AdamW state "
+                         "and the top-k select are split across shards)")
+    ap.add_argument("--fused-max-configs", type=int, default=12,
+                    help="arms (score x ratio) advanced per fused window "
+                         "pass (config group size; state memory per group "
+                         "scales with this)")
     ap.add_argument("--score-names", default=None,
                     help="comma list restricting the score set (validated "
                          "against the framework score registry). Default: all "
@@ -1590,6 +1627,10 @@ def main(argv=None):
         raise ValueError(
             "--dense-cache cannot be combined with --self-check "
             "(the self-check must actually replay the window)")
+    if args.fused and args.self_check is not None:
+        # the remaining fused gates live in run_fused_branch, which the
+        # branch dispatch reaches; the self-check path returns before it
+        raise ValueError("--fused cannot be combined with --self-check")
 
     trace_dir = os.path.abspath(args.trace_dir)
     catalog, names, offsets, N, state_files, g_files = discover_trace(trace_dir)
@@ -1646,7 +1687,11 @@ def main(argv=None):
 
     branch_results = {}
     for t0 in branch_pts:
-        branch_results[str(t0)] = process_branch(t0, ctx, args)
+        if args.fused:
+            from sga.replay_fused import run_fused_branch
+            branch_results[str(t0)] = run_fused_branch(args, ctx, t0)
+        else:
+            branch_results[str(t0)] = process_branch(t0, ctx, args)
 
     report = {
         "trace_dir": trace_dir,
@@ -1658,9 +1703,13 @@ def main(argv=None):
             "chunk_mb": args.chunk_mb,
             "replay_dtype": args.replay_dtype,
             "trace_dtype": args.trace_dtype,
+            "norm_dtype": args.norm_dtype,
             "dense_cache": args.dense_cache,
             "replay_mode": args.replay_mode,
             "cycle_len": args.cycle_len,
+            "fused": args.fused,
+            "fused_shards": args.fused_shards,
+            "fused_max_configs": args.fused_max_configs,
             "score_names": args.score_names,
             "window": args.window,
             "seed": args.seed,

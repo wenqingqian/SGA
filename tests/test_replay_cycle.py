@@ -186,7 +186,7 @@ def _make_trace(tmpdir, pre_grads, lrs, clip, t0, n):
 
 def _run_module(tmpdir, name, w0, m0, v0, t0, W, score_name, ratio_pct, T,
                 replay_dtype=torch.float64, sel_trace=None,
-                upcast_bf16=False):
+                upcast_bf16=False, norm_fp32=False):
     """Run the module's dense + cycle sparse replays; return num_at {h: num}."""
     catalog, names, offsets, N, state_files, g_files = soa.discover_trace(tmpdir)
     meta, params, w_parts, m_parts, v_parts, g_parts = soa.build_branch_state(
@@ -211,7 +211,7 @@ def _run_module(tmpdir, name, w0, m0, v0, t0, W, score_name, ratio_pct, T,
     num_at = soa.sparse_replay_cycle(
         params, g_files, window_steps, meta, t0, eff, score_name, k, T, sel0,
         snap_d, replay_dtype, 1, "cpu", sel_trace=sel_trace,
-        upcast_bf16=upcast_bf16)
+        upcast_bf16=upcast_bf16, norm_fp32=norm_fp32)
     return num_at
 
 
@@ -790,6 +790,44 @@ def test_self_check_trace_dtype():
     print("PASS test_self_check_trace_dtype")
 
 
+def test_norm_dtype_fp32():
+    """--norm-dtype fp32: with clipping inactive the norm is unused and the
+    replay is bitwise identical; with active clipping the fp32-quantized
+    pass-1 norms perturb the trajectory only at the band scale."""
+    torch.manual_seed(13)
+    t0, W, n = 900, 6, 24
+    lrs = [5e-5] * W
+    # clip inactive (clip=0): coef is structurally 1, the norm is never
+    # consumed
+    pre = [torch.randn(n) * 0.02 for _ in range(W)]
+    with tempfile.TemporaryDirectory() as td:
+        name, w0, m0, v0 = _make_trace(td, pre, lrs, 0.0, t0, n)
+        a = _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 25.0, 2,
+                        norm_fp32=False)
+        b = _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 25.0, 2,
+                        norm_fp32=True)
+        assert a == b, "clip-inactive replay must not depend on norm dtype"
+    # clip active (norms >> clip): fp32 quantization of the pass-1 norms
+    # perturbs coef at ~1e-7 relative; the trajectory stays within the band
+    pre = [torch.randn(n) * 0.5 for _ in range(W)]
+    with tempfile.TemporaryDirectory() as td:
+        name, w0, m0, v0 = _make_trace(td, pre, lrs, 0.3, t0, n)
+        a = _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 25.0, 2,
+                        norm_fp32=False)
+        b = _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 25.0, 2,
+                        norm_fp32=True)
+        # the flag must actually fire on the clip-active arm: a no-op
+        # norm_fp32 would produce b == a, trivially inside the band
+        assert any(b[h] != a[h] for h in a), \
+            "fp32-norm quantization must perturb the clipped trajectory"
+        for h in a:
+            assert (a[h] == 0.0) == (b[h] == 0.0), f"d@{h}: {a[h]} vs {b[h]}"
+            if a[h] != 0.0:
+                assert _close(b[h], a[h], 1e-4), (
+                    f"fp32-norm d@{h} outside band: {b[h]} vs {a[h]}")
+    print("PASS test_norm_dtype_fp32")
+
+
 def main():
     test_T1_is_dense()
     test_no_fold_within_window()
@@ -806,6 +844,7 @@ def main():
     test_trace_dtype_bf16()
     test_trace_convert_module()
     test_self_check_trace_dtype()
+    test_norm_dtype_fp32()
     print("\nall replay-cycle tests passed")
 
 
