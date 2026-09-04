@@ -593,7 +593,7 @@ def test_compact_grad_correct_dir_table():
     exact — it pins the pin (a future tolerance-comparator swap), not a
     plausible kernel fault (the poisoned entry differs from `ref` by
     construction). The consumer legs pin: fired-set equality vs the
-    binary form (the integer path), the fp tail to the measured
+    bisection form (the integer path), the fp tail to the measured
     contraction class, same-binary rerun stability, the r=1023
     extreme-residue geometry (every p/q at its bracket's far edge)
     through the writeback oracle chain, and bisecting brackets over
@@ -736,7 +736,7 @@ def test_compact_grad_correct_dir_table():
             fired_tab = a_tab["m"][sl] != 0.9 * m0[sl]
             sel = mask.to(device).bool()[sl]
             assert int((fired_tab & ~sel).sum()) == 0, "ghost lookup (table)"
-            assert int((fired_bin & ~sel).sum()) == 0, "ghost lookup (binary)"
+            assert int((fired_bin & ~sel).sum()) == 0, "ghost lookup (bisection)"
             sym = int((fired_tab ^ fired_bin).sum())
             # absorption tail: the m-detector flips only at summation
             # rounding ties (~2e-8/element — expected sym is 0 at this
@@ -762,7 +762,7 @@ def test_compact_grad_correct_dir_table():
             for name in ("p", "m", "v"):
                 _assert_tail_ulp_class(a_tab[name][sl], a_bin[name][sl],
                                        scales[name][sl],
-                                       f"table-vs-binary {name}, fold={fold}, "
+                                       f"table-vs-bisection {name}, fold={fold}, "
                                        f"rec_start={rec_start}")
 
     # --- two records, one shared table (the production loop's shape:
@@ -770,7 +770,7 @@ def test_compact_grad_correct_dir_table():
     # table and values, only rec_start differs — record 1's b = c0 >> 10
     # must index the table record 0 consumed, built once over the full
     # bucket width; a per-record rebuild would hide a shared-table
-    # indexing bug). Two-record harness pattern of the binary-path test,
+    # indexing bug). Two-record harness pattern of the bisection-path test,
     # record boundary NOT block-aligned so record 1 starts mid-block
     # with a nonzero residue; instruments identical to the A/B legs
     # above.
@@ -808,7 +808,7 @@ def test_compact_grad_correct_dir_table():
     fired_tab = a_tab["m"] != 0.9 * m0
     sel = mask.to(device).bool()
     assert int((fired_tab & ~sel).sum()) == 0, "ghost lookup (table)"
-    assert int((fired_bin & ~sel).sum()) == 0, "ghost lookup (binary)"
+    assert int((fired_bin & ~sel).sum()) == 0, "ghost lookup (bisection)"
     sym = int((fired_tab ^ fired_bin).sum())
     assert sym <= max(4, k >> 16), (
         f"fired-set symmetric difference {sym} >> absorption tail "
@@ -826,7 +826,7 @@ def test_compact_grad_correct_dir_table():
     }
     for name in ("p", "m", "v"):
         _assert_tail_ulp_class(a_tab[name], a_bin[name], scales[name],
-                               f"table-vs-binary {name}, two records")
+                               f"table-vs-bisection {name}, two records")
 
     # --- r=1023 extreme residue: start 1023 over a full-dense bucket —
     # every block's true p/q sits exactly at table[b]+1023 /

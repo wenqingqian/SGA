@@ -22,8 +22,10 @@ how the sparse allreduce hands its result to the optimizer.
   grad buffer back (the zero store inside pack establishes the
   buffer-state invariant at grad_sync time; clip/grad_correct consume
   (idx, values) via the engine's compact branches).
-- ``writeback``: the historical choreography (the pre-compact form, and
-  bit for bit the nccl backend's) — pure-read ``index_select`` gather,
+- ``writeback``: the historical choreography (the pre-compact form; the
+  end state is bitwise-equal to the nccl backend's within the dist
+  suite's 2-rank scope — the mechanism itself differs) — pure-read
+  ``index_select`` gather,
   payload-only scale, pipelined allreduce, ``scatter_selected`` writes the
   communicated values back into the dense grad buffer; the optimizer's
   masked kernel reads them there and does the selective clear post-commit.
@@ -303,6 +305,8 @@ class TorchPipelinedIndexBackend:
                          gradient_scaling_factor: float, reduce_op,
                          key: int):
         """Sparse allreduce of ``grad_data`` at ``support.idx`` positions —
+        the contract is conditional on the resolved ``self.emission``.
+
         COMPACT EMISSION: returns the communicated values view.
 
         ``support`` is a ``sga.support.BucketSupport``; ``key`` identifies
@@ -315,6 +319,12 @@ class TorchPipelinedIndexBackend:
         until this bucket's next pack; an empty tensor when nothing was
         selected (k == 0), still a Tensor so the engine can distinguish
         compact zero-selection from a writeback backend's None.
+
+        WRITEBACK EMISSION: pure-read gather (``grad_data`` is never
+        zeroed), payload-only scale, pipelined allreduce, then the reduced
+        values are scattered back into ``grad_data`` — returns ``None``
+        (also at k == 0); the engine treats None as the writeback
+        signature and keeps clip/grad_correct on the masked paths.
         """
         # int32 canonical indices: refuse oversized buckets loudly instead
         # of wrapping silently (buckets ~40M elements today, 2^31 is far).
@@ -339,7 +349,8 @@ class TorchPipelinedIndexBackend:
 
         if self.emission == "writeback":
             # The historical choreography (bit for bit the pre-compact
-            # form and the nccl backend's): pure-read gather, payload-only
+            # form; end state bitwise-equal to the nccl backend's within
+            # the dist suite's 2-rank scope): pure-read gather, payload-only
             # scale, pipelined allreduce, scatter the communicated values
             # back into the dense grad; the optimizer's masked kernel
             # reads them there and does the selective clear post-commit.

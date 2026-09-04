@@ -638,7 +638,7 @@ def adamw_grad_correct_compact(
     zeroed them at grad_sync time (there is deliberately no clear knob).
 
     ``dir_table`` (compact_search=table) routes to the table-bracketed
-    kernel; None keeps the plain full-depth binary form. Both forms share
+    kernel; None keeps the plain full-depth bisection form. Both forms share
     this wrapper's contract; ignored on the torch fallback path.
 
     ulp-class contract: values-level math is single-rounding (bitwise the

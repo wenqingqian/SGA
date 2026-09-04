@@ -329,15 +329,17 @@ def validate_sga_flat(flat: dict, train_iters=None):
     backend = typed["sga_backend"]
     emission = typed.get("sga_backend_emission",
                          defaults["sga_backend_emission"])
+    get_score_spec(score)
+    selection_decl = get_selection_decl(selection)
+    optimizer_decl = get_optimizer_decl(optimizer)
+    backend_decl = get_backend_plugin_decl(backend)
+    # The emission rule sits after the decl lookups: a retired backend
+    # name must raise the absorbed-backend hint, not the emission refusal.
     if emission == "compact" and backend != "torch_pipelined_index":
         raise ValueError(
             f"sga_backend_emission 'compact' is only supported by "
             f"torch_pipelined_index (got backend '{backend}'); the "
             "writeback-inherent backends run writeback only")
-    get_score_spec(score)
-    selection_decl = get_selection_decl(selection)
-    optimizer_decl = get_optimizer_decl(optimizer)
-    backend_decl = get_backend_plugin_decl(backend)
 
     # --- selection (topk): per-method rules over values ---
     if selection == "topk":

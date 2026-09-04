@@ -779,7 +779,7 @@ def test_compact_search_cpu_compact_dispatch():
     CPU tensors) must never run before the fallback engages (the DECL's
     "silently ignored on ... the torch fallback path" contract). Drives
     SgaAdamW.sparse_step -> _records_pass_compact with compact_values on
-    CPU tensors: the 'table' end state must be bitwise the 'binary' end
+    CPU tensors: the 'table' end state must be bitwise the 'bisection' end
     state, and the values must actually be consumed (the fallback is not
     a silent no-op)."""
     from sga.support import BucketSupport, Support

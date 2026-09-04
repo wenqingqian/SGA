@@ -35,7 +35,7 @@ sga.config.validation (flat keys).
 """
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
 
 from sga.plugins.scores import Score, ScoreSpec, get_score_spec, score_names
 
@@ -186,7 +186,7 @@ def registered_names() -> dict:
 
 def validate_combination(score_name: str, selection: SelectionDecl,
                          optimizer: OptimizerDecl, backend,
-                         backend_emission: str = None) -> None:
+                         backend_emission: Optional[str] = None) -> None:
     """Declaration-based CROSS-AXIS combination validation (config time,
     no scheme names).
 
@@ -214,7 +214,7 @@ def validate_combination(score_name: str, selection: SelectionDecl,
                           else backend.emission)
     if effective_emission == "compact" and not optimizer.consumes_compact:
         problems.append(
-            f"backend '{backend.name}' declares emission='compact' but "
+            f"backend '{backend.name}' resolves to emission='compact' but "
             f"optimizer '{optimizer.name}' does not consume the compact "
             "(idx, values) handoff (consumes_compact=false) — the "
             "communicated values would never reach the m/v commit and "

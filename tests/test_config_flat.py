@@ -252,7 +252,7 @@ def test_inv4_historical_surface_pinned():
         assert actions[dest].default == default, dest
         assert _param_kind(dest) == kind, dest
         assert tuple(getattr(actions[dest], "choices", None) or ()) == choices, dest
-    print("ok: 26-row golden pin holds")
+    print("ok: 27-row golden pin holds")
 
 
 # ---------------------------------------------------------------- INV-5
@@ -403,7 +403,9 @@ def test_inv2_emission_switch_flat_rules():
     the plugin constructors' business); explicit 'compact' is a
     torch_pipelined_index capability only; explicit values survive the
     canonical round-trip and the engine-config slicing; the retired
-    merge_join_dir dest fails closed (old checkpoints surface here)."""
+    merge_join_dir dest fails closed on the flat/yaml route only (the
+    resume route maps it silently — LEG-1 pins the end states
+    bitwise-identical)."""
     base = {"sga_enabled": True, "sga_score": "update",
             "sga_selection_method": "histogram",
             "sga_selection_ratio_percent": 10.0,
@@ -442,7 +444,9 @@ def test_inv2_emission_switch_flat_rules():
                 {**base, "sga_backend": wb,
                  "sga_backend_emission": "compact"}),
             "only supported by torch_pipelined_index")
-    # the retired rename fails closed (resume guard surfaces it too)
+    # the retired rename fails closed on the flat route only (the resume
+    # guard canonicalizes it away silently — LEG-1 pins the end states
+    # bitwise-identical)
     expect_error(lambda: validate_sga_flat(
         {**base, "sga_optimizer_merge_join_dir": "table"}), "unknown keys")
 

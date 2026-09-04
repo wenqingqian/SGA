@@ -155,6 +155,14 @@ def main():
     # that is the writeback signature)
     assert isinstance(ret_i, torch.Tensor) and ret_i.numel() == 0
     assert torch.equal(g_empty, local)
+    # writeback emission: zero-selection is None (the writeback signature
+    # the engine keys on) and the buffer stays untouched
+    g_empty2 = local.clone()
+    ret_wb_empty = TorchPipelinedIndexBackend(
+        {"emission": "writeback"}).allreduce_sparse(
+            g_empty2, empty, group, factor, op, key=1)
+    assert ret_wb_empty is None
+    assert torch.equal(g_empty2, local)
     dist.barrier()
 
     # --- layer-1 count check: pass on identical supports -------------------

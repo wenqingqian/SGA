@@ -240,8 +240,11 @@ def build_engine(flat: dict, api_version: int):
     optimizer_decl = get_optimizer_decl(optimizer_name)
     backend_decl = get_backend_plugin_decl(backend_name)
 
+    # backend_emission must match the flat layer's resolution, else the two
+    # validation layers contradict each other for explicit non-auto values
     validate_combination(score_name, selection_decl, optimizer_decl,
-                         backend_decl)
+                         backend_decl,
+                         backend_emission=canonical.get("sga_backend_emission"))
 
     selection = build_selection(selection_name, dict(engine_config["selection"]))
     # Scores are materialized by the optimizer template on full steps; inject
