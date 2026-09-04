@@ -26,10 +26,23 @@ Tests (ported from the legacy oracle suite, importing sga.replay):
 6. Determinism: two identical runs produce bitwise-equal distortion numbers.
 7. Per-group hyperparameter resolution (new-trace additive extension with
    legacy global fallback).
+8. Dense-artifact cache (--dense-cache): miss writes, hit reproduces the
+   whole report, a tampered cache ident fails loudly.
+9. bf16 screening copies (--trace-dtype bf16): bitwise no-op on fp32 traces;
+   on bf16 copies the upcast path stays within the quantization band; a bf16
+   payload replayed with the upcast off fails loudly.
+10. sga.trace_convert: one-way fp32->bf16 copy contract (payloads bf16,
+    meta/catalog/states verbatim), step-range selection, rejections,
+    --overwrite removes stale out-of-range files.
+11. --self-check provenance: --trace-dtype is threaded into the dense replay
+    and echoed in the report; bf16 payloads without the flag are rejected.
 """
+import glob
 import io
+import json
 import math
 import os
+import shutil
 import sys
 import tempfile
 from contextlib import redirect_stdout
@@ -39,6 +52,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sga import replay as soa
+from sga import trace_convert as tc
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +185,8 @@ def _make_trace(tmpdir, pre_grads, lrs, clip, t0, n):
 
 
 def _run_module(tmpdir, name, w0, m0, v0, t0, W, score_name, ratio_pct, T,
-                replay_dtype=torch.float64, sel_trace=None):
+                replay_dtype=torch.float64, sel_trace=None,
+                upcast_bf16=False):
     """Run the module's dense + cycle sparse replays; return num_at {h: num}."""
     catalog, names, offsets, N, state_files, g_files = soa.discover_trace(tmpdir)
     meta, params, w_parts, m_parts, v_parts, g_parts = soa.build_branch_state(
@@ -191,10 +206,12 @@ def _run_module(tmpdir, name, w0, m0, v0, t0, W, score_name, ratio_pct, T,
         prm["v"] = prm["v0"].clone()
         prm["label"] = torch.zeros(prm["n"], dtype=replay_dtype)
     _label, _den, _recon, snap_d = soa.dense_replay(
-        params, g_files, window_steps, meta, t0, eff, replay_dtype, 1, "cpu")
+        params, g_files, window_steps, meta, t0, eff, replay_dtype, 1, "cpu",
+        upcast_bf16=upcast_bf16)
     num_at = soa.sparse_replay_cycle(
         params, g_files, window_steps, meta, t0, eff, score_name, k, T, sel0,
-        snap_d, replay_dtype, 1, "cpu", sel_trace=sel_trace)
+        snap_d, replay_dtype, 1, "cpu", sel_trace=sel_trace,
+        upcast_bf16=upcast_bf16)
     return num_at
 
 
@@ -515,6 +532,8 @@ def test_cli_rejects_invalid_options():
         (["--horizons", "0"], "--horizons"),
         (["--ratios", "nan"], "--ratios"),
         (["--branch-point", ","], "--branch-point"),
+        (["--dense-cache", "/tmp/x", "--self-check", "1", "2"],
+         "--dense-cache"),
     ]
     for extra, opt in cases:
         try:
@@ -548,6 +567,229 @@ def test_print_summary_zero_distortion():
     print("PASS test_print_summary_zero_distortion")
 
 
+def test_dense_cache_roundtrip():
+    """--dense-cache: run 1 writes the dense artifacts (miss), run 2 loads
+    them (hit) and the whole JSON report is identical; a tampered ident
+    inside the cache file fails loudly instead of serving wrong numbers."""
+    torch.manual_seed(10)
+    t0, W, n = 300, 5, 16
+    pre = [torch.randn(n) * 0.02 for _ in range(W)]
+    lrs = [5e-5] * W
+    with tempfile.TemporaryDirectory() as td:
+        _make_trace(td, pre, lrs, 1.0, t0, n)
+        argv = ["--trace-dir", td, "--branch-point", str(t0),
+                "--window", str(W), "--ratios", "25,50", "--horizons", "2,5",
+                "--replay-mode", "cycle", "--cycle-len", "2",
+                "--score-names", "abs_g,update",
+                "--dense-cache", os.path.join(td, "dense_cache")]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            r1 = soa.main(argv + ["--out", os.path.join(td, "r1.json")])
+        b1 = r1["branch_results"][str(t0)]["replay"]
+        assert b1["dense_cache_hit"] is False, b1["dense_cache_hit"]
+        with redirect_stdout(buf):
+            r2 = soa.main(argv + ["--out", os.path.join(td, "r2.json")])
+        b2 = r2["branch_results"][str(t0)]["replay"]
+        assert b2["dense_cache_hit"] is True, b2["dense_cache_hit"]
+        # everything but the hit marker itself must round-trip identically
+        # (compare via json: the synthetic state meta carries a NaN
+        # grad_norm, and NaN != NaN under plain dict equality)
+        b1.pop("dense_cache_hit")
+        b2.pop("dense_cache_hit")
+        assert json.dumps(r1) == json.dumps(r2), \
+            "cache HIT report differs from MISS report"
+
+        # tampered ident -> loud failure, never silent wrong numbers
+        cpath = glob.glob(os.path.join(td, "dense_cache", "dense_*.pt"))[0]
+        blob = torch.load(cpath, map_location="cpu", weights_only=False)
+        blob["ident"] = "tampered"
+        torch.save(blob, cpath)
+        try:
+            with redirect_stdout(buf):
+                soa.main(argv + ["--out", os.path.join(td, "r3.json")])
+            raise AssertionError("tampered cache ident accepted")
+        except ValueError as e:
+            assert "ident" in str(e), e
+    print("PASS test_dense_cache_roundtrip")
+
+
+def test_trace_dtype_bf16():
+    """--trace-dtype bf16: on fp32 traces the flag is a bitwise no-op; on
+    bf16 screening copies the upcast path keeps the distortion within the
+    bf16 quantization band of the fp32 trajectory."""
+    torch.manual_seed(11)
+    t0, W, n = 500, 6, 32
+    pre = [torch.randn(n) * 0.05 for _ in range(W)]
+    lrs = [5e-5] * W
+    with tempfile.TemporaryDirectory() as td:
+        name, w0, m0, v0 = _make_trace(td, pre, lrs, 1.0, t0, n)
+        a = _run_module(td, name, w0, m0, v0, t0, W, "coi", 30.0, 2)
+        b = _run_module(td, name, w0, m0, v0, t0, W, "coi", 30.0, 2,
+                        upcast_bf16=True)
+        assert a == b, "--trace-dtype bf16 must be a no-op on fp32 traces"
+
+        bf = os.path.join(td, "bf16")
+        os.makedirs(bf)
+        shutil.copy2(os.path.join(td, "catalog.pt"),
+                     os.path.join(bf, "catalog.pt"))
+        shutil.copy2(os.path.join(td, f"step_{t0:06d}_state.pt"),
+                     os.path.join(bf, f"step_{t0:06d}_state.pt"))
+        for si in range(W):
+            f = os.path.join(td, f"step_{t0 + si:06d}_g.pt")
+            d = torch.load(f, map_location="cpu", weights_only=False)
+            d["payload"] = {k: v.to(torch.bfloat16)
+                            for k, v in d["payload"].items()}
+            torch.save(d, os.path.join(bf, f"step_{t0 + si:06d}_g.pt"))
+        # the bf16 gate: replaying a bf16 payload with the upcast off is a
+        # hard error naming the flag (the sparse paths would divide by
+        # coef_dense in bf16), never a silently degraded run
+        try:
+            _run_module(bf, name, w0, m0, v0, t0, W, "coi", 30.0, 2,
+                        upcast_bf16=False)
+            raise AssertionError("bf16 payload accepted with upcast off")
+        except ValueError as e:
+            assert "--trace-dtype" in str(e), e
+        c = _run_module(bf, name, w0, m0, v0, t0, W, "coi", 30.0, 2,
+                        upcast_bf16=True)
+        for h in a:
+            assert (a[h] == 0.0) == (c[h] == 0.0), f"d@{h}: {a[h]} vs {c[h]}"
+            if a[h] != 0.0:
+                rel = abs(c[h] - a[h]) / abs(a[h])
+                assert rel < 0.05, f"bf16 copy d@{h}: rel err {rel:.3e}"
+    print("PASS test_trace_dtype_bf16")
+
+
+def test_trace_convert_module():
+    """sga.trace_convert: one-way fp32->bf16 copy — g payloads become bf16
+    with meta preserved and values exactly the bf16 rounding of the source,
+    catalog/states are copied verbatim (fp32), the step range selects which
+    g/state files land in dst, and dst==src / non-empty dst are rejected."""
+    torch.manual_seed(12)
+    t0, W, n = 700, 4, 8
+    pre = [torch.randn(n) * 0.05 for _ in range(W)]
+    lrs = [5e-5] * W
+    with tempfile.TemporaryDirectory() as td:
+        name, w0, m0, v0 = _make_trace(td, pre, lrs, 1.0, t0, n)
+        dst = os.path.join(td, "dst")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            tc.main(["--src", td, "--dst", dst])
+
+        src_g = torch.load(os.path.join(td, f"step_{t0:06d}_g.pt"),
+                           map_location="cpu", weights_only=False)
+        dst_g = torch.load(os.path.join(dst, f"step_{t0:06d}_g.pt"),
+                           map_location="cpu", weights_only=False)
+        assert dst_g["payload"][name].dtype == torch.bfloat16
+        assert dst_g["meta"] == src_g["meta"]
+        assert torch.equal(dst_g["payload"][name],
+                           src_g["payload"][name].to(torch.bfloat16))
+        dst_st = torch.load(os.path.join(dst, f"step_{t0:06d}_state.pt"),
+                            map_location="cpu", weights_only=False)
+        assert dst_st["payload"]["w"][name].dtype == torch.float32
+        assert torch.equal(dst_st["payload"]["w"][name], w0)
+        src_cat = torch.load(os.path.join(td, "catalog.pt"),
+                             map_location="cpu", weights_only=False)
+        dst_cat = torch.load(os.path.join(dst, "catalog.pt"),
+                             map_location="cpu", weights_only=False)
+        assert dst_cat == src_cat
+        assert sorted(f for f in os.listdir(dst) if f.endswith("_g.pt")) == \
+            sorted(f"step_{t0 + si:06d}_g.pt" for si in range(W))
+
+        # step range: only g files in [from, to) land in dst2 (the t0 state
+        # is outside the range and must not be copied)
+        dst2 = os.path.join(td, "dst2")
+        with redirect_stdout(buf):
+            tc.main(["--src", td, "--dst", dst2,
+                     "--from-step", str(t0 + 2), "--to-step", str(t0 + 4)])
+        assert sorted(f for f in os.listdir(dst2) if f.endswith("_g.pt")) == \
+            [f"step_{t0 + 2:06d}_g.pt", f"step_{t0 + 3:06d}_g.pt"]
+        assert not [f for f in os.listdir(dst2) if f.endswith("_state.pt")]
+
+        # --overwrite is deterministic: re-converting a narrower range into
+        # dst removes the previous selection's out-of-range files (the dst is
+        # a trace, not a manifest — discover_trace must not see the union of
+        # two step sets)
+        with redirect_stdout(buf):
+            tc.main(["--src", td, "--dst", dst, "--overwrite",
+                     "--from-step", str(t0 + 2), "--to-step", str(t0 + 4)])
+        assert sorted(f for f in os.listdir(dst) if f.endswith("_g.pt")) == \
+            [f"step_{t0 + 2:06d}_g.pt", f"step_{t0 + 3:06d}_g.pt"]
+        assert not [f for f in os.listdir(dst) if f.endswith("_state.pt")], \
+            "overwrite must drop stale state files outside the new range"
+        assert os.path.isfile(os.path.join(dst, "catalog.pt"))
+
+        for bad, why in (
+            (["--src", td, "--dst", dst], "non-empty dst accepted"),
+            (["--src", td, "--dst", td], "dst == src accepted"),
+        ):
+            try:
+                tc.main(bad)
+                raise AssertionError(why)
+            except ValueError:
+                pass
+    print("PASS test_trace_convert_module")
+
+
+def test_self_check_trace_dtype():
+    """--self-check provenance: --trace-dtype is threaded into the dense
+    replay and echoed in the report (on an fp32 trace the numbers are
+    identical with and without the flag — only the echoed field differs);
+    on a bf16 copy the self-check without the flag fails loudly (the bf16
+    gate) instead of silently ignoring it, and with the flag it reports
+    trace_dtype "bf16"."""
+    torch.manual_seed(13)
+    t0, W, n = 900, 5, 16
+    pre = [torch.randn(n) * 0.02 for _ in range(W)]
+    lrs = [5e-5] * W
+    with tempfile.TemporaryDirectory() as td:
+        name, w0, m0, v0 = _make_trace(td, pre, lrs, 1.0, t0, n)
+        # self-check compares against the real state dump at TO_STEP
+        torch.save({"payload": {"w": {name: w0}, "m": {name: m0},
+                                "v": {name: v0}, "g": {name: torch.randn(n)}},
+                    "meta": {**BASE_META, "step": t0 + W}},
+                   os.path.join(td, f"step_{t0 + W:06d}_state.pt"))
+        argv = ["--trace-dir", td, "--self-check", str(t0), str(t0 + W)]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            r_fp = soa.main(list(argv))
+            r_up = soa.main(argv + ["--trace-dtype", "bf16"])
+        sc_fp, sc_up = r_fp["self_check"], r_up["self_check"]
+        assert sc_fp.pop("trace_dtype") == "fp32"
+        assert sc_up.pop("trace_dtype") == "bf16"
+        # fp32 payloads: the flag changes nothing but the echoed field
+        # (compare via json: NaN != NaN under plain dict equality)
+        assert json.dumps(sc_fp) == json.dumps(sc_up), (
+            "--trace-dtype bf16 must be a no-op on fp32 traces")
+
+        # bf16 screening copy of the same window (states/catalog verbatim)
+        bf = os.path.join(td, "bf16")
+        os.makedirs(bf)
+        shutil.copy2(os.path.join(td, "catalog.pt"),
+                     os.path.join(bf, "catalog.pt"))
+        for st in (t0, t0 + W):
+            shutil.copy2(os.path.join(td, f"step_{st:06d}_state.pt"),
+                         os.path.join(bf, f"step_{st:06d}_state.pt"))
+        for si in range(W):
+            f = os.path.join(td, f"step_{t0 + si:06d}_g.pt")
+            d = torch.load(f, map_location="cpu", weights_only=False)
+            d["payload"] = {k: v.to(torch.bfloat16)
+                            for k, v in d["payload"].items()}
+            torch.save(d, os.path.join(bf, f"step_{t0 + si:06d}_g.pt"))
+
+        argv_bf = ["--trace-dir", bf, "--self-check", str(t0), str(t0 + W)]
+        try:
+            with redirect_stdout(buf):
+                soa.main(list(argv_bf))
+            raise AssertionError("bf16 self-check accepted without "
+                                 "--trace-dtype bf16")
+        except ValueError as e:
+            assert "--trace-dtype" in str(e), e
+        with redirect_stdout(buf):
+            r_bf = soa.main(argv_bf + ["--trace-dtype", "bf16"])
+        assert r_bf["self_check"]["trace_dtype"] == "bf16"
+    print("PASS test_self_check_trace_dtype")
+
+
 def main():
     test_T1_is_dense()
     test_no_fold_within_window()
@@ -560,6 +802,10 @@ def main():
     test_param_hp_group_index_out_of_range()
     test_cli_rejects_invalid_options()
     test_print_summary_zero_distortion()
+    test_dense_cache_roundtrip()
+    test_trace_dtype_bf16()
+    test_trace_convert_module()
+    test_self_check_trace_dtype()
     print("\nall replay-cycle tests passed")
 
 

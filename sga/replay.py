@@ -62,10 +62,16 @@ PYTHONPATH):
 
     # replay-machinery validation against real state dumps:
     python -m sga.replay --trace-dir <dir> --self-check 40 60
+
+    # offline acceleration: bf16 screening copy + dense-artifact cache
+    python -m sga.trace_convert --src <fp32-trace> --dst <bf16-trace>
+    python -m sga.replay --trace-dir <bf16-trace> ... --trace-dtype bf16 \
+        --dense-cache <cache-dir>
 """
 
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
@@ -79,6 +85,11 @@ import torch
 # included); replay defines no score names of its own.
 from sga.plugins.scores import SCORES, get_score_spec
 
+# Bump on ANY change to replay arithmetic or semantics (score formulas,
+# clip/norm handling, dtype rules, ...). Part of the dense-cache key: a stale
+# cache from an older semantics must fail loudly, never silently serve.
+REPLAY_SEMANTIC_VERSION = 2  # 1 = pre-dense-cache baseline
+
 _G_STEP_RE = re.compile(r"step_(\d+)_g\.pt$")
 _STAT_STEP_RE = re.compile(r"step_(\d+)_state\.pt$")
 
@@ -91,6 +102,27 @@ def _load(path, mmap=True):
     """Load a trace file. ``weights_only=False`` + mmap to avoid copying the
     5-20 GB tensors into heap (storages stay file-backed)."""
     return torch.load(path, map_location="cpu", weights_only=False, mmap=mmap)
+
+
+def _load_g(g_files, gstep, upcast_bf16=False):
+    """Load one step's g dump. With ``upcast_bf16`` (--trace-dtype bf16
+    screening copies) bf16 payloads are upcast to fp32, so every replay path
+    consumes exactly fp32 inputs. A bf16 payload met with the upcast off is a
+    hard error: the sparse paths would divide by coef_dense in bf16 and
+    silently lose precision while the report still records the requested
+    fp32 declaration."""
+    gdict = _load(g_files[gstep])
+    gp = gdict["payload"]
+    bf16_keys = [k for k, t in gp.items()
+                 if torch.is_tensor(t) and t.dtype == torch.bfloat16]
+    if bf16_keys and not upcast_bf16:
+        raise ValueError(
+            f"{g_files[gstep]}: bf16 payload(s) {bf16_keys} but "
+            "--trace-dtype is fp32; rerun with --trace-dtype bf16 "
+            "(payloads are upcast to fp32 at load)")
+    for k in bf16_keys:
+        gp[k] = gp[k].float()
+    return gdict
 
 
 def discover_trace(trace_dir):
@@ -479,7 +511,7 @@ def _replay_meta(params, base_meta):
 
 
 def dense_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
-                 replay_dtype, chunk_mb, device):
+                 replay_dtype, chunk_mb, device, upcast_bf16=False):
     """Dense trajectory w_d / m_d / v_d from the logged (post-clip) g, the
     per-coordinate squared gradient-driven update label, the per-horizon
     denominator norms ||w_d(H)-w0||, pre-clip reconstruction diagnostics, and
@@ -499,7 +531,7 @@ def dense_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
     label_total = 0.0
 
     for si, gstep in enumerate(window_steps):
-        gdict = _load(g_files[gstep])
+        gdict = _load_g(g_files, gstep, upcast_bf16)
         gmeta = gdict["meta"]
         gp = gdict["payload"]
         coef_dense, flag = coef_dense_for(gmeta)
@@ -569,7 +601,7 @@ def dense_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
 
 
 def dense_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons,
-                     replay_dtype, chunk_mb, device):
+                     replay_dtype, chunk_mb, device, upcast_bf16=False):
     """Device-resident dense replay; same outputs as dense_replay but the
     dense m/v/w/label never leave ``device`` (horizon snapshots are cloned to
     cpu). Exists to avoid the 40-80 GB/step H2D/D2H round trips of the
@@ -585,7 +617,7 @@ def dense_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons,
     den_at, snap_d, recon_steps = {}, {}, []
 
     for si, gstep in enumerate(window_steps):
-        gdict = _load(g_files[gstep])
+        gdict = _load_g(g_files, gstep, upcast_bf16)
         gmeta = gdict["meta"]
         gp = gdict["payload"]
         coef_dense, flag = coef_dense_for(gmeta)
@@ -649,7 +681,8 @@ def dense_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons,
 
 
 def sparse_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
-                  sel, snap_d, replay_dtype, chunk_mb, device):
+                  sel, snap_d, replay_dtype, chunk_mb, device,
+                  upcast_bf16=False):
     """Sparse replay with a fixed support ``sel`` (flat bool, catalog order).
 
     Per window step the pre-clip gradient is reconstructed
@@ -671,7 +704,7 @@ def sparse_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
         prm["vs"] = prm["v0"].clone()
         prm["ws"] = prm["w0"].clone()
     for si, gstep in enumerate(window_steps):
-        gdict = _load(g_files[gstep])
+        gdict = _load_g(g_files, gstep, upcast_bf16)
         gp = gdict["payload"]
         coef_dense, _flag = coef_dense_for(gdict["meta"])
         gmeta = gdict["meta"]
@@ -735,7 +768,8 @@ def sparse_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
 
 
 def sparse_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons,
-                      sel, snap_d, replay_dtype, chunk_mb, device):
+                      sel, snap_d, replay_dtype, chunk_mb, device,
+                      upcast_bf16=False):
     """Device-resident sparse replay; semantics identical to sparse_replay."""
     (names, offs, N) = _replay_meta(params, base_meta)
     chunk_n = _chunk_elems(chunk_mb, torch.finfo(replay_dtype).bits // 8)
@@ -746,7 +780,7 @@ def sparse_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons
         prm["ws"] = prm["w0"].to(dev)
     num_at = {}
     for si, gstep in enumerate(window_steps):
-        gdict = _load(g_files[gstep])
+        gdict = _load_g(g_files, gstep, upcast_bf16)
         gp = gdict["payload"]
         gmeta = gdict["meta"]
         coef_dense, _flag = coef_dense_for(gmeta)
@@ -820,7 +854,8 @@ def _fresh_state(t, dev):
 
 def sparse_replay_cycle(params, g_files, window_steps, base_meta, t0,
                         eff_horizons, score_name, k, cycle_len, sel0, snap_d,
-                        replay_dtype, chunk_mb, device, sel_trace=None):
+                        replay_dtype, chunk_mb, device, sel_trace=None,
+                        upcast_bf16=False):
     """Sparse replay with residual accumulation and cycle-boundary mask
     re-selection — the offline twin of the online cyclic semantics:
 
@@ -855,7 +890,7 @@ def sparse_replay_cycle(params, g_files, window_steps, base_meta, t0,
     num_at = {}
     W = len(window_steps)
     for si, gstep in enumerate(window_steps):
-        gdict = _load(g_files[gstep])
+        gdict = _load_g(g_files, gstep, upcast_bf16)
         gmeta = gdict["meta"]
         gp = gdict["payload"]
         coef_dense, _flag = coef_dense_for(gmeta)
@@ -954,6 +989,77 @@ def sparse_replay_cycle(params, g_files, window_steps, base_meta, t0,
     if dev != "cpu":
         torch.cuda.empty_cache()
     return num_at
+
+
+# ----------------------------------------------------------------------------
+# dense replay artifact cache (--dense-cache)
+# ----------------------------------------------------------------------------
+
+def _dense_cache_ident(trace_dir, t0, window_steps, eff_horizons,
+                       replay_dtype, trace_dtype):
+    """Identity of one branch's dense replay artifacts. The trace path stands
+    for the trace content (dumps are immutable); window/horizons/dtype change
+    the saved artifacts; REPLAY_SEMANTIC_VERSION fences caches across replay
+    semantic edits."""
+    return "|".join([
+        f"semver={REPLAY_SEMANTIC_VERSION}",
+        f"trace={trace_dir}",
+        f"t0={t0}",
+        f"W={len(window_steps)}",
+        f"horizons={','.join(str(h) for h in eff_horizons)}",
+        f"dtype={replay_dtype}",
+        f"trace_dtype={trace_dtype}",
+    ])
+
+
+def _dense_cache_path(cache_dir, ident):
+    h = hashlib.sha1(ident.encode()).hexdigest()[:16]
+    return os.path.join(cache_dir, f"dense_{h}.pt")
+
+
+def save_dense_cache(cache_dir, ident, label_total, den_at, recon_steps,
+                     snap_d, label_flat):
+    """Persist one branch's dense artifacts atomically (tmp + rename), so a
+    killed writer never leaves a half file that a later run mistakes for a
+    usable cache. Returns the cache file path."""
+    blob = {
+        "ident": ident,
+        "label_total": label_total,
+        "den_at": den_at,
+        "recon_steps": recon_steps,
+        "snap_d": snap_d,
+        "label_flat": label_flat,
+    }
+    os.makedirs(cache_dir, exist_ok=True)
+    path = _dense_cache_path(cache_dir, ident)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    torch.save(blob, tmp)
+    os.replace(tmp, path)
+    return path
+
+
+def load_dense_cache(cache_dir, ident):
+    """Load the dense artifacts for ``ident``; None on miss. A present file
+    whose ident disagrees (hand-copied/hand-edited cache) fails loudly —
+    silently replaying against someone else's dense trajectory would corrupt
+    every distortion number this run reports."""
+    path = _dense_cache_path(cache_dir, ident)
+    if not os.path.isfile(path):
+        return None
+    try:
+        blob = _load(path)
+    except Exception as e:
+        # a truncated/corrupt blob (host/NFS crash mid-write) would otherwise
+        # surface as an opaque mmap RuntimeError or AttributeError
+        raise ValueError(
+            f"dense cache {path} is unreadable ({e!r}); "
+            "delete it and rerun") from e
+    if blob.get("ident") != ident:
+        raise ValueError(
+            f"dense cache {path} holds ident\n  {blob.get('ident')!r}\n"
+            f"but this run needs\n  {ident!r}\n"
+            "clear the cache dir and rerun")
+    return {"path": path, **blob}
 
 
 # ----------------------------------------------------------------------------
@@ -1060,26 +1166,53 @@ def process_branch(t0, ctx, args):
     score_stats = {s: _score_stats(score_flats[s]) for s in score_names}
 
     # ---- dense replay -> label / denominators / snapshots / recon ----------
+    # (--dense-cache: the dense pass is the only whole-window read; on a hit
+    # its artifacts load from one file and the dense working states are never
+    # created — the sparse replays below only need w0/m0/v0.)
     use_dev = args.device != "cpu"
-    if not use_dev:
-        for prm in params:
-            prm["w"] = prm["w0"].clone()
-            prm["m"] = prm["m0"].clone()
-            prm["v"] = prm["v0"].clone()
-            prm["label"] = torch.zeros(prm["n"], dtype=replay_dtype)
-        label_total, den_at, recon_steps, snap_d = dense_replay(
-            params, g_files, window_steps, meta, t0, eff_horizons,
-            replay_dtype, args.chunk_mb, args.device,
-        )
+    upcast_bf16 = args.trace_dtype == "bf16"
+    cached = None
+    if args.dense_cache:
+        ident = _dense_cache_ident(trace_dir, t0, window_steps, eff_horizons,
+                                   replay_dtype, args.trace_dtype)
+        cached = load_dense_cache(args.dense_cache, ident)
+    if cached is not None:
+        label_total = cached["label_total"]
+        den_at = cached["den_at"]
+        recon_steps = cached["recon_steps"]
+        snap_d = cached["snap_d"]
+        label_flat = cached["label_flat"]
+        if args.verbose:
+            print(f"  [t0={t0}] dense cache hit: {cached['path']}", flush=True)
     else:
-        label_total, den_at, recon_steps, snap_d = dense_replay_dev(
-            params, g_files, window_steps, meta, t0, eff_horizons,
-            replay_dtype, args.chunk_mb, args.device,
-        )
-    if args.verbose:
-        print(f"  [t0={t0}] dense replay done; den={den_at}", flush=True)
-    # label flat (fp32) used by the ranking metrics
-    label_flat = torch.cat([prm["label"].float() for prm in params])
+        if not use_dev:
+            for prm in params:
+                prm["w"] = prm["w0"].clone()
+                prm["m"] = prm["m0"].clone()
+                prm["v"] = prm["v0"].clone()
+                prm["label"] = torch.zeros(prm["n"], dtype=replay_dtype)
+            label_total, den_at, recon_steps, snap_d = dense_replay(
+                params, g_files, window_steps, meta, t0, eff_horizons,
+                replay_dtype, args.chunk_mb, args.device,
+                upcast_bf16=upcast_bf16,
+            )
+        else:
+            label_total, den_at, recon_steps, snap_d = dense_replay_dev(
+                params, g_files, window_steps, meta, t0, eff_horizons,
+                replay_dtype, args.chunk_mb, args.device,
+                upcast_bf16=upcast_bf16,
+            )
+        if args.verbose:
+            print(f"  [t0={t0}] dense replay done; den={den_at}", flush=True)
+        # label flat (fp32) used by the ranking metrics
+        label_flat = torch.cat([prm["label"].float() for prm in params])
+        if args.dense_cache:
+            cache_path = save_dense_cache(
+                args.dense_cache, ident, label_total, den_at, recon_steps,
+                snap_d, label_flat)
+            if args.verbose:
+                print(f"  [t0={t0}] dense cache written: {cache_path}",
+                      flush=True)
     label_stats = _score_stats(label_flat)
     # the dense running states are no longer needed after den/label/snapshots
     # are in; free them so each sparse replay (which clones its own sparse
@@ -1106,16 +1239,19 @@ def process_branch(t0, ctx, args):
                     params, g_files, window_steps, meta, t0, eff_horizons,
                     sname, k, args.cycle_len, sel, snap_d, replay_dtype,
                     args.chunk_mb, args.device,
+                    upcast_bf16=upcast_bf16,
                 )
             elif use_dev:
                 num_at = sparse_replay_dev(
                     params, g_files, window_steps, meta, t0, eff_horizons, sel,
                     snap_d, replay_dtype, args.chunk_mb, args.device,
+                    upcast_bf16=upcast_bf16,
                 )
             else:
                 num_at = sparse_replay(
                     params, g_files, window_steps, meta, t0, eff_horizons, sel,
                     snap_d, replay_dtype, args.chunk_mb, args.device,
+                    upcast_bf16=upcast_bf16,
                 )
             if args.verbose:
                 print(f"  [t0={t0}] {sname}@{r}% sparse replay done "
@@ -1160,6 +1296,9 @@ def process_branch(t0, ctx, args):
         },
         "replay": {
             "dtype": args.replay_dtype,
+            "trace_dtype": args.trace_dtype,
+            "dense_cache_hit": (
+                (cached is not None) if args.dense_cache else None),
             "per_step": recon_steps,
             "den_norm_at_horizon": {
                 str(h): den_at.get(h) for h in eff_horizons if den_at.get(h) is not None
@@ -1213,6 +1352,7 @@ def run_self_check(ctx, from_step, to_step, args):
     label_total, den_at, recon_steps, _snap = dense_replay(
         params, g_files, steps, meta, from_step, [], replay_dtype,
         args.chunk_mb, args.device,
+        upcast_bf16=(args.trace_dtype == "bf16"),
     )
 
     real = _load(state_files[to_step])
@@ -1256,6 +1396,7 @@ def run_self_check(ctx, from_step, to_step, args):
         "to_step": to_step,
         "replay_steps": steps,
         "steps_replayed": W,
+        "trace_dtype": args.trace_dtype,
         "state_absent_from": bool(meta.get("state_absent", False)),
         "per_step": recon_steps,
         "overall_relative_l2": overall,
@@ -1378,6 +1519,17 @@ def main(argv=None):
                     help="per-chunk working-set budget for large params, MB")
     ap.add_argument("--replay-dtype", default="fp64", choices=["fp64", "fp32"],
                     help="dtype for the AdamW replay arithmetic")
+    ap.add_argument("--trace-dtype", default="fp32", choices=["fp32", "bf16"],
+                    help="g payload dtype in the trace: fp32 (original "
+                         "dumps) or bf16 (screening copies built by "
+                         "sga.trace_convert; payloads upcast to fp32 at "
+                         "load, replay arithmetic unchanged)")
+    ap.add_argument("--dense-cache", default=None, metavar="DIR",
+                    help="cache directory for the dense replay artifacts "
+                         "(label/den/snapshots/recon, one file per trace + "
+                         "t0 + window + horizons + dtype + semantic "
+                         "version); repeated runs reuse the whole dense "
+                         "pass instead of re-reading the window")
     ap.add_argument("--replay-mode", default="zerofill",
                     choices=["zerofill", "cycle"],
                     help="zerofill (default): frozen mask, zero-filled q each "
@@ -1434,6 +1586,10 @@ def main(argv=None):
         raise ValueError("need either --branch-point or --self-check")
     if args.self_check is not None and args.branch_point:
         raise ValueError("--self-check and --branch-point are mutually exclusive")
+    if args.self_check is not None and args.dense_cache:
+        raise ValueError(
+            "--dense-cache cannot be combined with --self-check "
+            "(the self-check must actually replay the window)")
 
     trace_dir = os.path.abspath(args.trace_dir)
     catalog, names, offsets, N, state_files, g_files = discover_trace(trace_dir)
@@ -1501,6 +1657,8 @@ def main(argv=None):
             "device": args.device,
             "chunk_mb": args.chunk_mb,
             "replay_dtype": args.replay_dtype,
+            "trace_dtype": args.trace_dtype,
+            "dense_cache": args.dense_cache,
             "replay_mode": args.replay_mode,
             "cycle_len": args.cycle_len,
             "score_names": args.score_names,
