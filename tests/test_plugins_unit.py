@@ -45,7 +45,17 @@ from sga.plugins.selection._histogram import (
     _histogram_select_threshold,
     select_masks_histogram,
 )
-from sga.plugins.selection.topk import _METHOD_KEYS, TopkSelection
+from sga.plugins.selection.topk import TopkSelection
+from sga.plugins import plugin_params
+
+
+def _method_allows(method: str, key: str) -> bool:
+    """Is `key` a legal topk param under `method`? Derived from the
+    catalog's equality guards (the per-method vocabularies)."""
+    for p in plugin_params("selection", "topk"):
+        if p.name == key:
+            return not p.requires or p.requires[1] == method
+    return False
 
 torch.manual_seed(0)
 
@@ -513,7 +523,7 @@ def test_topk_adaptive_lifecycle():
                          ("adaptive_warmup_syncs", 3),
                          ("adaptive_warmup_mode", "fast")):
             cfg = {"method": method, "ratio_percent": 10.0, key: val}
-            if key in _METHOD_KEYS[method]:
+            if _method_allows(method, key):
                 TopkSelection(cfg)  # legal under its own method
                 continue
             try:
@@ -876,16 +886,22 @@ def test_emission_declaration_and_compact_capability():
     time (the communicated values would never reach the m/v commit)."""
 
     seen = {}
-    for bad in ("comapct", "write", "", None):
-        try:
-            _register("backend", seen, "stub",
-                      BackendDecl(name="stub", emission=bad))
-            raise AssertionError(f"emission {bad!r} accepted at registration")
-        except ValueError as e:
-            assert "emission" in str(e) and "compact" in str(e), e
-    _register("backend", seen, "stub",
-              BackendDecl(name="stub", emission="compact"))  # legal passes
-    assert isinstance(seen["stub"].emission, str)
+    from sga.config.arguments import PLUGIN_PARAMS
+
+    PLUGIN_PARAMS["backend"]["stub"] = ()  # test-scaffold catalog row
+    try:
+        for bad in ("comapct", "write", "", None):
+            try:
+                _register("backend", seen, "stub",
+                          BackendDecl(name="stub", emission=bad))
+                raise AssertionError(f"emission {bad!r} accepted at registration")
+            except ValueError as e:
+                assert "emission" in str(e) and "compact" in str(e), e
+        _register("backend", seen, "stub",
+                  BackendDecl(name="stub", emission="compact"))  # legal passes
+        assert isinstance(seen["stub"].emission, str)
+    finally:
+        del PLUGIN_PARAMS["backend"]["stub"]
 
     register_default_plugins()
     cycle = {"period": 8}

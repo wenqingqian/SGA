@@ -150,7 +150,7 @@ def _extra_args_provider(parser):
     """
     if has_nvidia_modelopt:
         add_modelopt_args(parser)
-    from sga.config.arguments import add_sga_flat_args
+    from sga.config.flatargs import add_sga_flat_args
 
     add_sga_flat_args(parser)
     return parser
@@ -173,7 +173,7 @@ if __name__ == "__main__":
     )
     # Fold the flat flags into the canonical args.sga_config BEFORE anyone
     # reads it (resume guard here; the waist's first attach inside pretrain).
-    from sga.config.arguments import assemble_sga_args
+    from sga.config.flatargs import assemble_sga_args
 
     assemble_sga_args(args)
     _sga_resume_guard(args)

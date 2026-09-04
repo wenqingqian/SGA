@@ -60,6 +60,10 @@ from typing import Dict, List, Optional
 
 import torch
 
+from sga.config.arguments import TRACE
+
+_TRACE_DEFAULTS = {p.name: p.default for p in TRACE if not p.required}
+
 
 def parse_branch_points(spec) -> List[int]:
     """Normalize a branch-point spec (comma string or int list) into a
@@ -132,7 +136,7 @@ class TraceCollector:
     def __init__(self, cfg: dict):
         self.dir = cfg["dir"]
         self.branch_points = parse_branch_points(cfg.get("branch_points"))
-        self.window = int(cfg.get("window", 100))
+        self.window = int(cfg.get("window", _TRACE_DEFAULTS["window"]))
         self._entries: Optional[list] = None   # [(name, rec, group_index)]
         self._catalog_written = False          # per process (resume-safe)
 

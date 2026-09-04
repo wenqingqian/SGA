@@ -5,7 +5,9 @@ Holds the globally-unique cycle manager, one generic BucketState per gradient
 bucket, the three plugin objects plus the score NAME (scores are registry
 data, not objects), the three-layer cross-rank consistency machinery, the
 shared masked-clip service, and the unified per-step metrics log. Scheme-free
-by construction: every behavioural difference lives in plugin declarations.
+by construction: behavior is selected by catalog parameters
+(sga/config/arguments.py) and implemented behind scheme-free plugin capability
+declarations.
 
 optimizer_step ordering contract (frozen):
 
@@ -48,6 +50,7 @@ import os
 
 import torch
 
+from sga.config.arguments import CYCLE, CHECKS, TOP
 from sga.kernels import (
     compact_norm_sq_contribution,
     masked_norm_sq_contribution,
@@ -64,6 +67,13 @@ from sga.trace import TraceCollector
 
 class SGAEngineError(RuntimeError):
     """Raised on cross-rank inconsistency or contract violations."""
+
+
+# Catalog defaults (the ONLY defaults — engine-side .get fallbacks read
+# these, never a restated literal; sga/config/arguments.py).
+_CYCLE_DEFAULTS = {p.name: p.default for p in CYCLE if not p.required}
+_CHECKS_DEFAULTS = {p.name: p.default for p in CHECKS if not p.required}
+_TOP_DEFAULTS = {p.name: p.default for p in TOP if not p.required}
 
 
 
@@ -187,10 +197,10 @@ class SGAEngine:
 
         cycle = config.get("cycle", {})
         self._cycle = CycleManager(
-            start_iter=int(cycle.get("start_iter", 0)),
-            period=int(cycle.get("period", 1)),
+            start_iter=int(cycle.get("start_iter", _CYCLE_DEFAULTS["start_iter"])),
+            period=int(cycle.get("period", _CYCLE_DEFAULTS["period"])),
             decouple=bool(cycle.get("decouple_full_sync_interval_and_period",
-                                    False)),
+                                    _CYCLE_DEFAULTS["decouple_full_sync_interval_and_period"])),
             full_sync_interval=(int(cycle["full_sync_interval"])
                                 if cycle.get("full_sync_interval") is not None
                                 else None),
@@ -225,7 +235,8 @@ class SGAEngine:
         # guard runs once per cycle at support activation — within a cycle
         # the support is immutable and its counts are cached, so per-step
         # re-checks re-verify identical numbers.
-        self._count_guard = bool(config.get("checks", {}).get("count_guard", True))
+        self._count_guard = bool(config.get("checks", {}).get(
+            "count_guard", _CHECKS_DEFAULTS["count_guard"]))
         # Trace collector: None unless sga.trace.dir is set — the dump slot
         # below then costs one None-check per step (zero-overhead-when-off).
         trace_cfg = config.get("trace", None)
@@ -234,8 +245,9 @@ class SGAEngine:
         # only READ state at cycle boundaries. shadow_score=false strips even
         # the read-only scoring (the stock-replication probe configuration:
         # bitwise risk lives in the replication machinery, not the reads).
-        self._shadow = bool(config.get("shadow", False))
-        self._shadow_score = bool(config.get("shadow_score", True))
+        self._shadow = bool(config.get("shadow", _TOP_DEFAULTS["shadow"]))
+        self._shadow_score = bool(config.get("shadow_score",
+                                             _TOP_DEFAULTS["shadow_score"]))
         self._metrics_file = os.environ.get("SGA_METRICS_FILE")
         self._rank = 0
         if torch.distributed.is_initialized():

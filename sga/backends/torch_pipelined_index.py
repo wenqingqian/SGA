@@ -55,24 +55,12 @@ import torch
 
 from sga.backends import COMM_WARMUP_ENV, RESUME_OVERRIDE_ENV
 from sga.kernels import pack_selected
-from sga.plugins import BackendDecl, PluginParam, resolve_plugin_params
+from sga.plugins import BackendDecl, resolve_plugin_params
 
 DECL = BackendDecl(
     name="torch_pipelined_index",
     consumes="idx",
     emission="compact",
-    params=(
-        PluginParam(
-            "high_priority_group", bool, default=False,
-            doc="run sparse collectives on a twin high-priority NCCL group "
-                "(true: legacy pipelined_idx_sorted, slices: 3; false: legacy "
-                "indexed_sparse on the training world's own group)",
-        ),
-        PluginParam(
-            "slices", int, default=2,
-            doc="number of idx slices pipelined against the allreduces",
-        ),
-    ),
 )
 
 # Escape hatch for the resume fail-closed in twin mode. Parsed as exactly
@@ -102,7 +90,7 @@ class TorchPipelinedIndexBackend:
 
     def __init__(self, params: dict):
         params = resolve_plugin_params("backend", "torch_pipelined_index",
-                                       DECL, dict(params))
+                                       dict(params))
         self._hiprio = bool(params["high_priority_group"])
         self._slices = int(params["slices"])
         if self._slices < 1:

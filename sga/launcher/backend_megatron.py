@@ -51,7 +51,7 @@ def _get_args_megatron(config: DictConfig):
     # JSON the waist reads — the opaque single-JSON injection is gone, but
     # the fork-side contract (ckpt-self-contained via args, no file paths)
     # is preserved: the JSON rides INSIDE the checkpointed args namespace.
-    from sga.config.arguments import sga_config_to_flags
+    from sga.config.flatargs import sga_config_to_flags
     from sga.config.loader import sga_section_to_config
 
     sga_engine_config = sga_section_to_config(config)

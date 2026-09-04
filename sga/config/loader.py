@@ -9,7 +9,7 @@ Structure (one file, no defaults/inheritance/merging):
 
 The `sga:` section is validated here and never reaches the megatron command
 line through the flatten. The launcher translates it into the FLAT flag
-vocabulary (``--sga-*``; sga/config/arguments.py — the single parsing
+vocabulary (``--sga-*``; sga/config/flatargs.py — the single parsing
 pipeline: the flags are registered into megatron's argparse by the training
 entry and re-assembled into the canonical ``args.sga_config`` JSON) —
 the waist reads only that JSON.
@@ -19,46 +19,32 @@ score/selection/optimizer/backend, each with its own params, plus the engine
 cycle {start_iter, start_iter_percent, period,
 decouple_full_sync_interval_and_period, full_sync_interval}. Legality is
 checked from plugin DECLARATIONS (sga.plugins.validate_combination) — no
-hardcoded scheme list — and each plugin's parameter vocabulary is declared
-on its decl (unknown keys fail loud). ``enabled: false`` keeps the SGA-off
-semantics: dense training, backend name must be 'dense'.
+hardcoded scheme list — and every section's parameter vocabulary is the
+CATALOG (sga/config/arguments.py): the allowlists and engine defaults
+below are derived from it, never restated. ``enabled: false`` keeps the
+SGA-off semantics: dense training, backend name must be 'dense'.
 """
 
 from omegaconf import DictConfig, OmegaConf
 
-from sga.trace import parse_branch_points
+from sga.config.arguments import ENGINE_SECTIONS, TOP
 
 _AXES = ("score", "selection", "optimizer", "backend")
 
-# Top-level sga: keys (single list, mode-independent: a typo like `shadw`
-# must fail loud even in a disabled config, where it would otherwise be
-# silently dropped and the run would proceed as live sparse instead of the
-# intended shadow). Plugin params inside score/selection/optimizer/backend
-# are validated against the plugins' declared vocabularies; cycle's own
-# interior is a fixed vocabulary.
-_SGA_KEYS = frozenset(
-    (
-        "enabled",
-        "cycle",
-        "score",
-        "selection",
-        "optimizer",
-        "backend",
-        "checks",
-        "trace",
-        "shadow",
-        "shadow_score",
-    )
-)
-_CYCLE_KEYS = frozenset(
-    (
-        "start_iter",
-        "start_iter_percent",
-        "period",
-        "decouple_full_sync_interval_and_period",
-        "full_sync_interval",
-    )
-)
+# All key sets derive from the catalog — this file restates no vocabulary.
+# Top-level sga: keys are mode-independent: a typo like `shadw` must fail
+# loud even in a disabled config, where it would otherwise be silently
+# dropped and the run would proceed as live sparse instead of the intended
+# shadow.
+_SGA_KEYS = (frozenset(_AXES) | {p.name for p in TOP}
+             | frozenset(ENGINE_SECTIONS))
+_CYCLE_KEYS = frozenset(p.name for p in ENGINE_SECTIONS["cycle"])  # incl. start_iter_percent
+_CHECKS_KEYS = frozenset(p.name for p in ENGINE_SECTIONS["checks"])
+_TRACE_KEYS = frozenset(p.name for p in ENGINE_SECTIONS["trace"])
+_ENGINE_DEFAULTS = {
+    section: {p.name: p.default for p in decl if not p.required}
+    for section, decl in ENGINE_SECTIONS.items()
+}
 
 
 def sga_section_to_config(config: DictConfig):
@@ -82,7 +68,7 @@ def sga_section_to_config(config: DictConfig):
 def engine_config_from_sga_dict(sga: dict, train_iters=None):
     """The shared validation core, on a plain dict (both input forms meet
     here): the nested yaml section (via sga_section_to_config) and the flat
-    flags re-nested by the assembler (sga/config/arguments.py). ``train_iters``
+    flags re-nested by the assembler (sga/config/flatargs.py). ``train_iters``
     is the percent-resolution context; the flat-flag path passes None
     (start_iter_percent has no flag and is rejected there).
     """
@@ -186,12 +172,13 @@ def engine_config_from_sga_dict(sga: dict, train_iters=None):
         if not isinstance(checks, dict):
             raise ValueError(f"sga.checks must be a mapping (got: {checks!r}).")
         engine_config["checks"] = dict(checks)
-        unknown = sorted(set(engine_config["checks"]) - {"count_guard"})
+        unknown = sorted(set(engine_config["checks"]) - _CHECKS_KEYS)
         if unknown:
             raise ValueError(
-                f"sga.checks: unknown keys {unknown} (known: ['count_guard'])"
+                f"sga.checks: unknown keys {unknown} (known: {sorted(_CHECKS_KEYS)})"
             )
-        if not isinstance(engine_config["checks"].get("count_guard", True), bool):
+        default = _ENGINE_DEFAULTS["checks"]["count_guard"]
+        if not isinstance(engine_config["checks"].get("count_guard", default), bool):
             raise ValueError("sga.checks.count_guard must be a boolean.")
 
     # Engine-side trace collector (offline replay data source). Off unless
@@ -203,22 +190,26 @@ def engine_config_from_sga_dict(sga: dict, train_iters=None):
             raise ValueError(f"sga.trace must be a mapping (got: {trace!r}).")
         engine_config["trace"] = dict(trace)
         t = engine_config["trace"]
-        unknown = sorted(set(t) - {"dir", "branch_points", "window"})
+        unknown = sorted(set(t) - _TRACE_KEYS)
         if unknown:
             raise ValueError(
                 f"sga.trace: unknown keys {unknown} "
-                "(known: ['branch_points', 'dir', 'window'])"
+                f"(known: {sorted(_TRACE_KEYS)})"
             )
         if not isinstance(t.get("dir"), str) or not t["dir"]:
             raise ValueError(
                 "sga.trace.dir is required and must be a non-empty string "
                 "(the trace output directory)."
             )
+        # Lazy import: sga.trace -> sga.config (package __init__) -> this
+        # module -> sga.trace is a cycle; sga.trace-first processes must
+        # keep importing (only call site, so the deferral costs nothing).
+        from sga.trace import parse_branch_points
         try:
             t["branch_points"] = parse_branch_points(t.get("branch_points"))
         except (TypeError, ValueError) as e:
             raise ValueError(f"sga.trace.branch_points: {e}") from None
-        window = t.get("window", 100)
+        window = t.get("window", _ENGINE_DEFAULTS["trace"]["window"])
         if not isinstance(window, int) or isinstance(window, bool) or window < 1:
             raise ValueError(f"sga.trace.window must be an int >= 1 (got {window!r}).")
         t["window"] = window
@@ -284,7 +275,7 @@ def _resolve_cycle_start(cycle: dict, train_iters) -> None:
 
 def _validate_against_registries(engine_config: dict) -> None:
     """Registry membership + declaration-based combination check + the
-    plugins' declared parameter vocabularies (unknown keys fail loud here —
+    CATALOG's parameter vocabularies (unknown keys fail loud here —
     a typo'd param would otherwise be silently swallowed downstream)."""
     from sga.plugins import (
         check_plugin_params,
@@ -292,6 +283,7 @@ def _validate_against_registries(engine_config: dict) -> None:
         get_optimizer_decl,
         get_score_spec,
         get_selection_decl,
+        plugin_params,
         register_default_plugins,
         validate_combination,
     )
@@ -302,7 +294,7 @@ def _validate_against_registries(engine_config: dict) -> None:
     optimizer = get_optimizer_decl(engine_config["optimizer"]["name"])
     backend = get_backend_plugin_decl(engine_config["backend"]["name"])
     cycle = engine_config.get("cycle", {})
-    if int(cycle.get("period", 1)) < 1:
+    if int(cycle.get("period", _ENGINE_DEFAULTS["cycle"]["period"])) < 1:
         raise ValueError("sga.cycle.period must be >= 1")
     validate_combination(score_name, selection, optimizer, backend, cycle)
 
@@ -313,16 +305,15 @@ def _validate_against_registries(engine_config: dict) -> None:
         raise ValueError(
             f"sga.score takes no params beyond name (got: {extra_score_keys})"
         )
-    for axis, decl in (("selection", selection),
-                       ("optimizer", optimizer),
-                       ("backend", backend)):
+    for axis in ("selection", "optimizer", "backend"):
+        name = engine_config[axis]["name"]
         params = {k: v for k, v in engine_config[axis].items() if k != "name"}
-        check_plugin_params(axis, engine_config[axis]["name"], decl, params)
+        check_plugin_params(axis, name, params)
         # Canonicalize float params to float regardless of the yaml spelling
         # (10 vs 10.0): the canonical --sga-config JSON must be
         # spelling-invariant, or the resume guard would refuse identical
         # configs over a byte difference.
-        for p in decl.params:
+        for p in plugin_params(axis, name):
             if p.type is float and isinstance(params.get(p.name), int):
                 engine_config[axis][p.name] = float(engine_config[axis][p.name])
 

@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omegaconf import OmegaConf
 
-from sga.config.arguments import (
+from sga.config.flatargs import (
     add_sga_flat_args,
     assemble_sga_args,
     flat_flags,
@@ -73,7 +73,7 @@ def _nested_section(extra_cycle=None, **kw):
     return OmegaConf.create({"sga": section, "train": {"model": {"train_iters": 5000}}})
 
 
-def test_flag_table_generated_from_declarations():
+def test_flag_table_generated_from_catalog():
     flags = {f.flag: f for f in flat_flags()}
     # engine sections
     for f in ("--sga-enabled", "--sga-shadow", "--sga-shadow-score",
@@ -83,7 +83,7 @@ def test_flag_table_generated_from_declarations():
               "--sga-trace-dir", "--sga-trace-branch-points",
               "--sga-trace-window"):
         assert f in flags, f
-    # per-axis plugin params (data-driven: a decl param implies its flag)
+    # per-axis plugin params (data-driven: a catalog param row implies its flag)
     assert flags["--sga-selection-ratio-percent"].type is float
     assert flags["--sga-selection-method"].choices == ("adaptive", "exact", "histogram")
     assert flags["--sga-selection-histogram-mode"].choices == ("balanced", "exact", "fast")
@@ -98,7 +98,7 @@ def test_flag_table_generated_from_declarations():
     assert "--sga-cycle-start-iter-percent" not in flags
     # fork-owned flags are never generated
     assert "--sga-config" not in flags
-    print("ok: flag table generated from declarations")
+    print("ok: flag table generated from the catalog")
 
 
 def test_dual_form_equivalence():

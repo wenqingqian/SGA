@@ -12,7 +12,11 @@ import json
 
 import torch
 
+from sga.config.arguments import CYCLE
+
 SGA_API_VERSION = 1
+
+_CYCLE_DEFAULTS = {p.name: p.default for p in CYCLE if not p.required}
 
 
 def _assert_args_compatible() -> None:
@@ -166,7 +170,7 @@ def build_engine(config: dict, api_version: int):
                 f"SGA config: axis '{axis}' must be a dict with a 'name' field"
             )
     cycle = config.get("cycle", {})
-    if int(cycle.get("period", 1)) < 1:
+    if int(cycle.get("period", _CYCLE_DEFAULTS["period"])) < 1:
         raise ValueError("SGA config: cycle.period must be >= 1")
 
     score_name = config["score"]["name"]

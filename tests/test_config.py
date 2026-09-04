@@ -258,7 +258,7 @@ def test_enabled_emits_flat_flag_sequence():
     cfg.sga.backend = {"name": "torch_pipelined_mask"}
     expected_engine_cfg = sga_section_to_config(cfg)
 
-    from sga.config.arguments import sga_config_to_flags
+    from sga.config.flatargs import sga_config_to_flags
     from sga.launcher.backend_megatron import _update_config_train
 
     try:

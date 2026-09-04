@@ -50,7 +50,7 @@ from typing import Optional
 
 import torch
 
-from sga.plugins import OptimizerDecl, PluginParam, resolve_plugin_params
+from sga.plugins import OptimizerDecl, resolve_plugin_params
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch
 from sga.plugins.scores import Score, emittable_score_names, get_score_spec
 
@@ -73,27 +73,6 @@ DECL = OptimizerDecl(
     # Derived, not restated: this template implements every registry score's
     # kernel branch (a second template would declare its own branch subset).
     emittable_scores=emittable_score_names(),
-    params=(
-        PluginParam(
-            "residual_mean", bool, default=False,
-            doc="pre-fold the accumulated residual by the fold window (the "
-                "accumulation span between full syncs) at full-sync "
-                "boundaries (residual-mean semantics)",
-        ),
-        PluginParam(
-            "merge_join_dir", str, default="table",
-            choices=("table", "binary"),
-            doc="compact-path merge-join bracket source: 'table' builds a "
-                "1024-stride directory table of lower_bound(idx, j*1024) "
-                "once per selection cycle (the bucket idx is frozen within "
-                "a cycle, so the table cannot go stale) and brackets both "
-                "lower_bounds to <=1024 candidates (~0.5ms build, "
-                "amortized over the cycle's sparse steps); 'binary' keeps "
-                "the plain full-depth bisection (the historical form). "
-                "Silently ignored on writeback backends and the torch "
-                "fallback path (no compact merge-join there)",
-        ),
-    ),
 )
 
 # The bare-int EMIT_MODE branches _grad_correct_kernel implements below.
@@ -792,7 +771,7 @@ class SgaAdamW:
     decl = DECL
 
     def __init__(self, params: dict, emit_score: Optional[str] = None):
-        params = resolve_plugin_params("optimizer", "adamw", DECL, dict(params))
+        params = resolve_plugin_params("optimizer", "adamw", dict(params))
         self.params = params
         self.residual_mean = bool(params["residual_mean"])
         # Compact-path merge-join form: 'table' seeds both

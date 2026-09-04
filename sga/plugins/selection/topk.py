@@ -26,8 +26,9 @@ Strict-ratio global topk over the optimizer-materialized score magnitudes:
 
 Params of one method are foreign keys under another and rejected at build
 time (their knobs have no effect there — a silently-dead knob is worse than
-a loud refusal). Historical note: this subject was previously registered as
-``circular_topk``.
+a loud refusal); the per-method vocabularies are the catalog's equality
+guards on these params (sga/config/arguments.py). Historical note: this
+subject was previously registered as ``circular_topk``.
 
 "Circular" (the support is regenerated once per cycle period T at the
 full-sync boundary and persists unchanged in between; non-topk coordinates
@@ -37,74 +38,16 @@ hence the bare registration name ``topk``.
 """
 
 from sga.plugins import (
-    PluginParam,
     SelectionDecl,
+    guard_foreign_keys,
+    plugin_params,
     resolve_plugin_params,
 )
 from sga.plugins.selection._adaptive import AdaptiveTau
 from sga.plugins.selection._exact import ExactKthvalue
-from sga.plugins.selection._histogram import _HIST_MODES, HistogramSelect
+from sga.plugins.selection._histogram import HistogramSelect
 
-_DECL_PARAMS = (
-    PluginParam(
-        "method", str, required=True,
-        choices=("adaptive", "exact", "histogram"),
-        doc="selection algorithm: adaptive tau controller / bit-pattern "
-            "histogram / kthvalue+OR-merge",
-    ),
-    PluginParam(
-        "ratio_percent", float, required=True,
-        doc="topk mask ratio in percent, strictly inside (0, 100)",
-    ),
-    PluginParam(
-        "histogram_mode", str, default="exact",
-        choices=tuple(sorted(_HIST_MODES)),
-        doc="method=histogram: geometry tier exact / balanced / fast",
-    ),
-    PluginParam(
-        "adaptive_warmup_syncs", int, default=5, nullable=True,
-        doc="method=adaptive: gated warmup selects before the persistent "
-            "tau takes over (null disables the warmup gate)",
-    ),
-    PluginParam(
-        "adaptive_warmup_mode", str, default="fast",
-        choices=tuple(sorted(_HIST_MODES)),
-        doc="method=adaptive: histogram tier used to bootstrap/steer the "
-            "adaptive tau",
-    ),
-)
-
-def effective_params(params: dict) -> dict:
-    """Method-aware view of a RESOLVED param dict for the resolve CLI: keep
-    only the keys the configured method consumes. The union declaration's
-    other defaults would be foreign keys — the dump's own output would be
-    rejected by the constructor's per-method check."""
-    keep = ("method", "ratio_percent", *_METHOD_KEYS[params["method"]])
-    return {k: v for k, v in params.items() if k in keep}
-
-
-DECL = SelectionDecl(name="topk", output_form="mask", params=_DECL_PARAMS,
-                     effective=effective_params)
-
-# Per-method vocabularies (the declaration carries the union — the flat
-# flag table must offer every param — while a CONFIG may only use the keys
-# of its own method).
-_METHOD_KEYS = {
-    "adaptive": ("adaptive_warmup_syncs", "adaptive_warmup_mode"),
-    "histogram": ("histogram_mode",),
-    "exact": (),
-}
-
-
-# Every method-specific key is foreign to SOME method; membership here is
-# what makes the per-method rejection below a closed check. A param added to
-# the declaration but forgotten in _METHOD_KEYS would silently become
-# accepted-under-every-method — the exact failure mode that check exists to
-# prevent, so the sync is enforced at import.
-_FOREIGN_POSSIBLE = frozenset().union(*_METHOD_KEYS.values())
-assert _FOREIGN_POSSIBLE == {p.name for p in _DECL_PARAMS} - {"method", "ratio_percent"}, (
-    "topk DECL params and _METHOD_KEYS are out of sync"
-)
+DECL = SelectionDecl(name="topk", output_form="mask")
 
 
 class TopkSelection:
@@ -114,22 +57,23 @@ class TopkSelection:
     def __init__(self, params: dict):
         raw = dict(params)  # pre-resolution view (explicit keys only)
         method = raw.get("method")
-        # Foreign-key check FIRST: a wrong-method knob is a vocabulary error
-        # and must not surface as (or be masked by) a type/choices complaint.
-        if method in _METHOD_KEYS:
-            foreign = sorted(
-                key for key in raw
-                if key in _FOREIGN_POSSIBLE and key not in _METHOD_KEYS[method]
-            )
+        # Foreign-key check FIRST, gated on a KNOWN method: a missing or
+        # invalid method must surface as the shared validator's
+        # required/choices error, not as a foreign-key refusal (which would
+        # name the raw value and mask the real problem). The per-method
+        # vocabularies live in the catalog's guards.
+        methods = next(p for p in plugin_params("selection", "topk")
+                       if p.name == "method").choices
+        if method in methods:
+            foreign, own = guard_foreign_keys("selection", "topk", raw)
             if foreign:
-                own = sorted(_METHOD_KEYS[method]) or "no extra params"
                 raise ValueError(
                     f"sga.selection (topk): params {foreign} do not belong to "
-                    f"method '{method}' (it takes {own}) — under this method "
-                    "they would be silently dead; drop them or switch the "
-                    "method"
+                    f"method '{method}' (it takes {own or 'no extra params'}) — "
+                    "under this method they would be silently dead; drop them "
+                    "or switch the method"
                 )
-        params = resolve_plugin_params("selection", "topk", DECL, raw)
+        params = resolve_plugin_params("selection", "topk", raw)
         self.params = params
         self.method = method
         self.ratio_percent = float(params["ratio_percent"])

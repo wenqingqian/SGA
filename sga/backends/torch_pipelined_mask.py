@@ -19,17 +19,11 @@ synchronous).
 
 import torch
 
-from sga.plugins import BackendDecl, PluginParam, resolve_plugin_params
+from sga.plugins import BackendDecl, resolve_plugin_params
 
 DECL = BackendDecl(
     name="torch_pipelined_mask",
     consumes="mask",
-    params=(
-        PluginParam(
-            "num_slices", int, default=0,
-            doc="mask slices pipelined against NCCL ops (0 = auto, i.e. 2)",
-        ),
-    ),
 )
 
 
@@ -39,7 +33,7 @@ class TorchPipelinedMaskBackend:
     decl = DECL
 
     def __init__(self, params: dict):
-        params = resolve_plugin_params("backend", "torch_pipelined_mask", DECL,
+        params = resolve_plugin_params("backend", "torch_pipelined_mask",
                                        dict(params))
         self.num_slices = int(params["num_slices"]) or 2
 

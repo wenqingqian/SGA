@@ -68,7 +68,6 @@ from sga.plugins import BackendDecl, resolve_plugin_params
 DECL = BackendDecl(
     name="nccl_pipelined_index",
     consumes="idx",
-    params=(),
 )
 
 # Path to the nccl-sar sparse library exporting ncclSparseAllReduce (the
@@ -111,7 +110,7 @@ class NcclPipelinedIndexBackend:
     def __init__(self, params: dict):
         # Validation-only (the decl declares no vocabulary): unknown keys
         # fail here, loudly.
-        resolve_plugin_params("backend", "nccl_pipelined_index", DECL,
+        resolve_plugin_params("backend", "nccl_pipelined_index",
                               dict(params))
         # comm_group -> _RawComm. Keyed by the group OBJECT with a strong
         # reference held on both sides (an id() key could collide after a
