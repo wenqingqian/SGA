@@ -353,7 +353,7 @@ if _HAS_TRITON:
         LANE_DEPTH: tl.constexpr,
         APPLY_COEFF: tl.constexpr, FOLD: tl.constexpr,
     ):
-        """Table-bracketed merge-join (merge_join_dir=table).
+        """Table-bracketed merge-join (compact_search=table).
 
         Identical contract to _grad_correct_compact_kernel — same records,
         same idx/values, same found set — with both scalar lower_bounds
@@ -637,7 +637,7 @@ def adamw_grad_correct_compact(
     positions of ``grad_buffer`` are NOT touched here — the pack kernel
     zeroed them at grad_sync time (there is deliberately no clear knob).
 
-    ``dir_table`` (merge_join_dir=table) routes to the table-bracketed
+    ``dir_table`` (compact_search=table) routes to the table-bracketed
     kernel; None keeps the plain full-depth binary form. Both forms share
     this wrapper's contract; ignored on the torch fallback path.
 
@@ -772,17 +772,18 @@ class SgaAdamW:
 
     def __init__(self, params: dict, emit_score: Optional[str] = None):
         params = expand_plugin_params(
-            "sga_optimizer_", ("residual_mean", "merge_join_dir"),
+            "sga_optimizer_", ("residual_mean", "compact_search"),
             dict(params), "sga_optimizer (adamw)")
         self.params = params
         self.residual_mean = bool(params["residual_mean"])
-        # Compact-path merge-join form: 'table' seeds both
-        # lower_bound brackets from the per-cycle directory table; 'binary'
-        # is the plain full-depth form. Dispatched per call (host
-        # branch) — the kernels stay branch-free. No-op on writeback
-        # backends (they never reach _records_pass_compact) and on the
-        # torch fallback (it ignores the table).
-        self.merge_join_dir = params["merge_join_dir"]
+        # Compact-path idx alignment search: 'table' seeds both
+        # lower_bound brackets from the per-cycle directory table;
+        # 'bisection' is the plain full-depth form. Dispatched per call
+        # (host branch) — the kernels stay branch-free. No-op on
+        # writeback-emission runs (they never reach
+        # _records_pass_compact) and on the torch fallback (it ignores
+        # the table).
+        self.compact_search = params["compact_search"]
         # Which registry score to materialize on full steps (build-time
         # injection). None/'update' keeps the historical default: the signed
         # AdamW update itself is the topk input. The emission mode int is
@@ -858,7 +859,7 @@ class SgaAdamW:
                 continue
             bucket = ctx.support.buckets[bs.support_index]
             idx = bucket.idx
-            # merge_join_dir dual dispatch: the table is the bucket's lazy
+            # compact_search dual dispatch: the table is the bucket's lazy
             # per-cycle derived field — first sparse step of the cycle pays
             # the ~0.5ms build, the rest reuse it (idx frozen per cycle).
             # Gated on the REAL execution path, not just the configured
@@ -867,7 +868,7 @@ class SgaAdamW:
             # before the fallback could engage, against the DECL's
             # "silently ignored" contract.
             dir_table = (bucket.dir_table
-                         if (self.merge_join_dir == "table"
+                         if (self.compact_search == "table"
                              and _HAS_TRITON and idx.is_cuda) else None)
             adamw_grad_correct_compact(
                 param_buffer=rec.main_param.data.view(-1),

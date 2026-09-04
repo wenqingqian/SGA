@@ -237,15 +237,15 @@ def _add_sga_optimizer_args(parser: argparse.ArgumentParser):
              "accumulation span between full syncs) at full-sync "
              "boundaries (residual-mean semantics). Default false.")
     group.add_argument(
-        "--sga-optimizer-merge-join-dir", type=str, default="table",
-        choices=("table", "binary"),
-        help="compact-path merge-join bracket source: 'table' builds a "
+        "--sga-optimizer-compact-search", type=str, default="table",
+        choices=("table", "bisection"),
+        help="compact-path idx alignment search: 'table' builds a "
              "1024-stride directory table of lower_bound(idx, j*1024) "
              "once per selection cycle (the bucket idx is frozen within "
              "a cycle, so the table cannot go stale) and brackets both "
-             "lower_bounds to <=1024 candidates; 'binary' keeps the "
+             "lower_bounds to <=1024 candidates; 'bisection' keeps the "
              "plain full-depth bisection (the historical form). "
-             "Silently ignored on writeback backends and the torch "
+             "Silently ignored on writeback-emission runs and the torch "
              "fallback path. Default table.")
 
 

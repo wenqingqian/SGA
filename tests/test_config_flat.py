@@ -239,7 +239,7 @@ def test_inv4_historical_surface_pinned():
         "sga_selection_adaptive_warmup_mode": ("fast", "str", ("balanced", "exact", "fast")),
         "sga_optimizer": (None, "str", ()),
         "sga_optimizer_residual_mean": (False, "bool", ()),
-        "sga_optimizer_merge_join_dir": ("table", "str", ("table", "binary")),
+        "sga_optimizer_compact_search": ("table", "str", ("table", "bisection")),
         "sga_backend": ("dense", "str", ()),
         "sga_backend_high_priority_group": (False, "bool", ()),
         "sga_backend_slices": (2, "int", ()),

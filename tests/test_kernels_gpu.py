@@ -582,7 +582,7 @@ def test_compact_grad_correct_full_density_clustered_and_bracket_fill():
 
 
 def test_compact_grad_correct_dir_table():
-    """merge_join_dir=table legs.
+    """compact_search=table legs.
 
     The directory table's exactness is the ONLY hard pin of the four-link
     invariance chain: a containment-PRESERVING table error is invisible to
@@ -674,7 +674,7 @@ def test_compact_grad_correct_dir_table():
         "BucketSupport.dir_table != searchsorted"
     del bs, t1, t2
 
-    # --- on/off A/B (merge_join_dir table vs binary), fold arms included:
+    # --- on/off A/B (compact_search table vs bisection), fold arms included:
     # LEG-1 grad end state bitwise (found is the kernels' integer
     # predicate — identical when the integer path holds); fired-set
     # symmetric difference within the rounding-absorption tail (the

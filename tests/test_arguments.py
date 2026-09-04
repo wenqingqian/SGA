@@ -123,7 +123,7 @@ def test_flag_table_declared_in_arguments_py():
         "sga_selection_adaptive_warmup_syncs",
         "sga_selection_adaptive_warmup_mode",
         "sga_optimizer", "sga_optimizer_residual_mean",
-        "sga_optimizer_merge_join_dir",
+        "sga_optimizer_compact_search",
         "sga_backend", "sga_backend_high_priority_group",
         "sga_backend_slices", "sga_backend_num_slices",
     }
