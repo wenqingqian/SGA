@@ -185,15 +185,20 @@ def registered_names() -> dict:
 
 
 def validate_combination(score_name: str, selection: SelectionDecl,
-                         optimizer: OptimizerDecl, backend) -> None:
+                         optimizer: OptimizerDecl, backend,
+                         backend_emission: str = None) -> None:
     """Declaration-based CROSS-AXIS combination validation (config time,
     no scheme names).
 
-    ``backend`` is a BackendDecl. ``selection`` is accepted for interface
-    completeness only; the rules checked here are the ones the decls
-    declare (emittable scores; compact emission requires an optimizer
-    that consumes the compact handoff). The cycle-calendar rules are
-    engine-level and live in sga.config.validation (flat keys).
+    ``backend`` is a BackendDecl; ``backend_emission`` is the resolved
+    flat value of sga_backend_emission (None/'auto' -> the decl's
+    inherent emission — emission is a runtime switch on
+    torch_pipelined_index, so the decl field alone no longer decides
+    which handoff the optimizer must consume). ``selection`` is accepted
+    for interface completeness only; the rules checked here are the ones
+    the decls declare (emittable scores; compact emission requires an
+    optimizer that consumes the compact handoff). The cycle-calendar
+    rules are engine-level and live in sga.config.validation (flat keys).
     """
     problems = []
     get_score_spec(score_name)  # unknown score fails with the registered list
@@ -204,7 +209,10 @@ def validate_combination(score_name: str, selection: SelectionDecl,
             f"{sorted(optimizer.emittable_scores) or 'nothing'}) — the score "
             "is offline-only under this optimizer"
         )
-    if backend.emission == "compact" and not optimizer.consumes_compact:
+    effective_emission = (backend_emission
+                          if backend_emission not in (None, "auto")
+                          else backend.emission)
+    if effective_emission == "compact" and not optimizer.consumes_compact:
         problems.append(
             f"backend '{backend.name}' declares emission='compact' but "
             f"optimizer '{optimizer.name}' does not consume the compact "

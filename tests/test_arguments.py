@@ -105,9 +105,9 @@ def _canon_from_namespace(argv, train_iters=5000):
 
 def test_flag_table_declared_in_arguments_py():
     """The vocabulary IS the add_argument set: every dest hyphenates to its
-    flag and the historical surface is pinned (26 dests)."""
+    flag and the historical surface is pinned (27 dests)."""
     actions = sga_actions()
-    assert len(actions) == 26, sorted(actions)
+    assert len(actions) == 27, sorted(actions)
     for dest, action in actions.items():
         assert action.option_strings == ["--" + dest.replace("_", "-")], dest
     assert set(sga_defaults()) == {
@@ -124,10 +124,11 @@ def test_flag_table_declared_in_arguments_py():
         "sga_selection_adaptive_warmup_mode",
         "sga_optimizer", "sga_optimizer_residual_mean",
         "sga_optimizer_compact_search",
-        "sga_backend", "sga_backend_high_priority_group",
+        "sga_backend", "sga_backend_emission",
+        "sga_backend_high_priority_group",
         "sga_backend_slices", "sga_backend_num_slices",
     }
-    print("ok: 26 flat flags declared, hyphenation 1:1")
+    print("ok: 27 flat flags declared, hyphenation 1:1")
 
 
 def test_dual_form_equivalence():

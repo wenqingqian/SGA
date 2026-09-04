@@ -92,6 +92,23 @@ def main():
     # --- the two emissions agree bitwise on the communicated values -------
     assert torch.equal(ret_idx, g_mask[active])
 
+    # --- indexed backend, emission=writeback (the restored historical
+    # choreography): pure-read gather + scatter-back, None return — the
+    # written-back buffer must equal the mask backend's bitwise (same
+    # payload elements in ascending order, same per-element SUMs) ---
+    g_wb = local.clone()
+    ret_wb = TorchPipelinedIndexBackend(
+        {"emission": "writeback"}).allreduce_sparse(
+            g_wb, support, group, factor, op, key=0)
+    assert ret_wb is None, "writeback emission must return None"
+    assert torch.equal(g_wb[~active], local[~active]), "residual changed"
+    assert torch.equal(g_wb[active], expected_selected[active]), \
+        f"writeback emission selected coords wrong (rank {rank})"
+    assert torch.equal(g_wb[active], g_mask[active]), \
+        "writeback emission must match the mask backend's buffer bitwise"
+    assert torch.equal(
+        g_wb, g_mask), "writeback emission must equal the masked backend"
+
     # --- raw-kernel backend (needs the sparse library; skip loudly) -------
     lib = os.environ.get("SGA_NCCL_SAR_LIB")
     if lib:

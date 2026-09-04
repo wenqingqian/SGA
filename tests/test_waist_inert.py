@@ -22,7 +22,10 @@ from types import SimpleNamespace
 
 SGA_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SGA_ROOT)
-sys.path.insert(0, os.path.dirname(SGA_ROOT) + "/Megatron-LM")
+# MEGATRON_SGA_DIR first (a dev worktree has no Megatron-LM sibling —
+# env.sh's first-priority knob), else the main checkout's sibling.
+sys.path.insert(0, os.environ.get("MEGATRON_SGA_DIR")
+                or os.path.dirname(SGA_ROOT) + "/Megatron-LM")
 
 import megatron.core.sga_waist as sga_waist
 import megatron.training as _mt

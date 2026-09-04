@@ -12,15 +12,23 @@ One backend, two transport modes chosen by ``high_priority_group``:
   True)`` — the legacy ``pipelined_idx_sorted`` transport (compact payloads
   do not queue behind the training stream's communicator).
 
-COMPACT EMISSION: the pack is a fused gather+zero+scale Triton
-kernel into a persistent grow-only compact buffer, the allreduce runs on
-that buffer, and the communicated values STAY there — ``allreduce_sparse``
-returns the values view and never writes the full grad buffer back (the
-zero store inside pack establishes the buffer-state invariant at grad_sync
-time; clip/grad_correct consume (idx, values) via the engine's compact
-branches). The zeroed writeback that this backend performed before compact
-emission is gone (the "bitwise-identical to the recorded baseline arms"
-property of the old plain mode died with it).
+EMISSION (``sga_backend_emission``, default ``auto`` -> compact here):
+how the sparse allreduce hands its result to the optimizer.
+
+- ``compact`` (the inherent default): the pack is a fused gather+zero+scale
+  Triton kernel into a persistent grow-only compact buffer, the allreduce
+  runs on that buffer, and the communicated values STAY there —
+  ``allreduce_sparse`` returns the values view and never writes the full
+  grad buffer back (the zero store inside pack establishes the
+  buffer-state invariant at grad_sync time; clip/grad_correct consume
+  (idx, values) via the engine's compact branches).
+- ``writeback``: the historical choreography (the pre-compact form, and
+  bit for bit the nccl backend's) — pure-read ``index_select`` gather,
+  payload-only scale, pipelined allreduce, ``scatter_selected`` writes the
+  communicated values back into the dense grad buffer; the optimizer's
+  masked kernel reads them there and does the selective clear post-commit.
+  The engine's deterministic compact grad-norm reverts to the masked
+  atomic path with it.
 
 Twin-mode runtime gates (probed via the optional ``validate_runtime`` /
 ``prepare`` hooks, only active when ``high_priority_group`` is true):
@@ -54,7 +62,7 @@ import os
 import torch
 
 from sga.backends import COMM_WARMUP_ENV, RESUME_OVERRIDE_ENV
-from sga.kernels import pack_selected
+from sga.kernels import pack_selected, scatter_selected
 from sga.plugins import BackendDecl, expand_plugin_params
 
 DECL = BackendDecl(
@@ -90,8 +98,18 @@ class TorchPipelinedIndexBackend:
 
     def __init__(self, params: dict):
         params = expand_plugin_params(
-            "sga_backend_", ("high_priority_group", "slices"), dict(params),
-            "sga_backend (torch_pipelined_index)")
+            "sga_backend_", ("high_priority_group", "slices", "emission"),
+            dict(params), "sga_backend (torch_pipelined_index)")
+        # Emission switch: how the sparse allreduce hands its result to
+        # the optimizer. 'auto' (the flag default) resolves to this
+        # backend's inherent compact form; explicit 'writeback' restores
+        # the historical choreography (see allreduce_sparse). The DECL's
+        # emission field is the declared inherent default the engine
+        # falls back to; the RESOLVED instance attribute is what the
+        # engine routes on.
+        self.emission = params["emission"]
+        if self.emission == "auto":
+            self.emission = "compact"
         self._hiprio = bool(params["high_priority_group"])
         self._slices = int(params["slices"])
         if self._slices < 1:
@@ -308,14 +326,41 @@ class TorchPipelinedIndexBackend:
         indices = support.idx
         k = indices.numel()
         if k == 0:
+            if self.emission == "writeback":
+                return None
             return torch.empty(0, dtype=grad_data.dtype,
                                device=grad_data.device)
 
         gather_buf = self._gather_buf(key, k, grad_data.dtype, grad_data.device)
         group = self._group_for(comm_group)
-        pack_factor = (float(gradient_scaling_factor)
-                       if (reduce_op == torch.distributed.ReduceOp.SUM
-                           and gradient_scaling_factor != 1.0) else 1.0)
+        factor = (float(gradient_scaling_factor)
+                  if (reduce_op == torch.distributed.ReduceOp.SUM
+                      and gradient_scaling_factor != 1.0) else 1.0)
+
+        if self.emission == "writeback":
+            # The historical choreography (bit for bit the pre-compact
+            # form and the nccl backend's): pure-read gather, payload-only
+            # scale, pipelined allreduce, scatter the communicated values
+            # back into the dense grad; the optimizer's masked kernel
+            # reads them there and does the selective clear post-commit.
+            prev = None  # (work, idx, sel)
+            for lo, hi in self._bounds(support, k):
+                if hi <= lo:
+                    continue
+                idx = indices[lo:hi]
+                sel = gather_buf[lo:hi]
+                torch.index_select(grad_data, 0, idx, out=sel)
+                if factor != 1.0:
+                    sel *= factor
+                if prev is not None:
+                    prev[0].wait()
+                    scatter_selected(grad_data, prev[1], prev[2])
+                prev = (torch.distributed.all_reduce(
+                    sel, op=reduce_op, group=group, async_op=True), idx, sel)
+            if prev is not None:
+                prev[0].wait()
+                scatter_selected(grad_data, prev[1], prev[2])
+            return None
 
         # One allreduce in flight at a time: slice i+1's pack (compute
         # stream) overlaps slice i's NCCL transfer. The pack of slice i+1
@@ -327,7 +372,7 @@ class TorchPipelinedIndexBackend:
                 continue
             idx = indices[lo:hi]
             sel = gather_buf[lo:hi]
-            pack_selected(grad_data, idx, sel, pack_factor)
+            pack_selected(grad_data, idx, sel, factor)
             if prev is not None:
                 prev[0].wait()
             prev = (torch.distributed.all_reduce(

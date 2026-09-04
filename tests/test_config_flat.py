@@ -241,6 +241,7 @@ def test_inv4_historical_surface_pinned():
         "sga_optimizer_residual_mean": (False, "bool", ()),
         "sga_optimizer_compact_search": ("table", "str", ("table", "bisection")),
         "sga_backend": ("dense", "str", ()),
+        "sga_backend_emission": ("auto", "str", ("auto", "compact", "writeback")),
         "sga_backend_high_priority_group": (False, "bool", ()),
         "sga_backend_slices": (2, "int", ()),
         "sga_backend_num_slices": (0, "int", ()),
@@ -395,6 +396,55 @@ def _run_all():
         if name.startswith("test_") and callable(fn):
             fn()
     print("ALL FLAT-CONFIG INVARIANT TESTS PASSED")
+
+
+def test_inv2_emission_switch_flat_rules():
+    """emission: 'auto' is the declared default (per-backend resolution is
+    the plugin constructors' business); explicit 'compact' is a
+    torch_pipelined_index capability only; explicit values survive the
+    canonical round-trip and the engine-config slicing; the retired
+    merge_join_dir dest fails closed (old checkpoints surface here)."""
+    base = {"sga_enabled": True, "sga_score": "update",
+            "sga_selection_method": "histogram",
+            "sga_selection_ratio_percent": 10.0,
+            "sga_optimizer": "adamw",
+            "sga_backend": "torch_pipelined_index"}
+
+    # auto default: canonical carries it; nothing explicit flows to the
+    # constructor (it resolves auto -> the backend's inherent form)
+    canon = validate_sga_flat(dict(base))
+    assert canon["sga_backend_emission"] == "auto"
+    # explicit writeback on tpi: survives canonical AND engine-config
+    # slicing (materialize re-diffs to explicit non-defaults: 'auto'
+    # vanishes, 'writeback' flows to the constructor)
+    canon = validate_sga_flat({**base, "sga_backend_emission": "writeback"})
+    assert canon["sga_backend_emission"] == "writeback"
+    from sga.runtime import materialize_engine_config
+    eng = materialize_engine_config(canon)
+    assert eng["backend"] == {"name": "torch_pipelined_index",
+                              "emission": "writeback"}
+    assert materialize_engine_config(
+        validate_sga_flat(dict(base)))["backend"] == {
+            "name": "torch_pipelined_index"}
+    # explicit compact on tpi itself: accepted
+    assert validate_sga_flat({**base, "sga_backend_emission": "compact"})[
+        "sga_backend_emission"] == "compact"
+    # wrong-typed / bogus values refused by the str-kind coercion
+    expect_error(lambda: validate_sga_flat(
+        {**base, "sga_backend_emission": None}), "must be a string")
+    expect_error(lambda: validate_sga_flat(
+        {**base, "sga_backend_emission": "quadtree"}), "must be one of")
+    # compact is tpi-only: refused flat-side on the writeback-inherent
+    # backends (the launcher catches it before any process is spawned)
+    for wb in ("torch_pipelined_mask", "nccl_pipelined_index"):
+        expect_error(
+            lambda wb=wb: validate_sga_flat(
+                {**base, "sga_backend": wb,
+                 "sga_backend_emission": "compact"}),
+            "only supported by torch_pipelined_index")
+    # the retired rename fails closed (resume guard surfaces it too)
+    expect_error(lambda: validate_sga_flat(
+        {**base, "sga_optimizer_merge_join_dir": "table"}), "unknown keys")
 
 
 if __name__ == "__main__":

@@ -258,6 +258,21 @@ def _add_sga_backend_args(parser: argparse.ArgumentParser):
              "representation — with --sga-enabled true a sparse backend "
              "must be named (registered names are the choices).")
     group.add_argument(
+        "--sga-backend-emission", type=str, default="auto",
+        choices=("auto", "compact", "writeback"),
+        help="how the sparse allreduce hands its result to the optimizer: "
+             "'compact' keeps the communicated values in the compact "
+             "buffer (the optimizer's merge-join kernel consumes "
+             "(idx, values) directly; deterministic compact grad-norm); "
+             "'writeback' scatters them back into the dense grad buffer "
+             "for the masked optimizer kernel (the historical "
+             "choreography). 'auto' takes each backend's inherent form — "
+             "compact for torch_pipelined_index, writeback for "
+             "torch_pipelined_mask / nccl_pipelined_index. Only "
+             "torch_pipelined_index switches behavior; an explicit "
+             "'compact' is refused on the writeback-inherent backends. "
+             "Default auto.")
+    group.add_argument(
         "--sga-backend-high-priority-group", type=sga_bool, default=False,
         help="torch_pipelined_index only: run sparse collectives on a twin "
              "high-priority NCCL group (true selects the legacy "

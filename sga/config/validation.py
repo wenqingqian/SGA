@@ -327,6 +327,13 @@ def validate_sga_flat(flat: dict, train_iters=None):
     selection = typed.get("sga_selection", defaults["sga_selection"])
     optimizer = typed["sga_optimizer"]
     backend = typed["sga_backend"]
+    emission = typed.get("sga_backend_emission",
+                         defaults["sga_backend_emission"])
+    if emission == "compact" and backend != "torch_pipelined_index":
+        raise ValueError(
+            f"sga_backend_emission 'compact' is only supported by "
+            f"torch_pipelined_index (got backend '{backend}'); the "
+            "writeback-inherent backends run writeback only")
     get_score_spec(score)
     selection_decl = get_selection_decl(selection)
     optimizer_decl = get_optimizer_decl(optimizer)
@@ -360,7 +367,8 @@ def validate_sga_flat(flat: dict, train_iters=None):
                 "this method they would be silently dead; drop them or "
                 "switch the method")
 
-    validate_combination(score, selection_decl, optimizer_decl, backend_decl)
+    validate_combination(score, selection_decl, optimizer_decl,
+                         backend_decl, backend_emission=emission)
 
     # --- canonical flat dict: every dest at its resolved value ---
     canonical = dict(defaults)

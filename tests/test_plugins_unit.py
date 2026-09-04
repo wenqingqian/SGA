@@ -706,6 +706,63 @@ def test_compact_search_param_resolution():
     print("ok: compact_search resolution (default table, enum validated)")
 
 
+def test_backend_emission_param_resolution():
+    """sga_backend emission: 'auto' (the flag default) resolves to each
+    backend's inherent form — compact ONLY on torch_pipelined_index;
+    explicit 'compact' on the writeback-inherent backends is refused with
+    a pointer (direct-construction backstop; the flag-layer rule catches
+    real runs earlier); bogus values fail the enum loudly."""
+    from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
+    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
+    from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
+
+    assert TorchPipelinedIndexBackend({}).emission == "compact"
+    assert TorchPipelinedIndexBackend(
+        {"emission": "writeback"}).emission == "writeback"
+    assert TorchPipelinedIndexBackend(
+        {"emission": "compact"}).emission == "compact"
+    assert TorchPipelinedMaskBackend({}).emission == "writeback"
+    assert TorchPipelinedMaskBackend(
+        {"emission": "writeback"}).emission == "writeback"
+    assert NcclPipelinedIndexBackend({}).emission == "writeback"
+    for cls in (TorchPipelinedMaskBackend, NcclPipelinedIndexBackend):
+        try:
+            cls({"emission": "compact"})
+            raise AssertionError(f"compact accepted by {cls.__name__}")
+        except ValueError as e:
+            assert "only supported" in str(e)
+            assert "torch_pipelined_index" in str(e), e
+    try:
+        TorchPipelinedIndexBackend({"emission": "quadtree"})
+        raise AssertionError("bogus emission accepted")
+    except ValueError as e:
+        assert "quadtree" in str(e), e
+    print("ok: backend emission resolution (auto->inherent, compact tpi-only)")
+
+
+def test_validate_combination_emission_value_aware():
+    """The compact-capability rule keys on the RESOLVED emission, not the
+    decl field: torch_pipelined_index (decl emission=compact) with an
+    explicit writeback may pair with a non-compact optimizer; explicit
+    compact still requires consumes_compact."""
+    backend = get_backend_plugin_decl("torch_pipelined_index")
+    non_consumer = OptimizerDecl(
+        name="fake", reset_mode="selective", consumes_compact=False,
+        emittable_scores=frozenset({"update"}))
+    # decl says compact; the run says writeback -> legal
+    validate_combination("update", get_selection_decl("topk"), non_consumer,
+                         backend, backend_emission="writeback")
+    # auto/None -> the decl's inherent compact -> still requires the consumer
+    for em in (None, "auto"):
+        try:
+            validate_combination("update", get_selection_decl("topk"),
+                                 non_consumer, backend, backend_emission=em)
+            raise AssertionError("non-consumer accepted under compact")
+        except ValueError as e:
+            assert "consumes_compact" in str(e), e
+    print("ok: combination check resolves emission by value")
+
+
 class _CompactRec(_Rec):
     """_Rec with the bucket fields _records_pass_compact consumes."""
 

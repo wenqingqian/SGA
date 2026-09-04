@@ -353,7 +353,9 @@ class SGAEngine:
 
         avg = getattr(model_chunk.ddp_config, "average_in_collective", False)
         reduce_op = torch.distributed.ReduceOp.AVG if avg else torch.distributed.ReduceOp.SUM
-        compact = self.backend.decl.emission == "compact"
+        # the backend instance's RESOLVED emission (the decl field is
+        # only the inherent default; torch_pipelined_index switches)
+        compact = self.backend.emission == "compact"
         for bucket_key, bs in self._chunk_buckets(model_chunk):
             support = self._active_support.buckets[bs.support_index]
             factor = 1.0 if avg else bs.gradient_scaling_factor
@@ -856,7 +858,7 @@ class SGAEngine:
         # longer load-bearing for it).
         compact = (self._compact_values
                    if (not was_full and self._compact_values
-                       and self.backend.decl.emission == "compact")
+                       and self.backend.emission == "compact")
                    else None)
         compact_seen = set() if compact is not None else None
 

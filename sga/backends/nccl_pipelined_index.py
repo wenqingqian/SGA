@@ -108,10 +108,28 @@ class NcclPipelinedIndexBackend:
     decl = DECL
 
     def __init__(self, params: dict):
-        # Validation-only (this backend takes no params): unknown keys
-        # fail here, loudly.
-        expand_plugin_params("sga_backend_", (), dict(params),
-                             "sga_backend (nccl_pipelined_index)")
+        # Validation-only beyond emission (this backend takes no other
+        # params): unknown keys fail here, loudly.
+        params = expand_plugin_params(
+            "sga_backend_", ("emission",), dict(params),
+            "sga_backend (nccl_pipelined_index)")
+        # Emission is inherent here (writeback): the communicated values
+        # are scattered back into the dense grad buffer for the masked
+        # optimizer kernel. 'auto' (the flag default) resolves to that;
+        # an explicit 'writeback' is the same thing spelled out; an
+        # explicit 'compact' is refused with a pointer — compact
+        # emission is a torch_pipelined_index capability (the flag-layer
+        # rule catches it earlier in real runs; this is the
+        # direct-construction backstop).
+        emission = params["emission"]
+        if emission == "compact":
+            raise ValueError(
+                "sga_backend (nccl_pipelined_index): emission 'compact' is only supported "
+                "by torch_pipelined_index; this backend is "
+                "writeback-inherent (set sga_backend: "
+                "torch_pipelined_index to switch emission)")
+        self.emission = "writeback"
+
         # comm_group -> _RawComm. Keyed by the group OBJECT with a strong
         # reference held on both sides (an id() key could collide after a
         # source group is released and Python reuses its id). Populated

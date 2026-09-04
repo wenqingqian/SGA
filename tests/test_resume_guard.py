@@ -31,7 +31,11 @@ from types import SimpleNamespace
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The megatron source: MEGATRON_SGA_DIR first (a dev worktree has no
+# Megatron-LM sibling — env.sh's first-priority knob, same rule as
+# test_config_flat), else the main checkout's sibling.
+sys.path.insert(0, os.environ.get("MEGATRON_SGA_DIR")
+                or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 + "/Megatron-LM")
 
 # Importing the training entry also imports megatron.core, which registers
