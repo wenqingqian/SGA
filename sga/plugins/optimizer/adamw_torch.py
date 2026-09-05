@@ -31,7 +31,8 @@ def _registry_score(mode: Score, param, m, v, g, beta1, beta2, eps,
 def grad_correct_torch(param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
                        bias_correction1, bias_correction2,
                        mask, emit_mode,
-                       coeff=1.0, clear=False, fold=False, interval=1.0) -> None:
+                       coeff=1.0, clear=False, fold=False, interval=1.0,
+                       inactive_lr_scale=1.0) -> None:
     """Torch reference of the grad-correct step; same contract as the kernel.
 
     ``emit_mode=None`` is the sparse step: fused apply. An int mode (a
@@ -47,11 +48,22 @@ def grad_correct_torch(param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
     active positions of ``grad`` after use, ``fold`` divides ``grad`` by
     ``interval`` (actives are 0 by then — 0/T == 0 exact, the same op
     sequence the standalone torch reset performed).
+
+    Full-step dual-lr (mirroring the kernel's LR_SPLIT): with
+    ``inactive_lr_scale != 1.0`` the boundary commits the merged buffer
+    at EVERY coordinate (the mask never gates the commit or the score)
+    and only the apply splits: active coords at ``lr``, the
+    never-communicated tail at ``lr * inactive_lr_scale``.
     """
-    if mask is not None:
+    if inactive_lr_scale != 1.0:
+        g = grad
+        lr_apply = torch.where(mask > 0, lr, lr * inactive_lr_scale)
+    elif mask is not None:
         g = torch.where(mask > 0, grad, torch.zeros_like(grad))
+        lr_apply = lr
     else:
         g = grad
+        lr_apply = lr
     if coeff != 1.0:
         g = torch.where(mask > 0, g * coeff, g)
     # The update doubles as the 'update' score; both come from the registry
@@ -80,4 +92,4 @@ def grad_correct_torch(param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
             grad.masked_fill_(mask > 0, 0.0)
         if fold:
             grad.div_(interval)
-    param.sub_(lr * update)
+    param.sub_(lr_apply * update)

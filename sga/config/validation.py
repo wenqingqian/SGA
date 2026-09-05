@@ -365,6 +365,32 @@ def validate_sga_flat(flat: dict, train_iters=None):
         except ValueError as e:
             raise ValueError(f"sga_always_sync_layers: {e}") from None
 
+    # --- optimizer (adamw): the boundary dual-lr knob ---
+    lr_scale = typed.get(
+        "sga_optimizer_full_sync_inactive_lr_scale",
+        defaults["sga_optimizer_full_sync_inactive_lr_scale"])
+    if lr_scale != 1.0:
+        # non-finite already refused by _coerce (float dests); the domain
+        # rule lives here: 0.0 is legal (freeze the tail outright — the
+        # split multiplies the whole update, weight decay included),
+        # anything negative is not a step size.
+        if lr_scale < 0.0:
+            raise ValueError(
+                "sga_optimizer_full_sync_inactive_lr_scale must be >= 0.0 "
+                f"(got {lr_scale!r})")
+        if shadow:
+            raise ValueError(
+                "sga_optimizer_full_sync_inactive_lr_scale "
+                f"({lr_scale!r}) is refused with sga_shadow true: shadow "
+                "replicates stock numerics bitwise and the dual-lr "
+                "boundary apply deviates by design")
+        if period == 1:
+            raise ValueError(
+                "sga_optimizer_full_sync_inactive_lr_scale "
+                f"({lr_scale!r}) is refused with sga_cycle_period 1: "
+                "every step is a full sync (no sparse rounds, no "
+                "mask-inactive tail), the knob would be dead config")
+
     # --- plugin names must be registered (plain value checks: the
     # registries own the name lists, nothing here restates them) ---
     from sga.plugins import (

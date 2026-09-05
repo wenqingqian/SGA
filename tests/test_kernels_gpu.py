@@ -146,6 +146,76 @@ def test_grad_correct_triton_matches_fallback():
     torch.testing.assert_close(vv_d.cpu(), v_ref, rtol=1e-4, atol=1e-6)
 
 
+def test_full_step_dual_lr_triton_vs_torch():
+    """Boundary dual-lr on GPU: the LR_SPLIT kernel matches
+    the torch reference on every buffer (tolerance-pinned like every
+    cross-impl leg — per-compilation FMA contraction forbids bitwise),
+    and against the mask-less single-lr boundary run the split's
+    mask-active coords keep the plain lr step while the tail's
+    displacement is the scale multiple of the plain one; a scale-0 leg
+    pins score materialization with a bitwise-frozen tail."""
+    torch.manual_seed(45)  # per-leg seed: the 40% mask must not shift
+    device = "cuda"        # when a test is inserted above
+    n = 4096
+    lr, b1, b2, eps, wd, step = 1e-3, 0.9, 0.95, 1e-8, 1e-2, 11
+    scale = 0.5
+    param0 = torch.randn(n)
+    m0, v0 = torch.randn(n) * 0.1, torch.rand(n) * 0.1
+    g0 = torch.randn(n)
+    mask = (torch.rand(n) < 0.4).to(torch.uint8)
+    active = mask > 0
+
+    def run(scale, with_mask):
+        p = param0.clone().to(device)
+        mm, vv = m0.clone().to(device), v0.clone().to(device)
+        g = g0.clone().to(device)
+        adamw_grad_correct(p, g, mm, vv, lr, b1, b2, eps, wd, step,
+                           mask=mask.to(device) if with_mask else None,
+                           emit_mode=int(Score.update),
+                           inactive_lr_scale=scale)
+        return p.cpu(), g.cpu(), mm.cpu(), vv.cpu()
+
+    p_s, g_s, m_s, v_s = run(scale, True)
+    p_n, g_n, m_n, v_n = run(1.0, False)  # the single-lr boundary run
+
+    # torch reference of the split run (commit/score mask-blind by design)
+    p_ref, m_ref, v_ref = map(torch.clone, (param0, m0, v0))
+    g_ref = g0.clone()
+    grad_correct_torch(p_ref, g_ref, m_ref, v_ref, lr, b1, b2, eps, wd,
+                       1 - b1 ** step, 1 - b2 ** step,
+                       mask, int(Score.update), inactive_lr_scale=scale)
+    torch.testing.assert_close(p_s, p_ref, rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(g_s, g_ref, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(m_s, m_ref, rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(v_s, v_ref, rtol=1e-4, atol=1e-6)
+
+    # vs the single-lr boundary run: same commit and score (few-ulp —
+    # cross-specialization contraction), active coords at the same lr,
+    # and the split apply matches the where(lr, lr*scale) oracle built
+    # from the run's OWN materialized update (the score view)
+    torch.testing.assert_close(g_s, g_n, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(m_s, m_n, rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(v_s, v_n, rtol=1e-4, atol=1e-6)
+    torch.testing.assert_close(p_s[active], p_n[active],
+                               rtol=1e-5, atol=1e-7)
+    lr_eff = torch.where(active, lr, lr * scale)
+    torch.testing.assert_close(p_s, param0 - lr_eff * g_s,
+                               rtol=1e-5, atol=1e-7)
+
+    # scale=0.0 corner on the compiled path: the score still materializes
+    # into the grad buffer (bitwise the 0.5-split run's — mask-blind) while
+    # the tail param is bitwise untouched and the active coords still step
+    p_z, g_z, _, _ = run(0.0, True)
+    assert torch.equal(g_z, g_s), \
+        "scale-0 score must materialize bitwise like any split run"
+    assert torch.equal(p_z[~active], param0[~active]), \
+        "scale-0 tail must be bitwise untouched"
+    assert not torch.equal(p_z[active], param0[active]), \
+        "scale-0 active coords must still step"
+    print("ok: full-step dual-lr triton==torch; active keeps lr, "
+          "tail is lr*scale")
+
+
 def test_grad_correct_sparse_fusion_bitwise():
     """coeff+clear+fold fused into grad-correct == the standalone
     three-pass sequence, bitwise, on every buffer.

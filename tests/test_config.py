@@ -209,6 +209,49 @@ def test_illegal_combination_rejected():
     print("ok: illegal combinations rejected (unknown score / cycle rules)")
 
 
+def test_optimizer_dual_lr_scale_rules():
+    """The boundary dual-lr knob's strict assertions: a finite
+    float >= 0 is required (0.0 is legal — the freeze-the-tail ablation
+    extreme), and a scale != 1.0 is refused under shadow (bitwise
+    stock-replication contract) and under sga_cycle_period 1 (no sparse
+    rounds — dead config, refused instead of silently ignored); the
+    disabled-clean contract covers sga_enabled false."""
+    base = {"sga_enabled": True, "sga_score": "update",
+            "sga_selection_method": "exact",
+            "sga_selection_ratio_percent": 10.0,
+            "sga_backend": "torch_pipelined_index",
+            "sga_cycle_period": 8}
+    for spelling in (0.5, 0.0, 2):
+        canon = validate_sga_flat(
+            dict(base, sga_optimizer_full_sync_inactive_lr_scale=spelling))
+        assert canon["sga_optimizer_full_sync_inactive_lr_scale"] \
+            == float(spelling)
+    # the canonical default rides along when unset
+    assert validate_sga_flat(dict(base))[
+        "sga_optimizer_full_sync_inactive_lr_scale"] == 1.0
+    expect_error(lambda: validate_sga_flat(
+        dict(base, sga_optimizer_full_sync_inactive_lr_scale=-0.5)),
+        "must be >= 0.0")
+    expect_error(lambda: validate_sga_flat(
+        dict(base, sga_optimizer_full_sync_inactive_lr_scale=float("nan"))),
+        "finite float")
+    expect_error(lambda: validate_sga_flat(
+        dict(base, sga_optimizer_full_sync_inactive_lr_scale=float("inf"))),
+        "finite float")
+    expect_error(lambda: validate_sga_flat(
+        dict(base, sga_optimizer_full_sync_inactive_lr_scale=0.5,
+             sga_shadow=True)), "sga_shadow")
+    expect_error(lambda: validate_sga_flat(
+        dict(base, sga_cycle_period=1,
+             sga_optimizer_full_sync_inactive_lr_scale=0.5)),
+        "sga_cycle_period 1")
+    expect_error(lambda: validate_sga_flat(
+        {"sga_enabled": False,
+         "sga_optimizer_full_sync_inactive_lr_scale": 0.5}),
+        "sga_enabled is false")
+    print("ok: dual-lr scale rules (domain / shadow / period=1 / disabled)")
+
+
 def test_sparse_backend_required_when_enabled():
     cfg, _ = make_base()
     OmegaConf.update(cfg, "sga", {"sga_enabled": True, "sga_score": "abs_m",

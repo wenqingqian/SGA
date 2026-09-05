@@ -207,6 +207,66 @@ def test_adamw_reset_folds_residual_by_decoupled_fold_window():
     assert torch.all(bs.grad_data == 0)
 
 
+def test_full_step_dual_lr_boundary_pin():
+    """CPU pin of the boundary dual-lr: the full-sync step with
+    full_sync_inactive_lr_scale != 1.0 splits ONLY the apply — the
+    materialized score and the m/v commit are bitwise the single-lr run,
+    mask-active coords step at lr (bitwise the plain run), the
+    never-communicated tail at lr * scale. The mask is the RESIDENT bucket
+    mask that _activate_support sets for every backend form — index-mode /
+    compact-emission runs land here identically, and the full step never
+    consults ctx.compact_values (the compact (idx, values) handoff is
+    sparse-step-only). A mask-less bucket (bootstrap / degenerate = fully
+    communicated) keeps plain lr."""
+    opt_split = build_optimizer("adamw", {"full_sync_inactive_lr_scale": 0.5})
+    opt_plain = build_optimizer("adamw", {})
+    n = 256
+    mask = torch.zeros(n, dtype=torch.uint8)
+    mask[::4] = 1  # communicated during the outgoing window
+    active = mask > 0
+    g_base, w_base = torch.randn(n), torch.randn(n)
+
+    def run(opt, compact_values=None, with_mask=True):
+        bs = BucketState(g_base.clone(), None, 1.0, 0)
+        bs.active_mask_u8 = mask if with_mask else None
+        w = w_base.clone()
+        w.grad = bs.grad_data
+        rec = ParamRecord(model_param=w, main_param=w, bucket_state=bs,
+                          start=0, end=n, lr=1e-3, beta1=0.9, beta2=0.95,
+                          eps=1e-8, weight_decay=1e-2, step=7, _state={})
+        ctx = OptContext(records=[rec], phase="full", bucket_states=[bs],
+                         fold_window=8, next_step_is_full=False)
+        ctx.compact_values = compact_values
+        opt.full_step(ctx)
+        return w, bs, rec
+
+    w_a, bs_a, rec_a = run(opt_split, {id(None): torch.full((3,), 7.0)})
+    w_b, bs_b, rec_b = run(opt_plain)
+    w_c, _, _ = run(opt_split)
+    w_ml, _, _ = run(opt_split, with_mask=False)
+
+    # score materialization + m/v commit: bitwise the single-lr run
+    assert torch.equal(bs_a.grad_data, bs_b.grad_data)
+    assert torch.equal(rec_a._state["exp_avg"], rec_b._state["exp_avg"])
+    assert torch.equal(rec_a._state["exp_avg_sq"], rec_b._state["exp_avg_sq"])
+    # the compact handoff riding the context changes nothing (full steps
+    # read the dense buffer + the resident mask, never (idx, values))
+    assert torch.equal(w_c.data, w_a.data)
+
+    update = bs_b.grad_data  # emit_mode=update: the score IS the update
+    lr = 1e-3
+    # plain run: stepped at lr everywhere
+    torch.testing.assert_close(w_b.data, w_base - lr * update,
+                               rtol=1e-6, atol=0)
+    # split run: active coords bitwise the plain run; the tail at half
+    torch.testing.assert_close(w_ml.data, w_base - lr * update,
+                               rtol=1e-6, atol=0)
+    assert torch.equal(w_a.data[active], w_b.data[active])
+    torch.testing.assert_close(w_a.data[~active],
+                               w_base[~active] - 0.5 * lr * update[~active],
+                               rtol=1e-6, atol=0)
+
+
 def test_torch_pipelined_index_modes_and_mechanics():
     """The unified idx backend: both transport modes (plain default vs
     high-priority twin) land bitwise-identical gradients (same element

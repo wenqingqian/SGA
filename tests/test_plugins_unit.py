@@ -841,6 +841,141 @@ def test_grad_correct_sparse_fusion_knob_guard():
             raise AssertionError(f"guard did not fire for {kwargs}")
 
 
+def test_full_step_dual_lr_semantics():
+    """Boundary dual-lr pinned at SgaAdamW level: on a full step
+    with full_sync_inactive_lr_scale != 1.0, the m/v commit and the
+    materialized update score are BITWISE the single-lr run (mask-blind),
+    the mask-active coords' apply is BITWISE unchanged, and the
+    never-communicated tail steps at exactly lr * scale (the split sits
+    outside the AdamW normalization, so the displacement is exactly
+    proportional — s=0 freezes the tail while m/v still commit). A
+    mask-less record (bootstrap / degenerate bucket = fully communicated)
+    keeps plain lr everywhere."""
+    torch.manual_seed(13)
+    n = 256
+    mask = (torch.rand(n) < 0.25).to(torch.uint8)
+    active = mask > 0
+    for scale in (0.0, 0.5, 2.0, 0.7):
+        w = torch.randn(n)
+        g0 = torch.randn(n)  # the boundary buffer: fresh g + residual
+        rec_a = _SparseRec(w.clone().requires_grad_(False),
+                           g0.clone().requires_grad_(False), mask)
+        rec_b = _SparseRec(w.clone().requires_grad_(False),
+                           g0.clone().requires_grad_(False), mask)
+        rec_c = _SparseRec(w.clone().requires_grad_(False),
+                           g0.clone().requires_grad_(False), None)
+        opt_split = SgaAdamW({"full_sync_inactive_lr_scale": scale})
+        opt_plain = SgaAdamW({})
+        opt_split.full_step(_RecCtx([rec_a]))
+        opt_plain.full_step(_RecCtx([rec_b]))
+        opt_split.full_step(_RecCtx([rec_c]))
+
+        # commit + score are mask-blind: bitwise the single-lr run
+        assert torch.equal(rec_a._state["exp_avg"],
+                           rec_b._state["exp_avg"]), scale
+        assert torch.equal(rec_a._state["exp_avg_sq"],
+                           rec_b._state["exp_avg_sq"]), scale
+        assert torch.equal(rec_a.grad.data, rec_b.grad.data), scale
+        # mask-less record: plain lr everywhere, bitwise the plain run
+        assert torch.equal(rec_c.main_param.data, rec_b.main_param.data)
+        assert torch.equal(rec_c._state["exp_avg"],
+                           rec_b._state["exp_avg"])
+
+        disp_a = w - rec_a.main_param.data
+        disp_b = w - rec_b.main_param.data
+        assert torch.equal(disp_a[active], disp_b[active]), scale
+        # exact apply oracle (same rounding sequence as the implementation:
+        # the materialized update score IS the update vector, and the apply
+        # is one rounded multiply-add per coordinate at the split lr)
+        update = rec_a.grad.data  # mask-blind: bitwise the plain run's
+        assert torch.equal(update, rec_b.grad.data), scale
+        lr_eff = torch.where(active, 1e-3, 1e-3 * scale)
+        assert torch.equal(rec_a.main_param.data, w - lr_eff * update), scale
+        if scale == 0.0:
+            # frozen tail: the param is bitwise untouched at inactive coords
+            assert torch.equal(rec_a.main_param.data[~active], w[~active])
+
+    # named emit score under the split: the score path is mask-blind too —
+    # the materialized abs_g score is bitwise the plain run's (the split
+    # lives only in the apply's lr)
+    w = torch.randn(n)
+    g0 = torch.randn(n)
+    rec_s = _SparseRec(w.clone().requires_grad_(False),
+                       g0.clone().requires_grad_(False), mask)
+    rec_p = _SparseRec(w.clone().requires_grad_(False),
+                       g0.clone().requires_grad_(False), mask)
+    SgaAdamW({"full_sync_inactive_lr_scale": 0.5},
+             emit_score="abs_g").full_step(_RecCtx([rec_s]))
+    SgaAdamW({}, emit_score="abs_g").full_step(_RecCtx([rec_p]))
+    assert torch.equal(rec_s.grad.data, rec_p.grad.data)
+
+    # default knob (1.0): full_step must not consult the mask at all —
+    # _Rec.mask_u8() raises by contract, so this call passing IS the pin
+    SgaAdamW({}).full_step(_RecCtx([_Rec(torch.randn(n), torch.randn(n))]))
+    print("ok: full-step dual-lr semantics (commit/score mask-blind, "
+          "tail exactly lr*scale, mask-less = plain lr, named score "
+          "bitwise)")
+
+
+def test_grad_correct_dual_lr_knob_guard():
+    """inactive_lr_scale is full-step-with-mask only: refused on sparse
+    steps (emit_mode=None), without a mask, and when negative/non-finite —
+    owned messages, before any buffer work; the sparse-fusion guard
+    precedes this one, and the dormant masked-commit hybrid (mask + full
+    step at scale 1.0) is refused outright; the constructor repeats the
+    domain guard for direct construction (tests/replay bypass config
+    validation)."""
+    n = 32
+    kw = dict(lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=1e-2,
+              step=5)
+    p, g, m, v = (torch.randn(n) for _ in range(4))
+    mask = (torch.rand(n) < .5).to(torch.uint8)
+    for kwargs in (dict(emit_mode=None, mask=mask, inactive_lr_scale=0.5),
+                   dict(emit_mode=0, mask=None, inactive_lr_scale=0.5),
+                   dict(emit_mode=0, mask=mask, inactive_lr_scale=-1.0),
+                   dict(emit_mode=0, mask=mask, inactive_lr_scale=float("inf")),
+                   dict(emit_mode=0, mask=mask, inactive_lr_scale=float("nan"))):
+        try:
+            adamw_grad_correct(p.clone(), g.clone(), m.clone(), v.clone(),
+                               **kwargs, **kw)
+        except ValueError as e:
+            assert "inactive_lr_scale" in str(e), e
+        else:
+            raise AssertionError(f"guard did not fire for {kwargs}")
+    # guard order: the sparse-fusion guard precedes the dual-lr guard — a
+    # combined coeff+clear+mask+scale violation reports the sparse-step rule
+    try:
+        adamw_grad_correct(p.clone(), g.clone(), m.clone(), v.clone(),
+                           emit_mode=0, mask=mask, coeff=0.5, clear=True,
+                           inactive_lr_scale=0.5, **kw)
+    except ValueError as e:
+        assert "requires a sparse step" in str(e), e
+    else:
+        raise AssertionError("fusion guard did not fire for the combined leg")
+    # the dormant hybrid (predates the dual-lr knob, nothing in production
+    # produces it): mask + full step without a split is refused outright
+    try:
+        adamw_grad_correct(p.clone(), g.clone(), m.clone(), v.clone(),
+                           emit_mode=0, mask=mask, inactive_lr_scale=1.0,
+                           **kw)
+    except ValueError as e:
+        assert "masked-commit full step" in str(e), e
+    else:
+        raise AssertionError("hybrid masked-commit full step was accepted")
+    # legal combination (full step + mask) runs; the constructor's own
+    # domain guard fires for direct construction
+    adamw_grad_correct(p, g, m, v, mask=mask, emit_mode=0,
+                       inactive_lr_scale=0.5, **kw)
+    try:
+        SgaAdamW({"full_sync_inactive_lr_scale": -0.5})
+    except ValueError as e:
+        assert "full_sync_inactive_lr_scale" in str(e), e
+    else:
+        raise AssertionError("constructor domain guard did not fire")
+    print("ok: dual-lr knob guarded (sparse/mask-less/domain/fusion-order/"
+          "hybrid)")
+
+
 # ----------------------------------------------------- combination validation
 
 def test_combination_validator_and_build_injection():

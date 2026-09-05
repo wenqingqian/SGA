@@ -255,6 +255,25 @@ def _add_sga_optimizer_args(parser: argparse.ArgumentParser):
              "accumulation span between full syncs) at full-sync "
              "boundaries (residual-mean semantics). Default false.")
     group.add_argument(
+        "--sga-optimizer-full-sync-inactive-lr-scale", type=float,
+        default=1.0,
+        help="boundary dual-lr: on full-sync steps the optimizer apply "
+             "uses lr at mask-active coords (communicated during the "
+             "window) and lr * scale at mask-inactive coords (the "
+             "residual-carrying tail). The m/v commit, the materialized "
+             "score and the bias corrections are all unchanged — only "
+             "the applied step size splits, multiplying the tail's "
+             "whole displacement (weight-decay component included) by "
+             "scale. The mask is the outgoing window's, so the fresh "
+             "gradient at inactive coords is scaled too (not only the "
+             "accumulated residual). Buckets "
+             "with no support yet (bootstrap) and degenerate mask-less "
+             "buckets are fully communicated: plain lr everywhere. "
+             "Backend-agnostic: the resident bucket mask serves both "
+             "emission modes. Refused with sga_shadow true or "
+             "sga_cycle_period 1 when != 1.0. Default 1.0 (bit-identical "
+             "to the single-lr behavior).")
+    group.add_argument(
         "--sga-optimizer-compact-search", type=str, default="table",
         choices=("table", "bisection"),
         help="compact-path idx alignment search: 'table' builds a "

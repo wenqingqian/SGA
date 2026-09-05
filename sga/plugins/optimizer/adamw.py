@@ -46,6 +46,7 @@ the residual when configured); zeroing again would destroy the accumulating
 residual. Degenerate mask-less buckets and full steps zero everything.
 """
 
+import math
 from typing import Optional
 
 import torch
@@ -102,7 +103,7 @@ if _HAS_TRITON:
         param_ptr, grad_ptr, m_ptr, v_ptr, mask_ptr,
         lr, beta1, beta2, eps, weight_decay,
         bias_correction1, bias_correction2,
-        coeff, inv_interval,
+        coeff, inv_interval, lr_inactive,
         n_elements,
         BLOCK_SIZE: tl.constexpr,
         HAS_MASK: tl.constexpr,
@@ -110,6 +111,7 @@ if _HAS_TRITON:
         APPLY_COEFF: tl.constexpr,
         CLEAR: tl.constexpr,
         FOLD: tl.constexpr,
+        LR_SPLIT: tl.constexpr,
     ):
         """AdamW m/v update + fused apply, with full-step score emission.
 
@@ -131,6 +133,17 @@ if _HAS_TRITON:
           only on fold steps (once per period at most) — the m/v commit
           still sees zero there (``grad = where(active, raw, 0)``); the
           residual enters the optimizer only via the boundary full step.
+
+        Full-step dual-lr (LR_SPLIT, full steps with a mask only — the
+        dispatch refuses the combination otherwise): the boundary commits
+        the merged buffer (g + residual) at EVERY coordinate — the load is
+        full-valid, the mask never gates the m/v commit or the emitted
+        score — and the mask gates only the apply: active coords step at
+        ``lr``, inactive coords (the never-communicated tail) at
+        ``lr_inactive = lr * full_sync_inactive_lr_scale``. The split
+        multiplies OUTSIDE the AdamW normalization, so the tail
+        displacement is exactly proportional to the scale (immune to the
+        per-coordinate scale invariance that would cancel a prescale).
         """
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -149,6 +162,8 @@ if _HAS_TRITON:
             # kernel — the residual enters m only at the boundary full step).
             raw = tl.load(grad_ptr + offsets, mask=valid, other=0.0)
             grad = tl.where(active, raw, 0.0)
+        elif LR_SPLIT:
+            grad = tl.load(grad_ptr + offsets, mask=valid, other=0.0)
         else:
             grad = tl.load(grad_ptr + offsets, mask=active, other=0.0)
         if APPLY_COEFF:
@@ -201,8 +216,16 @@ if _HAS_TRITON:
                     grad_ptr + offsets, raw * inv_interval, mask=inactive,
                 )
         # Fused apply on every path (sparse: masked-out coords loaded grad=0,
-        # so their update is the pure weight-decay/momentum drift).
-        param = param - lr * update
+        # so their update is the pure weight-decay/momentum drift). LR_SPLIT
+        # (full steps only): the never-communicated tail steps at
+        # lr_inactive while the communicated coords keep lr. The split
+        # multiplies the WHOLE update, weight-decay term included — the
+        # tail's decay displacement scales with it (scale 0 freezes the
+        # tail entirely, decay included; the test pins this bitwise).
+        if LR_SPLIT:
+            param = param - tl.where(active, lr, lr_inactive) * update
+        else:
+            param = param - lr * update
         tl.store(param_ptr + offsets, param, mask=valid)
 
 
@@ -513,6 +536,7 @@ def adamw_grad_correct(
     clear: bool = False,
     fold: bool = False,
     interval: float = 1.0,
+    inactive_lr_scale: float = 1.0,
 ) -> None:
     """Run the grad-correct step on contiguous same-size 1-D buffers.
 
@@ -536,6 +560,13 @@ def adamw_grad_correct(
     - ``fold`` multiplies mask-inactive positions by 1/``interval`` (the
       host fp32 reciprocal on the Triton path) — bitwise equal to the
       standalone reset kernel's fold branch.
+
+    Full-step dual-lr knob: ``inactive_lr_scale != 1.0`` (refused on
+    sparse steps, without a mask, or when non-finite/negative) applies the
+    boundary update at ``lr * inactive_lr_scale`` on the mask-inactive
+    coords — the m/v commit, the emitted score and the bias corrections
+    are untouched; the split multiplies the whole applied step
+    (weight-decay component included) at the tail.
     """
     bias_correction1 = 1.0 - beta1 ** step
     bias_correction2 = 1.0 - beta2 ** step
@@ -566,6 +597,29 @@ def adamw_grad_correct(
             "(the reselection reads the materialized score from the grad "
             "buffer)"
         )
+    if inactive_lr_scale != 1.0:
+        if not (math.isfinite(inactive_lr_scale)
+                and inactive_lr_scale >= 0.0):
+            raise ValueError(
+                "grad-correct inactive_lr_scale must be a finite float "
+                f">= 0.0 (got {inactive_lr_scale!r})"
+            )
+        if emit_mode is None or mask is None:
+            raise ValueError(
+                f"grad-correct boundary dual-lr (inactive_lr_scale="
+                f"{inactive_lr_scale!r}) requires a full step (emit_mode "
+                "set) with a mask — only the boundary update's lr splits; "
+                "sparse steps and mask-less records take plain lr"
+            )
+    if (mask is not None and emit_mode is not None
+            and inactive_lr_scale == 1.0):
+        raise ValueError(
+            "grad-correct masked-commit full step (mask + emit_mode with "
+            "inactive_lr_scale=1.0) is refused: the shape predates the "
+            "dual-lr knob and nothing in production produces it — pass "
+            "inactive_lr_scale != 1.0 for the boundary split, or drop "
+            "the mask for the mask-blind full step"
+        )
 
     n_elements = param_buffer.numel()
     if n_elements == 0:
@@ -578,6 +632,7 @@ def adamw_grad_correct(
             bias_correction1, bias_correction2,
             mask, emit_mode,
             coeff=coeff, clear=clear, fold=fold, interval=interval,
+            inactive_lr_scale=inactive_lr_scale,
         )
         return
 
@@ -594,7 +649,7 @@ def adamw_grad_correct(
         mask_u8 if has_mask else grad_buffer,
         lr, beta1, beta2, eps, weight_decay,
         bias_correction1, bias_correction2,
-        coeff, inv_interval,
+        coeff, inv_interval, lr * inactive_lr_scale,
         n_elements,
         BLOCK_SIZE=_BLOCK_SIZE,
         HAS_MASK=has_mask,
@@ -604,6 +659,7 @@ def adamw_grad_correct(
         APPLY_COEFF=coeff != 1.0,
         CLEAR=clear,
         FOLD=fold,
+        LR_SPLIT=inactive_lr_scale != 1.0,
     )
 
 
@@ -772,7 +828,8 @@ class SgaAdamW:
 
     def __init__(self, params: dict, emit_score: Optional[str] = None):
         params = expand_plugin_params(
-            "sga_optimizer_", ("residual_mean", "compact_search"),
+            "sga_optimizer_",
+            ("residual_mean", "compact_search", "full_sync_inactive_lr_scale"),
             dict(params), "sga_optimizer (adamw)")
         self.params = params
         self.residual_mean = bool(params["residual_mean"])
@@ -784,6 +841,24 @@ class SgaAdamW:
         # _records_pass_compact) and on the torch fallback (it ignores
         # the table).
         self.compact_search = params["compact_search"]
+        # Boundary dual-lr: on full-sync steps the apply runs at
+        # lr * scale on the mask-inactive (never-communicated) coords.
+        # 1.0 keeps the single-lr behavior bit-identical; the shadow/period
+        # combination rules live in config validation — this guard covers
+        # direct construction (tests/replay); the negative leg is the
+        # reachable one — non-finite is already refused by _coerce upstream.
+        self.full_sync_inactive_lr_scale = float(
+            params["full_sync_inactive_lr_scale"])
+        # -0.0 normalizes to 0.0: the same tail freeze, without the
+        # sign-of-zero flips on params that are exactly -0.0
+        if self.full_sync_inactive_lr_scale == 0.0:
+            self.full_sync_inactive_lr_scale = 0.0
+        if not (math.isfinite(self.full_sync_inactive_lr_scale)
+                and self.full_sync_inactive_lr_scale >= 0.0):
+            raise ValueError(
+                "sga_optimizer_full_sync_inactive_lr_scale must be a "
+                "finite float >= 0.0 (got "
+                f"{self.full_sync_inactive_lr_scale!r})")
         # Which registry score to materialize on full steps (build-time
         # injection). None/'update' keeps the historical default: the signed
         # AdamW update itself is the topk input. The emission mode int is
@@ -802,7 +877,8 @@ class SgaAdamW:
         pass  # no persistent per-bucket buffers beyond the Support caches
 
     def _records_pass(self, ctx, emit_mode, use_mask,
-                      coeff=1.0, clear=False, fold=False, interval=1.0):
+                      coeff=1.0, clear=False, fold=False, interval=1.0,
+                      inactive_lr_scale=1.0):
         for rec in ctx.records:
             state = rec._state
             if len(state) == 0:
@@ -830,6 +906,10 @@ class SgaAdamW:
                 clear=clear and m is not None,
                 fold=fold and m is not None,
                 interval=interval,
+                # A mask-less record on a split-lr full step (bootstrap /
+                # degenerate bucket) was fully communicated: plain lr, the
+                # documented semantics — never a split, never an error.
+                inactive_lr_scale=inactive_lr_scale if m is not None else 1.0,
             )
 
     def _records_pass_compact(self, ctx, coeff=1.0, fold=False, interval=1.0):
@@ -887,8 +967,22 @@ class SgaAdamW:
     def full_step(self, ctx):
         """Full-sync step: one fused pass per record — m/v commit, the
         configured score materialized into the main grads (the reselection
-        reads it from there), and the apply ``w -= lr * update``."""
-        self._records_pass(ctx, emit_mode=self._emit_mode, use_mask=False)
+        reads it from there), and the apply ``w -= lr * update``. With
+        ``full_sync_inactive_lr_scale != 1.0`` the pass turns mask-aware:
+        the OUTGOING window's mask (still resident — reselection runs
+        after this step) splits the apply's lr, active coords at lr and
+        the never-communicated tail at ``lr * scale``; the update vector
+        (adam term and weight decay alike) stays mask-blind — only the
+        applied lr splits. The mask is resident for every backend (it IS
+        the selection output; idx is its derived form), so both emission
+        modes land here identically — no compact variant exists or is
+        needed on full steps."""
+        split = self.full_sync_inactive_lr_scale != 1.0
+        self._records_pass(
+            ctx, emit_mode=self._emit_mode, use_mask=split,
+            inactive_lr_scale=(self.full_sync_inactive_lr_scale
+                               if split else 1.0),
+        )
 
     @torch.no_grad()
     def sparse_step(self, ctx):

@@ -235,6 +235,7 @@ def test_inv4_historical_surface_pinned():
         "sga_selection_adaptive_warmup_mode": ("fast", "str", ("balanced", "exact", "fast")),
         "sga_optimizer": ("adamw", "str", ()),
         "sga_optimizer_residual_mean": (False, "bool", ()),
+        "sga_optimizer_full_sync_inactive_lr_scale": (1.0, "float", ()),
         "sga_optimizer_compact_search": ("table", "str", ("table", "bisection")),
         "sga_backend": ("dense", "str", ()),
         "sga_backend_emission": ("auto", "str", ("auto", "compact", "writeback")),
