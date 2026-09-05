@@ -64,7 +64,8 @@ import os
 import torch
 
 from sga.backends import COMM_WARMUP_ENV, RESUME_OVERRIDE_ENV
-from sga.kernels import pack_selected, scatter_selected
+from sga.kernels import (gather_selected_blocks, pack_selected,
+                         scatter_selected, scatter_selected_blocks)
 from sga.plugins import BackendDecl, expand_plugin_params
 
 DECL = BackendDecl(
@@ -301,6 +302,72 @@ class TorchPipelinedIndexBackend:
         s = self._slices
         return [(i * k // s, (i + 1) * k // s) for i in range(s)]
 
+    def _allreduce_sparse_block(self, grad_data, support, comm_group,
+                                gradient_scaling_factor, reduce_op, key):
+        """Block-granular writeback sync (sga_selection_block_size > 1).
+
+        Each block-idx entry heads a contiguous x-element run; the payload
+        packs k_blocks*x slots whose lanes are mask-guarded (tail-short
+        blocks contribute zeros — allreduce-neutral, and identical on
+        every rank since all ranks hold the same verified mask). Slices
+        pipeline over BLOCK counts (the default 2-slice plain mode splits
+        at the bucket midpoint in block space, ``support.block_split``).
+        The reduced values scatter back into the dense grad on the same
+        lane mask (writeback contract: returns None; the optimizer's
+        masked path reads them there and clears post-commit).
+
+        Config validation refuses compact emission for block supports (the
+        compact consumers — merge-join, compact norm — are
+        element-granular); the raise below is the direct-construction
+        belt.
+        """
+        if self.emission != "writeback":
+            raise ValueError(
+                "torch_pipelined_index: block supports "
+                "(sga_selection_block_size > 1) run writeback emission "
+                "only — the compact consumers are element-granular; set "
+                "sga_backend_emission=writeback")
+        x = int(support.block_size)
+        blk = support.block_idx
+        kb = blk.numel()
+        if kb == 0:
+            return None
+        gather_buf = self._gather_buf(key, kb * x, grad_data.dtype,
+                                      grad_data.device)
+        group = self._group_for(comm_group)
+        factor = (float(gradient_scaling_factor)
+                  if (reduce_op == torch.distributed.ReduceOp.SUM
+                      and gradient_scaling_factor != 1.0) else 1.0)
+        if not self._hiprio and self._slices == 2:
+            n0 = support.block_split
+            bounds = [(0, n0), (n0, kb)]
+        else:
+            s = self._slices
+            bounds = [(i * kb // s, (i + 1) * kb // s) for i in range(s)]
+
+        # One allreduce in flight at a time (same overlap choreography as
+        # the element path): slice i+1's gather touches grad/buffer memory
+        # disjoint from slice i's in-flight transfer.
+        prev = None  # (work, block_idx slice, payload slice)
+        for lo, hi in bounds:
+            if hi <= lo:
+                continue
+            bidx = blk[lo:hi]
+            sel = gather_buf[lo * x:hi * x]
+            gather_selected_blocks(grad_data, support.mask_u8, bidx, sel,
+                                   x, factor)
+            if prev is not None:
+                prev[0].wait()
+                scatter_selected_blocks(grad_data, support.mask_u8,
+                                        prev[1], prev[2], x)
+            prev = (torch.distributed.all_reduce(
+                sel, op=reduce_op, group=group, async_op=True), bidx, sel)
+        if prev is not None:
+            prev[0].wait()
+            scatter_selected_blocks(grad_data, support.mask_u8,
+                                    prev[1], prev[2], x)
+        return None
+
     def allreduce_sparse(self, grad_data: torch.Tensor, support, comm_group,
                          gradient_scaling_factor: float, reduce_op,
                          key: int):
@@ -333,6 +400,10 @@ class TorchPipelinedIndexBackend:
                 f"int32 support indices assume < 2^31 bucket elements, "
                 f"got {grad_data.numel()} (bucket key {key})"
             )
+        if getattr(support, "block_size", 1) > 1:
+            return self._allreduce_sparse_block(
+                grad_data, support, comm_group, gradient_scaling_factor,
+                reduce_op, key)
         indices = support.idx
         k = indices.numel()
         if k == 0:

@@ -1023,6 +1023,118 @@ def test_pack_selected_contract():
     assert torch.count_nonzero(gc_[idx_cpu.long()]).item() == 0
 
 
+def test_block_gather_scatter_ab():
+    """Block gather/scatter vs the torch reference, bitwise at every leg
+    (pure loads/stores + at most one fp32 multiply — no FMA tail to
+    ulp-class).
+
+    Legs: x in {1, 8, 64} x factor in {0.125, 1.0}; a param-TAIL block
+    (short run at the buffer end: out-of-bounds lanes are zero payload and
+    never stored); a mask-PARTIAL listed block (interior mask-off lanes
+    stay zero in the payload and the scatter mirror writes nothing there —
+    the mask guard, not the block structure, decides what moves); payload
+    buffer slots past k_blocks*x untouched; the x=1 degenerate equals
+    element pack/scatter values on the same support (minus pack's
+    zeroing); empty support is a no-op; an undersized payload buffer is
+    refused loudly. block_idx comes from block_idx_from_mask itself so the
+    ANY-rule derivation is exercised end to end.
+    """
+    from sga.kernels import (gather_selected_blocks,
+                             scatter_selected_blocks)
+    from sga.kernels_torch import (gather_selected_blocks_torch,
+                                   scatter_selected_blocks_torch)
+    from sga.support import block_idx_from_mask
+
+    device = "cuda"
+    for x in (1, 8, 64):
+        for factor in (0.125, 1.0):
+            torch.manual_seed(31_000 + 7 * x + (factor == 1.0))
+            nfull, tail = 48, 7
+            n = nfull * x + tail
+            mask = torch.zeros(n, dtype=torch.uint8)
+            m2 = mask[:nfull * x].view(nfull, x)
+            m2[(torch.rand(nfull) < 0.4).nonzero(as_tuple=True)[0]] = 1
+            m2[0] = 1                     # force at least one full block
+            if x > 2:
+                m2[0, 1::2] = 0           # a mask-partial listed block
+            mask[nfull * x + 2] = 1       # tail block: one lane set
+            bidx = block_idx_from_mask(mask, [(0, n)], x)
+            assert bidx[0] == 0
+            if x > 1:
+                # the tail block is listed by ANY set lane: its entry is
+                # the tail START even though only lane 2 is set
+                assert int(bidx[-1]) == nfull * x
+            kb = bidx.numel()
+
+            g0 = torch.randn(n)
+            bidx_d = bidx.to(device)
+            # gather: Triton vs torch fallback; payload bitwise, grad is a
+            # PURE READ, slots past kb*x keep their NaN sentinels
+            g_tri = g0.clone().to(device)
+            v_tri = torch.full((kb * x + 13,), float("nan"), device=device)
+            gather_selected_blocks(g_tri, mask.to(device), bidx_d,
+                                   v_tri, x, factor)
+            v_ref = torch.full((kb * x + 13,), float("nan"))
+            gather_selected_blocks_torch(g0.clone(), mask, bidx, v_ref,
+                                         x, factor)
+            assert torch.equal(g_tri.cpu(), g0), "gather must be a pure read"
+            assert torch.equal(v_tri[:kb * x].cpu(), v_ref[:kb * x]), (
+                f"block payload diverged (x={x}, factor={factor})")
+            assert torch.isnan(v_tri[kb * x:].cpu()).all(), \
+                "gather wrote past k_blocks*x"
+            # inactive lanes are exactly zero (allreduce-neutral payload)
+            pos = (bidx.long().unsqueeze(1)
+                   + torch.arange(x)).clamp_max(n - 1)
+            act = ((bidx.long().unsqueeze(1) + torch.arange(x)) < n
+                   ) & (mask[pos] != 0)
+            assert torch.all(v_tri[:kb * x].cpu().view(kb, x)[~act] == 0)
+
+            # x=1 degenerate: same values as the element pack (which
+            # additionally zeroes — the block gather does not)
+            if x == 1:
+                idx_d = mask.nonzero(as_tuple=True)[0].to(
+                    torch.int32).to(device)
+                vp = torch.empty(kb, device=device)
+                pack_selected(g0.clone().to(device), idx_d, vp, factor)
+                assert torch.equal(v_tri[:kb], vp), \
+                    "x=1 block gather != element pack values"
+
+            # scatter: mirror A/B; end state bitwise, and nothing lands
+            # outside in-bounds mask-set lanes of the listed blocks
+            src = torch.randn(kb * x)
+            src.view(kb, x)[~act] = 0.0    # production shape: zero padding
+            d_tri = torch.zeros(n, device=device)
+            scatter_selected_blocks(d_tri, mask.to(device), bidx_d,
+                                    src.to(device), x)
+            d_ref = torch.zeros(n)
+            scatter_selected_blocks_torch(d_ref, mask, bidx, src, x)
+            assert torch.equal(d_tri.cpu(), d_ref), (
+                f"block scatter diverged (x={x}, factor={factor})")
+            written = torch.zeros(n, dtype=torch.bool)
+            written[pos[act]] = True
+            assert torch.all(d_tri.cpu()[~written] == 0), \
+                "scatter wrote outside mask-set lanes of listed blocks"
+
+            # guard: undersized payload buffer refused
+            try:
+                gather_selected_blocks(g_tri, mask.to(device), bidx_d,
+                                       torch.empty(kb * x - 1,
+                                                   device=device), x, factor)
+                raise AssertionError("undersized payload accepted")
+            except AssertionError as e:
+                assert "k_blocks*x" in str(e), e
+
+    # empty support: no-op on both paths
+    z = torch.zeros(64, device=device)
+    e = torch.empty(0, dtype=torch.int32, device=device)
+    zm = torch.zeros(64, dtype=torch.uint8, device=device)
+    gather_selected_blocks(z, zm, e, torch.empty(0, device=device), 8, 0.125)
+    scatter_selected_blocks(z, zm, e, torch.empty(0, device=device), 8)
+    assert torch.all(z == 0)
+    print("ok: block gather/scatter A/B bitwise (tails, partial blocks, "
+          "x=1 identity, guards)")
+
+
 def test_compact_norm_deterministic():
     """Compact norm: same aggregate as the masked contribution (within the
     declared ulp-class reduction-order difference) and DETERMINISTIC across

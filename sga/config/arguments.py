@@ -241,6 +241,24 @@ def _add_sga_selection_args(parser: argparse.ArgumentParser):
         choices=("balanced", "exact", "fast"),
         help="method=adaptive only: histogram tier used to bootstrap/steer "
              "the adaptive tau. Default fast.")
+    group.add_argument(
+        "--sga-selection-block-size", type=int, default=1,
+        help="method=histogram only: select in contiguous blocks of this "
+             "many gradient elements — each support index then denotes the "
+             "START of a contiguous x-element run instead of one element. "
+             "Must be a power of two in [1, 1024]; 1 (default) keeps "
+             "element-granular selection. With block_size > 1 the backend "
+             "must be torch_pipelined_mask, or torch_pipelined_index with "
+             "sga_backend_emission=writeback (the compact consumers and "
+             "the nccl fork kernel are element-granular).")
+    group.add_argument(
+        "--sga-selection-block-reduce", type=str, default="mean",
+        choices=("mean", "max"),
+        help="method=histogram only, block_size > 1: the per-block topk "
+             "value — the mean of |score| over the block's real length "
+             "(default; tail blocks are not discriminated against) or the "
+             "max (keeps spiky blocks). A dead knob under block_size 1 — "
+             "setting it there is refused.")
 
 
 def _add_sga_optimizer_args(parser: argparse.ArgumentParser):

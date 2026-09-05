@@ -446,6 +446,129 @@ def test_hist_tiers_geometry_and_chunking():
     print("ok: hist tiers (exact/balanced/fast) geometry, chunking, closeness")
 
 
+def test_histogram_block_selection():
+    """Block-granular histogram selection: block-mean/max
+    reduce, real-length tail blocks, mask expansion structure, k_blocks
+    rounding, exact-vs-histogram threshold identity on block scores,
+    empty-view tolerance, and constructor/foreign-key guards."""
+    import sga.plugins.selection._histogram as _h
+    from sga.plugins.selection._histogram import (
+        HistogramSelect, _block_reduce_views)
+
+    # --- reduce correctness incl. real-length tails ---
+    torch.manual_seed(21)
+    g = torch.randn(1000)          # 1000 = 62*16 + 8 -> tail block of 8
+    red_mean = _block_reduce_views([g], 16, "mean")[0]
+    ref = torch.cat([g[:62 * 16].abs().view(62, 16).mean(1),
+                     g[62 * 16:].abs().mean().reshape(1)])
+    assert torch.equal(red_mean, ref)
+    red_max = _block_reduce_views([g], 16, "max")[0]
+    ref_max = torch.cat([g[:62 * 16].abs().view(62, 16).amax(1),
+                         g[62 * 16:].abs().amax().reshape(1)])
+    assert torch.equal(red_max, ref_max)
+    # chunked == unchunked reduce (chunk patched small but x-aligned)
+    old_chunk = _h._HIST_CHUNK
+    _h._HIST_CHUNK = 16 * 40
+    try:
+        red_ch = _block_reduce_views([g], 16, "mean")[0]
+    finally:
+        _h._HIST_CHUNK = old_chunk
+    assert torch.equal(red_ch, ref)
+
+    # --- tail block scored by REAL length (a sum would discriminate) ---
+    # 1-element tail holding the global max must beat a full block of
+    # mediums under mean (and under max).
+    grads = [torch.cat([torch.full((64,), 10.0), torch.tensor([50.0])])]
+    for reduce in ("mean", "max"):
+        _t, m = HistogramSelect("exact", block_size=64,
+                                block_reduce=reduce).select(grads, 64, None)
+        # k_blocks = round(64/64) = 1: the tail block wins
+        assert int(m[0][64].item()) == 1 and int(m[0][:64].sum().item()) == 0
+
+    # --- mask structure: all-or-nothing blocks, tail clamped ---
+    torch.manual_seed(22)
+    grads = [torch.randn(1000), torch.randn(37)]
+    x, k = 16, 200
+    _t, masks = HistogramSelect("exact", block_size=x).select(grads, k, None)
+    for mm, gg in zip(masks, grads):
+        assert mm.dtype == torch.uint8 and mm.numel() == gg.numel()
+        n = gg.numel()
+        pad = (-n) % x
+        rows = torch.cat([mm, torch.zeros(pad, dtype=torch.uint8)]
+                         ).view(-1, x).sum(1)
+        lens = [x] * (rows.numel() - 1) + [x - pad]
+        assert all(int(s) in (0, L) for s, L in zip(rows.tolist(), lens))
+    n_sel = sum(int(mm.sum()) for mm in masks)
+    assert abs(n_sel - max(1, round(k / x)) * x) <= x
+
+    # --- histogram block threshold == exact kthvalue on the block scores,
+    #     and the expanded mask is exactly per-block (score >= thresh) ---
+    torch.manual_seed(23)
+    grads = [torch.randn(100000), torch.randn(317)]
+    x, k = 32, 5000
+    t_h, m_h = HistogramSelect("exact", block_size=x).select(grads, k, None)
+    bviews = _block_reduce_views(grads, x, "mean")
+    bcat = torch.cat(bviews)
+    kb = max(1, round(k / x))
+    t_ref = torch.kthvalue(bcat, bcat.numel() - kb + 1).values.item()
+    assert t_h == t_ref, (t_h, t_ref)
+    n_sel = 0
+    for mm, bv, gg in zip(m_h, bviews, grads):
+        ref_m = (bv >= t_ref).repeat_interleave(x)[:gg.numel()]
+        assert torch.equal(mm, ref_m.to(torch.uint8))
+        n_sel += int(ref_m.sum())
+    assert n_sel >= kb  # boundary ties all selected
+
+    # --- mean vs max genuinely differ on spiky blocks ---
+    spike = torch.zeros(64)
+    spike[0] = 100.0                                # mean 1.5625, max 100
+    flat = torch.full((64,), 10.0)                  # mean 10, max 10
+    grads = [torch.cat([spike, flat])]
+    _t, m_mean = HistogramSelect("exact", block_size=64,
+                                 block_reduce="mean").select(grads, 64, None)
+    _t, m_max = HistogramSelect("exact", block_size=64,
+                                block_reduce="max").select(grads, 64, None)
+    assert int(m_mean[0][64:].sum()) == 64 and int(m_mean[0][:64].sum()) == 0
+    assert int(m_max[0][:64].sum()) == 64 and int(m_max[0][64:].sum()) == 0
+
+    # --- empty grad view: tolerated, not a crash (an empty view enters no
+    #     reduce chunk and must come back as an empty mask, like the
+    #     element path) ---
+    grads = [torch.randn(48), torch.empty(0)]
+    bviews = _block_reduce_views(grads, 16, "mean")
+    assert bviews[0].numel() == 3 and bviews[1].numel() == 0
+    _t, masks = HistogramSelect("exact", block_size=16).select(grads, 16, None)
+    assert masks[1].dtype == torch.uint8 and masks[1].numel() == 0
+    assert masks[0].numel() == 48
+
+    # --- TopkSelection plumbing + constructor/foreign-key guards ---
+    sel = TopkSelection({"method": "histogram", "ratio_percent": 10.0,
+                         "block_size": 16})
+    assert sel.block_size == 16 and sel.params["block_reduce"] == "mean"
+    assert TopkSelection({"method": "histogram",
+                          "ratio_percent": 10.0}).block_size == 1
+    assert TopkSelection({"method": "exact",
+                          "ratio_percent": 10.0}).block_size == 1
+    for bad in (0, 3, True, -16):
+        try:
+            HistogramSelect("exact", block_size=bad)
+            raise AssertionError(f"bad block_size accepted: {bad}")
+        except ValueError:
+            pass
+    try:
+        HistogramSelect("exact", block_size=16, block_reduce="sum")
+        raise AssertionError("bad block_reduce accepted")
+    except ValueError:
+        pass
+    try:
+        TopkSelection({"method": "exact", "ratio_percent": 10.0,
+                       "block_size": 16})
+        raise AssertionError("block_size accepted under method=exact")
+    except ValueError as e:
+        assert "do not belong" in str(e)
+    print("ok: block histogram selection (reduce/tail/structure/k_blocks)")
+
+
 def test_adaptive_threshold_band_and_clamps():
     from sga.plugins.selection._adaptive import _adapt_threshold
 
@@ -1139,6 +1262,50 @@ def test_support_split_and_idx_positional_equivalence():
     assert bs.idx.data_ptr() == idx.data_ptr()
     assert bs.split == bs.split
     print("ok: BucketSupport idx/split == flatnonzero + midpoint split")
+
+
+def test_support_block_idx_from_mask():
+    """block_idx derives FROM THE MASK + spans: one int32 start per
+    x-block with ANY set bit, per-span tiling (span tails are short
+    blocks), ascending by construction; x=1 degenerates to the element
+    idx; block_size > 1 without spans is a loud error."""
+    from sga.support import BucketSupport, block_idx_from_mask
+
+    # two spans: [0,10) tiles of 4 -> [0-3] [4-7] tail [8-9];
+    #            [10,26) -> [10-13] [14-17] [18-21] tail [22-25]
+    mask = torch.zeros(26, dtype=torch.uint8)
+    mask[5] = 1        # partial set in block [4-7]: ANY rule lists it
+    mask[8] = 1        # tail block of span 0
+    mask[10:14] = 1    # full block of span 1
+    spans = [(0, 10), (10, 26)]
+    got = block_idx_from_mask(mask, spans, 4)
+    assert got.dtype == torch.int32
+    assert got.tolist() == [4, 8, 10]
+
+    # x=1 is exactly the element idx
+    torch.manual_seed(5)
+    m = (torch.rand(1000) < 0.3).to(torch.uint8)
+    assert torch.equal(block_idx_from_mask(m, [(0, 1000)], 1),
+                       m.nonzero(as_tuple=True)[0].to(torch.int32))
+
+    # empty support -> empty int32
+    z = block_idx_from_mask(torch.zeros(20, dtype=torch.uint8),
+                            [(0, 20)], 8)
+    assert z.dtype == torch.int32 and z.numel() == 0
+
+    # BucketSupport wiring: lazy derive + x=1 identity + block_split +
+    # the spans-required refusal
+    bs = BucketSupport(mask.clone(), block_size=4, block_spans=spans)
+    assert torch.equal(bs.block_idx, got)
+    assert bs.block_split == 3  # mid = 26//2 = 13; all of [4,8,10] below
+    bs1 = BucketSupport(m.clone())
+    assert torch.equal(bs1.block_idx, bs1.idx)
+    try:
+        BucketSupport(mask.clone(), block_size=4).block_idx
+        raise AssertionError("block_idx without spans accepted")
+    except ValueError:
+        pass
+    print("ok: block_idx from mask+spans (ANY rule, tails, x=1 identity)")
 
 
 if __name__ == "__main__":

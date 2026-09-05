@@ -233,6 +233,8 @@ def test_inv4_historical_surface_pinned():
         "sga_selection_histogram_mode": ("exact", "str", ("balanced", "exact", "fast")),
         "sga_selection_adaptive_warmup_syncs": (5, "int_or_null", ()),
         "sga_selection_adaptive_warmup_mode": ("fast", "str", ("balanced", "exact", "fast")),
+        "sga_selection_block_size": (1, "int", ()),
+        "sga_selection_block_reduce": ("mean", "str", ("mean", "max")),
         "sga_optimizer": ("adamw", "str", ()),
         "sga_optimizer_residual_mean": (False, "bool", ()),
         "sga_optimizer_full_sync_inactive_lr_scale": (1.0, "float", ()),
@@ -330,7 +332,17 @@ def test_inv5_unlock_tables_in_sync():
 
     param_values = {"histogram_mode": "fast",
                     "adaptive_warmup_syncs": 3,
-                    "adaptive_warmup_mode": "fast"}
+                    "adaptive_warmup_mode": "fast",
+                    "block_size": 4,
+                    "block_reduce": "max"}
+    # params whose clean validation needs another knob off its default
+    # (block_reduce is a dead knob under the block_size=1 default; any
+    # block_size > 1 leg additionally needs a block-carrying comm
+    # combination — tpi with explicit writeback — or the cross-field rule
+    # fires first)
+    param_extras = {"block_size": {"sga_backend_emission": "writeback"},
+                    "block_reduce": {"sga_selection_block_size": 4,
+                                     "sga_backend_emission": "writeback"}}
     base = {"sga_enabled": True, "sga_score": "update",
             "sga_selection_ratio_percent": 10.0,
             "sga_optimizer": "adamw",
@@ -339,7 +351,8 @@ def test_inv5_unlock_tables_in_sync():
         for method in declared_choices("sga_selection_method"):
             for param in params:
                 flat = {**base, "sga_selection_method": method,
-                        f"sga_selection_{param}": param_values[param]}
+                        f"sga_selection_{param}": param_values[param],
+                        **param_extras.get(param, {})}
                 if method == owner:
                     canon = validate_sga_flat(flat)
                     assert canon[f"sga_selection_{param}"] == \
@@ -348,6 +361,66 @@ def test_inv5_unlock_tables_in_sync():
                     expect_error(lambda f=flat: validate_sga_flat(f),
                                  "do not belong to method")
     print("ok: validation refusal tracks the plugin UNLOCKS table")
+
+
+def test_inv5_block_size_rules():
+    """Block-granularity value rules: power-of-two [1, 1024]
+    range and the block_reduce dead-knob refusal under block_size 1."""
+    base = {"sga_enabled": True, "sga_score": "update",
+            "sga_selection_method": "histogram",
+            "sga_selection_ratio_percent": 10.0,
+            "sga_optimizer": "adamw",
+            "sga_backend": "torch_pipelined_index",
+            "sga_backend_emission": "writeback"}  # the block-carrying comm
+                                                  # combination (cross-field)
+    canon = validate_sga_flat({**base, "sga_selection_block_size": 64,
+                               "sga_selection_block_reduce": "max"})
+    assert canon["sga_selection_block_size"] == 64
+    assert canon["sga_selection_block_reduce"] == "max"
+    for bad in (0, 3, 2048, -16):
+        expect_error(lambda b=bad: validate_sga_flat(
+            {**base, "sga_selection_block_size": b}), "power of two")
+    # bool-as-int is refused one layer earlier, at type coercion
+    expect_error(lambda: validate_sga_flat(
+        {**base, "sga_selection_block_size": True}), "valid int")
+    expect_error(lambda: validate_sga_flat(
+        {**base, "sga_selection_block_reduce": "max"}), "dead knob")
+    print("ok: block_size power-of-two range + block_reduce dead-knob refusal")
+
+
+def test_inv5_block_backend_cross_field_rules():
+    """Block-granularity comm-path cross-field rules. The mask stays the
+    canonical support form (correct on every backend), so these gates only
+    refuse combinations whose evident intent — block communication — would
+    silently degrade to element-level transport: nccl's fork kernel has no
+    block-size argument, and tpi's compact consumers are
+    element-granular. tpi+writeback and the mask backend carry blocks."""
+    base = {"sga_enabled": True, "sga_score": "update",
+            "sga_selection_method": "histogram",
+            "sga_selection_ratio_percent": 10.0,
+            "sga_optimizer": "adamw",
+            "sga_selection_block_size": 16}
+    expect_error(lambda: validate_sga_flat(
+        {**base, "sga_backend": "nccl_pipelined_index"}),
+        "element-granular")
+    # tpi with the auto default: auto resolves to compact here, and the
+    # refusal must say so (the hint text is the user's only signpost)
+    expect_error(lambda: validate_sga_flat(
+        {**base, "sga_backend": "torch_pipelined_index"}),
+        "resolves to 'compact'")
+    expect_error(lambda: validate_sga_flat(
+        {**base, "sga_backend": "torch_pipelined_index",
+         "sga_backend_emission": "compact"}), "'writeback'")
+    # allowed: tpi+writeback and the mask backend (canonical round-trip)
+    canon = validate_sga_flat(
+        {**base, "sga_backend": "torch_pipelined_index",
+         "sga_backend_emission": "writeback"})
+    assert canon["sga_selection_block_size"] == 16
+    assert canon["sga_backend_emission"] == "writeback"
+    canon = validate_sga_flat(
+        {**base, "sga_backend": "torch_pipelined_mask"})
+    assert canon["sga_selection_block_size"] == 16
+    print("ok: block comm-path cross-field refusals (nccl, tpi non-writeback)")
 
 
 def test_inv5_topk_unknown_method_keeps_validator_error():

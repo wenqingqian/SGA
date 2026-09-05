@@ -789,8 +789,21 @@ class SGAEngine:
             masks = sel_masks
         bucket_masks = self._assemble_bucket_masks(masks, meta)
         self._verify_support_consistency(bucket_masks)
+        # Block granularity rides along from the selection (1 = element).
+        # The block-index form is NOT assembled here: it derives lazily
+        # from the canonical mask + param spans (single-source doctrine),
+        # materialized at activation for idx-consuming backends only. The
+        # spans are sorted by start so the derived block_idx is ascending
+        # (params_list order is an implementation detail of the DDP side —
+        # block_split's midpoint searchsorted assumes ascending).
+        block_size = getattr(self.selection, "block_size", 1)
         return Support([
-            BucketSupport(m, idx_pool=self._bucket_idx_pool(i))
+            BucketSupport(
+                m, idx_pool=self._bucket_idx_pool(i),
+                block_size=block_size,
+                block_spans=(sorted((start, end) for (_p, start, end)
+                                    in self._bucket_states[i].param_spans)
+                             if block_size > 1 else None))
             for i, m in enumerate(bucket_masks)
         ])
 
@@ -1338,7 +1351,10 @@ class SGAEngine:
         # compacted pool would be pure resident waste (~idx-sized per bucket).
         if self.backend.decl.consumes == "idx" and not self._shadow:
             for bucket_support in support.buckets:
-                bucket_support.idx
+                if bucket_support.block_size > 1:
+                    bucket_support.block_idx
+                else:
+                    bucket_support.idx
         for bs, bucket_support in zip(self._bucket_states, support.buckets):
             bs.active_mask_u8 = bucket_support.mask_u8
         # The freshly written pool slot becomes the active one; the next

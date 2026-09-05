@@ -53,8 +53,9 @@ DECL = SelectionDecl(name="topk", output_form="mask")
 # required-ness live in the argparse declarations — a None default means
 # required); UNLOCKS says which method each guarded param belongs to.
 PARAMS = ("method", "ratio_percent", "histogram_mode",
-          "adaptive_warmup_syncs", "adaptive_warmup_mode")
-UNLOCKS = {"histogram": ("histogram_mode",),
+          "adaptive_warmup_syncs", "adaptive_warmup_mode",
+          "block_size", "block_reduce")
+UNLOCKS = {"histogram": ("histogram_mode", "block_size", "block_reduce"),
            "adaptive": ("adaptive_warmup_syncs", "adaptive_warmup_mode")}
 
 
@@ -97,10 +98,21 @@ class TopkSelection:
                 params["adaptive_warmup_mode"],
             )
         elif method == "histogram":
-            self._impl = HistogramSelect(params["histogram_mode"])
+            self._impl = HistogramSelect(
+                params["histogram_mode"],
+                block_size=int(params["block_size"]),
+                block_reduce=params["block_reduce"])
         else:
             self._impl = ExactKthvalue()
         self.last_threshold = None
+
+    @property
+    def block_size(self):
+        """Selection granularity: 1 = element-level (every non-histogram
+        method); > 1 = each selected coordinate heads a contiguous run of
+        ``block_size`` elements. The engine reads this to decide whether a
+        block-index form exists for the support."""
+        return getattr(self._impl, "block_size", 1)
 
     @property
     def tau(self):

@@ -641,7 +641,13 @@ class _FakeGroup:
 
 class _FakeChunk:
     def __init__(self, n_params=2, numel_per=64, names=None):
-        self.params = [torch.nn.Parameter(torch.randn(4, 16)) for _ in range(n_params)]
+        # 2-D (4, numel_per // 4), not flat (numel_per,): the trace suite pins
+        # the dumped param shapes at the historical 4x16 default. numel_per is
+        # still honored EXACTLY (numel = numel_per); the assert keeps a
+        # non-multiple from silently shrinking it back to the default.
+        assert numel_per % 4 == 0, f"numel_per={numel_per} must be a multiple of 4"
+        self.params = [torch.nn.Parameter(torch.randn(4, numel_per // 4))
+                       for _ in range(n_params)]
         spans, off = {}, 0
         for p in self.params:
             spans[p] = (off, off + p.numel())
@@ -733,8 +739,8 @@ def _build_engine(combo):
     return eng
 
 
-def _run_flow(combo, steps):
-    chunk = _FakeChunk()
+def _run_flow(combo, steps, **chunk_kw):
+    chunk = _FakeChunk(**chunk_kw)
     mp = _FakeMPOpt(chunk)
     eng = _build_engine(combo)
     eng.attach(chunk)
@@ -992,6 +998,47 @@ def test_reselect_boundary_orders_reset_before_activation():
     for old, new in zip(old_masks, new_masks):
         assert int((old & new).sum()) == 0
         assert not torch.equal(old, new)
+
+
+def test_block_support_assembly_and_prefetch():
+    """Engine assembly of block-granular supports: the selection's
+    block_size rides into every BucketSupport together with the bucket's
+    param spans; block_idx derives FROM THE MASK (single-source doctrine —
+    the engine never receives a block channel from selection) and is
+    materialized at ACTIVATION for idx-consuming backends (the prefetch
+    that keeps the chunked derivation off the first sparse sync)."""
+    from sga.support import block_idx_from_mask
+
+    combo = dict(_UPDATE)
+    combo["selection_params"] = {"method": "histogram",
+                                 "ratio_percent": 30.0,
+                                 "block_size": 4}
+    combo["backend"] = TorchPipelinedIndexBackend({"emission": "writeback"})
+    numel_per = 64
+    eng, chunk, mp, log = _run_flow(combo, steps=6, numel_per=numel_per)
+    sup = eng._active_support.buckets[0]
+    assert sup.block_size == 4
+    # spans derive from numel_per: two params of numel_per elements, one bucket
+    spans = [(i * numel_per, (i + 1) * numel_per)
+             for i in range(len(chunk.params))]
+    assert sup.block_spans == spans
+    mask = eng._bucket_states[0].active_mask_u8
+    assert torch.equal(sup.block_idx, block_idx_from_mask(mask, spans, 4))
+    assert sup._block_idx is not None, "block_idx not prefetched at activation"
+    # selection-emitted block masks are all-or-nothing per span block
+    for s, e in spans:
+        blocks = mask[s:e].view(-1, 4)
+        assert bool((blocks.any(dim=1) == blocks.all(dim=1)).all())
+    # a non-default numel_per must be honored by _FakeChunk (never silently
+    # ignored): the assembled spans scale with it
+    eng96, _, _, _ = _run_flow(combo, steps=6, numel_per=96)
+    sup96 = eng96._active_support.buckets[0]
+    assert sup96.block_spans == [(0, 96), (96, 192)]
+    # an element-granular selection leaves the support block-inert
+    eng1, _, _, _ = _run_flow(_UPDATE, steps=3)
+    sup1 = eng1._active_support.buckets[0]
+    assert sup1.block_size == 1 and sup1.block_spans is None
+    assert torch.equal(sup1.block_idx, sup1.idx)
 
 
 def test_forced_step_never_reselects():

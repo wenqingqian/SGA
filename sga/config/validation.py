@@ -434,7 +434,9 @@ def validate_sga_flat(flat: dict, train_iters=None):
         # dead config: a param another method owns is silently ignored
         # where it is — refuse it instead
         unlocks = {
-            "histogram": ("sga_selection_histogram_mode",),
+            "histogram": ("sga_selection_histogram_mode",
+                          "sga_selection_block_size",
+                          "sga_selection_block_reduce"),
             "adaptive": ("sga_selection_adaptive_warmup_syncs",
                          "sga_selection_adaptive_warmup_mode"),
         }
@@ -448,6 +450,49 @@ def validate_sga_flat(flat: dict, train_iters=None):
                 f"{sorted(method_params) or 'no extra params'}) — under "
                 "this method they would be silently dead; drop them or "
                 "switch the method")
+
+        # --- block granularity (histogram-unlocked above) ---
+        block_size = typed.get("sga_selection_block_size",
+                               defaults["sga_selection_block_size"])
+        if (not isinstance(block_size, int) or isinstance(block_size, bool)
+                or block_size < 1 or block_size > 1024
+                or block_size & (block_size - 1)):
+            raise ValueError(
+                f"sga_selection_block_size must be a power of two in "
+                f"[1, 1024] (got {block_size!r}); 1 keeps element-granular "
+                "selection")
+        if (block_size == 1
+                and "sga_selection_block_reduce" in typed):
+            raise ValueError(
+                "sga_selection_block_reduce is set but "
+                "sga_selection_block_size is 1 (element-granular): the "
+                "per-block reduce is a dead knob there — drop it or set "
+                "block_size > 1")
+        # Block-granularity comm-path constraints. The mask stays the
+        # canonical support form, so a block-structured mask is CORRECT on
+        # every backend — but the block-INDEX transport (one entry per
+        # contiguous run) exists only on torch_pipelined_index with
+        # writeback emission. Refuse the combinations whose evident intent
+        # (block communication) would silently degrade to element-level
+        # transport or hit element-granular consumers.
+        if block_size > 1:
+            if backend == "nccl_pipelined_index":
+                raise ValueError(
+                    "sga_selection_block_size > 1 with backend "
+                    "nccl_pipelined_index: the fork kernel's idx is "
+                    "element-granular (no block-size argument). Use "
+                    "torch_pipelined_index with sga_backend_emission "
+                    "'writeback', or torch_pipelined_mask")
+            if (backend == "torch_pipelined_index"
+                    and emission != "writeback"):
+                raise ValueError(
+                    f"sga_selection_block_size > 1 with backend "
+                    f"torch_pipelined_index needs sga_backend_emission "
+                    f"'writeback' (got '{emission}'"
+                    + (", which resolves to 'compact' here"
+                       if emission == "auto" else "")
+                    + "): the compact consumers (merge-join, compact norm) "
+                    "are element-granular")
 
     validate_combination(score, selection_decl, optimizer_decl,
                          backend_decl, backend_emission=emission)

@@ -109,6 +109,68 @@ def main():
     assert torch.equal(
         g_wb, g_mask), "writeback emission must equal the masked backend"
 
+    # --- block-granular arm (sga_selection_block_size > 1): tpi writeback
+    # on a block-structured support must land the SAME end state as the
+    # mask backend on the same mask, bitwise — the payload holds the same
+    # elements in ascending order and the zero-padded inactive lanes are
+    # allreduce-neutral, so every mask-set coordinate gets the same SUM.
+    # The mask exercises a mask-partial listed block (drift) and both
+    # span-tail blocks.
+    x = 16
+    spans = [(0, 8100), (8100, 8192)]
+    genb = torch.Generator(device="cpu").manual_seed(11)
+    bmask = torch.zeros(n, dtype=torch.uint8)
+    bview = bmask[:8096].view(506, x)      # span 0's full blocks
+    bview[(torch.rand(506, generator=genb) < 0.25)
+          .nonzero(as_tuple=True)[0]] = 1
+    bview[3, 1::2] = 0                     # a mask-partial listed block
+    bview[3, 0] = 1                        # ...still listed (ANY rule)
+    bmask[8097] = 1                        # span-0 tail block [8096, 8100)
+    bmask[8100 + 3 * x:8100 + 4 * x] = 1   # a full block of span 1
+    bmask[8180] = 1                        # span-1 tail block [8180, 8192)
+    bsupport = BucketSupport(bmask.to(device), block_size=x,
+                             block_spans=spans)
+    g_blk = local.clone()
+    ret_blk = TorchPipelinedIndexBackend(
+        {"emission": "writeback"}).allreduce_sparse(
+            g_blk, bsupport, group, factor, op, key=2)
+    assert ret_blk is None, "block writeback must return None"
+    g_bmask = local.clone()
+    TorchPipelinedMaskBackend({"mask_slices": 2}).allreduce_sparse(
+        g_bmask, BucketSupport(bmask.to(device)), group, factor, op, key=2)
+    bact = bmask.to(device) > 0
+    assert torch.equal(g_blk[~bact], local[~bact]), "block residual changed"
+    assert torch.equal(g_blk[bact], expected_selected[bact]), \
+        f"block writeback selected coords wrong (rank {rank})"
+    assert torch.equal(g_blk, g_bmask), \
+        "block writeback must equal the mask backend's buffer bitwise"
+
+    # block + empty support: the writeback signature (None, untouched)
+    bempty = BucketSupport(torch.zeros(n, dtype=torch.uint8, device=device),
+                           block_size=x, block_spans=[(0, n)])
+    g_be = local.clone()
+    assert TorchPipelinedIndexBackend(
+        {"emission": "writeback"}).allreduce_sparse(
+            g_be, bempty, group, factor, op, key=3) is None
+    assert torch.equal(g_be, local)
+
+    # block + tpi compact or nccl: refused loudly (direct-construction
+    # belt; config validation is the front gate, pinned in
+    # test_config_flat)
+    try:
+        TorchPipelinedIndexBackend({"emission": "compact"}).allreduce_sparse(
+            local.clone(), bsupport, group, factor, op, key=4)
+        raise AssertionError("compact emission accepted a block support")
+    except ValueError as e:
+        assert "writeback" in str(e), e
+    from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
+    try:
+        NcclPipelinedIndexBackend({}).allreduce_sparse(
+            local.clone(), bsupport, group, factor, op, key=4)
+        raise AssertionError("nccl accepted a block-granular support")
+    except ValueError as e:
+        assert "element-granular" in str(e), e
+
     # --- raw-kernel backend (needs the sparse library; skip loudly) -------
     lib = os.environ.get("SGA_NCCL_SAR_LIB")
     if lib:

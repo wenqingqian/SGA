@@ -12,8 +12,10 @@ import torch
 
 from sga.kernels_torch import (
     compact_norm_sq_contribution_torch,
+    gather_selected_blocks_torch,
     masked_norm_sq_contribution_torch,
     pack_selected_torch,
+    scatter_selected_blocks_torch,
     scatter_selected_torch,
 )
 
@@ -89,6 +91,53 @@ if _HAS_TRITON:
         v = tl.load(val_ptr + t, mask=t < k, other=0.0)
         tl.store(part_ptr + pid, tl.sum(v * v, axis=0))
 
+    @triton.jit
+    def _gather_blocks_kernel(grad_ptr, mask_ptr, blk_ptr, val_ptr, factor,
+                              k_blocks, n_elements,
+                              X: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+                              SCALE: tl.constexpr):
+        """Block gather: values[t] = grad[blk[t//X] + t%X] * factor on
+        in-bounds MASK-SET lanes, 0 elsewhere. X is constexpr (a power of
+        two from config validation), so the div/mod compile to shifts. The
+        mask guard — not the block structure — decides what moves: tail
+        blocks and any structural drift transfer exactly the set lanes, and
+        every rank holds the same verified mask, so masked-off payload
+        lanes are identical zeros everywhere."""
+        pid = tl.program_id(0)
+        t = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        valid = t < k_blocks * X
+        j = t // X
+        i = t % X
+        start = tl.load(blk_ptr + j, mask=valid, other=0)
+        pos = start + i
+        inb = valid & (pos < n_elements)
+        m = tl.load(mask_ptr + pos, mask=inb, other=0)
+        act = inb & (m != 0)
+        v = tl.load(grad_ptr + pos, mask=act, other=0.0)
+        if SCALE:
+            v = v * factor
+        tl.store(val_ptr + t, v, mask=valid)
+
+    @triton.jit
+    def _scatter_blocks_kernel(src_ptr, mask_ptr, blk_ptr, dst_ptr,
+                               k_blocks, n_elements,
+                               X: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+        """Block scatter: dst[blk[t//X] + t%X] = src[t] on in-bounds
+        mask-set lanes only — the exact mirror of the gather's lane mask,
+        so payload zeros (masked-off lanes) never land in the grad."""
+        pid = tl.program_id(0)
+        t = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        valid = t < k_blocks * X
+        j = t // X
+        i = t % X
+        start = tl.load(blk_ptr + j, mask=valid, other=0)
+        pos = start + i
+        inb = valid & (pos < n_elements)
+        m = tl.load(mask_ptr + pos, mask=inb, other=0)
+        act = inb & (m != 0)
+        v = tl.load(src_ptr + t, mask=valid, other=0.0)
+        tl.store(dst_ptr + pos, v, mask=act)
+
 
 _CLIP_BLOCK_SIZE = 1024
 
@@ -136,6 +185,68 @@ def pack_selected(grad: torch.Tensor, indices: torch.Tensor,
         )
     else:
         pack_selected_torch(grad, indices, values, factor)
+
+
+def gather_selected_blocks(grad: torch.Tensor, mask_u8: torch.Tensor,
+                           block_idx: torch.Tensor, values: torch.Tensor,
+                           x: int, factor: float) -> None:
+    """Block gather: fill ``values[:k_blocks*x]`` from ``grad`` at the
+    x-element runs headed by ``block_idx`` (int32 block-start addresses).
+
+    Lane (j, i) reads position ``block_idx[j] + i``; the lane is active
+    only when in-bounds AND mask-set, and inactive lanes write 0 (so the
+    payload is allreduce-safe: every rank holds the same verified mask and
+    contributes the same zeros). Unlike ``pack_selected`` this is a PURE
+    READ — the writeback choreography clears via the optimizer's masked
+    path post-commit, not at sync time. Same int32 / < 2^31 contract.
+    """
+    kb = block_idx.numel()
+    if kb == 0:
+        return
+    assert grad.numel() < 2 ** 31, (
+        f"gather_selected_blocks assumes < 2^31 bucket elements, "
+        f"got {grad.numel()}"
+    )
+    assert values.numel() >= kb * x, (
+        f"values buffer {values.numel()} < k_blocks*x {kb * x}")
+    if _HAS_TRITON and grad.is_cuda:
+        total = kb * x
+        grid = ((total + _CLIP_BLOCK_SIZE - 1) // _CLIP_BLOCK_SIZE,)
+        _gather_blocks_kernel[grid](
+            grad, mask_u8, block_idx, values, factor, kb, grad.numel(),
+            X=x, BLOCK_SIZE=_CLIP_BLOCK_SIZE, SCALE=factor != 1.0,
+        )
+    else:
+        gather_selected_blocks_torch(grad, mask_u8, block_idx, values,
+                                     x, factor)
+
+
+def scatter_selected_blocks(dst: torch.Tensor, mask_u8: torch.Tensor,
+                            block_idx: torch.Tensor, src: torch.Tensor,
+                            x: int) -> None:
+    """Block scatter: write ``src[:k_blocks*x]`` back into ``dst`` at the
+    x-element runs headed by ``block_idx`` — the exact mirror of
+    ``gather_selected_blocks``' lane mask, so payload zeros (masked-off
+    lanes, e.g. tail-block padding) never land in the grad buffer.
+    """
+    kb = block_idx.numel()
+    if kb == 0:
+        return
+    assert dst.numel() < 2 ** 31, (
+        f"scatter_selected_blocks assumes < 2^31 bucket elements, "
+        f"got {dst.numel()}"
+    )
+    assert src.numel() >= kb * x, (
+        f"src buffer {src.numel()} < k_blocks*x {kb * x}")
+    if _HAS_TRITON and dst.is_cuda:
+        total = kb * x
+        grid = ((total + _CLIP_BLOCK_SIZE - 1) // _CLIP_BLOCK_SIZE,)
+        _scatter_blocks_kernel[grid](
+            src, mask_u8, block_idx, dst, kb, dst.numel(),
+            X=x, BLOCK_SIZE=_CLIP_BLOCK_SIZE,
+        )
+    else:
+        scatter_selected_blocks_torch(dst, mask_u8, block_idx, src, x)
 
 
 def compact_norm_sq_contribution(values: torch.Tensor,

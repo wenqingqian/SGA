@@ -180,21 +180,86 @@ def select_masks_histogram(grads, k, comm_group, mode="exact"):
     return _bin_edge_float(b, shift), masks
 
 
+def _block_reduce_views(grads, x, reduce):
+    """Per-grad block scores: |g| reduced over contiguous x-element blocks.
+
+    The tail block of a grad view (numel % x != 0) reduces over its REAL
+    length, so mean never dilutes and sum-bias never discriminates it.
+    Chunked at x-aligned slices of ``_HIST_CHUNK``: |g| never materializes
+    as a second full-size copy (a 1.2B-element bucket's fp32 abs is
+    GB-scale next to the resident sparse-comm buffers).
+    """
+    chunk = _HIST_CHUNK - (_HIST_CHUNK % x)
+    out = []
+    for g in grads:
+        # An empty view enters no chunk (parts would stay empty and the
+        # cat below would raise); emit the empty block-score view directly,
+        # matching the element path's tolerance of zero-numel views.
+        if g.numel() == 0:
+            out.append(torch.empty(0, device=g.device))
+            continue
+        parts = []
+        for s in range(0, g.numel(), chunk):
+            c = g[s:s + chunk].abs()
+            nb, rem = divmod(c.numel(), x)
+            if nb:
+                b = c[:nb * x].view(nb, x)
+                parts.append(b.mean(dim=1) if reduce == "mean"
+                             else b.amax(dim=1))
+            if rem:
+                # only the param's LAST chunk can have a partial block
+                t = c[nb * x:]
+                parts.append(
+                    (t.mean() if reduce == "mean" else t.amax()).reshape(1))
+            del c
+        out.append(torch.cat(parts) if len(parts) > 1 else parts[0])
+    return out
+
+
 class HistogramSelect:
     """method=histogram impl: ``select(grads, k, comm_group, warmup_target)``.
 
     ``warmup_target`` is adaptive-only and ignored here. Threshold semantics
     by tier: exact kth value (``exact``) or the crossing bin's lower edge
     (``balanced``/``fast``; also the adaptive tau's bootstrap input).
+
+    ``block_size`` > 1 selects in contiguous blocks: each grad view is
+    block-reduced (``block_reduce`` mean|max of |score| over the block's
+    real length), the same histogram machinery runs on the ~n/x block
+    scores with ``k_blocks = round(k / block_size)``, and the selected
+    block masks expand back to element masks (tail block clamped). The
+    threshold is in block-score units then, not |score| units.
     """
 
-    def __init__(self, mode: str = "exact"):
+    def __init__(self, mode: str = "exact", block_size: int = 1,
+                 block_reduce: str = "mean"):
         if mode not in _HIST_MODES:
             raise ValueError(
                 f"unknown histogram_mode: {mode!r} "
                 f"(expected one of {sorted(_HIST_MODES)})"
             )
+        if (not isinstance(block_size, int) or isinstance(block_size, bool)
+                or block_size < 1 or block_size & (block_size - 1)):
+            raise ValueError(
+                f"block_size must be a positive power of two, got "
+                f"{block_size!r}")
+        if block_reduce not in ("mean", "max"):
+            raise ValueError(
+                f"block_reduce must be 'mean' or 'max', got "
+                f"{block_reduce!r}")
         self.mode = mode
+        self.block_size = block_size
+        self.block_reduce = block_reduce
 
     def select(self, grads, k, comm_group, warmup_target=None):
-        return select_masks_histogram(grads, k, comm_group, mode=self.mode)
+        if self.block_size == 1:
+            return select_masks_histogram(grads, k, comm_group,
+                                          mode=self.mode)
+        x = self.block_size
+        k_blocks = max(1, int(round(k / x)))
+        bviews = _block_reduce_views(grads, x, self.block_reduce)
+        thresh, bmasks = select_masks_histogram(bviews, k_blocks,
+                                                comm_group, mode=self.mode)
+        masks = [bm.repeat_interleave(x)[:g.numel()]
+                 for bm, g in zip(bmasks, grads)]
+        return thresh, masks

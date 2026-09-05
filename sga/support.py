@@ -99,6 +99,44 @@ def compact_mask_u8(mask_u8: torch.Tensor, pool: Optional[IndexPool] = None) -> 
     return buf[:k]
 
 
+def block_idx_from_mask(mask_u8: torch.Tensor, spans, x: int) -> torch.Tensor:
+    """Block-start indices derived FROM THE MASK (single-source doctrine):
+    one int32 entry per x-element block that has ANY set bit, per span.
+
+    ``spans`` are the bucket's (start, end) param element spans, ascending
+    and non-overlapping; blocks tile each span independently (a block never
+    crosses a param boundary, so the tail block of a span can be short).
+    The ANY rule (not ALL) keeps partial-block drift communicable: the
+    mask-guarded block kernels transfer exactly the set bits of every
+    listed block, so a drifted half-set block still reaches the wire.
+    Sorted ascending by construction (spans ascending, blocks ascending
+    within a span). With x == 1 the result equals ``compact_mask_u8``.
+    """
+    # int32 block starts: refuse oversized masks loudly instead of wrapping
+    # silently. The element path's own guard (compact_mask_u8) never runs
+    # here — block mode materializes block_idx INSTEAD of idx — so wrapped
+    # starts would sit cached through the activate->sync window.
+    assert mask_u8.numel() < 2 ** 31, (
+        f"int32 block-start indices assume < 2^31 elements, "
+        f"got {mask_u8.numel()}")
+    outs = []
+    for start, end in spans:
+        n = end - start
+        nb, rem = divmod(n, x)
+        if nb:
+            sel = mask_u8[start:start + nb * x].view(nb, x).any(dim=1)
+            idx = sel.nonzero(as_tuple=True)[0]
+        else:
+            idx = torch.empty(0, dtype=torch.int64, device=mask_u8.device)
+        if rem and bool(mask_u8[start + nb * x:end].any()):
+            idx = torch.cat([idx, idx.new_tensor([nb])])
+        if idx.numel():
+            outs.append(idx.mul(x).add(start))
+    if not outs:
+        return torch.empty(0, dtype=torch.int32, device=mask_u8.device)
+    return torch.cat(outs).to(torch.int32)
+
+
 @dataclass
 class BucketSupport:
     """Support for one gradient bucket, built from a selection decision."""
@@ -111,10 +149,23 @@ class BucketSupport:
     # Number of selected elements (host int; derived once and cached — the
     # mask never changes within a cycle, so per-step rescans are pure waste).
     n_selected: Optional[int] = field(default=None, repr=False)
+    # Block granularity of this support: 1 = element-level. > 1 means the
+    # selection produced x-element contiguous blocks and a block-index form
+    # exists (``block_idx``), derived from the mask + ``block_spans``.
+    block_size: int = 1
+    # (start, end) param element spans the blocks tile; required for the
+    # lazy block_idx derivation when block_size > 1 (engine supplies them
+    # from BucketState.param_spans).
+    block_spans: Optional[list] = field(default=None, repr=False)
     # Canonical sorted int32 indices of the selected elements (derived lazily).
     _idx: torch.Tensor = field(default=None, repr=False)
+    # Block-start indices (derived lazily from the mask via
+    # ``block_idx_from_mask``); only materialized for idx-consuming backends.
+    _block_idx: torch.Tensor = field(default=None, repr=False)
     # Midpoint split for two-slice pipelining (derived lazily, cached).
     _split: int = field(default=None, repr=False)
+    # Block-idx midpoint split (the block path's ``split`` analog).
+    _block_split: int = field(default=None, repr=False)
     # Merge-join directory table (derived lazily): table[j] ==
     # lower_bound(idx, j*1024). Lifetime = this cycle: idx is frozen once
     # built (the mask never changes within a cycle), so the table cannot
@@ -148,6 +199,37 @@ class BucketSupport:
         if self._idx is None:
             self._idx = compact_mask_u8(self.mask_u8, self.idx_pool)
         return self._idx
+
+    @property
+    def block_idx(self) -> torch.Tensor:
+        """Sorted int32 block-start indices (each entry heads a contiguous
+        run of ``block_size`` elements, tail-short at span ends).
+
+        Element granularity degenerates honestly: block_size 1 IS the
+        element idx. Above 1 the form derives from the mask + the param
+        spans (never an independent selection-side channel), so the mask
+        stays the single source the consistency layers verify.
+        """
+        if self.block_size == 1:
+            return self.idx
+        if self._block_idx is None:
+            if self.block_spans is None:
+                raise ValueError(
+                    "block_idx needs block_spans (param element spans) — "
+                    "the engine supplies them at assembly; direct "
+                    "construction with block_size > 1 must pass them")
+            self._block_idx = block_idx_from_mask(
+                self.mask_u8, self.block_spans, self.block_size)
+        return self._block_idx
+
+    @property
+    def block_split(self) -> int:
+        """Index into ``block_idx`` that splits it at the bucket midpoint."""
+        if self._block_split is None:
+            mid = self.mask_u8.numel() // 2
+            self._block_split = int(torch.searchsorted(self.block_idx, mid)
+                                    .item())
+        return self._block_split
 
     @property
     def dir_table(self) -> torch.Tensor:

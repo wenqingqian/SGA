@@ -388,6 +388,16 @@ class NcclPipelinedIndexBackend:
             raise ValueError(
                 f"nccl_pipelined_index needs a contiguous grad buffer, got "
                 f"non-contiguous (bucket key {key})")
+        # The fork kernel is element-granular: an idx entry moves exactly
+        # one element, and there is no block-size argument to teach it
+        # contiguous runs (config validation refuses this combination
+        # earlier; this is the direct-construction belt).
+        if getattr(support, "block_size", 1) > 1:
+            raise ValueError(
+                "nccl_pipelined_index cannot carry block-granular supports "
+                "(sga_selection_block_size > 1): the fork kernel's idx is "
+                "element-granular. Use torch_pipelined_index with "
+                "sga_backend_emission=writeback, or torch_pipelined_mask")
         indices = support.idx
         k = indices.numel()
         if k == 0:
