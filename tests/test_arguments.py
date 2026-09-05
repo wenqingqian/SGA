@@ -100,13 +100,14 @@ def _canon_from_namespace(argv, train_iters=5000):
 
 def test_flag_table_declared_in_arguments_py():
     """The vocabulary IS the add_argument set: every dest hyphenates to its
-    flag and the historical surface is pinned (27 dests)."""
+    flag and the historical surface is pinned (28 dests)."""
     actions = sga_actions()
-    assert len(actions) == 27, sorted(actions)
+    assert len(actions) == 28, sorted(actions)
     for dest, action in actions.items():
         assert action.option_strings == ["--" + dest.replace("_", "-")], dest
     assert set(sga_defaults()) == {
         "sga_enabled", "sga_shadow", "sga_shadow_score",
+        "sga_always_sync_layers",
         "sga_cycle_start_iter", "sga_cycle_start_iter_percent",
         "sga_cycle_period", "sga_cycle_decouple_full_sync_interval_and_period",
         "sga_cycle_full_sync_interval",
@@ -123,7 +124,7 @@ def test_flag_table_declared_in_arguments_py():
         "sga_backend_high_priority_group",
         "sga_backend_index_slices", "sga_backend_mask_slices",
     }
-    print("ok: 27 flat flags declared, hyphenation 1:1")
+    print("ok: 28 flat flags declared, hyphenation 1:1")
 
 
 def test_dual_form_equivalence():
@@ -301,6 +302,54 @@ def _run_all():
         if name.startswith("test_") and callable(fn):
             fn()
     print("ALL ARGUMENT TESTS PASSED")
+
+
+
+
+def test_always_sync_layers_dual_form():
+    """The list-kind always-sync flag: a yaml string list and the
+    comma-joined CLI token (the launcher's list spelling) canonicalize
+    to the SAME parsed pattern list."""
+    flat = dict(ENABLED, sga_always_sync_layers=["embed", "norm"])
+    cfg = _cfg_with_sga(dict(flat))
+    canon_direct = validate_sga_flat(
+        OmegaConf.to_container(cfg.sga, resolve=True), train_iters=5000)
+    assert canon_direct["sga_always_sync_layers"] == ["embed", "norm"]
+    tokens = _flags_of(cfg)
+    assert tokens[tokens.index("--sga-always-sync-layers") + 1] == "embed,norm"
+    canon_ns = _canon_from_namespace(tokens)
+    assert canon_ns["sga_always_sync_layers"] == ["embed", "norm"]
+    assert canonical_flat_json(canon_direct) == canonical_flat_json(canon_ns)
+    print("ok: always-sync layers list <-> comma token canonicalize identically")
+
+
+def test_always_sync_layers_empty_is_off_on_both_routes():
+    """The yaml [] OFF spelling round-trips: the launcher emits it as the
+    single empty token (",".join([])), and BOTH that token and a
+    hand-written empty flag value canonicalize to None — identical to
+    the unset flag (the broken-join defense only refuses holes BETWEEN
+    patterns, never the whole-empty spelling)."""
+    cfg = _cfg_with_sga(dict(ENABLED, sga_always_sync_layers=[]))
+    # yaml route: the empty list itself is an OFF spelling
+    canon_direct = validate_sga_flat(
+        OmegaConf.to_container(cfg.sga, resolve=True), train_iters=5000)
+    assert canon_direct["sga_always_sync_layers"] is None
+    # launcher route: [] is emitted as the single empty token
+    tokens = _flags_of(cfg)
+    assert tokens[tokens.index("--sga-always-sync-layers") + 1] == ""
+    canon_ns = _canon_from_namespace(tokens)
+    assert canon_ns["sga_always_sync_layers"] is None
+    # a hand-written empty flag value is that same token
+    canon_cli = _canon_from_namespace(
+        _flags_of(_cfg_with_sga(dict(ENABLED)))
+        + ["--sga-always-sync-layers", ""])
+    assert canon_cli["sga_always_sync_layers"] is None
+    # all three spellings are identical to the unset flag
+    unset = _canon_from_namespace(_flags_of(_cfg_with_sga(dict(ENABLED))))
+    assert canonical_flat_json(canon_direct) == canonical_flat_json(unset)
+    assert canonical_flat_json(canon_ns) == canonical_flat_json(unset)
+    assert canonical_flat_json(canon_cli) == canonical_flat_json(unset)
+    print("ok: empty list / empty token <-> off equivalence on both routes")
 
 
 if __name__ == "__main__":

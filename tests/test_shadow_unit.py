@@ -731,7 +731,40 @@ def test_shadow_activates_without_idx_materialization():
     print("PASS test_shadow_activates_without_idx_materialization")
 
 
+
+
+def test_shadow_always_sync_inherits_eligible_interception():
+    """The shadow boundary rides the SAME shared selection tail —
+    the forced spans land all-ones in the shadow support and the selector
+    sees only the eligible pool (no live/shadow support divergence)."""
+    from test_engine_unit import _ALWAYS, _AS_NAMES
+
+    torch.manual_seed(0)
+    chunk = _FakeChunk(n_params=len(_AS_NAMES), names=_AS_NAMES)
+    mp = _ShadowCapableMPOpt(chunk)
+    selection = build_selection("topk", dict(_ALWAYS["selection_params"]))
+    opt = build_optimizer("adamw", {}, emit_score="abs_g")
+    eng = SGAEngine({"cycle": {"start_iter": 0, "period": 1},
+                     "shadow": True, "shadow_score": True,
+                     "always_sync": _ALWAYS["always_sync"]},
+                    "abs_g", selection, opt, _ALWAYS["backend"])
+    eng._dp_cp_group = lambda: None
+    eng.attach(chunk)
+    gen = torch.Generator().manual_seed(5)
+    with _ReplicaWorld(world=1):
+        _push_grads(chunk, gen)
+        chunk.finish_grad_sync(force_all_reduce=False)
+        ok, _, _ = eng.optimizer_step(mp, [chunk], 1)  # period=1: boundary
+        assert ok is True
+    mask = eng._bucket_states[0].active_mask_u8
+    n_per = chunk.params[0].numel()
+    assert mask[:n_per].min() == 1 and mask[2 * n_per:].min() == 1
+    assert int(mask[n_per:2 * n_per].sum()) == max(1, int(round(n_per * 0.30)))
+    print("PASS test_shadow_always_sync_inherits_eligible_interception")
+
+
 def main():
+    test_shadow_always_sync_inherits_eligible_interception()
     test_shadow_replicates_stock_call_sequence()
     test_shadow_numerics_equal_stock_loop()
     test_shadow_found_inf_full_clear_and_skip()

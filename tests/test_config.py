@@ -4,8 +4,9 @@
 The yaml ``sga:`` section speaks the SAME flat vocabulary as the --sga-*
 flags (underscores instead of hyphens); validation lives in
 sga/config/validation.py. These tests pin the section contract: disabled
-semantics, axis requirements, engine sections (cycle/checks/trace),
-percent resolution, combination rejection and the flag emission shape.
+semantics, axis requirements, engine sections
+(cycle/checks/always_sync/trace), percent resolution, combination
+rejection and the flag emission shape.
 """
 
 import os
@@ -390,6 +391,21 @@ def _run_all():
         if name.startswith("test_") and callable(fn):
             fn()
     print("ALL CONFIG TESTS PASSED")
+
+
+
+
+def test_list_kind_flag_emits_comma_token():
+    """A list-valued sga key rides the command line as ONE comma-joined
+    token (megatron list style) — the shape the str-typed flag parses."""
+    cfg, _ = make_base()
+    _enable_standard(cfg)
+    cfg.sga.sga_always_sync_layers = ["embed", "norm"]
+    args = _get_args_megatron(cfg)
+    flags = {args[i]: args[i + 1] for i in range(len(args) - 1)
+             if args[i].startswith("--sga-")}
+    assert flags["--sga-always-sync-layers"] == "embed,norm", flags
+    print("ok: list-valued sga key emits one comma-joined token")
 
 
 if __name__ == "__main__":

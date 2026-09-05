@@ -34,8 +34,9 @@ Conventions (single-sourced here, consumed by introspection):
   - ``sga_selection_adaptive_warmup_syncs`` additionally accepts the
     explicit ``null`` spelling (``sga_int_or_null``): "null" disables
     the warmup gate, which is distinct from the default 5.
-  - ``sga_trace_branch_points`` rides as one comma-joined token
-    (megatron list style); ``sga_cycle_start_iter_percent`` is resolved
+  - ``sga_trace_branch_points`` and ``sga_always_sync_layers`` ride as
+    one comma-joined token (megatron list style; yaml may also give a
+    string list); ``sga_cycle_start_iter_percent`` is resolved
     against ``train_iters`` during validation.
 
 Axis-identity flags (``--sga-score``/``--sga-selection``/...) take
@@ -108,6 +109,20 @@ def _add_sga_core_args(parser: argparse.ArgumentParser):
         help="false strips even the read-only boundary scoring from a "
              "shadow run (the pure stock-replication probe); only "
              "meaningful with --sga-shadow true.")
+    group.add_argument(
+        "--sga-always-sync-layers", type=str, default=None,
+        help="substring patterns of parameter names whose gradients are "
+             "always fully communicated (the per-parameter dense axis; "
+             "complements the per-step cycle): matched params never "
+             "compete in the topk — their coordinates leave the ratio "
+             "denominator too — and are force-included in every support, "
+             "so they are communicated and cleared each sparse step, "
+             "never accumulate residual, and get the standard update "
+             "every step. One comma-joined token (megatron list style) or "
+             "a yaml string list; unset = plain sparse selection over "
+             "all coordinates. Pipeline parallelism > 1 is refused while "
+             "this flag is set (v1): matching is per-rank over the "
+             "attached stage's params.")
 
 
 def _add_sga_cycle_args(parser: argparse.ArgumentParser):

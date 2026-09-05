@@ -76,6 +76,9 @@ sga:
   sga_backend: torch_pipelined_index
   sga_backend_high_priority_group: true
   sga_backend_index_slices: 3
+  # always-sync layers: params matching these substrings are
+  # force-communicated at every sparse step (commented sample; unset = off)
+  # sga_always_sync_layers: [embedding, output_layer]
 
 #### model ####
 

@@ -74,7 +74,8 @@ def declared_choices(dest: str) -> tuple:
 
 
 def engine_section_defaults(section: str) -> dict:
-    """{key: default} for one engine section (``cycle``/``checks``/``trace``,
+    """{key: default} for one engine section
+    (``cycle``/``checks``/``always_sync``/``trace``,
     prefix stripped) — the fallback single source for engine-side reads."""
     prefix = f"sga_{section}_"
     # cycle picks up the vestigial start_iter_percent key (None default):
@@ -138,9 +139,9 @@ def _coerce(dest: str, val):
             raise ValueError(f"{dest} must be a finite float (got {val!r})")
         return fval
     if isinstance(val, (list, tuple)):
-        # the yaml spelling of the one list-kind flag (branch_points
-        # rides the command line as a comma token; yaml may give a list)
-        if dest == "sga_trace_branch_points":
+        # the yaml spelling of the list-kind flags (they ride the command
+        # line as one comma token; yaml may give a list)
+        if dest in ("sga_trace_branch_points", "sga_always_sync_layers"):
             return list(val)
         raise ValueError(f"{dest} must be a string (got {val!r})")
     if not isinstance(val, str):
@@ -199,6 +200,51 @@ def collect_sga_flat(args) -> dict:
 def canonical_flat_json(canonical: dict) -> str:
     """Canonical (sorted-key) serialization of a validated flat dict."""
     return json.dumps(canonical, sort_keys=True)
+
+
+def parse_layer_patterns(raw):
+    """Always-sync layer patterns -> sorted, deduped list of non-empty
+    strings (None passes through as the unset spelling — and a
+    whitespace-only token is that spelling too: the launcher renders a
+    yaml ``[]`` as the single empty token, and an empty list must stay
+    OFF, the natural merge spelling for clearing an inherited list).
+
+    Accepts the two legal spellings: one comma-joined token (the CLI
+    form; the launcher emits the same shape from a yaml list) or a list
+    of strings. Empty or whitespace-only ELEMENTS are refused — a typo'd
+    join ("a,,b") would match nothing and the knob would die silently
+    (the attach-time zero-match guard is the second line of defense).
+    The literal token ``null`` is refused as well: the launcher's
+    explicit-null spelling must not become a pattern that matches a
+    parameter name (the branch-points flag sets the same precedent).
+    The canonical form is sorted — matching is a union, so a reordered
+    list is the same config (resume-safe, like parse_branch_points).
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str) and not raw.strip():
+        return None
+    if isinstance(raw, str):
+        items = raw.split(",")
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        raise ValueError(
+            f"must be a comma-joined string or a list of strings "
+            f"(got {raw!r})")
+    out = set()
+    for item in items:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(
+                f"patterns must be non-empty strings (got {item!r})")
+        pat = item.strip()
+        if pat == "null":
+            raise ValueError(
+                "an explicit null is NOT the unset spelling here (the "
+                "null token would match a parameter name literally); "
+                "leave the flag unset instead")
+        out.add(pat)
+    return sorted(out) or None
 
 
 def validate_sga_flat(flat: dict, train_iters=None):
@@ -310,6 +356,15 @@ def validate_sga_flat(flat: dict, train_iters=None):
             "sga_shadow_score is set but sga_shadow is not true; it only "
             "modifies shadow runs")
 
+    # --- always-sync layer patterns (the per-parameter dense axis) ---
+    always_sync_layers = None
+    if "sga_always_sync_layers" in typed:
+        try:
+            always_sync_layers = parse_layer_patterns(
+                typed["sga_always_sync_layers"])
+        except ValueError as e:
+            raise ValueError(f"sga_always_sync_layers: {e}") from None
+
     # --- plugin names must be registered (plain value checks: the
     # registries own the name lists, nothing here restates them) ---
     from sga.plugins import (
@@ -377,6 +432,7 @@ def validate_sga_flat(flat: dict, train_iters=None):
     canonical["sga_enabled"] = True
     canonical.pop("sga_cycle_start_iter_percent", None)  # resolved away
     canonical["sga_cycle_start_iter"] = start_iter
+    canonical["sga_always_sync_layers"] = always_sync_layers
     if trace_present:
         canonical["sga_trace_branch_points"] = branch_points
     return canonical

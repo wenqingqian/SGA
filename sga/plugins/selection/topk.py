@@ -2,7 +2,10 @@
 """Topk selection — the selection axis' single registration subject.
 
 Strict-ratio global topk over the optimizer-materialized score magnitudes:
-``k = max(1, round(n_total * ratio%))``. The selection ALGORITHM is the
+``k = max(1, round(n_total * ratio%))``. Under ``sga_always_sync_layers``
+the pool is the engine-filtered eligible subset — forced params never
+compete, and ``n_total`` (like every ratio statistic) is the eligible
+count (see ``SelectionContext``). The selection ALGORITHM is the
 ``method`` parameter, dispatched to a per-method impl file:
 
 - ``method: histogram`` (+ ``histogram_mode: exact|balanced|fast``):

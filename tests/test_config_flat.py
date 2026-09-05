@@ -111,6 +111,7 @@ def test_inv2_engine_defaults_equal_declarations():
     }
     assert engine_mod._CYCLE_DEFAULTS == engine_section_defaults("cycle")
     assert engine_mod._CHECKS_DEFAULTS == engine_section_defaults("checks")
+    assert engine_mod._ALWAYS_DEFAULTS == engine_section_defaults("always_sync")
     assert engine_mod._TOP_DEFAULTS == {
         "shadow": sga_defaults()["sga_shadow"],
         "shadow_score": sga_defaults()["sga_shadow_score"],
@@ -131,7 +132,7 @@ def test_inv2_validation_materializes_every_section_key():
         "sga_selection_method": "exact", "sga_selection_ratio_percent": 5.0,
         "sga_optimizer": "adamw", "sga_backend": "torch_pipelined_index"})
     eng = materialize_engine_config(canon)
-    for section in ("cycle", "checks", "trace"):
+    for section in ("cycle", "checks", "always_sync", "trace"):
         declared = engine_section_defaults(section)
         prefix = f"sga_{section}_"
         for key in declared:
@@ -142,6 +143,8 @@ def test_inv2_validation_materializes_every_section_key():
                                  "decouple_full_sync_interval_and_period",
                                  "full_sync_interval"}
     assert set(eng["checks"]) == {"count_guard"}
+    assert set(eng["always_sync"]) == {"layers"}
+    assert eng["always_sync"]["layers"] is None
     print("ok: validation materializes every declared section key")
 
 
@@ -200,7 +203,7 @@ def test_inv4_every_knob_documented_and_typed():
             "sga_score", "sga_selection_method", "sga_selection_ratio_percent",
             "sga_backend", "sga_trace_dir",
             "sga_trace_branch_points", "sga_cycle_start_iter_percent",
-            "sga_cycle_full_sync_interval"), dest
+            "sga_cycle_full_sync_interval", "sga_always_sync_layers"), dest
         assert _param_kind(dest) in ("bool", "int", "int_or_null",
                                      "float", "str"), dest
     print("ok: every knob has help, explicit default and known kind")
@@ -219,6 +222,7 @@ def test_inv4_historical_surface_pinned():
         "sga_cycle_decouple_full_sync_interval_and_period": (False, "bool", ()),
         "sga_cycle_full_sync_interval": (None, "int", ()),
         "sga_checks_count_guard": (True, "bool", ()),
+        "sga_always_sync_layers": (None, "str", ()),
         "sga_trace_dir": (None, "str", ()),
         "sga_trace_branch_points": (None, "str", ()),
         "sga_trace_window": (100, "int", ()),
@@ -244,7 +248,7 @@ def test_inv4_historical_surface_pinned():
         assert actions[dest].default == default, dest
         assert _param_kind(dest) == kind, dest
         assert tuple(getattr(actions[dest], "choices", None) or ()) == choices, dest
-    print("ok: 27-row golden pin holds")
+    print(f"ok: {len(pin)}-row golden pin holds")
 
 
 def test_inv4_score_choices_synced_with_registry():
@@ -390,6 +394,41 @@ def test_inv5_plugin_vocabularies_are_plugin_owned():
             "sga_backend_mask_slices": 3}
     assert validate_sga_flat(base)["sga_backend_mask_slices"] == 3
     print("ok: plugin vocabularies are plugin-owned (build-time)")
+
+
+def test_always_sync_layers_parser_edge_table():
+    """Direct pin of parse_layer_patterns' documented edge cases (the
+    cheapest defense layer of the always-sync knob): broken joins and
+    whitespace-only elements refuse, non-string shapes refuse, the
+    canonical form strips/dedupes/SORTS (order-insensitive, resume-safe),
+    the unset spellings pass through as None, the launcher's null token
+    refuses, and validation names the key on every refusal."""
+    parse = V.parse_layer_patterns
+    assert parse(None) is None
+    assert parse("") is None            # hand-written empty CLI value
+    assert parse("   ") is None         # the launcher's yaml-[] token
+    assert parse([]) is None            # the yaml OFF spelling itself
+    assert parse(("a", "b")) == ["a", "b"]   # tuple input accepted
+    assert parse("b, a ,a") == ["a", "b"]    # strip + dedupe + sorted
+    for bad in ("a,,b", "a, ,b", ["a", 1], [1, 2], 5, "null", ["null"]):
+        try:
+            parse(bad)
+            raise AssertionError(f"parse_layer_patterns accepted {bad!r}")
+        except ValueError:
+            pass
+    # the flat validator prefixes every parser refusal with the key name
+    base = {"sga_enabled": True, "sga_score": "update",
+            "sga_selection_method": "exact",
+            "sga_selection_ratio_percent": 5.0,
+            "sga_optimizer": "adamw",
+            "sga_backend": "torch_pipelined_index",
+            "sga_always_sync_layers": "a,,b"}
+    expect_error(lambda: validate_sga_flat(base),
+                 "sga_always_sync_layers: patterns must be non-empty")
+    expect_error(lambda: validate_sga_flat(
+        {**base, "sga_always_sync_layers": "null"}),
+        "sga_always_sync_layers: an explicit null is NOT the unset spelling")
+    print("ok: always-sync pattern parser edge table holds")
 
 
 def _run_all():

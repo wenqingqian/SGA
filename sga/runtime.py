@@ -168,6 +168,7 @@ def materialize_engine_config(canonical: dict) -> dict:
             "full_sync_interval": canonical["sga_cycle_full_sync_interval"],
         },
         "checks": {"count_guard": canonical["sga_checks_count_guard"]},
+        "always_sync": {"layers": canonical["sga_always_sync_layers"]},
         "shadow": canonical["sga_shadow"],
         "shadow_score": canonical["sga_shadow_score"],
         "score": _axis("score"),
@@ -224,6 +225,20 @@ def build_engine(flat: dict, api_version: int):
             "(the waist must key off sga_enabled)"
         )
     engine_config = materialize_engine_config(canonical)
+
+    # The always-sync patterns are matched PER RANK against the attached
+    # stage's params only: under pp > 1 the endpoint and middle ranks see
+    # different param sets, so the per-rank attach guards cannot be
+    # world-honest — v1 pins pp == 1 for this axis (the engine-side
+    # guards stay correct under that pin).
+    if (canonical.get("sga_always_sync_layers") is not None
+            and getattr(args, "pipeline_model_parallel_size", 1) > 1):
+        raise ValueError(
+            "sga_always_sync_layers: always-sync layer matching is "
+            "per-rank over the attached stage's params (with pipeline "
+            "parallelism > 1 the endpoint and middle ranks see different "
+            "param sets); v1 pins pipeline_model_parallel_size == 1 — "
+            "drop the flag or run with pp == 1")
 
     _assert_args_compatible()
 

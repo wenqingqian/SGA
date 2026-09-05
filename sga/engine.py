@@ -73,6 +73,7 @@ class SGAEngineError(RuntimeError):
 # these, never a restated literal; sga/config/arguments.py).
 _CYCLE_DEFAULTS = engine_section_defaults("cycle")
 _CHECKS_DEFAULTS = engine_section_defaults("checks")
+_ALWAYS_DEFAULTS = engine_section_defaults("always_sync")
 _TOP_DEFAULTS = {"shadow": sga_defaults()["sga_shadow"],
                  "shadow_score": sga_defaults()["sga_shadow_score"]}
 
@@ -97,7 +98,14 @@ class BucketState:
 
 
 class SelectionContext:
-    """What a selection sees at a reselection boundary (CPU-testable shape)."""
+    """What a selection sees at a reselection boundary (CPU-testable shape).
+
+    ``grad_views`` is the ELIGIBLE pool: when always-sync layers are
+    active the engine excludes the forced params from the views, so
+    ``k`` and every ratio statistic (the adaptive controller's
+    achieved-ratio included) are computed over the competing coordinates
+    only. A selector must not assume full-model coverage of the views.
+    """
 
     def __init__(self, grad_views, comm_group, warmup_target=None):
         self.grad_views = grad_views
@@ -238,6 +246,14 @@ class SGAEngine:
         # re-checks re-verify identical numbers.
         self._count_guard = bool(config.get("checks", {}).get(
             "count_guard", _CHECKS_DEFAULTS["count_guard"]))
+        # Always-sync layers (the per-parameter dense axis): None = off.
+        # Resolved against attached param names at attach
+        # (_always_sync_attach_check); the forced ids drive the selection
+        # interception in _run_selection.
+        always_cfg = config.get("always_sync", None) or {}
+        layers = always_cfg.get("layers", _ALWAYS_DEFAULTS["layers"])
+        self._always_sync_layers = list(layers) if layers else None
+        self._forced_param_ids = set()
         # Trace collector: None unless sga.trace.dir is set — the dump slot
         # below then costs one None-check per step (zero-overhead-when-off).
         trace_cfg = config.get("trace", None)
@@ -303,6 +319,7 @@ class SGAEngine:
                 self._bucket_states.append(bs)
 
         self._selection_meta = None  # rebuilt after a new chunk attaches
+        self._always_sync_attach_check()
         self.opt.ensure_state(self._bucket_states)
         # The comm groups just became known (DDP bucket construction is a
         # world-collective, so attach runs symmetrically on every rank):
@@ -643,6 +660,83 @@ class SGAEngine:
                     "dense trajectories and breaks the shadow invariant"
                 )
 
+    def _always_sync_attach_check(self):
+        """Resolve the always-sync patterns against every attached param
+        name — at attach (model build), so a typo'd pattern dies here,
+        not at the first reselection. Two-tier zero-match policy: the
+        whole list matching nothing is refused (a silently-dead knob is
+        worse than a loud refusal — this tier is also what catches a
+        broken comma join), while a single unmatched pattern only WARNs
+        (fallback spellings across model variants legitimately hit a
+        subset). Matching EVERY parameter is refused too: the topk
+        competition pool would be empty (``k_for(0)`` degenerates to
+        selecting one coordinate out of nothing). The cumulative rescan
+        across attaches keeps the ``n_eligible == 0`` tier honest; the
+        whole-list ZERO-MATCH tier is exact only under the pinned
+        one-chunk-per-rank topology (vpp > 1 is refused at build time,
+        and pp > 1 refuses the feature outright in build_engine)."""
+        if self._always_sync_layers is None:
+            return
+        patterns = self._always_sync_layers
+        matched_patterns = set()
+        matched_names = []
+        n_forced = 0
+        n_total = 0
+        for bs in self._bucket_states:
+            for (param, start, end), name in zip(bs.param_spans,
+                                                 bs.param_names):
+                n_total += end - start
+                # every matching pattern counts as matched (overlapping
+                # patterns are a union — the param is forced once)
+                hits = [p for p in patterns if p in name]
+                if hits:
+                    matched_patterns.update(hits)
+                    matched_names.append(name)
+                    n_forced += end - start
+                    self._forced_param_ids.add(id(param))
+        if not matched_names:
+            sample = ", ".join(name for bs in self._bucket_states[:2]
+                               for name in bs.param_names[:4])
+            raise ValueError(
+                f"sga_always_sync_layers: none of the patterns {patterns} "
+                "matches any parameter name (attached names include "
+                f"{sample or '(none)'}); refusing a silently-dead knob — "
+                "fix the patterns")
+        n_eligible = n_total - n_forced
+        if n_eligible == 0:
+            raise ValueError(
+                "sga_always_sync_layers matches EVERY parameter — the "
+                "topk competition pool is empty; drop patterns or run "
+                "dense training")
+        if self._rank == 0:
+            for p in patterns:
+                if p not in matched_patterns:
+                    print(f"[SGA] WARN sga_always_sync_layers pattern "
+                          f"{p!r} matches no parameter name (kept: "
+                          "fallback spellings across model variants may "
+                          "hit a subset)", flush=True)
+            k_for = getattr(self.selection, "k_for", None)
+            k = k_for(n_eligible) if callable(k_for) else None
+            shown = ", ".join(matched_names[:8])
+            more = (f" (+{len(matched_names) - 8} more)"
+                    if len(matched_names) > 8 else "")
+            eff = ((k + n_forced) / n_total if k is not None
+                   else n_forced / n_total)
+            k_txt = f"topk k≈{k}, " if k is not None else ""
+            print(f"[SGA] always-sync layers: patterns {patterns} matched "
+                  f"{len(matched_names)} params ({shown}{more}); forced "
+                  f"{n_forced}/{n_total} coords; {k_txt}effective "
+                  f"communicated ratio ≈ {eff:.1%}", flush=True)
+
+    def _forced_flags(self, meta):
+        """Always-sync membership per selection-meta entry (only called
+        with the feature ON — _run_selection branches the off path away;
+        once per reselection, not per step)."""
+        if self._always_sync_layers is None:
+            return [False] * len(meta)
+        forced = self._forced_param_ids
+        return [id(m[3]) in forced for m in meta]
+
     def _run_selection(self, views, meta) -> "Support":
         """Shared selection tail for both reselection call sites: warmup
         probe → context → select → bucket assembly → consistency verify →
@@ -650,16 +744,49 @@ class SGAEngine:
         everything around it: live activates only after the optimizer's selective
         reset has consumed the old support (step 7), shadow activates
         immediately inside the RNG bracket — those orderings are load-bearing
-        and deliberately stay at the call sites."""
+        and deliberately stay at the call sites.
+
+        With always-sync layers active the selection sees ONLY the
+        eligible (unforced) views — ``k`` and every ratio statistic are
+        computed over the competing pool by construction — and the
+        forced params' all-ones masks are spliced back in before bucket
+        assembly, so both support forms (the mask and the idx derived
+        from it) inherit the forced spans."""
+        # Feature-off fast path: no _forced_flags allocation, the original
+        # views/masks objects pass through untouched.
+        forced = (self._forced_flags(meta)
+                  if self._always_sync_layers is not None else None)
+        has_forced = any(forced) if forced else False
+        sel_views = ([v for v, f in zip(views, forced) if not f]
+                     if has_forced else views)
         warmup_hook = getattr(self.selection, "warmup_sync_target", None)
         sel_ctx = SelectionContext(
-            grad_views=views,
+            grad_views=sel_views,
             comm_group=self._dp_cp_group(),
             warmup_target=(warmup_hook(self._cycle.start_iter,
                                        self._cycle.period)
                            if callable(warmup_hook) else None),
         )
-        masks = self.selection.select(sel_ctx)
+        sel_masks = self.selection.select(sel_ctx)
+        if has_forced:
+            if len(sel_masks) != len(sel_views):
+                name = getattr(getattr(self.selection, "decl", None),
+                               "name", type(self.selection).__name__)
+                raise SGAEngineError(
+                    f"selection plugin '{name}' returned {len(sel_masks)} "
+                    f"masks for {len(sel_views)} eligible views — the "
+                    "per-param splice would misalign; a selector must "
+                    "return exactly one mask per view")
+            masks = []
+            picked = iter(sel_masks)
+            for f, (_, start, end, _), view in zip(forced, meta, views):
+                if f:
+                    masks.append(torch.ones(end - start, dtype=torch.uint8,
+                                            device=view.device))
+                else:
+                    masks.append(next(picked))
+        else:
+            masks = sel_masks
         bucket_masks = self._assemble_bucket_masks(masks, meta)
         self._verify_support_consistency(bucket_masks)
         return Support([

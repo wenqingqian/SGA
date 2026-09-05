@@ -580,7 +580,7 @@ class _FakeGroup:
 
 
 class _FakeChunk:
-    def __init__(self, n_params=2, numel_per=64):
+    def __init__(self, n_params=2, numel_per=64, names=None):
         self.params = [torch.nn.Parameter(torch.randn(4, 16)) for _ in range(n_params)]
         spans, off = {}, 0
         for p in self.params:
@@ -592,8 +592,11 @@ class _FakeChunk:
         self.expert_parallel_bucket_groups = []
         self.buffers = [SimpleNamespace(buckets=[self.bucket], extra_main_grads=[])]
         self.expert_parallel_buffers = []
+        if names is None:
+            names = [f"p{i}" for i in range(n_params)]
+        assert len(names) == n_params
         self.module = SimpleNamespace(
-            named_parameters=lambda: [(f"p{i}", p) for i, p in enumerate(self.params)]
+            named_parameters=lambda: list(zip(names, self.params))
         )
         self.ddp_config = SimpleNamespace(average_in_collective=False)
         self.params_with_grad = list(self.params)
@@ -662,8 +665,10 @@ def _build_engine(combo):
     selection = build_selection(combo["selection"], dict(combo["selection_params"]))
     opt = build_optimizer(combo["opt"], dict(combo["opt_params"]),
                           emit_score=combo["score"])
-    eng = SGAEngine({"cycle": combo["cycle"]}, combo["score"], selection, opt,
-                    combo["backend"])
+    cfg = {"cycle": combo["cycle"]}
+    if "always_sync" in combo:
+        cfg["always_sync"] = combo["always_sync"]
+    eng = SGAEngine(cfg, combo["score"], selection, opt, combo["backend"])
     eng._dp_cp_group = lambda: None  # single-process: skip cross-rank layers
     return eng
 
@@ -1283,6 +1288,282 @@ def test_dual_checksum_catches_position_sum_collision():
     # Control: identical replicas pass cleanly.
     with _MutatingAllReduce(mutate=lambda t: None):
         eng._verify_support_consistency([B])
+
+
+# ------------------------------------------------- always-sync layers
+
+# Layer-like names so substring matching is exercised on realistic
+# spellings; params 0 and 2 are the forced ones.
+_AS_NAMES = ["module.embedding.word_embeddings.weight",
+             "module.decoder.layers.0.input_layernorm.weight",
+             "module.output_layer.weight"]
+_AS_PATTERNS = ["embedding", "output_layer"]
+
+_ALWAYS = {
+    "score": "update",
+    "selection": "topk",
+    "selection_params": {"method": "histogram", "ratio_percent": 30.0},
+    "opt": "adamw",
+    "opt_params": {"residual_mean": False},
+    "cycle": {"start_iter": 0, "period": 3},
+    "backend": TorchPipelinedMaskBackend({"mask_slices": 2}),
+    "always_sync": {"layers": list(_AS_PATTERNS)},
+}
+
+
+def _as_flow(combo, steps, **chunk_kw):
+    chunk = _FakeChunk(n_params=len(_AS_NAMES), names=_AS_NAMES, **chunk_kw)
+    mp = _FakeMPOpt(chunk)
+    eng = _build_engine(combo)
+    eng.attach(chunk)
+    with _ReplicaWorld(world=1):
+        for step in range(1, steps + 1):
+            _accumulate_into_bucket(chunk)
+            assert eng.grad_sync(chunk, force_all_reduce=False) is True
+            ok, _, _ = eng.optimizer_step(mp, [chunk], step)
+            assert ok is True
+    return eng, chunk
+
+
+def test_always_sync_attach_two_tier_zero_match():
+    """The whole list matching nothing is a loud attach-time
+    refusal; a single unmatched pattern only warns (the list still has a
+    hit); matching EVERY parameter refuses the empty competition pool."""
+    def _attach_with(layers, names=_AS_NAMES):
+        chunk = _FakeChunk(n_params=len(names), names=names)
+        combo = dict(_ALWAYS, always_sync={"layers": layers})
+        eng = _build_engine(combo)
+        eng.attach(chunk)
+        return eng, chunk
+
+    try:
+        _attach_with(["nonexistent_substring"])
+    except ValueError as e:
+        assert "always_sync" in str(e) and "matches any parameter" in str(e), e
+    else:
+        raise AssertionError("whole-list zero match accepted")
+
+    try:
+        _attach_with(["embedding", "layernorm", "output_layer"])
+    except ValueError as e:
+        assert "EVERY parameter" in str(e), e
+    else:
+        raise AssertionError("all-params-matched accepted (empty pool)")
+
+    # Single-pattern zero match is tolerated: the list still has hits.
+    eng, chunk = _attach_with(["embedding", "zzz_nothing", "output_layer"])
+    assert len(eng._forced_param_ids) == 2  # p0 + p2 forced, p1 eligible
+
+
+def test_always_sync_support_forced_spans_and_k_denominator():
+    """Forced params land all-ones in every support; the topk
+    ratio keeps its strict semantics over the ELIGIBLE pool only —
+    k = round(n_eligible * ratio), not round(n_total * ratio)."""
+    eng, chunk = _as_flow(_ALWAYS, steps=4)
+    mask = eng._bucket_states[0].active_mask_u8
+    n_per = chunk.params[0].numel()
+    forced = torch.cat([mask[:n_per], mask[2 * n_per:]])
+    eligible = mask[n_per:2 * n_per]
+    assert forced.min() == 1  # every forced coordinate selected, always
+    k_expected = max(1, int(round(n_per * 0.30)))  # 30% of 64 == 19
+    assert int(eligible.sum()) == k_expected, int(eligible.sum())
+    assert 0 < k_expected < int(round(3 * n_per * 0.30))  # denominator excluded
+    # the effective communicated set is k + n_forced
+    assert eng._active_support.total_selected == k_expected + 2 * n_per
+
+
+def test_always_sync_selection_sees_eligible_pool_only():
+    """The SelectionContext handed to the selector carries ONLY
+    the eligible views (k and every ratio statistic — the adaptive
+    controller's achieved-ratio included — are computed over the
+    competing pool by construction)."""
+    class _Recorder:
+        def __init__(self, inner):
+            self.inner = inner
+            self.seen_numel = []
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+        def select(self, ctx):
+            self.seen_numel.append(sum(v.numel() for v in ctx.grad_views))
+            return self.inner.select(ctx)
+
+    for method in ("histogram", "exact", "adaptive"):
+        params = {"method": method, "ratio_percent": 30.0}
+        if method == "adaptive":
+            params["adaptive_warmup_syncs"] = None  # controller from step 1
+        combo = dict(_ALWAYS, selection_params=params)
+        chunk = _FakeChunk(n_params=len(_AS_NAMES), names=_AS_NAMES)
+        mp = _FakeMPOpt(chunk)
+        eng = _build_engine(combo)
+        rec = _Recorder(eng.selection)
+        eng.selection = rec
+        eng.attach(chunk)
+        with _ReplicaWorld(world=1):
+            for step in range(1, 5):
+                _accumulate_into_bucket(chunk)
+                eng.grad_sync(chunk, force_all_reduce=False)
+                eng.optimizer_step(mp, [chunk], step)
+        n_per = chunk.params[0].numel()
+        assert rec.seen_numel and all(n == n_per for n in rec.seen_numel), \
+            (method, rec.seen_numel)
+
+
+def test_always_sync_sparse_step_clears_forced_no_residual():
+    """After a sparse step the forced spans are zero
+    (communicated AND cleared every step — they never accumulate
+    residual), while the eligible param keeps its unselected residual."""
+    eng, chunk = _as_flow(_ALWAYS, steps=4)  # step 4 is sparse
+    n_per = chunk.params[0].numel()
+    buf = chunk.bucket.grad_data
+    assert torch.equal(buf[:n_per], torch.zeros(n_per))          # forced p0
+    assert torch.equal(buf[2 * n_per:], torch.zeros(n_per))      # forced p2
+    eligible = buf[n_per:2 * n_per]
+    mask = eng._bucket_states[0].active_mask_u8[n_per:2 * n_per]
+    assert torch.equal(eligible[mask > 0], torch.zeros(int(mask.sum())))
+    assert float(eligible[mask == 0].abs().sum()) > 0.0  # residual survives
+
+
+def test_always_sync_compact_emission_flow():
+    """The compact/idx backend inherits the forced
+    spans through the same mask (idx is derived from it) — forced
+    coordinates ride the pack every sparse step."""
+    combo = dict(_ALWAYS, backend=TorchPipelinedIndexBackend({}))
+    eng, chunk = _as_flow(combo, steps=4)
+    n_per = chunk.params[0].numel()
+    buf = chunk.bucket.grad_data
+    assert torch.equal(buf[:n_per], torch.zeros(n_per))          # pack zeroed
+    idx = eng._active_support.buckets[0].idx
+    assert torch.equal(idx[:n_per], torch.arange(n_per))         # p0 forced in
+    assert torch.equal(idx[-n_per:], torch.arange(2 * n_per, 3 * n_per))
+    k_expected = max(1, int(round(n_per * 0.30)))
+    assert idx.numel() == 2 * n_per + k_expected
+
+
+def test_always_sync_default_off_matches_plain_engine():
+    """Unset AND explicit-None spellings leave the engine on the
+    plain path — support masks bitwise identical to a config that never
+    mentioned the axis."""
+    torch.manual_seed(7)
+    plain_eng, plain_chunk = _as_flow(
+        dict(_ALWAYS, always_sync=None), steps=4)
+    torch.manual_seed(7)
+    off_eng, off_chunk = _as_flow(
+        {k: v for k, v in _ALWAYS.items() if k != "always_sync"}, steps=4)
+    torch.manual_seed(7)
+    named_eng, named_chunk = _as_flow(_ALWAYS, steps=4)  # control: differs
+    assert torch.equal(plain_eng._bucket_states[0].active_mask_u8,
+                       off_eng._bucket_states[0].active_mask_u8)
+    assert not torch.equal(plain_eng._bucket_states[0].active_mask_u8,
+                           named_eng._bucket_states[0].active_mask_u8)
+
+
+def test_always_sync_flow_across_two_reselections():
+    """The forced-span splice is per-reselection state: after the second
+    boundary the NEW support again carries the forced spans all-ones and
+    a freshly selected eligible topk (a one-shot splice or a stale
+    support would show up as an unforced or unchanged second cycle)."""
+    chunk = _FakeChunk(n_params=len(_AS_NAMES), names=_AS_NAMES)
+    mp = _FakeMPOpt(chunk)
+    eng = _build_engine(_ALWAYS)
+    eng.attach(chunk)
+    masks = {}
+    with _ReplicaWorld(world=1):
+        # _ALWAYS cycle (period 3): reselections at 3 and 6; step 5 rides
+        # the first support, step 7 the second
+        for step in range(1, 8):
+            _accumulate_into_bucket(chunk)
+            assert eng.grad_sync(chunk, force_all_reduce=False) is True
+            assert eng.optimizer_step(mp, [chunk], step)[0] is True
+            if step in (5, 7):
+                masks[step] = eng._bucket_states[0].active_mask_u8.clone()
+    n_per = chunk.params[0].numel()
+    k_expected = max(1, int(round(n_per * 0.30)))
+    for mask in masks.values():
+        forced = torch.cat([mask[:n_per], mask[2 * n_per:]])
+        eligible = mask[n_per:2 * n_per]
+        assert int(forced.min()) == 1 and int(forced.max()) == 1
+        assert int(eligible.sum()) == k_expected
+    # the second reselection genuinely re-selected from fresh scores
+    assert not torch.equal(masks[5], masks[7])
+
+
+def test_always_sync_sparse_step_residual_mean_clears_forced():
+    """With residual_mean=on the pre-boundary
+    grad-correct fold must leave the forced spans EXACTLY zero (they
+    were communicated this very step — folding them by the window would
+    double-discount coords that never accumulated residual), while the
+    eligible uncommunicated residual folds by exactly the fold window
+    (4, a power of two — the comparison stays bitwise)."""
+    combo = dict(_ALWAYS, cycle={"start_iter": 0, "period": 4},
+                 opt_params={"residual_mean": True})
+    chunk = _FakeChunk(n_params=len(_AS_NAMES), names=_AS_NAMES)
+    mp = _FakeMPOpt(chunk)
+    eng = _build_engine(combo)
+    eng.attach(chunk)
+    with _ReplicaWorld(world=1):
+        # steps 1-3 bootstrap dense; 4 boundary (first support); 5-6
+        # sparse; 7 sparse AND pre-boundary (8 is the next boundary) —
+        # this step's grad-correct pass carries the fold
+        for step in range(1, 7):
+            _accumulate_into_bucket(chunk)
+            assert eng.grad_sync(chunk, force_all_reduce=False) is True
+            assert eng.optimizer_step(mp, [chunk], step)[0] is True
+        _accumulate_into_bucket(chunk)
+        pre = chunk.bucket.grad_data.clone()
+        assert eng.grad_sync(chunk, force_all_reduce=False) is True
+        assert eng.optimizer_step(mp, [chunk], 7)[0] is True
+    n_per = chunk.params[0].numel()
+    buf = chunk.bucket.grad_data
+    pre_forced = torch.cat([pre[:n_per], pre[2 * n_per:]])
+    assert float(pre_forced.abs().sum()) > 0.0  # the zero is not vacuous
+    assert torch.equal(buf[:n_per], torch.zeros(n_per))      # forced p0
+    assert torch.equal(buf[2 * n_per:], torch.zeros(n_per))  # forced p2
+    # eligible residual: divided by exactly the fold window (4)
+    mask = eng._bucket_states[0].active_mask_u8[n_per:2 * n_per]
+    rest = mask == 0
+    assert int(rest.sum()) > 0
+    assert torch.equal(buf[n_per:2 * n_per][rest],
+                       pre[n_per:2 * n_per][rest] / 4)
+
+
+def test_always_sync_attach_log_and_overlapping_patterns():
+    """attach is the only feedback users get about substring
+    resolution: the rank-0 summary names the matched params, the
+    forced/total split and the effective communicated ratio; a truly
+    unmatched pattern WARNs, while an OVERLAPPING pattern (a stricter
+    spelling hitting the same param) must not falsely WARN nor
+    double-count the forced coords."""
+    import io
+    from contextlib import redirect_stdout
+
+    def _attach_logged(layers):
+        chunk = _FakeChunk(n_params=len(_AS_NAMES), names=_AS_NAMES)
+        eng = _build_engine(dict(_ALWAYS, always_sync={"layers": layers}))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            eng.attach(chunk)
+        return eng, buf.getvalue()
+
+    # single-pattern zero match: exactly one WARN, summary still printed
+    eng, out = _attach_logged(["embedding", "zzz_nothing", "output_layer"])
+    assert "'zzz_nothing' matches no parameter name" in out, out
+    assert out.count("matches no parameter name") == 1, out
+    assert "matched 2 params" in out, out
+    assert "forced 128/192 coords" in out, out
+    assert "topk k≈19" in out, out
+    assert "effective communicated ratio ≈ 76.6%" in out, out
+    assert len(eng._forced_param_ids) == 2
+
+    # overlapping patterns: both spellings hit the same param — no false
+    # WARN, forced coords counted once
+    eng2, out2 = _attach_logged(
+        ["embedding", "embedding.word", "output_layer"])
+    assert "WARN" not in out2, out2
+    assert "matched 2 params" in out2, out2
+    assert "forced 128/192 coords" in out2, out2
+    assert len(eng2._forced_param_ids) == 2
+
+
 
 
 if __name__ == "__main__":

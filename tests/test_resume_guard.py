@@ -313,8 +313,47 @@ def test_nonzero_rank_never_loads():
     print("ok: RANK!=0 returns without any checkpoint load")
 
 
+
+
+def test_always_sync_layers_resume_legs():
+    """The always-sync axis rides the canonical comparison: a
+    checkpoint saved WITHOUT the key refuses a current config that sets
+    it (fail-closed), and the two legal spellings of the same value
+    (comma token on the saved side, list-typed attr on the current side)
+    compare equal."""
+    with tempfile.TemporaryDirectory() as tmp:
+        make_ckpt(tmp)  # CURRENT: no sga_always_sync_layers attr
+        current = dict(CURRENT, sga_always_sync_layers="embed,norm")
+        expect_exit(lambda: _with_rank(
+            0, lambda: _sga_resume_guard(_Args(load=tmp,
+                                               config=current))), "differs")
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = dict(CURRENT, sga_always_sync_layers="embed,norm")
+        make_ckpt(tmp, saved_config=saved)
+        current = dict(CURRENT, sga_always_sync_layers=["embed", "norm"])
+        _with_rank(0, lambda: _sga_resume_guard(_Args(load=tmp,
+                                                      config=current)))
+        # and a different pattern list still refuses
+        expect_exit(lambda: _with_rank(
+            0, lambda: _sga_resume_guard(
+                _Args(load=tmp,
+                      config=dict(CURRENT,
+                                  sga_always_sync_layers=["norm"])))),
+            "differs")
+    with tempfile.TemporaryDirectory() as tmp:
+        # whitespace spelling is the same canonical list (per-element
+        # strip is part of the parse, so "embed, norm" == ["embed", "norm"])
+        saved = dict(CURRENT, sga_always_sync_layers="embed, norm")
+        make_ckpt(tmp, saved_config=saved)
+        current = dict(CURRENT, sga_always_sync_layers="embed,norm")
+        _with_rank(0, lambda: _sga_resume_guard(
+            _Args(load=tmp, config=current)))  # must not raise
+    print("ok: always-sync resume legs (absent key refuses, spellings equal)")
+
+
 if __name__ == "__main__":
     test_model_build_chain_is_stock()
+    test_always_sync_layers_resume_legs()
     test_identical_and_spelling_variant_configs_pass()
     test_cross_spelling_sides_pass_and_train_iters_drift_refuses()
     test_differing_config_refuses()
