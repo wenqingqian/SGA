@@ -239,9 +239,10 @@ class HistogramSelect:
                 f"(expected one of {sorted(_HIST_MODES)})"
             )
         if (not isinstance(block_size, int) or isinstance(block_size, bool)
-                or block_size < 1 or block_size & (block_size - 1)):
+                or block_size < 1 or block_size > 1024
+                or block_size & (block_size - 1)):
             raise ValueError(
-                f"block_size must be a positive power of two, got "
+                f"block_size must be a power of two in [1, 1024], got "
                 f"{block_size!r}")
         if block_reduce not in ("mean", "max"):
             raise ValueError(

@@ -120,7 +120,12 @@ def block_idx_from_mask(mask_u8: torch.Tensor, spans, x: int) -> torch.Tensor:
         f"int32 block-start indices assume < 2^31 elements, "
         f"got {mask_u8.numel()}")
     outs = []
+    prev_end = 0
     for start, end in spans:
+        assert start >= prev_end, (
+            f"spans must be ascending and non-overlapping, got span "
+            f"starting at {start} after one ending at {prev_end}")
+        prev_end = end
         n = end - start
         nb, rem = divmod(n, x)
         if nb:

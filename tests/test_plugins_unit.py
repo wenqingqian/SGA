@@ -549,12 +549,13 @@ def test_histogram_block_selection():
                           "sga_selection_ratio_percent": 10.0}).block_size == 1
     assert TopkSelection({"sga_selection_method": "exact",
                           "sga_selection_ratio_percent": 10.0}).block_size == 1
-    for bad in (0, 3, True, -16):
+    for bad in (0, 3, True, -16, 2048):
         try:
             HistogramSelect("exact", block_size=bad)
             raise AssertionError(f"bad block_size accepted: {bad}")
         except ValueError:
             pass
+    HistogramSelect("exact", block_size=1024)  # config-cap boundary accepted
     try:
         HistogramSelect("exact", block_size=16, block_reduce="sum")
         raise AssertionError("bad block_reduce accepted")
@@ -1300,6 +1301,18 @@ def test_support_block_idx_from_mask():
     z = block_idx_from_mask(torch.zeros(20, dtype=torch.uint8),
                             [(0, 20)], 8)
     assert z.dtype == torch.int32 and z.numel() == 0
+
+    # non-ascending / overlapping spans are a loud precondition violation
+    # (the docstring declares ascending+disjoint; block_split's searchsorted
+    # and the scatter's last-write-wins both rely on it)
+    m26 = torch.zeros(26, dtype=torch.uint8)
+    m26[4] = m26[12] = 1
+    for bad_spans in ([(10, 26), (0, 10)], [(0, 12), (10, 26)]):
+        try:
+            block_idx_from_mask(m26, bad_spans, 4)
+            raise AssertionError(f"bad spans accepted: {bad_spans}")
+        except AssertionError as e:
+            assert "ascending and non-overlapping" in str(e)
 
     # BucketSupport wiring: lazy derive + x=1 identity + block_split +
     # the spans-required refusal
