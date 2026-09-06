@@ -13,7 +13,6 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
-from sga.config import validate_run_config
 from sga.launcher.runner_base import Runner
 from sga.logger import logger
 
@@ -91,9 +90,11 @@ def main(config: DictConfig) -> None:
 
 
 def _main(config: DictConfig) -> None:
-    """Core logic, separated from main() for error wrapping."""
-    validate_run_config(config)
+    """Core logic, separated from main() for error wrapping.
 
+    The sga: section is pre-validated inside the backend's flag assembly
+    (backend_megatron._prevalidate_sga), still fail-fast before any
+    process is spawned."""
     task_type = config.experiment.task.get("type", None)
     action = config.action
     validate_task(task_type, action)

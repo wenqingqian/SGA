@@ -22,10 +22,9 @@ way in):
     hand-written flags ----------------> megatron argparse (this file)
                                         |
                              args namespace (``sga_*`` attrs)
-                                        |
-              fork waist collects ``sga_*`` attrs -> ``build_engine``
-                                        |
-              ``sga/config/validation.py`` -> engine config (internal)
+                                                              |
+              fork waist only checks ``sga_enabled``; ``build_engine``
+    pulls the megatron namespace itself (sga/config singleton)
 
 Conventions (single-sourced here, consumed by introspection):
   - booleans use the ``sga_bool`` string type ("true"/"false", any
@@ -41,7 +40,8 @@ Conventions (single-sourced here, consumed by introspection):
 
 Axis-identity flags (``--sga-score``/``--sga-selection``/...) take
 registered plugin names; the registries are runtime data, so the value
-check happens in validation against ``sga.plugins.registered_names()``.
+check happens in validation against the registered names
+(``sga.plugins.plugin_class``).
 The one exception is ``--sga-score``, whose closed vocabulary is also
 declared as argparse ``choices`` and kept synced with the registry by
 ``test_inv4_score_choices_synced_with_registry``. "Required" below
@@ -95,9 +95,9 @@ def _add_sga_core_args(parser: argparse.ArgumentParser):
         "--sga-enabled", type=sga_bool, default=False,
         help="master switch: true turns on the SGA engine; false (or a run "
              "with no --sga-* flags at all) is dense training, "
-             "byte-identical to stock megatron. When false no other sga "
-             "flag may be set (an at-default spelling errors in the yaml "
-             "sga: section, is silently dropped on the command line).")
+             "byte-identical to stock megatron. When false every other "
+             "sga flag is silently ignored (megatron semantics: a "
+             "disabled feature's sub-args are never validated).")
     group.add_argument(
         "--sga-shadow", type=sga_bool, default=False,
         help="shadow mode: replicate the stock optimizer step literally and "
@@ -182,8 +182,8 @@ def _add_sga_trace_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--sga-trace-dir", type=str, default=None,
         help="trace output directory; setting it at all activates the "
-             "collector (rejected when --sga-enabled false — dense "
-             "replay-grade traces come from shadow runs).")
+             "collector (silently ignored when --sga-enabled false — "
+             "dense replay-grade traces come from shadow runs).")
     group.add_argument(
         "--sga-trace-branch-points", type=str, default=None,
         help="engine steps to dump full optimizer state at, as one "
@@ -258,7 +258,7 @@ def _add_sga_selection_args(parser: argparse.ArgumentParser):
              "value — the mean of |score| over the block's real length "
              "(default; tail blocks are not discriminated against) or the "
              "max (keeps spiky blocks). A dead knob under block_size 1 — "
-             "setting it there is refused.")
+             "silently ignored there (megatron dead-config semantics).")
 
 
 def _add_sga_optimizer_args(parser: argparse.ArgumentParser):

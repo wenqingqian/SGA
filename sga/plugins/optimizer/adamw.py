@@ -22,7 +22,7 @@ momentum keeps decaying) and the apply ``w -= lr * update`` ALWAYS fused
   the pack kernel already zeroed the communicated positions at grad_sync
   time, the commit reads (idx, values) via merge-join, and the fold step
   alone re-reads the residual at inactive coords.
-- Full steps (EMIT_MODE>=0, the Score enum value of the configured score):
+- Full steps (EMIT_MODE>=0, the _TRITON_SCORE_MAP id of the configured score):
   the same pass additionally materializes the score into the fp32 main grads
   (the reselection reads it from there). The grad buffer ALIASES the DDP
   bucket's fp32 grad storage (megatron: main_param.grad =
@@ -51,9 +51,8 @@ from typing import Optional
 
 import torch
 
-from sga.plugins import OptimizerDecl, expand_plugin_params
+from sga.config import get_args
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch
-from sga.plugins.scores import Score, emittable_score_names, get_score_spec
 
 try:
     import triton
@@ -64,39 +63,20 @@ except ImportError:  # pragma: no cover
     _HAS_TRITON = False
 
 
-DECL = OptimizerDecl(
-    name="adamw",
-    reset_mode="selective",
-    # The sparse path consumes the compact-emission (idx, values) handoff
-    # directly (_records_pass_compact) — required by compact backends,
-    # ignored by writeback ones.
-    consumes_compact=True,
-    # Derived, not restated: this template implements every registry score's
-    # kernel branch (a second template would declare its own branch subset).
-    emittable_scores=emittable_score_names(),
-)
-
-# adamw's own vocabulary: its params as FULL flat dests (defaults and
-# required-ness live in the argparse declarations).
-PARAMS = ("sga_optimizer_residual_mean", "sga_optimizer_compact_search",
-          "sga_optimizer_full_sync_inactive_lr_scale")
-
-# The bare-int EMIT_MODE branches _grad_correct_kernel implements below.
-# Load-time tie between the DERIVED emittable set above and that hardcoded
-# branch coverage: a score registered without a branch here would pass every
-# CPU gate (the registry formula exists) and only crash inside Triton
-# tracing on the first GPU full step — possibly hours into a cluster run.
-_IMPLEMENTED_MODES = frozenset({0, 1, 2, 3})
-_MISSING_BRANCHES = sorted(
-    n for n in emittable_score_names()
-    if int(get_score_spec(n).score) not in _IMPLEMENTED_MODES
-)
-if _MISSING_BRANCHES:
-    raise ValueError(
-        f"registry scores {_MISSING_BRANCHES} have no _grad_correct_kernel "
-        f"branch (implemented EMIT_MODEs: {sorted(_IMPLEMENTED_MODES)}) — "
-        "add the branch or mark the score OFFLINE"
-    )
+# Score name -> the kernel's compile-time EMIT_MODE branch. One dict, three
+# duties: the name→int mapping for the kernel launch, the loud
+# "registered but no kernel branch" refusal (unknown names raise through it
+# at optimizer construction — a missing branch would otherwise silently
+# skip the score materialization and training would run on wrong numerics),
+# and the human-readable branch inventory kept next to the kernel's own
+# if-chain (same file, same edit). Adding an online score: registry entry
+# (scores.py) + kernel branch + one line here.
+_TRITON_SCORE_MAP = {
+    "update": 0,   # wd*w + U(g), signed — the default topk input
+    "abs_g": 1,    # |g| of the committed gradient
+    "abs_m": 2,    # |m| of the pre-commit first moment
+    "coi": 3,      # |U(g) - U(0)|
+}
 
 _BLOCK_SIZE = 1024
 
@@ -120,7 +100,8 @@ if _HAS_TRITON:
     ):
         """AdamW m/v update + fused apply, with full-step score emission.
 
-        EMIT_MODE is the Score enum value as a compile-time int: -1 = sparse
+        EMIT_MODE is the _TRITON_SCORE_MAP branch id as a compile-time
+        int: -1 = sparse
         (masked commit), >=0 = full step (score materialized into the grad
         buffer). Both paths apply ``w -= lr * update`` in this same pass.
 
@@ -536,7 +517,7 @@ def adamw_grad_correct(
     weight_decay: float,
     step: int,
     mask: torch.Tensor = None,
-    emit_mode: Optional[int] = None,
+    emit_score: Optional[str] = None,
     coeff: float = 1.0,
     clear: bool = False,
     fold: bool = False,
@@ -548,13 +529,14 @@ def adamw_grad_correct(
     Callers pass ``.view(-1)`` flats (the engine flattens every buffer;
     a 2-D grad against the 1-D bucket mask would broadcast-error here).
     Updates m/v in place and always fuses the apply ``w -= lr * update``.
-    ``emit_mode=None`` is the sparse step: with ``mask``, positions outside
-    it contribute a zero gradient. An int mode (a ``Score`` value) is the
-    full step: the mode's score — all computed from pre-commit state
-    reachable only inside this pass — is materialized into ``grad_buffer``
-    in the same pass (the reselection reads it from there). An unknown int
-    or the OFFLINE sentinel raises a ValueError (owned messages) before any
-    work.
+    ``emit_score=None`` is the sparse step: with ``mask``, positions outside
+    it contribute a zero gradient. A score NAME is the full step: the
+    score's math — all computed from pre-commit state reachable only inside
+    this pass — is materialized into ``grad_buffer`` in the same pass (the
+    reselection reads it from there). A name without a kernel branch
+    (``_TRITON_SCORE_MAP``) raises a ValueError (owned message) before any
+    work — the int branch id is this function's internal business, nothing
+    upstream ever sees it.
 
     Sparse-step fusion knobs (refused on full steps and without a
     mask — they only make sense for the masked commit path):
@@ -575,29 +557,19 @@ def adamw_grad_correct(
     """
     bias_correction1 = 1.0 - beta1 ** step
     bias_correction2 = 1.0 - beta2 ** step
-    if emit_mode is not None:
-        emit_mode = int(emit_mode)
-        try:
-            mode = Score(emit_mode)
-        except ValueError:
-            # Owned text: the raw enum-cast error ("7 is not a valid Score")
-            # doesn't say which modes ARE valid.
-            raise ValueError(
-                f"emit_mode {emit_mode} is not a valid Score — known "
-                f"full-step modes: "
-                f"{[int(m) for m in Score if m is not Score.OFFLINE]}"
-            ) from None
-        if mode is Score.OFFLINE:
-            raise ValueError(
-                f"emit_mode {emit_mode} is Score.OFFLINE — offline-only "
-                "scores have no kernel branch to materialize"
-            )
+    if emit_score is not None and emit_score not in _TRITON_SCORE_MAP:
+        # Owned text: covers both an unregistered name and a registered
+        # score without a kernel branch — either way there is no branch to
+        # materialize it, and silent fallback would train on wrong numerics.
+        raise ValueError(
+            f"emit_score '{emit_score}' has no _grad_correct_kernel branch "
+            f"(implemented: {sorted(_TRITON_SCORE_MAP)})")
 
     sparse_fusion = (coeff != 1.0) or clear or fold
-    if sparse_fusion and (emit_mode is not None or mask is None):
+    if sparse_fusion and (emit_score is not None or mask is None):
         raise ValueError(
             f"grad-correct sparse fusion (coeff={coeff!r}, clear={clear!r}, "
-            f"fold={fold!r}) requires a sparse step (emit_mode=None) with a "
+            f"fold={fold!r}) requires a sparse step (emit_score=None) with a "
             "mask — full steps scale in place engine-side and never clear "
             "(the reselection reads the materialized score from the grad "
             "buffer)"
@@ -609,17 +581,17 @@ def adamw_grad_correct(
                 "grad-correct inactive_lr_scale must be a finite float "
                 f">= 0.0 (got {inactive_lr_scale!r})"
             )
-        if emit_mode is None or mask is None:
+        if emit_score is None or mask is None:
             raise ValueError(
                 f"grad-correct boundary dual-lr (inactive_lr_scale="
-                f"{inactive_lr_scale!r}) requires a full step (emit_mode "
+                f"{inactive_lr_scale!r}) requires a full step (emit_score "
                 "set) with a mask — only the boundary update's lr splits; "
                 "sparse steps and mask-less records take plain lr"
             )
-    if (mask is not None and emit_mode is not None
+    if (mask is not None and emit_score is not None
             and inactive_lr_scale == 1.0):
         raise ValueError(
-            "grad-correct masked-commit full step (mask + emit_mode with "
+            "grad-correct masked-commit full step (mask + emit_score with "
             "inactive_lr_scale=1.0) is refused: the shape predates the "
             "dual-lr knob and nothing in production produces it — pass "
             "inactive_lr_scale != 1.0 for the boundary split, or drop "
@@ -635,7 +607,7 @@ def adamw_grad_correct(
             param_buffer, grad_buffer, exp_avg_buffer, exp_avg_sq_buffer,
             lr, beta1, beta2, eps, weight_decay,
             bias_correction1, bias_correction2,
-            mask, emit_mode,
+            mask, emit_score,
             coeff=coeff, clear=clear, fold=fold, interval=interval,
             inactive_lr_scale=inactive_lr_scale,
         )
@@ -658,9 +630,10 @@ def adamw_grad_correct(
         n_elements,
         BLOCK_SIZE=_BLOCK_SIZE,
         HAS_MASK=has_mask,
-        # -1 here is the kernel's sparse-step sentinel; Score.OFFLINE's -1
-        # never reaches this point (rejected host-side above).
-        EMIT_MODE=emit_mode if emit_mode is not None else -1,
+        # -1 is the kernel's sparse-step sentinel; a real branch id comes
+        # from the map (an unbranched name already raised above).
+        EMIT_MODE=(_TRITON_SCORE_MAP[emit_score]
+                   if emit_score is not None else -1),
         APPLY_COEFF=coeff != 1.0,
         CLEAR=clear,
         FOLD=fold,
@@ -829,13 +802,9 @@ def adamw_grad_correct_compact(
 class SgaAdamW:
     """The SGA AdamW optimizer template: grad-correct + residual reset."""
 
-    decl = DECL
-
-    def __init__(self, params: dict, emit_score: Optional[str] = None):
-        params = expand_plugin_params(PARAMS, dict(params),
-                                      "sga_optimizer (adamw)")
-        self.params = params
-        self.residual_mean = bool(params["sga_optimizer_residual_mean"])
+    def __init__(self):
+        args = get_args()
+        self.residual_mean = bool(args.sga_optimizer_residual_mean)
         # Compact-path idx alignment search: 'table' seeds both
         # lower_bound brackets from the per-cycle directory table;
         # 'bisection' is the plain full-depth form. Dispatched per call
@@ -843,15 +812,17 @@ class SgaAdamW:
         # writeback-emission runs (they never reach
         # _records_pass_compact) and on the torch fallback (it ignores
         # the table).
-        self.compact_search = params["sga_optimizer_compact_search"]
+        self.compact_search = args.sga_optimizer_compact_search
         # Boundary dual-lr: on full-sync steps the apply runs at
         # lr * scale on the mask-inactive (never-communicated) coords.
         # 1.0 keeps the single-lr behavior bit-identical; the shadow/period
-        # combination rules live in config validation — this guard covers
-        # direct construction (tests/replay); the negative leg is the
-        # reachable one — non-finite is already refused by _coerce upstream.
+        # combination rules live in config validation — on the flag routes
+        # its domain rule refuses non-finite too (argparse float typing
+        # ACCEPTS "nan"/"inf"); this guard covers direct construction
+        # (tests/replay), where the negative and non-finite legs are both
+        # reachable.
         self.full_sync_inactive_lr_scale = float(
-            params["sga_optimizer_full_sync_inactive_lr_scale"])
+            args.sga_optimizer_full_sync_inactive_lr_scale)
         # -0.0 normalizes to 0.0: the same tail freeze, without the
         # sign-of-zero flips on params that are exactly -0.0
         if self.full_sync_inactive_lr_scale == 0.0:
@@ -862,24 +833,24 @@ class SgaAdamW:
                 "sga_optimizer_full_sync_inactive_lr_scale must be a "
                 "finite float >= 0.0 (got "
                 f"{self.full_sync_inactive_lr_scale!r})")
-        # Which registry score to materialize on full steps (build-time
-        # injection). None/'update' keeps the historical default: the signed
-        # AdamW update itself is the topk input. The emission mode int is
-        # resolved ONCE here from the registry (the kernel branches on it).
-        self.emit_score = emit_score or Score.update.name
-        spec = get_score_spec(self.emit_score)
-        if spec.score is Score.OFFLINE:
+        # Which registry score to materialize on full steps — read straight
+        # off the config (validation already required it). The name without
+        # a kernel branch fails loud HERE, at build time: the kernel would
+        # otherwise silently skip the materialization and the reselection
+        # would rank raw grads.
+        self.emit_score = args.sga_score
+        try:
+            _TRITON_SCORE_MAP[self.emit_score]
+        except KeyError:
             raise ValueError(
-                f"adamw cannot emit score '{self.emit_score}': it is "
-                "offline-only (no kernel branch). Emittable: "
-                f"{sorted(DECL.emittable_scores)}"
-            )
-        self._emit_mode = int(spec.score)
+                f"adamw kernel has no EMIT_MODE branch for score "
+                f"'{self.emit_score}' (implemented: "
+                f"{sorted(_TRITON_SCORE_MAP)})") from None
 
     def ensure_state(self, bucket_states):
         pass  # no persistent per-bucket buffers beyond the Support caches
 
-    def _records_pass(self, ctx, emit_mode, use_mask,
+    def _records_pass(self, ctx, emit_score, use_mask,
                       coeff=1.0, clear=False, fold=False, interval=1.0,
                       inactive_lr_scale=1.0):
         for rec in ctx.records:
@@ -900,7 +871,7 @@ class SgaAdamW:
                 weight_decay=rec.weight_decay,
                 step=rec.step,
                 mask=m,
-                emit_mode=emit_mode,
+                emit_score=emit_score,
                 # Degenerate mask-less bucket on a sparse step: plain full
                 # commit (old behavior) — the fusion knobs require a mask,
                 # and the engine scaled such a record explicitly; reset's
@@ -937,7 +908,7 @@ class SgaAdamW:
                     exp_avg_sq_buffer=state["exp_avg_sq"].view(-1),
                     lr=rec.lr, beta1=rec.beta1, beta2=rec.beta2,
                     eps=rec.eps, weight_decay=rec.weight_decay,
-                    step=rec.step, mask=None, emit_mode=None,
+                    step=rec.step, mask=None, emit_score=None,
                 )
                 continue
             bucket = ctx.support.buckets[bs.support_index]
@@ -948,8 +919,8 @@ class SgaAdamW:
             # Gated on the REAL execution path, not just the configured
             # mode: on the torch fallback (CPU tensors / triton-less)
             # there is no table to build — asking for one would raise
-            # before the fallback could engage, against the DECL's
-            # "silently ignored" contract.
+            # before the fallback could engage (compact_search's dead-config
+            # exception: silently ignored off its live path).
             dir_table = (bucket.dir_table
                          if (self.compact_search == "table"
                              and _HAS_TRITON and idx.is_cuda) else None)
@@ -982,7 +953,7 @@ class SgaAdamW:
         needed on full steps."""
         split = self.full_sync_inactive_lr_scale != 1.0
         self._records_pass(
-            ctx, emit_mode=self._emit_mode, use_mask=split,
+            ctx, emit_score=self.emit_score, use_mask=split,
             inactive_lr_scale=(self.full_sync_inactive_lr_scale
                                if split else 1.0),
         )
@@ -1005,7 +976,7 @@ class SgaAdamW:
             )
             return
         self._records_pass(
-            ctx, emit_mode=None, use_mask=True,
+            ctx, emit_score=None, use_mask=True,
             coeff=float(ctx.apply_coeff),
             clear=True, fold=fold, interval=float(ctx.fold_window),
         )

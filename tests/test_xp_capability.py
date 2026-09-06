@@ -23,6 +23,7 @@ Run: python tests/test_xp_capability.py
 import math
 import os
 import sys
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -30,9 +31,10 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import sga.plugins.selection._adaptive as adapt_mod
+from sga.config import set_args
+from sga.config.validation import sga_defaults
 from sga.plugins.optimizer.adamw import adamw_grad_correct
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch
-from sga.plugins.scores import Score
 from sga.plugins.selection._histogram import (
     _HIST_BINS,
     _abs_bit_top16,
@@ -198,8 +200,10 @@ def test_adaptive_warmup_gate_and_consecutive_reset():
     bad = torch.zeros(1000, dtype=torch.uint8)
     bad[:800] = 1   # 80% >> target -> gate fails
 
-    sel = TopkSelection({"sga_selection_method": "adaptive",
-                            "sga_selection_ratio_percent": 40.0})
+    set_args(SimpleNamespace(**{**sga_defaults(),
+                                 "sga_selection_method": "adaptive",
+                                 "sga_selection_ratio_percent": 40.0}))
+    sel = TopkSelection()
     seq = [(0.6, [good]), (0.6, [good]), (0.6, [bad]), (0.6, [good])]
     with mock.patch.object(
         adapt_mod, "select_masks_histogram", side_effect=seq):
@@ -212,8 +216,10 @@ def test_adaptive_warmup_gate_and_consecutive_reset():
         sel.select(_SelCtx(grads, warmup_target=3))
         assert sel.warmup_passed == 1
 
-    sel2 = TopkSelection({"sga_selection_method": "adaptive",
-                            "sga_selection_ratio_percent": 40.0})
+    set_args(SimpleNamespace(**{**sga_defaults(),
+                                 "sga_selection_method": "adaptive",
+                                 "sga_selection_ratio_percent": 40.0}))
+    sel2 = TopkSelection()
     with mock.patch.object(
         adapt_mod, "select_masks_histogram", return_value=(0.6, [good])
     ) as hist:
@@ -233,8 +239,10 @@ def test_adaptive_tau_feedback_and_collapse_mode():
     guard re-bootstraps in the CONFIGURED warmup mode."""
     grads = [torch.linspace(-1, 1, 1000)]
 
-    sel = TopkSelection({"sga_selection_method": "adaptive",
-                            "sga_selection_ratio_percent": 40.0})
+    set_args(SimpleNamespace(**{**sga_defaults(),
+                                 "sga_selection_method": "adaptive",
+                                 "sga_selection_ratio_percent": 40.0}))
+    sel = TopkSelection()
     sel._impl.tau = 0.5           # 50% selected -> over target
     sel._impl.warmup_passed = 5   # past the default warmup
     masks = sel.select(_SelCtx(grads))
@@ -242,8 +250,10 @@ def test_adaptive_tau_feedback_and_collapse_mode():
     assert torch.equal(masks[0], (grads[0].abs() >= 0.5).to(torch.uint8))
     assert math.isclose(sel.tau, 0.5 * 1.25 ** 0.5, rel_tol=1e-12)
 
-    sel2 = TopkSelection({"sga_selection_method": "adaptive",
-                            "sga_selection_ratio_percent": 40.0})
+    set_args(SimpleNamespace(**{**sga_defaults(),
+                                 "sga_selection_method": "adaptive",
+                                 "sga_selection_ratio_percent": 40.0}))
+    sel2 = TopkSelection()
     sel2._impl.tau = 0.6           # 40% selected, in band
     sel2._impl.warmup_passed = 5
     sel2.select(_SelCtx(grads))
@@ -251,9 +261,11 @@ def test_adaptive_tau_feedback_and_collapse_mode():
 
     # collapse: nothing passes tau -> re-bootstrap in the warmup mode
     canned = (0.6, [(grads[0].abs() >= 0.6).to(torch.uint8)])
-    sel3 = TopkSelection({"sga_selection_method": "adaptive",
-                            "sga_selection_ratio_percent": 40.0,
-                            "sga_selection_adaptive_warmup_mode": "exact"})
+    set_args(SimpleNamespace(**{**sga_defaults(),
+                                 "sga_selection_method": "adaptive",
+                                 "sga_selection_ratio_percent": 40.0,
+                                 "sga_selection_adaptive_warmup_mode": "exact"}))
+    sel3 = TopkSelection()
     sel3._impl.tau = 1e9
     sel3._impl.warmup_passed = 5
     with mock.patch.object(
@@ -295,7 +307,7 @@ def test_coi_score_matches_fp64_oracle():
         grad_correct_torch(
             w, buf, m.clone(), v.clone(), 0.0, b1, b2, eps, 0.0,
             1 - b1 ** step, 1 - b2 ** step,
-            None, int(Score.coi),
+            None, "coi",
         )
         ref = _coi_reference(grad, m, v, b1, b2, eps, step)
         rel = ((buf.double() - ref).abs().max() / ref.max()).item()
@@ -307,7 +319,7 @@ def test_coi_score_matches_fp64_oracle():
     buf = grad.clone()
     grad_correct_torch(
         torch.zeros(1000), buf, torch.zeros(1000), torch.zeros(1000),
-        0.0, b1, b2, eps, 0.0, 1 - b1, 1 - b2, None, int(Score.coi),
+        0.0, b1, b2, eps, 0.0, 1 - b1, 1 - b2, None, "coi",
     )
     ref = _coi_reference(grad, torch.zeros(1000), torch.zeros(1000),
                          b1, b2, eps, 1)
@@ -316,7 +328,7 @@ def test_coi_score_matches_fp64_oracle():
     # empty input: noop via the public wrapper
     adamw_grad_correct(torch.empty(0), torch.empty(0), torch.empty(0),
                         torch.empty(0), 1e-3, b1, b2, eps, 0.0, 1,
-                        emit_mode=int(Score.coi))
+                        emit_score="coi")
     print("ok: coi score == fp64 oracle (steps 1/2/17/1501, zero-state, empty)")
 
 

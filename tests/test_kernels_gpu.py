@@ -41,7 +41,8 @@ from sga.plugins.optimizer.adamw import (
     build_dir_table,
 )
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch
-from sga.plugins.scores import Score, emittable_score_names, get_score_spec
+from sga.plugins.optimizer.adamw import _TRITON_SCORE_MAP
+from sga.plugins.scores import get_score_spec, score_names
 
 torch.manual_seed(0)
 
@@ -107,12 +108,12 @@ def test_grad_correct_triton_matches_fallback():
     m0, v0 = torch.randn(n) * 0.1, torch.rand(n) * 0.1
     mask = (torch.rand(n) < 0.4).to(torch.uint8)
 
-    # Sparse path (emit_mode=None): fused apply; grad buffer untouched.
+    # Sparse path (emit_score=None): fused apply; grad buffer untouched.
     p_d = param0.clone().to(device); mm_d = m0.clone().to(device)
     vv_d = v0.clone().to(device); g_d = torch.randn(n).to(device)
     mk_d = mask.clone().to(device)
     adamw_grad_correct(p_d, g_d, mm_d, vv_d, lr, b1, b2, eps, wd, step,
-                       mask=mk_d, emit_mode=None)
+                       mask=mk_d, emit_score=None)
     p_ref, m_ref, v_ref = map(torch.clone, (param0, m0, v0))
     g_init = g_d.cpu().clone()
     grad_correct_torch(
@@ -125,20 +126,20 @@ def test_grad_correct_triton_matches_fallback():
     torch.testing.assert_close(vv_d.cpu(), v_ref, rtol=1e-4, atol=1e-6)
     assert torch.equal(g_d.cpu(), g_init), "sparse step must not touch grads"
 
-    # Full path (emit_mode=update): materialize the update INTO the grad,
+    # Full path (emit_score='update'): materialize the update INTO the grad,
     # with the apply fused in the same pass on both paths.
     p_d = param0.clone().to(device); mm_d = m0.clone().to(device)
     vv_d = v0.clone().to(device)
     grads = torch.randn(n)          # fresh residual-shaped input
     g_d = grads.clone().to(device)
     adamw_grad_correct(p_d, g_d, mm_d, vv_d, lr, b1, b2, eps, wd, step,
-                       mask=None, emit_mode=int(Score.update))
+                       mask=None, emit_score="update")
     p_ref, m_ref, v_ref = map(torch.clone, (param0, m0, v0))
     g_ref = grads.clone()
     grad_correct_torch(
         p_ref, g_ref, m_ref, v_ref, lr, b1, b2, eps, wd,
         1 - b1 ** step, 1 - b2 ** step,
-        None, int(Score.update),
+        None, "update",
     )
     torch.testing.assert_close(g_d.cpu(), g_ref, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(p_d.cpu(), p_ref, rtol=1e-5, atol=1e-7)
@@ -171,7 +172,7 @@ def test_full_step_dual_lr_triton_vs_torch():
         g = g0.clone().to(device)
         adamw_grad_correct(p, g, mm, vv, lr, b1, b2, eps, wd, step,
                            mask=mask.to(device) if with_mask else None,
-                           emit_mode=int(Score.update),
+                           emit_score="update",
                            inactive_lr_scale=scale)
         return p.cpu(), g.cpu(), mm.cpu(), vv.cpu()
 
@@ -183,7 +184,7 @@ def test_full_step_dual_lr_triton_vs_torch():
     g_ref = g0.clone()
     grad_correct_torch(p_ref, g_ref, m_ref, v_ref, lr, b1, b2, eps, wd,
                        1 - b1 ** step, 1 - b2 ** step,
-                       mask, int(Score.update), inactive_lr_scale=scale)
+                       mask, "update", inactive_lr_scale=scale)
     torch.testing.assert_close(p_s, p_ref, rtol=1e-5, atol=1e-7)
     torch.testing.assert_close(g_s, g_ref, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(m_s, m_ref, rtol=1e-5, atol=1e-7)
@@ -241,14 +242,14 @@ def test_grad_correct_sparse_fusion_bitwise():
 
             fp, fg, fm, fv = (t.clone().to(device) for t in (p, g0, m, v))
             adamw_grad_correct(fp, fg, fm, fv, mask=mask.to(device),
-                               emit_mode=None, coeff=coeff, clear=True,
+                               emit_score=None, coeff=coeff, clear=True,
                                fold=fold, interval=interval, **kw)
 
             rp, rg, rm, rv = (t.clone().to(device) for t in (p, g0, m, v))
             dmask = mask.to(device)
             if coeff != 1.0:
                 rg = torch.where(dmask > 0, rg * coeff, rg)
-            adamw_grad_correct(rp, rg, rm, rv, mask=dmask, emit_mode=None, **kw)
+            adamw_grad_correct(rp, rg, rm, rv, mask=dmask, emit_score=None, **kw)
             rg.masked_fill_(dmask > 0, 0.0)
             if fold:
                 inv = float((torch.ones(1, dtype=torch.float32) / interval).item())
@@ -339,7 +340,7 @@ def test_compact_grad_correct_ab():
         vb *= factor
         scatter_selected(b["g"], idx, vb)
         adamw_grad_correct(b["p"], b["g"], b["m"], b["v"], mask=mask.to(device),
-                           emit_mode=None, coeff=coeff, clear=True,
+                           emit_score=None, coeff=coeff, clear=True,
                            fold=fold, interval=interval, **kw)
         a, vals = chain_a()
         a2, vals2 = chain_a()  # LEG-3: same binary, fresh buffers
@@ -387,7 +388,7 @@ def test_compact_grad_correct_ab():
                                0, coeff=coeff, **kw)
     zero_mask = torch.zeros(n, dtype=torch.uint8, device=device)
     adamw_grad_correct(b["p"], b["g"], b["m"], b["v"], mask=zero_mask,
-                       emit_mode=None, **kw)
+                       emit_score=None, **kw)
     for name in ("p", "m", "v", "g"):
         assert torch.equal(a[name], b[name]), f"k==0 mismatch ({name})"
 
@@ -411,7 +412,7 @@ def test_compact_grad_correct_ab():
                                    idx, vals, 0, coeff=coeff, **kw)
         b = {name: t.clone().to(device) for name, t in z.items()}
         adamw_grad_correct(b["p"], b["g"], b["m"], b["v"],
-                           mask=mask.to(device), emit_mode=None,
+                           mask=mask.to(device), emit_score=None,
                            coeff=coeff, clear=True, **kw)
         assert torch.equal(vals, z["g"].to(device)[idx.long()]), \
             f"k={k} values diverged"
@@ -478,7 +479,7 @@ def test_compact_grad_correct_dense_runs_and_rec_start():
         vb *= factor
         scatter_selected(b["g"], idx, vb)
         adamw_grad_correct(b["p"], b["g"], b["m"], b["v"],
-                           mask=mask.to(device), emit_mode=None,
+                           mask=mask.to(device), emit_score=None,
                            coeff=coeff, clear=True, fold=fold,
                            interval=interval, **kw)
 
@@ -585,7 +586,7 @@ def test_compact_grad_correct_full_density_clustered_and_bracket_fill():
         vb *= factor
         scatter_selected(b["g"], idx, vb)
         adamw_grad_correct(b["p"], b["g"], b["m"], b["v"],
-                           mask=mask.to(device), emit_mode=None,
+                           mask=mask.to(device), emit_score=None,
                            coeff=coeff, clear=True, fold=fold,
                            interval=interval, **kw)
 
@@ -929,7 +930,7 @@ def test_compact_grad_correct_dir_table():
     b["g"][:] = vals[rs:]
     mask = torch.ones(n - rs, dtype=torch.uint8, device=device)
     adamw_grad_correct(b["p"], b["g"], b["m"], b["v"], mask=mask,
-                       emit_mode=None, coeff=coeff, clear=True, **kw)
+                       emit_score=None, coeff=coeff, clear=True, **kw)
     gc = torch.zeros(n - rs, device=device)
     gc[:] = vals[rs:] * coeff
     upd = (kw["weight_decay"] * z["p"].abs().to(device)
@@ -967,7 +968,7 @@ def test_compact_grad_correct_dir_table():
                                    **kw)
         b = {name: t.clone().to(device) for name, t in z.items()}
         adamw_grad_correct(b["p"], b["g"], b["m"], b["v"],
-                           mask=mask.to(device), emit_mode=None,
+                           mask=mask.to(device), emit_score=None,
                            coeff=coeff, clear=True, **kw)
         # End-state equality re-pins pack-zeroing == clear-zeroing, NOT
         # the found set: at fold=False neither form writes g, so a
@@ -1164,8 +1165,9 @@ def test_score_modes_purity_and_content():
     """Triton full-step score emission: every named score lands
     in the grad buffer with the apply fused in the same pass, and the
     emitted score matches its reference from the PRE-commit state; the
-    bare-int kernel modes equal the Score enum members BY NAME (the enum is
-    the namespace; migrated from test_sga_scheme_xp_mask_score.py)."""
+    kernel's internal EMIT_MODE ints are pinned via _TRITON_SCORE_MAP
+    (the name->branch map IS the namespace; migrated from
+    test_sga_scheme_xp_mask_score.py)."""
     device = "cuda"
     n = 999_999
     lr, b1, b2, eps, wd, step = 5e-5, 0.9, 0.95, 1e-8, 0.1, 1501
@@ -1180,20 +1182,20 @@ def test_score_modes_purity_and_content():
         g = g0.clone().to(device)
         m, v = m0.clone().to(device), v0.clone().to(device)
         adamw_grad_correct(w, g, m, v, lr, b1, b2, eps, wd, step,
-                           mask=None, emit_mode=int(score))
+                           mask=None, emit_score=score)
         return w, g, m, v
 
-    w1, g1, m1, v1 = run(Score.update)        # default: update in grads
+    w1, g1, m1, v1 = run("update")          # default: update in grads
     bc1, bc2 = 1 - b1 ** step, 1 - b2 ** step
 
-    # Content + purity for EVERY emittable score, iterated from the registry
-    # (derived: a score registered without a kernel branch fails HERE at the
-    # GPU gate instead of mid-cluster). The reference is the registry
-    # formula — the same single-source math the torch fallback calls,
-    # fp64-oracle-pinned on CPU by tests/test_xp_capability.py — computed
-    # from the same PRE-commit state.
-    for name in sorted(emittable_score_names()):
-        w2, g2, m2, v2 = run(Score[name])
+    # Content + purity for EVERY registered score, iterated from the
+    # registry (derived: a score registered without a kernel branch fails
+    # HERE at the GPU gate instead of mid-cluster). The reference is the
+    # registry formula — the same single-source math the torch fallback
+    # calls, fp64-oracle-pinned on CPU by tests/test_xp_capability.py —
+    # computed from the same PRE-commit state.
+    for name in sorted(score_names()):
+        w2, g2, m2, v2 = run(name)
         ref = get_score_spec(name).formula(
             w0, m0, v0, g0, b1, b2, eps, wd, bc1, bc2,
             update_includes_wd=True,
@@ -1209,28 +1211,24 @@ def test_score_modes_purity_and_content():
         # equal the default run's (same update, same fused arithmetic)
         torch.testing.assert_close(w2.cpu(), w1.cpu(), rtol=1e-5, atol=1e-7)
 
-    # the bare kernel-mode ints equal the enum values (Score is the single
-    # namespace: the kernel's EMIT_MODE comments must not drift)
-    for name, mode in (("update", 0), ("abs_g", 1), ("abs_m", 2), ("coi", 3)):
-        assert int(Score[name]) == mode, name
+    # the name->int map equals the kernel's EMIT_MODE branch order (the
+    # map lives beside the kernel's if-chain; a reordered branch must
+    # move BOTH together — this pin catches the silent half of that edit)
+    assert _TRITON_SCORE_MAP == {"update": 0, "abs_g": 1,
+                                 "abs_m": 2, "coi": 3}
 
-    # offline sentinel mode is rejected host-side before any launch
-    try:
-        adamw_grad_correct(w0.clone(), g0.clone(), m0.clone(), v0.clone(),
-                           lr, b1, b2, eps, wd, step, mask=None,
-                           emit_mode=int(Score.OFFLINE))
-        raise AssertionError("offline emit_mode accepted")
-    except ValueError as e:
-        assert "OFFLINE" in str(e), e
-
-    # any out-of-range int gets the same host-side rejection with owned text
-    # (not the raw enum-cast error) — the public unknown-mode contract
-    try:
-        adamw_grad_correct(w0.clone(), g0.clone(), m0.clone(), v0.clone(),
-                           lr, b1, b2, eps, wd, step, mask=None, emit_mode=7)
-        raise AssertionError("out-of-range emit_mode accepted")
-    except ValueError as e:
-        assert "not a valid Score" in str(e), e
+    # an unknown name is rejected host-side before any launch, with the
+    # owned wrapper message (covers both unregistered names and a
+    # registered score without a kernel branch — there is no public
+    # int-mode face anymore; EMIT_MODE ints are this map's business)
+    for bogus in ("bogus", "offline"):
+        try:
+            adamw_grad_correct(w0.clone(), g0.clone(), m0.clone(),
+                               v0.clone(), lr, b1, b2, eps, wd, step,
+                               mask=None, emit_score=bogus)
+            raise AssertionError(f"unknown emit_score accepted: {bogus}")
+        except ValueError as e:
+            assert "no _grad_correct_kernel branch" in str(e), e
 
 
 if __name__ == "__main__":

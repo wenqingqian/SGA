@@ -25,27 +25,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omegaconf import OmegaConf
 
-from sga.config import validate_run_config
 from sga.engine import SGAEngine
+from sga.launcher.backend_megatron import _prevalidate_sga
 from sga.plugins import (
-    Score,
+    build_backend_plugin,
     build_optimizer,
     build_selection,
-    get_optimizer_decl,
-    register_default_plugins,
 )
 from sga.plugins.optimizer import ParamRecord
+from sga.plugins.optimizer.adamw import _TRITON_SCORE_MAP
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch
-from sga.plugins.scores import emittable_score_names, score_names
+from sga.plugins.scores import score_names
 from sga.shadow import readonly_score
 
 from test_engine_unit import (
     _ABS_M,
     _FakeChunk,
     _FakeMPOpt,
-    _flat_config,
     _ReplicaWorld,
     _UPDATE,
+    _seed,
+    _seed_combo,
 )
 
 
@@ -88,13 +88,12 @@ class _ShadowCapableMPOpt(_FakeMPOpt):
 
 
 def _build_shadow_engine(combo, config_extra=None, shadow_score=True):
-    selection = build_selection(combo["selection"], dict(combo["selection_params"]))
-    opt = build_optimizer(combo["opt"], dict(combo["opt_params"]),
-                          emit_score=combo["score"])
-    config = {**combo["config"], **(config_extra or {}),
-              "sga_shadow": True, "sga_shadow_score": shadow_score}
-    eng = SGAEngine(_flat_config(config),
-                    combo["score"], selection, opt, combo["backend"])
+    _seed_combo(combo, {**(config_extra or {}),
+                        "sga_shadow": True, "sga_shadow_score": shadow_score})
+    selection = build_selection(combo["selection"])
+    opt = build_optimizer(combo["opt"])
+    eng = SGAEngine(combo["score"], selection, opt,
+                    build_backend_plugin(combo["backend"]))
     eng._dp_cp_group = lambda: None
     return eng
 
@@ -211,13 +210,14 @@ def test_shadow_rng_guard_raises():
     torch.manual_seed(3)
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
-    selection = build_selection("topk", {"sga_selection_method": "histogram",
-                            "sga_selection_ratio_percent": 30.0})
-    opt = build_optimizer("adamw", {}, emit_score="abs_m")
-    eng = SGAEngine(_flat_config({"sga_cycle_start_iter": 0,
-                                  "sga_cycle_period": 1,
-                                  "sga_shadow": True}),
-                    "abs_m", selection, opt, _ABS_M["backend"])
+    _seed({"sga_selection_method": "histogram",
+           "sga_selection_ratio_percent": 30.0, "sga_score": "abs_m",
+           "sga_cycle_start_iter": 0, "sga_cycle_period": 1,
+           "sga_shadow": True})
+    selection = build_selection("topk")
+    opt = build_optimizer("adamw")
+    eng = SGAEngine("abs_m", selection, opt,
+                    build_backend_plugin(_ABS_M["backend"]))
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
     orig = engine_mod.readonly_score
@@ -265,7 +265,7 @@ def test_readonly_score_matches_optimizer_torch_reference():
         grad_correct_torch(
             w_ref, g_ref, m0.clone(), v0.clone(), lr, b1, b2, eps, wd,
             1.0 - b1 ** step, 1.0 - b2 ** step,
-            None, int(Score[emit]),
+            None, emit,
         )
         # shadow: fresh record over the same pre-commit state
         main_p = torch.nn.Parameter(w.clone())
@@ -322,7 +322,7 @@ def test_readonly_score_matches_optimizer_torch_reference():
         grad_correct_torch(
             w.clone(), g_ref, torch.zeros(n), torch.zeros(n), 1e-3, 0.9, 0.95,
             1e-8, 0.1, 1.0 - 0.9 ** 1, 1.0 - 0.95 ** 1,
-            None, int(Score[emit]),
+            None, emit,
         )
         assert torch.equal(readonly_score(rec, emit), g_ref), \
             f"{emit} at zero state: shadow score != kernel reference"
@@ -554,7 +554,7 @@ def _cfg_with(**sga_overrides):
 
 
 def _sga_section_to_config(cfg):
-    return validate_run_config(cfg)
+    return _prevalidate_sga(cfg)
 
 
 def _expect_error(cfg, needle):
@@ -567,25 +567,21 @@ def _expect_error(cfg, needle):
 
 
 def test_loader_shadow_validation():
-    # the canonical is complete by construction: shadow defaults carry
-    # real values
-    out = _sga_section_to_config(_cfg_with(shadow=True))
-    assert out["sga_shadow"] is True and out["sga_shadow_score"] is True
+    # positive spellings all pass the launch-time pre-validation
+    _sga_section_to_config(_cfg_with(shadow=True))
+    _sga_section_to_config(_cfg_with(shadow=False))
+    _sga_section_to_config(_cfg_with(shadow=True, shadow_score=False))
 
-    out = _sga_section_to_config(_cfg_with(shadow=False))
-    assert out["sga_shadow"] is False  # plain live
-
-    out = _sga_section_to_config(_cfg_with(shadow=True, shadow_score=False))
-    assert out["sga_shadow_score"] is False
-
-    _expect_error(_cfg_with(shadow="yes"), "bool")
+    _expect_error(_cfg_with(shadow="yes"), "must be 'true' or 'false'")
     _expect_error(_cfg_with(shadow_score=False), "sga_shadow is not true")
-    _expect_error(_cfg_with(shadow=True, shadow_score="no"), "bool")
+    _expect_error(_cfg_with(shadow=True, shadow_score="no"), "must be 'true' or 'false'")
 
+    # disabled → zero checks (megatron semantics): a shadow key under a
+    # disabled config is silently ignored, not refused
     cfg = OmegaConf.create(_BASE)
     cfg.sga = {"sga_enabled": False, "sga_backend": "dense",
                "sga_shadow": True}
-    _expect_error(cfg, "sga_enabled is false")
+    _sga_section_to_config(cfg)
     print("PASS test_loader_shadow_validation")
 
 
@@ -599,13 +595,14 @@ def test_shadow_rng_guard_cuda_half_raises():
     torch.manual_seed(3)
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
-    selection = build_selection("topk", {"sga_selection_method": "histogram",
-                            "sga_selection_ratio_percent": 30.0})
-    opt = build_optimizer("adamw", {}, emit_score="abs_m")
-    eng = SGAEngine(_flat_config({"sga_cycle_start_iter": 0,
-                                  "sga_cycle_period": 1,
-                                  "sga_shadow": True}),
-                    "abs_m", selection, opt, _ABS_M["backend"])
+    _seed({"sga_selection_method": "histogram",
+           "sga_selection_ratio_percent": 30.0, "sga_score": "abs_m",
+           "sga_cycle_start_iter": 0, "sga_cycle_period": 1,
+           "sga_shadow": True})
+    selection = build_selection("topk")
+    opt = build_optimizer("adamw")
+    eng = SGAEngine("abs_m", selection, opt,
+                    build_backend_plugin(_ABS_M["backend"]))
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
 
@@ -669,10 +666,11 @@ def test_registry_scores_shadow_evaluable_and_decl_alignment():
     """The registry is the single emit namespace: every registered score
     evaluates through readonly_score (existence pin; value drift is pinned by
     test_readonly_score_matches_optimizer_torch_reference), unknown names
-    fail with the registered list, and the adamw template's emittable set
-    stays a subset of the registry (a decl advertising an unregistered name
-    would pass config validation and blow up mid-run; today every registry
-    entry is online-usable, so the subset is an equality pin)."""
+    fail with the registered list, and the adamw kernel's branch inventory
+    (_TRITON_SCORE_MAP) covers the whole registry with distinct branch ids —
+    every registry entry is online-usable today; a replay-only score must
+    consciously relax the equality pin (and the kernel will refuse it loudly
+    at optimizer construction)."""
     torch.manual_seed(2)
     n = 16
     main_p = torch.nn.Parameter(torch.randn(n))
@@ -695,15 +693,12 @@ def test_registry_scores_shadow_evaluable_and_decl_alignment():
     else:
         raise SystemExit("unknown emit must be rejected")
 
-    register_default_plugins()
-    decl = get_optimizer_decl("adamw")
-    assert set(decl.emittable_scores) <= set(score_names()), \
-        "decl advertises unregistered scores"
-    assert decl.emittable_scores == emittable_score_names(), \
-        "the single template's emittable set must stay the DERIVED online set"
-    assert emittable_score_names() == frozenset(score_names()), \
-        ("every registry entry is online-usable today (an offline-only entry "
-         "must consciously relax this pin)")
+    assert set(_TRITON_SCORE_MAP) == set(score_names()), \
+        ("every registry entry must carry a kernel branch id (a replay-only "
+         "entry must consciously relax this pin)")
+    assert sorted(_TRITON_SCORE_MAP.values()) == \
+        list(range(len(_TRITON_SCORE_MAP))), \
+        "branch ids are distinct dense ints (kernel if-chain inventory)"
     print("PASS test_registry_scores_shadow_evaluable_and_decl_alignment")
 
 
@@ -715,7 +710,7 @@ def test_shadow_activates_without_idx_materialization():
     torch.manual_seed(11)
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
-    assert _ABS_M["backend"].decl.consumes == "idx"
+    assert build_backend_plugin(_ABS_M["backend"]).consumes == "idx"
     # 'update' score: nonzero already at step 1 (abs_m over the zero
     # pre-first-commit moments would tie at 0 everywhere and select all)
     combo = dict(_ABS_M, score="update")
@@ -743,18 +738,21 @@ def test_shadow_always_sync_inherits_eligible_interception():
     """The shadow boundary rides the SAME shared selection tail —
     the forced spans land all-ones in the shadow support and the selector
     sees only the eligible pool (no live/shadow support divergence)."""
-    from test_engine_unit import _ALWAYS, _AS_NAMES
+    from test_engine_unit import _ALWAYS, _AS_NAMES, _AS_PATTERNS
 
     torch.manual_seed(0)
     chunk = _FakeChunk(n_params=len(_AS_NAMES), names=_AS_NAMES)
     mp = _ShadowCapableMPOpt(chunk)
-    selection = build_selection("topk", dict(_ALWAYS["selection_params"]))
-    opt = build_optimizer("adamw", {}, emit_score="abs_g")
+    _seed({**_ALWAYS["selection_params"], **_ALWAYS["opt_params"],
+           **_ALWAYS["backend_params"],
+           "sga_cycle_start_iter": 0, "sga_cycle_period": 1,
+           "sga_always_sync_layers": _AS_PATTERNS,
+           "sga_shadow": True, "sga_shadow_score": True,
+           "sga_score": "abs_g"})
+    selection = build_selection("topk")
+    opt = build_optimizer("adamw")
     eng = SGAEngine(
-        _flat_config({**_ALWAYS["config"], "sga_cycle_start_iter": 0,
-                      "sga_cycle_period": 1, "sga_shadow": True,
-                      "sga_shadow_score": True}),
-        "abs_g", selection, opt, _ALWAYS["backend"])
+        "abs_g", selection, opt, build_backend_plugin(_ALWAYS["backend"]))
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
     gen = torch.Generator().manual_seed(5)

@@ -17,32 +17,29 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 from sga.engine import SGAEngine
-from sga.plugins import build_optimizer, build_selection
+from sga.plugins import build_backend_plugin, build_optimizer, build_selection
 from sga.trace import TraceCollector, _canonical_name, parse_branch_points
 
 from test_engine_unit import (
     _FakeChunk,
     _FakeMPOpt,
-    _flat_config,
     _ReplicaWorld,
     _UPDATE,
+    _seed_combo,
 )
 
 
 def _build_traced_engine(dir, branch_points, window, chunk,
                          config_extra=None, backend=None):
-    selection = build_selection(_UPDATE["selection"],
-                                dict(_UPDATE["selection_params"]))
-    opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
-                          emit_score=_UPDATE["score"])
-    config = {**_UPDATE["config"], **(config_extra or {}),
-              "sga_trace_dir": dir,
-              "sga_trace_branch_points": branch_points,
-              "sga_trace_window": window}
-    eng = SGAEngine(_flat_config(config), _UPDATE["score"], selection, opt,
-                    backend or _UPDATE["backend"])
+    _seed_combo(_UPDATE, {**(config_extra or {}),
+                          "sga_trace_dir": dir,
+                          "sga_trace_branch_points": branch_points,
+                          "sga_trace_window": window})
+    selection = build_selection(_UPDATE["selection"])
+    opt = build_optimizer(_UPDATE["opt"])
+    eng = SGAEngine(_UPDATE["score"], selection, opt,
+                    build_backend_plugin(backend or _UPDATE["backend"]))
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
     return eng
@@ -109,12 +106,11 @@ def test_zero_overhead_when_off_structural():
     """No sga.trace config -> the engine holds _trace = None (the per-step
     slot cost is a single None-check)."""
     chunk = _FakeChunk()
-    selection = build_selection(_UPDATE["selection"],
-                                dict(_UPDATE["selection_params"]))
-    opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
-                          emit_score=_UPDATE["score"])
-    eng = SGAEngine(_flat_config(dict(_UPDATE["config"])),
-                    _UPDATE["score"], selection, opt, _UPDATE["backend"])
+    _seed_combo(_UPDATE)
+    selection = build_selection(_UPDATE["selection"])
+    opt = build_optimizer(_UPDATE["opt"])
+    eng = SGAEngine(_UPDATE["score"], selection, opt,
+                    build_backend_plugin(_UPDATE["backend"]))
     assert eng._trace is None
     eng2 = _build_traced_engine("/tmp/sga-trace-never", [], 100, chunk)
     assert isinstance(eng2._trace, TraceCollector)
@@ -401,16 +397,14 @@ def test_meta_carries_engine_phase():
     with tempfile.TemporaryDirectory() as td:
         chunk = _FakeChunk()
         from test_shadow_unit import _ShadowCapableMPOpt
-        selection = build_selection(_UPDATE["selection"],
-                                    dict(_UPDATE["selection_params"]))
-        opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
-                              emit_score=_UPDATE["score"])
+        _seed_combo(_UPDATE, {"sga_shadow": True, "sga_trace_dir": td,
+                              "sga_trace_branch_points": [0],
+                              "sga_trace_window": 1})
+        selection = build_selection(_UPDATE["selection"])
+        opt = build_optimizer(_UPDATE["opt"])
         eng = SGAEngine(
-            _flat_config({**_UPDATE["config"], "sga_shadow": True,
-                          "sga_trace_dir": td,
-                          "sga_trace_branch_points": [0],
-                          "sga_trace_window": 1}),
-            _UPDATE["score"], selection, opt, _UPDATE["backend"])
+            _UPDATE["score"], selection, opt,
+            build_backend_plugin(_UPDATE["backend"]))
         eng._dp_cp_group = lambda: None
         eng.attach(chunk)
         mp = _ShadowCapableMPOpt(chunk)
@@ -530,7 +524,7 @@ def test_sparse_dump_compact_rebuild_content():
             td, [0], 4, chunk,
             config_extra={"sga_cycle_start_iter": 0,
                           "sga_cycle_period": 2},
-            backend=TorchPipelinedIndexBackend({}))
+            backend="torch_pipelined_index")
 
         seen = {}
         orig_sparse = eng.opt.sparse_step
@@ -614,7 +608,7 @@ def test_sparse_dump_compact_restore_on_dump_exception():
             td, [0], 4, chunk,
             config_extra={"sga_cycle_start_iter": 0,
                           "sga_cycle_period": 2},
-            backend=TorchPipelinedIndexBackend({}))
+            backend="torch_pipelined_index")
 
         with _ReplicaWorld(world=1):
             for it in (0, 1, 2):

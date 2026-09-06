@@ -64,20 +64,10 @@ import os
 import torch
 
 from sga.backends import COMM_WARMUP_ENV, RESUME_OVERRIDE_ENV
+from sga.config import get_args
 from sga.kernels import (gather_selected_blocks, pack_selected,
                          scatter_selected, scatter_selected_blocks)
-from sga.plugins import BackendDecl, expand_plugin_params
-
-DECL = BackendDecl(
-    name="torch_pipelined_index",
-    consumes="idx",
-    emission="compact",
-)
-
-# This backend's own vocabulary: its params as FULL flat dests (defaults
-# and required-ness live in the argparse declarations).
-PARAMS = ("sga_backend_high_priority_group", "sga_backend_index_slices",
-          "sga_backend_emission")
+from sga.plugins import resolve_emission
 
 # Escape hatch for the resume fail-closed in twin mode. Parsed as exactly
 # "1": any other value — "yes" included — keeps the safe refusal. Must be
@@ -102,24 +92,31 @@ _TWIN_WARMUP_ELEMS = 8 << 20
 class TorchPipelinedIndexBackend:
     """Consumes the canonical sorted-idx form of a bucket's support."""
 
-    decl = DECL
+    consumes = "idx"
+    inherent_emission = "compact"
 
-    def __init__(self, params: dict):
-        params = expand_plugin_params(
-            PARAMS, dict(params), "sga_backend (torch_pipelined_index)")
+    def __init__(self):
+        args = get_args()
         # Emission switch: how the sparse allreduce hands its result to
         # the optimizer. 'auto' (the flag default) resolves to this
         # backend's inherent compact form; explicit 'writeback' restores
-        # the historical choreography (see allreduce_sparse). The DECL's
-        # emission field is the declared inherent default the resolution
-        # falls back to; the RESOLVED instance attribute is what the
-        # engine routes on.
-        self.emission = self.decl.resolve_emission(
-            params["sga_backend_emission"])
-        self._hiprio = bool(params["sga_backend_high_priority_group"])
-        self._slices = int(params["sga_backend_index_slices"])
-        if self._slices < 1:
-            raise ValueError(f"index_slices must be >= 1, got {self._slices}")
+        # the historical choreography (see allreduce_sparse). The resolved
+        # instance attribute is what the engine routes on.
+        emission = args.sga_backend_emission
+        if emission not in (None, "auto", "compact", "writeback"):
+            # Direct-construction backstop (argparse choices own the flag
+            # routes): a bogus spelling would run the compact pack/zeros
+            # data path while the engine routed writeback — silently
+            # dropping the communicated gradients.
+            raise ValueError(
+                "sga_backend_emission must be auto|compact|writeback "
+                f"(got {emission!r})")
+        self.emission = resolve_emission(emission, self.inherent_emission)
+        self._hiprio = bool(args.sga_backend_high_priority_group)
+        s = args.sga_backend_index_slices
+        if not isinstance(s, int) or isinstance(s, bool) or s < 1:
+            raise ValueError(f"index_slices must be an int >= 1, got {s!r}")
+        self._slices = s
         self._gather_bufs: dict = {}  # bucket key -> persistent compact buffer
         # comm_group -> twin high-priority group. Keyed by the group OBJECT
         # with a strong reference held on both sides (an id() key could

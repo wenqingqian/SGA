@@ -1,52 +1,41 @@
 # Copyright (c) 2026, SGA framework contributors.
-"""The flat SGA config validation core.
+"""The SGA config validation — megatron ``validate_args`` style.
 
 Everything a config may say lives in ``sga/config/arguments.py`` (plain
-``add_argument`` declarations); THIS module derives the flag vocabulary
-from that file by parser introspection — no key set, default or choice is
-restated anywhere — and adds the context argparse cannot express as PLAIN
-CONDITIONAL RULES over the flat keys (megatron ``validate_args`` style:
-``if args.xxx: assert args.yyy``).
+``add_argument`` declarations); THIS module derives the flag vocabulary from
+that file by parser introspection (no key set, default or choice is restated
+anywhere) and adds the context argparse cannot express as PLAIN CONDITIONAL
+RULES over the args (``if args.xxx: raise ...``), exactly the way megatron's
+own validate_args works:
 
-Names carry no structure here. Which flags exist is a question for the
-declarations; what combinations of VALUES are legal is argued below, one
-rule per branch (the enabled/disabled contract, required flags, the
-cycle/trace/shadow rules, registered plugin names, topk's per-method
-rules). Per-plugin parameters are each plugin's own business: their
-vocabularies and defaults live with the plugins
-(``sga/plugins/__init__.py:expand_plugin_params``), never in a central
-table — but an explicitly-set key owned by a NON-selected plugin is
-rejected here regardless of value (a sibling plugin's parameter is
-dead config, and the value-diff of the engine builder would otherwise
-absorb an explicit-but-at-default spelling before the constructor's
-build-time rejection could see it). Note the two notions of "explicit"
-on the yaml route, intentional per the layer split: the topk
-dead-config guard and the plugin-ownership gate fire on key presence
-in the explicit input, while the constructor route consumes the
-explicit-default diff of the canonical.
+  - feature-gated: ``sga_enabled`` false means zero checks below it run —
+    a disabled feature's sub-args are never validated (megatron semantics;
+    "key set" vs "key at default" is deliberately indistinguishable, that
+    is argparse's native semantics too);
+  - value-level only: no explicit-diff, no plugin vocabularies, no
+    ownership machinery — dead config keys are silently ignored EXCEPT the
+    curated list in ``_dead_config_exceptions`` (a different, louder
+    category is the set-but-inapplicable pairing refusals —
+    ``sga_cycle_full_sync_interval`` without the decouple switch,
+    ``sga_shadow_score`` without ``sga_shadow``: live keys whose enabler
+    is off, not dead-key resurrections);
+  - write-backs: derived values are resolved ONTO the args (megatron
+    writes ``args.data_parallel_size = ...`` the same way) — the percent
+    spelling resolves into ``sga_cycle_start_iter``, the comma-token list
+    keys parse into sorted lists. Exactly three write-backs exist; every
+    other key passes through untouched.
 
-Inputs are EXPLICIT-key dicts (only what the user actually wrote): the
-launcher passes the yaml ``sga:`` section verbatim; the training side
-passes ``explicit_from_args(args)`` (the argparse-defaults diff — with
-real defaults filled in by argparse, "flag absent" is indistinguishable
-from "flag at default", and the two are semantically identical anyway).
-Every key must BE the full flat name — the ``sga_`` prefix is asserted
-at the door, and there is no short form anywhere.
-
-Output: the canonical FLAT dict (every dest at its resolved, typed
-value; percent resolved away) — the ONE object the engine's config
-print, the resume guard comparison AND the SGAEngine itself read.
-Validation is flat in, flat out; nothing derives a second shape from
-the canonical.
-
-Disabled-clean input returns ``None``.
+Inputs: an args-like namespace (attribute access). ``args=None`` reads the
+sga singleton (``sga.config.get_args`` — the copy build_engine seeded from
+the megatron namespace). The launcher pre-validation builds a temporary
+namespace by parsing the flags it is about to emit with the real parser, so
+both routes see argparse-typed values and one code path.
 """
 
 import argparse
-import json
 import math
 
-from sga.config.arguments import add_sga_args, sga_bool, sga_int_or_null
+from sga.config.arguments import add_sga_args
 
 _PARSER = None
 
@@ -68,134 +57,6 @@ def sga_actions() -> dict:
 def sga_defaults() -> dict:
     """dest -> declared default (the single source; nothing restates it)."""
     return {dest: action.default for dest, action in sga_actions().items()}
-
-
-def declared_choices(dest: str) -> tuple:
-    """The argparse-declared choices of one flag (empty when open-ended)."""
-    return tuple(getattr(sga_actions()[dest], "choices", None) or ())
-
-
-# The trace-activation set, spelled out in full (names carry no
-# structure, so there is no prefix rule for "the trace keys"): setting
-# any of these keys activates the collector.
-_TRACE_KEYS = ("sga_trace_dir", "sga_trace_branch_points", "sga_trace_window")
-
-
-def _param_kind(dest: str):
-    """'bool' | 'int' | 'int_or_null' | 'float' | 'str' for one dest."""
-    action = sga_actions()[dest]
-    if action.type is sga_bool:
-        return "bool"
-    if action.type is sga_int_or_null:
-        return "int_or_null"
-    if action.type is int:
-        return "int"
-    if action.type is float:
-        return "float"
-    return "str"
-
-
-def _coerce(dest: str, val):
-    """One explicit value -> typed (accepts yaml spellings AND the
-    argparse-typed namespace values; canonicalizes floats; enforces
-    argparse-declared choices). Wrong-typed values fail loud: only the
-    yaml route feeds raw user values through here (the CLI route is
-    typed by argparse first), so a bare ``true``/``8.0``/``"8"`` must
-    never silently become 1/8/8 — bools are rejected explicitly (bool is
-    an int subclass), the int kinds accept only ``type(val) is int`` and
-    float dests must be finite."""
-    kind = _param_kind(dest)
-    if kind == "bool":
-        if isinstance(val, bool):
-            return val
-        t = str(val).strip().lower()
-        if t == "true":
-            return True
-        if t == "false":
-            return False
-        raise ValueError(f"{dest} must be a valid bool (got {val!r})")
-    if kind == "int_or_null":
-        if val is None:
-            return None
-        if isinstance(val, str) and val.strip().lower() == "null":
-            return None
-        if type(val) is not int:
-            raise ValueError(
-                f"{dest} must be a valid int_or_null (got {val!r})")
-        return val
-    if kind == "int":
-        if type(val) is not int:
-            raise ValueError(f"{dest} must be a valid int (got {val!r})")
-        return val
-    if kind == "float":
-        if isinstance(val, bool) or not isinstance(val, (int, float)):
-            raise ValueError(f"{dest} must be a valid float (got {val!r})")
-        fval = float(val)
-        if not math.isfinite(fval):
-            raise ValueError(f"{dest} must be a finite float (got {val!r})")
-        return fval
-    if isinstance(val, (list, tuple)):
-        # the yaml spelling of the list-kind flags (they ride the command
-        # line as one comma token; yaml may give a list)
-        if dest in ("sga_trace_branch_points", "sga_always_sync_layers"):
-            return list(val)
-        raise ValueError(f"{dest} must be a string (got {val!r})")
-    if not isinstance(val, str):
-        # str-kind values arrive typed already; anything else is a shape bug
-        raise ValueError(f"{dest} must be a string (got {val!r})")
-    choices = tuple(getattr(sga_actions()[dest], "choices", None) or ())
-    if choices and val not in choices:
-        raise ValueError(
-            f"{dest} must be one of {list(choices)} (got {val!r})")
-    return val
-
-
-def explicit_from_flat(flat: dict) -> dict:
-    """A complete raw flat dict (e.g. the waist's namespace collection,
-    argparse defaults included) -> the explicit diff. A value equal to
-    its default AND of the same type is semantically identical to an
-    absent flag; the exceptions survive as explicit: an explicit null on
-    a param with a real default (sga_int_or_null), and a wrong-typed
-    look-alike of a cross-type default (0 == False must not read as
-    absent)."""
-    defaults = sga_defaults()
-    out = {}
-    for dest, default in defaults.items():
-        if dest not in flat:
-            continue
-        value = flat[dest]
-        if (value == default and type(value) is type(default)
-                and not (value is None and default is not None)):
-            continue
-        out[dest] = value
-    return out
-
-
-def explicit_from_args(args) -> dict:
-    """The explicit SGA keys of a parsed namespace: the argparse-defaults
-    diff (a parser without the SGA provider contributes nothing — stock
-    entries stay dense-clean)."""
-    present = {dest: getattr(args, dest)
-               for dest in sga_defaults() if hasattr(args, dest)}
-    return explicit_from_flat(present)
-
-
-# sga_config is the retired v1 JSON-transport key: it still rides old
-# checkpoints' saved namespaces and must never masquerade as config.
-_NON_CONFIG_SGA_KEYS = ("sga_allow_config_override", "sga_config")
-
-
-def collect_sga_flat(args) -> dict:
-    """Every sga_* attribute of a namespace, RAW (fork-side collection
-    twin — used SGA-side by the resume guard to re-read checkpointed
-    namespaces)."""
-    return {key: value for key, value in vars(args).items()
-            if key.startswith("sga_") and key not in _NON_CONFIG_SGA_KEYS}
-
-
-def canonical_flat_json(canonical: dict) -> str:
-    """Canonical (sorted-key) serialization of a validated flat dict."""
-    return json.dumps(canonical, sort_keys=True)
 
 
 def parse_layer_patterns(raw):
@@ -243,120 +104,89 @@ def parse_layer_patterns(raw):
     return sorted(out) or None
 
 
-def _plugin_param_owners():
-    """dest -> ((axis, plugin), ...) over every built-in plugin's PARAMS
-    vocabulary (function-local imports: sga.plugins.selection.topk imports
-    this module at top level for ``declared_choices`` — hoisting these
-    imports would close the cycle)."""
-    from sga.backends.nccl_pipelined_index import PARAMS as NPI_PARAMS
-    from sga.backends.torch_pipelined_index import PARAMS as TPI_PARAMS
-    from sga.backends.torch_pipelined_mask import PARAMS as TPM_PARAMS
-    from sga.plugins.optimizer.adamw import PARAMS as ADAMW_PARAMS
-    from sga.plugins.selection.topk import PARAMS as TOPK_PARAMS
-    owners = {}
-    for axis, plugin, dests in (
-            ("selection", "topk", TOPK_PARAMS),
-            ("optimizer", "adamw", ADAMW_PARAMS),
-            ("backend", "torch_pipelined_index", TPI_PARAMS),
-            ("backend", "torch_pipelined_mask", TPM_PARAMS),
-            ("backend", "nccl_pipelined_index", NPI_PARAMS)):
-        for dest in dests:
-            owners.setdefault(dest, []).append((axis, plugin))
-    return {dest: tuple(v) for dest, v in owners.items()}
+def _dead_config_exceptions(args) -> None:
+    """Dead-config refusals that are worth their loudness (user-curated
+    list, 2026-09-06 x-grilling): everything else that a config path does
+    not read is silently ignored, megatron-style. New entries go HERE and
+    nowhere else.
+
+    block_size: the one knob whose silent death means a WRONG EXPERIMENT
+    rather than a no-op — block-granular selection configured under a
+    non-histogram method would silently run element-sparse.
+    """
+    if args.sga_selection_method != "histogram":
+        if args.sga_selection_block_size != sga_defaults()["sga_selection_block_size"]:
+            raise ValueError(
+                "sga_selection_block_size only applies to the histogram "
+                "method (got method "
+                f"'{args.sga_selection_method}'): under it the run would "
+                "silently degrade to element-granular selection — drop the "
+                "flag or switch the method")
 
 
-def validate_sga_flat(flat: dict, train_iters=None):
-    """Validate an explicit-key flat dict -> the canonical flat dict, or
-    None when disabled-clean. Raises ValueError naming the offending key
-    on any problem."""
-    actions = sga_actions()
-    non_prefixed = sorted(
-        (k for k in flat
-         if not isinstance(k, str) or not k.startswith("sga_")),
-        key=repr)
-    if non_prefixed:
-        raise ValueError(
-            f"sga: keys must be the full flat sga_* names (got "
-            f"{non_prefixed}) — there is no short form and no nested "
-            "section; spell the flag dest in full")
-    unknown = sorted(set(flat) - set(actions))
-    if unknown:
-        raise ValueError(
-            f"sga: unknown keys {unknown} (known: {sorted(actions)})")
-    typed = {dest: _coerce(dest, val) for dest, val in flat.items()}
-    defaults = sga_defaults()
+def validate_sga_args(args=None) -> None:
+    """Validate the SGA configuration on an args namespace.
 
-    # --- enabled/disabled contract ---
-    if typed.get("sga_enabled", defaults["sga_enabled"]) is not True:
-        # Disabled semantics: dense training; nothing else may be set
-        # (no other key has meaning while disabled).
-        for dest in sorted(typed):
-            if dest != "sga_enabled":
-                raise ValueError(
-                    f"{dest} is set but sga_enabled is false; either "
-                    "enable SGA or remove the flag")
-        return None
+    ``args=None`` reads the sga singleton (build_engine route); the
+    launcher pre-validation passes the temporary namespace it parsed from
+    the flags it is about to emit. Raises ValueError naming the offending
+    key on any problem; returns None (megatron ``validate_args`` carries
+    no return value — derived values are written back onto ``args``).
+    """
+    if args is None:
+        from sga.config import get_args
+        args = get_args()
+    if not args.sga_enabled:
+        # Feature off → zero checks (megatron semantics: a disabled
+        # feature's sub-args are never validated).
+        return
+    # The name checks below consult the plugin registries; populate them
+    # first (idempotent; function-level import keeps the cycle closed —
+    # plugins import sga.config, never the other way round at module level).
+    from sga.plugins import plugin_class, register_default_plugins
+
+    register_default_plugins()
 
     # --- required when enabled ---
-    if typed.get("sga_score") is None:
+    if args.sga_score is None:
         raise ValueError(
             "sga_score is required when sga_enabled is true "
             "(the choices are the registered scores)")
-    if typed.get("sga_backend", defaults["sga_backend"]) == "dense":
+    if args.sga_backend == "dense":
         raise ValueError(
             "sga_enabled is true but sga_backend is still 'dense' (the "
             "SGA-off default) — name a sparse backend")
 
-    # --- plugin param ownership: an explicitly set key must be owned by
-    # the SELECTED plugin of its axis — a sibling plugin's parameter is
-    # dead config, and the explicit-but-at-default spelling would
-    # otherwise be value-diffed away silently before the constructor's
-    # build-time rejection could see it ---
-    owners = _plugin_param_owners()
-    chosen = {
-        "selection": typed.get("sga_selection", defaults["sga_selection"]),
-        "optimizer": typed.get("sga_optimizer", defaults["sga_optimizer"]),
-        "backend": typed.get("sga_backend", defaults["sga_backend"]),
-    }
-    for dest in sorted(flat):
-        owner_list = owners.get(dest)
-        if not owner_list:
-            continue
-        axis = owner_list[0][0]  # sharing is within one axis only
-        if chosen[axis] not in {plugin for _, plugin in owner_list}:
-            names = ", ".join(plugin for _, plugin in owner_list)
-            raise ValueError(
-                f"sga: {dest} is a parameter of the {names} {axis} "
-                f"plugin, but sga_{axis} selects {chosen[axis]!r} — "
-                "remove the key or select the plugin it belongs to "
-                "(a sibling plugin's parameter is silently dead config)")
+    # --- plugin names must be registered (plain lookups, curated errors;
+    # the score name is already pinned by the argparse choices) ---
+    plugin_class("selection", args.sga_selection)
+    plugin_class("optimizer", args.sga_optimizer)
+    plugin_class("backend", args.sga_backend)
 
     # --- cycle (incl. percent resolution and the decouple calendar) ---
-    if typed.get("sga_cycle_start_iter_percent") is not None:
-        if "sga_cycle_start_iter" in typed:
+    if args.sga_cycle_start_iter_percent is not None:
+        if args.sga_cycle_start_iter != sga_defaults()["sga_cycle_start_iter"]:
             raise ValueError(
                 "set either sga_cycle_start_iter or "
                 "sga_cycle_start_iter_percent, not both")
-        if not train_iters or int(train_iters) <= 0:
+        if not args.train_iters or int(args.train_iters) <= 0:
             raise ValueError(
                 "sga_cycle_start_iter_percent requires train_iters > 0")
-        pct = float(typed["sga_cycle_start_iter_percent"])
+        pct = float(args.sga_cycle_start_iter_percent)
         if not 0.0 <= pct <= 100.0:
             raise ValueError(
                 "sga_cycle_start_iter_percent must be in [0, 100] "
                 f"(got {pct})")
-        start_iter = max(0, int(round(pct / 100.0 * int(train_iters))))
-    else:
-        start_iter = int(typed.get("sga_cycle_start_iter",
-                                   defaults["sga_cycle_start_iter"]))
-    period = int(typed.get("sga_cycle_period", defaults["sga_cycle_period"]))
+        # write-back (megatron validate_args pattern): the percent
+        # spelling resolves into the absolute step it names
+        args.sga_cycle_start_iter = max(
+            0, int(round(pct / 100.0 * int(args.train_iters))))
+        args.sga_cycle_start_iter_percent = None
+    period = int(args.sga_cycle_period)
     if period < 1:
         raise ValueError("sga_cycle_period must be >= 1")
-    decouple = bool(typed.get(
-        "sga_cycle_decouple_full_sync_interval_and_period",
-        defaults["sga_cycle_decouple_full_sync_interval_and_period"]))
-    interval = typed.get("sga_cycle_full_sync_interval",
-                         defaults["sga_cycle_full_sync_interval"])
+    decouple = bool(args.sga_cycle_decouple_full_sync_interval_and_period)
+    interval = args.sga_cycle_full_sync_interval
     if not decouple:
         if interval is not None:
             raise ValueError(
@@ -375,59 +205,69 @@ def validate_sga_flat(flat: dict, train_iters=None):
             f"satisfy 0 < full_sync_interval < period ({period}) and "
             "period % full_sync_interval == 0")
 
-    # --- trace (setting any trace key activates the collector) ---
-    trace_present = any(dest in typed for dest in _TRACE_KEYS)
-    branch_points = None
+    # --- trace (a non-default trace value activates the collector) ---
+    trace_present = (
+        args.sga_trace_dir is not None
+        or args.sga_trace_branch_points is not None
+        or args.sga_trace_window
+        != sga_defaults()["sga_trace_window"])
     if trace_present:
-        tdir = typed.get("sga_trace_dir")
+        tdir = args.sga_trace_dir
         if not isinstance(tdir, str) or not tdir:
             raise ValueError(
                 "sga_trace_dir is required and must be a non-empty string "
                 "(the trace output directory)")
         # Lazy import: sga.trace -> sga.config (package __init__) -> this
-        # module -> sga.trace is a cycle; sga.trace-first processes must
-        # keep importing (only call site, so the deferral costs nothing).
+        # module -> sga.trace is a cycle; deferring keeps both importable
+        # first.
         from sga.trace import parse_branch_points
         try:
-            branch_points = parse_branch_points(
-                typed.get("sga_trace_branch_points",
-                          defaults["sga_trace_branch_points"]))
+            # write-back: the comma token parses into the sorted list
+            args.sga_trace_branch_points = parse_branch_points(
+                args.sga_trace_branch_points)
         except (TypeError, ValueError) as e:
             raise ValueError(f"sga_trace_branch_points: {e}") from None
-        window = typed.get("sga_trace_window", defaults["sga_trace_window"])
+        window = args.sga_trace_window
         if not isinstance(window, int) or isinstance(window, bool) or window < 1:
             raise ValueError(
                 f"sga_trace_window must be an int >= 1 (got {window!r})")
 
     # --- shadow ---
-    shadow = bool(typed.get("sga_shadow", defaults["sga_shadow"]))
-    if "sga_shadow_score" in typed and not shadow:
+    shadow = bool(args.sga_shadow)
+    if args.sga_shadow_score is not True and not shadow:
         raise ValueError(
             "sga_shadow_score is set but sga_shadow is not true; it only "
             "modifies shadow runs")
 
     # --- always-sync layer patterns (the per-parameter dense axis) ---
-    always_sync_layers = None
-    if "sga_always_sync_layers" in typed:
-        try:
-            always_sync_layers = parse_layer_patterns(
-                typed["sga_always_sync_layers"])
-        except ValueError as e:
-            raise ValueError(f"sga_always_sync_layers: {e}") from None
+    # write-back: the comma token parses into the sorted pattern list
+    try:
+        args.sga_always_sync_layers = parse_layer_patterns(
+            args.sga_always_sync_layers)
+    except ValueError as e:
+        raise ValueError(f"sga_always_sync_layers: {e}") from None
+    if (args.sga_always_sync_layers is not None
+            and args.pipeline_model_parallel_size > 1):
+        # (a config-legality rule, not an engine-internal one: the
+        # launcher pre-validation must see it too)
+        raise ValueError(
+            "sga_always_sync_layers: always-sync layer matching is "
+            "per-rank over the attached stage's params (with pipeline "
+            "parallelism > 1 the endpoint and middle ranks see different "
+            "param sets); v1 pins pipeline_model_parallel_size == 1 — "
+            "drop the flag or run with pp == 1")
 
     # --- optimizer (adamw): the boundary dual-lr knob ---
-    lr_scale = typed.get(
-        "sga_optimizer_full_sync_inactive_lr_scale",
-        defaults["sga_optimizer_full_sync_inactive_lr_scale"])
+    lr_scale = args.sga_optimizer_full_sync_inactive_lr_scale
     if lr_scale != 1.0:
-        # non-finite already refused by _coerce (float dests); the domain
-        # rule lives here: 0.0 is legal (freeze the tail outright — the
-        # split multiplies the whole update, weight decay included),
-        # anything negative is not a step size.
-        if lr_scale < 0.0:
+        # argparse's float typing ACCEPTS "nan"/"inf" spellings — the
+        # domain rule refuses them here; 0.0 is legal (freeze the tail
+        # outright — the split multiplies the whole update, weight decay
+        # included), anything negative is not a step size.
+        if not math.isfinite(lr_scale) or lr_scale < 0.0:
             raise ValueError(
-                "sga_optimizer_full_sync_inactive_lr_scale must be >= 0.0 "
-                f"(got {lr_scale!r})")
+                "sga_optimizer_full_sync_inactive_lr_scale must be a finite "
+                f"float >= 0.0 (got {lr_scale!r})")
         if shadow:
             raise ValueError(
                 "sga_optimizer_full_sync_inactive_lr_scale "
@@ -441,69 +281,37 @@ def validate_sga_flat(flat: dict, train_iters=None):
                 "every step is a full sync (no sparse rounds, no "
                 "mask-inactive tail), the knob would be dead config")
 
-    # --- plugin names must be registered (plain value checks: the
-    # registries own the name lists, nothing here restates them) ---
-    from sga.plugins import (
-        get_backend_plugin_decl,
-        get_optimizer_decl,
-        get_score_spec,
-        get_selection_decl,
-        register_default_plugins,
-        validate_combination,
-    )
-
-    register_default_plugins()
-    score = typed["sga_score"]
-    selection = typed.get("sga_selection", defaults["sga_selection"])
-    optimizer = typed.get("sga_optimizer", defaults["sga_optimizer"])
-    backend = typed["sga_backend"]
-    emission = typed.get("sga_backend_emission",
-                         defaults["sga_backend_emission"])
-    get_score_spec(score)
-    selection_decl = get_selection_decl(selection)
-    optimizer_decl = get_optimizer_decl(optimizer)
-    backend_decl = get_backend_plugin_decl(backend)
-    # The emission rule sits after the decl lookups: a retired backend
-    # name must raise the absorbed-backend hint, not the emission refusal.
-    if emission == "compact" and backend != "torch_pipelined_index":
+    # --- emission ↔ backend pairing (the one cross-axis combination rule
+    # that survives the registry simplification: 'compact' is a switch only
+    # torch_pipelined_index implements — the writeback-inherent backends
+    # have no compact handoff to give) ---
+    emission = args.sga_backend_emission
+    if emission == "compact" and args.sga_backend != "torch_pipelined_index":
         raise ValueError(
             f"sga_backend_emission 'compact' is only supported by "
-            f"torch_pipelined_index (got backend '{backend}'); the "
-            "writeback-inherent backends run writeback only")
+            f"torch_pipelined_index (got backend '{args.sga_backend}'); "
+            "the writeback-inherent backends run writeback only")
 
-    # --- selection (topk): per-method rules over values ---
-    if selection == "topk":
-        if typed.get("sga_selection_method") is None:
+    # --- selection (topk) ---
+    if args.sga_selection == "topk":
+        if args.sga_selection_method is None:
             raise ValueError(
                 "sga_selection_method is required by topk "
                 "(adaptive | exact | histogram)")
-        if "sga_selection_ratio_percent" not in typed:
+        if args.sga_selection_ratio_percent is None:
             raise ValueError(
                 "sga_selection_ratio_percent is required by topk")
-        method = typed["sga_selection_method"]
-        # dead config: a param another method owns is silently ignored
-        # where it is — refuse it instead
-        unlocks = {
-            "histogram": ("sga_selection_histogram_mode",
-                          "sga_selection_block_size",
-                          "sga_selection_block_reduce"),
-            "adaptive": ("sga_selection_adaptive_warmup_syncs",
-                         "sga_selection_adaptive_warmup_mode"),
-        }
-        method_params = unlocks.get(method, ())
-        dead = sorted(dest for dests in unlocks.values() for dest in dests
-                      if dest in typed and dest not in method_params)
-        if dead:
+        ratio = args.sga_selection_ratio_percent
+        if (not isinstance(ratio, float) or not math.isfinite(ratio)
+                or not 0.0 < ratio < 100.0):
+            # argparse's float typing accepts "nan"/"inf"; the selector's
+            # constructor assert is the direct-construction backstop only
             raise ValueError(
-                f"sga_selection (topk): params {dead} do not belong to "
-                f"method '{method}' (it takes "
-                f"{sorted(method_params) or 'no extra params'}) — under "
-                "this method they would be silently dead; drop them or "
-                "switch the method")
-
-        # --- block granularity (histogram-unlocked above) ---
-        block_size = typed.get("sga_selection_block_size",
-                               defaults["sga_selection_block_size"])
+                "sga_selection_ratio_percent must be a finite float in "
+                f"(0, 100) (got {ratio!r})")
+        # --- block granularity (histogram-unlocked; see
+        # _dead_config_exceptions for the method gate) ---
+        block_size = args.sga_selection_block_size
         if (not isinstance(block_size, int) or isinstance(block_size, bool)
                 or block_size < 1 or block_size > 1024
                 or block_size & (block_size - 1)):
@@ -511,13 +319,11 @@ def validate_sga_flat(flat: dict, train_iters=None):
                 f"sga_selection_block_size must be a power of two in "
                 f"[1, 1024] (got {block_size!r}); 1 keeps element-granular "
                 "selection")
-        if (block_size == 1
-                and "sga_selection_block_reduce" in typed):
-            raise ValueError(
-                "sga_selection_block_reduce is set but "
-                "sga_selection_block_size is 1 (element-granular): the "
-                "per-block reduce is a dead knob there — drop it or set "
-                "block_size > 1")
+        # the curated dead-config gate runs BEFORE the block comm-path
+        # rules: for method=exact + block_size + nccl/tpi-auto the honest
+        # first error is the dead block_size knob, not a backend-switch
+        # pointer
+        _dead_config_exceptions(args)
         # Block-granularity comm-path constraints. The mask stays the
         # canonical support form, so a block-structured mask is CORRECT on
         # every backend — but the block-INDEX transport (one entry per
@@ -526,14 +332,14 @@ def validate_sga_flat(flat: dict, train_iters=None):
         # (block communication) would silently degrade to element-level
         # transport or hit element-granular consumers.
         if block_size > 1:
-            if backend == "nccl_pipelined_index":
+            if args.sga_backend == "nccl_pipelined_index":
                 raise ValueError(
                     "sga_selection_block_size > 1 with backend "
                     "nccl_pipelined_index: the fork kernel's idx is "
                     "element-granular (no block-size argument). Use "
                     "torch_pipelined_index with sga_backend_emission "
                     "'writeback', or torch_pipelined_mask")
-            if (backend == "torch_pipelined_index"
+            if (args.sga_backend == "torch_pipelined_index"
                     and emission != "writeback"):
                 raise ValueError(
                     f"sga_selection_block_size > 1 with backend "
@@ -543,54 +349,3 @@ def validate_sga_flat(flat: dict, train_iters=None):
                        if emission == "auto" else "")
                     + "): the compact consumers (merge-join, compact norm) "
                     "are element-granular")
-
-    validate_combination(score, selection_decl, optimizer_decl,
-                         backend_decl, backend_emission=emission)
-
-    # --- canonical flat dict: every dest at its resolved value ---
-    canonical = dict(defaults)
-    canonical.update(typed)
-    canonical["sga_enabled"] = True
-    canonical.pop("sga_cycle_start_iter_percent", None)  # resolved away
-    canonical["sga_cycle_start_iter"] = start_iter
-    canonical["sga_always_sync_layers"] = always_sync_layers
-    if trace_present:
-        canonical["sga_trace_branch_points"] = branch_points
-    return canonical
-
-
-def validate_sga_args(args):
-    """Training-side fail-fast entry: validate the parsed namespace's SGA
-    configuration (also when disabled — the disabled-cleanliness contract
-    is enforced here). Returns the canonical flat dict, or None when
-    disabled."""
-    return validate_sga_flat(explicit_from_args(args),
-                             train_iters=getattr(args, "train_iters", None))
-
-
-def validate_run_config(config):
-    """Launcher-side entry on the whole run config: the ``sga:`` section
-    (flat keys, validated fail-fast before any process is spawned) plus
-    the train-boundary assert. Returns the canonical flat dict or None
-    when disabled."""
-    sga = config.get("sga", None)
-    if sga is None:
-        raise ValueError(
-            "Config is missing the 'sga:' section (declare it with just "
-            "sga_enabled: false for pure dense training)."
-        )
-    from omegaconf import DictConfig, OmegaConf
-
-    if isinstance(sga, DictConfig):
-        sga = OmegaConf.to_container(sga, resolve=True)
-    if not isinstance(sga, dict):
-        raise ValueError(f"sga section must be a mapping (got: {sga!r}).")
-    train_iters = OmegaConf.select(config, "train.model.train_iters",
-                                   default=None)
-    result = validate_sga_flat(sga, train_iters=train_iters)
-    # `sga:` must not leak into the megatron arg flattening; the launcher
-    # only reads train.{system,model,data}, but assert the boundary here
-    # so a future flatten change cannot silently start forwarding it.
-    assert "sga" not in OmegaConf.to_container(config.train, resolve=True), \
-        "sga section leaked into train.*"
-    return result

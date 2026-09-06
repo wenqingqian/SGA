@@ -5,8 +5,8 @@ Physically isolated from ``adamw.py`` (Triton kernels + dispatch only) so the
 CPU unit tests and non-CUDA fallback never touch Triton import paths. Score
 math is NOT restated here: the score-registry formulas
 (``sga/plugins/scores.py`` — the single source of score math) are called
-directly; only the m/v commit skeleton lives in this file. Numerics: the
-same op sequence as the Triton kernel, tolerance-pinned by
+directly by NAME; only the m/v commit skeleton lives in this file.
+Numerics: the same op sequence as the Triton kernel, tolerance-pinned by
 tests/test_kernels_gpu.py (the kernel's fused-apply FMA makes bitwise
 equality across the two impossible by design); the op sequence itself is
 pinned elementwise (torch.equal) against the shadow path by
@@ -15,13 +15,13 @@ tests/test_shadow_unit.py.
 
 import torch
 
-from sga.plugins.scores import Score, get_score_spec
+from sga.plugins.scores import get_score_spec
 
 
-def _registry_score(mode: Score, param, m, v, g, beta1, beta2, eps,
+def _registry_score(name, param, m, v, g, beta1, beta2, eps,
                     weight_decay, bias_correction1, bias_correction2):
     """Materialized score from the PRE-commit state, via the registry."""
-    return get_score_spec(mode.name).formula(
+    return get_score_spec(name).formula(
         param, m, v, g, beta1, beta2, eps, weight_decay,
         bias_correction1, bias_correction2,
         update_includes_wd=True,
@@ -30,18 +30,17 @@ def _registry_score(mode: Score, param, m, v, g, beta1, beta2, eps,
 
 def grad_correct_torch(param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
                        bias_correction1, bias_correction2,
-                       mask, emit_mode,
+                       mask, emit_score,
                        coeff=1.0, clear=False, fold=False, interval=1.0,
                        inactive_lr_scale=1.0) -> None:
     """Torch reference of the grad-correct step; same contract as the kernel.
 
-    ``emit_mode=None`` is the sparse step: fused apply. An int mode (a
-    ``Score`` value) is the full step: the mode's score materializes into
-    ``grad`` and the apply is fused in the same pass. Wrapper-fed:
-    ``adamw_grad_correct`` validates ``emit_mode`` and the sparse-fusion
-    knob combinations first — a DIRECT call with ``-1`` bypasses that guard
-    and dies in the registry lookup with the misleading "Unknown SGA score
-    'OFFLINE'" message.
+    ``emit_score=None`` is the sparse step: fused apply. A score NAME is
+    the full step: the score materializes into ``grad`` and the apply is
+    fused in the same pass. Wrapper-fed: ``adamw_grad_correct`` validates
+    ``emit_score`` and the sparse-fusion knob combinations first — a
+    DIRECT call with an unknown name dies in the registry lookup with the
+    "Unknown SGA score" message.
 
     Sparse-fusion knobs (mirroring the kernel): ``coeff`` multiplies
     the working gradient at mask-active positions, ``clear`` zeroes the
@@ -68,14 +67,14 @@ def grad_correct_torch(param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
         g = torch.where(mask > 0, g * coeff, g)
     # The update doubles as the 'update' score; both come from the registry
     # so the reference path can never drift from the online math.
-    update = _registry_score(Score.update, param, m, v, g, beta1, beta2, eps,
+    update = _registry_score("update", param, m, v, g, beta1, beta2, eps,
                              weight_decay, bias_correction1, bias_correction2)
-    if emit_mode is None:
+    if emit_score is None:
         score = None
-    elif emit_mode == int(Score.update):
+    elif emit_score == "update":
         score = update
     else:
-        score = _registry_score(Score(emit_mode), param, m, v, g, beta1, beta2,
+        score = _registry_score(emit_score, param, m, v, g, beta1, beta2,
                                 eps, weight_decay, bias_correction1,
                                 bias_correction2)
     # m_new/v_new are computed a SECOND time here (the registry update chain
@@ -85,7 +84,7 @@ def grad_correct_torch(param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
     v_new = beta2 * v + (1.0 - beta2) * g * g
     m.copy_(m_new)
     v.copy_(v_new)
-    if emit_mode is not None:
+    if emit_score is not None:
         grad.copy_(score)
     else:
         if clear and mask is not None:

@@ -62,16 +62,9 @@ import os
 import torch
 
 from sga.backends import COMM_WARMUP_ENV, RESUME_OVERRIDE_ENV
+from sga.config import get_args
 from sga.kernels import scatter_selected
-from sga.plugins import BackendDecl, expand_plugin_params
-
-DECL = BackendDecl(
-    name="nccl_pipelined_index",
-    consumes="idx",
-)
-
-# This backend's own vocabulary: its params as FULL flat dests.
-PARAMS = ("sga_backend_emission",)
+from sga.plugins import resolve_emission
 
 # Path to the nccl-sar sparse library exporting ncclSparseAllReduce (the
 # fork's ncclAllReduce signature differs from stock, so it can never be
@@ -108,29 +101,33 @@ class _RawComm:
 class NcclPipelinedIndexBackend:
     """Consumes the canonical sorted-idx form of a bucket's support."""
 
-    decl = DECL
+    consumes = "idx"
+    inherent_emission = "writeback"
 
-    def __init__(self, params: dict):
-        # Validation-only beyond emission (this backend takes no other
-        # params): unknown keys fail here, loudly.
-        params = expand_plugin_params(PARAMS, dict(params),
-                                      "sga_backend (nccl_pipelined_index)")
+    def __init__(self):
+        args = get_args()
         # Emission is inherent here (writeback): the communicated values
         # are scattered back into the dense grad buffer for the masked
         # optimizer kernel. 'auto' (the flag default) resolves to that;
         # an explicit 'writeback' is the same thing spelled out; an
         # explicit 'compact' is refused with a pointer — compact
-        # emission is a torch_pipelined_index capability (the flag-layer
-        # rule catches it earlier in real runs; this is the
+        # emission is a torch_pipelined_index capability (the config
+        # validation rule catches it earlier in real runs; this is the
         # direct-construction backstop).
-        emission = params["sga_backend_emission"]
+        emission = args.sga_backend_emission
         if emission == "compact":
             raise ValueError(
-                "sga_backend (nccl_pipelined_index): emission 'compact' is only supported "
-                "by torch_pipelined_index; this backend is "
+                "sga_backend (nccl_pipelined_index): emission 'compact' is "
+                "only supported by torch_pipelined_index; this backend is "
                 "writeback-inherent (set sga_backend: "
                 "torch_pipelined_index to switch emission)")
-        self.emission = self.decl.resolve_emission(emission)
+        if emission not in (None, "auto", "writeback"):
+            # same direct-construction backstop: an out-of-vocabulary
+            # spelling must fail here, not ride the resolution verbatim
+            raise ValueError(
+                "sga_backend_emission must be auto|compact|writeback "
+                f"(got {emission!r})")
+        self.emission = resolve_emission(emission, self.inherent_emission)
 
         # comm_group -> _RawComm. Keyed by the group OBJECT with a strong
         # reference held on both sides (an id() key could collide after a

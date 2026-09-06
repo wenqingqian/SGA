@@ -176,33 +176,34 @@ class CycleManager:
 class SGAEngine:
     """Engine over the plugin objects; built by sga.runtime.build_engine."""
 
-    def __init__(self, config: dict, score_name: str, selection, opt, backend):
-        """``config`` is the validated CANONICAL flat dict (every
-        ``sga_*`` dest at its resolved, typed value — complete by
-        construction, so reads below are direct key lookups with no
-        fallback machinery; the same object feeds the config print and
-        the resume guard)."""
-        self.config = config
+    def __init__(self, score_name: str, selection, opt, backend):
+        """Reads its knobs straight off the sga args singleton
+        (``sga.config.get_args`` — the validated copy build_engine seeded
+        from the megatron namespace; validation and percent/list
+        write-backs already ran, so reads below are plain attribute
+        lookups). ``score_name`` stays an explicit argument: it is the
+        engine's identity (shadow scoring, resume identity), not just a
+        config value — build_engine passes ``args.sga_score``, and the
+        optimizer derives its materialized score from the same key, so
+        the two cannot desync on the build_engine route; direct
+        construction is guarded by the assert below."""
+        from sga.config import get_args
+
+        cfg = get_args()
         self.score_name = score_name
         self.selection = selection
         self.opt = opt
         self.backend = backend
-        # Shadow scores with ``score_name`` while the live path consumes the
-        # optimizer's materialized ``emit_score``; build_engine ties them, but
-        # a direct-construction caller desyncing the two must fail loudly here
-        # (shadow would score a different formula than the optimizer
-        # materializes).
-        assert getattr(opt, "emit_score", self.score_name) == self.score_name, (
-            f"engine score_name {self.score_name!r} != optimizer emit_score "
-            f"{getattr(opt, 'emit_score', self.score_name)!r}: the shadow "
-            "score and the optimizer's materialized score must coincide"
-        )
+        assert self.opt.emit_score == self.score_name, (
+            f"engine score '{score_name}' != optimizer emit_score "
+            f"'{self.opt.emit_score}' — shadow would score a different "
+            "formula than the optimizer materializes")
 
         self._cycle = CycleManager(
-            start_iter=config["sga_cycle_start_iter"],
-            period=config["sga_cycle_period"],
-            decouple=config["sga_cycle_decouple_full_sync_interval_and_period"],
-            full_sync_interval=config["sga_cycle_full_sync_interval"],
+            start_iter=cfg.sga_cycle_start_iter,
+            period=cfg.sga_cycle_period,
+            decouple=cfg.sga_cycle_decouple_full_sync_interval_and_period,
+            full_sync_interval=cfg.sga_cycle_full_sync_interval,
         )
         self._chunks = {}                 # id(chunk) -> chunk
         self._bucket_states = []          # global ordered list (Support alignment)
@@ -234,27 +235,27 @@ class SGAEngine:
         # The guard runs once per cycle at support activation — within a
         # cycle the support is immutable and its counts are cached, so
         # per-step re-checks re-verify identical numbers.
-        self._count_guard = config["sga_checks_count_guard"]
+        self._count_guard = cfg.sga_checks_count_guard
         # Always-sync layers (the per-parameter dense axis): None = off.
         # Resolved against attached param names at attach
         # (_always_sync_attach_check); the forced ids drive the selection
         # interception in _run_selection.
-        layers = config["sga_always_sync_layers"]
+        layers = cfg.sga_always_sync_layers
         self._always_sync_layers = list(layers) if layers is not None else None
         self._forced_param_ids = set()
         # Trace collector: None unless sga_trace_dir is set — the dump slot
         # below then costs one None-check per step (zero-overhead-when-off).
         self._trace = (TraceCollector(
-            dir=config["sga_trace_dir"],
-            branch_points=config["sga_trace_branch_points"],
-            window=config["sga_trace_window"])
-            if config["sga_trace_dir"] is not None else None)
+            dir=cfg.sga_trace_dir,
+            branch_points=cfg.sga_trace_branch_points,
+            window=cfg.sga_trace_window)
+            if cfg.sga_trace_dir is not None else None)
         # Shadow mode (sga_shadow): replicate the stock step() literally and
         # only READ state at cycle boundaries. shadow_score=false strips even
         # the read-only scoring (the stock-replication probe configuration:
         # bitwise risk lives in the replication machinery, not the reads).
-        self._shadow = config["sga_shadow"]
-        self._shadow_score = config["sga_shadow_score"]
+        self._shadow = cfg.sga_shadow
+        self._shadow_score = cfg.sga_shadow_score
         self._metrics_file = os.environ.get("SGA_METRICS_FILE")
         self._rank = 0
         if torch.distributed.is_initialized():
@@ -360,7 +361,7 @@ class SGAEngine:
 
         avg = getattr(model_chunk.ddp_config, "average_in_collective", False)
         reduce_op = torch.distributed.ReduceOp.AVG if avg else torch.distributed.ReduceOp.SUM
-        # the backend instance's RESOLVED emission (the decl field is
+        # the backend instance's RESOLVED emission (inherent_emission is
         # only the inherent default; torch_pipelined_index switches)
         compact = self.backend.emission == "compact"
         for bucket_key, bs in self._chunk_buckets(model_chunk):
@@ -760,8 +761,7 @@ class SGAEngine:
         sel_masks = self.selection.select(sel_ctx)
         if has_forced:
             if len(sel_masks) != len(sel_views):
-                name = getattr(getattr(self.selection, "decl", None),
-                               "name", type(self.selection).__name__)
+                name = type(self.selection).__name__
                 raise SGAEngineError(
                     f"selection plugin '{name}' returned {len(sel_masks)} "
                     f"masks for {len(sel_views)} eligible views — the "
@@ -1332,14 +1332,15 @@ class SGAEngine:
         for bucket_support in support.buckets:
             bucket_support.num_selected()
         support.total_selected
-        # Dual representation, resident per the backend's declared input form
-        # (yaml picks the backend by name, which IS the manual override): an
+        # Dual representation, resident per the backend's declared input
+        # form (the config names the backend, which IS the manual
+        # override): an
         # idx-consuming backend gets its sorted indices compacted and cached
         # here, outside the collective path, instead of paying the chunked
         # compaction inside the first sparse sync. Shadow gates this off:
         # grad sync never goes sparse there, so no consumer exists and the
         # compacted pool would be pure resident waste (~idx-sized per bucket).
-        if self.backend.decl.consumes == "idx" and not self._shadow:
+        if self.backend.consumes == "idx" and not self._shadow:
             for bucket_support in support.buckets:
                 if bucket_support.block_size > 1:
                     bucket_support.block_idx

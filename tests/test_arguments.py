@@ -5,13 +5,16 @@ Pins the flag-as-transport contract: the yaml ``sga:`` section keys and
 the hand-written ``--sga-*`` flags are two spellings of ONE flat
 vocabulary declared in sga/config/arguments.py. The launcher emits
 flags; megatron's argparse parses them onto the namespace; validation
-reads the namespace's explicit diff. Canonical flat-dict equality is
-the contract (the engine print and the resume guard both speak it).
+(validate_sga_args, megatron validate_args style) runs on the namespace
+and writes derived values back onto it. Raw attrs equality (defaults +
+the namespace's sga_* attrs, the same comparison the resume guard
+speaks) is the contract.
 
 Run: python tests/test_arguments.py
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -19,14 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omegaconf import OmegaConf
 
+from sga.config import sga_config_attrs
 from sga.config.arguments import add_sga_args
-from sga.config.validation import (
-    canonical_flat_json,
-    explicit_from_args,
-    sga_actions,
-    sga_defaults,
-    validate_sga_flat,
-)
+from sga.config.validation import sga_actions, sga_defaults, validate_sga_args
 from sga.launcher.backend_megatron import _get_args_megatron
 
 ENABLED = {
@@ -44,7 +42,7 @@ ENABLED = {
 def expect_error(fn, needle):
     try:
         fn()
-    except (ValueError, SystemExit) as e:
+    except (ValueError, SystemExit, AssertionError) as e:
         assert needle in str(e), f"error missing '{needle}': {e}"
         return
     raise SystemExit(f"expected error containing '{needle}'")
@@ -93,9 +91,21 @@ def _flags_of(cfg):
     return tokens
 
 
-def _canon_from_namespace(argv, train_iters=5000):
-    args = _parse(argv)
-    return validate_sga_flat(explicit_from_args(args), train_iters=train_iters)
+def _ns_from_flags(tokens, train_iters=5000, pp=1):
+    """The namespace route: parse flags, attach the two non-sga keys,
+    validate (write-backs land on the namespace)."""
+    ns = _parse(tokens)
+    ns.train_iters = train_iters
+    ns.pipeline_model_parallel_size = pp
+    validate_sga_args(ns)
+    return ns
+
+
+def _raw_json(attrs_owner):
+    """The raw comparison form (the resume guard's _config_json contract):
+    declared defaults + the namespace's sga_* attrs."""
+    return json.dumps(dict(sga_defaults(), **sga_config_attrs(attrs_owner)),
+                      sort_keys=True, default=repr)
 
 
 def test_flag_table_declared_in_arguments_py():
@@ -131,79 +141,92 @@ def test_flag_table_declared_in_arguments_py():
 
 def test_dual_form_equivalence():
     """yaml sga: section -> launcher flags -> argparse namespace ->
-    validation produces the SAME canonical flat dict as validating the
-    section directly. The two spellings are one pipeline."""
+    validation produces the SAME raw attrs as the hand-written flag
+    spelling. The two spellings are one pipeline."""
     cfg = _cfg_with_sga(dict(ENABLED))
-    canon_direct = validate_sga_flat(
-        OmegaConf.to_container(cfg.sga, resolve=True), train_iters=5000)
-    canon_ns = _canon_from_namespace(_flags_of(cfg))
-    assert canonical_flat_json(canon_direct) == canonical_flat_json(canon_ns)
-    print("ok: yaml and hand-written flags canonicalize identically")
+    ns_launcher = _ns_from_flags(_flags_of(cfg))
+    hand = ["--sga-enabled", "true", "--sga-cycle-start-iter", "20",
+            "--sga-cycle-period", "8", "--sga-score", "update",
+            "--sga-selection-method", "histogram",
+            "--sga-selection-ratio-percent", "10",
+            "--sga-optimizer", "adamw",
+            "--sga-backend", "torch_pipelined_index"]
+    ns_hand = _ns_from_flags(hand)
+    assert _raw_json(ns_launcher) == _raw_json(ns_hand)
+    print("ok: yaml and hand-written flags validate identically")
 
 
 def test_dual_form_explicit_null_round_trip():
     """R5: the explicit-null spelling of the nullable warmup flag
     survives the dual-form round trip — a yaml flat section carrying
     sga_selection_adaptive_warmup_syncs: null and the CLI
-    --sga-selection-adaptive-warmup-syncs null canonicalize identically
+    --sga-selection-adaptive-warmup-syncs null validate identically
     (a launcher/OmegaConf conversion that dropped the null or reset it
     to the default would fail here)."""
     adaptive = dict(ENABLED, sga_selection_method="adaptive",
                     sga_selection_adaptive_warmup_syncs=None)
     cfg = _cfg_with_sga(dict(adaptive))
-    canon_direct = validate_sga_flat(
-        OmegaConf.to_container(cfg.sga, resolve=True), train_iters=5000)
-    assert canon_direct["sga_selection_adaptive_warmup_syncs"] is None
     tokens = _flags_of(cfg)
     assert tokens[tokens.index("--sga-selection-adaptive-warmup-syncs") + 1] \
         == "null"
-    canon_ns = _canon_from_namespace(tokens)
-    assert canon_ns["sga_selection_adaptive_warmup_syncs"] is None
-    assert canonical_flat_json(canon_direct) == canonical_flat_json(canon_ns)
+    ns_launcher = _ns_from_flags(tokens)
+    assert ns_launcher.sga_selection_adaptive_warmup_syncs is None
+    # the hand spelling written out independently of the launcher tokens
+    # (a copied token list would make the raw-equality assert vacuous)
+    hand = ["--sga-enabled", "true",
+            "--sga-backend", "torch_pipelined_index",
+            "--sga-cycle-period", "8",
+            "--sga-cycle-start-iter", "20",
+            "--sga-optimizer", "adamw",
+            "--sga-score", "update",
+            "--sga-selection-adaptive-warmup-syncs", "null",
+            "--sga-selection-method", "adaptive",
+            "--sga-selection-ratio-percent", "10.0"]
+    ns_hand = _ns_from_flags(hand)
+    assert ns_hand.sga_selection_adaptive_warmup_syncs is None
+    assert _raw_json(ns_launcher) == _raw_json(ns_hand)
     print("ok: explicit null round-trips through both spellings")
 
 
 def test_decoupled_cycle_round_trip():
-    flat = dict(ENABLED,
-                sga_cycle_decouple_full_sync_interval_and_period=True,
-                sga_cycle_full_sync_interval=4,
-                sga_cycle_period=8)
-    canon_direct = validate_sga_flat(dict(flat))
-    args = _parse(["--sga-enabled", "true",
-                   "--sga-cycle-start-iter", "20",
-                   "--sga-cycle-period", "8",
-                   "--sga-cycle-decouple-full-sync-interval-and-period",
-                   "true", "--sga-cycle-full-sync-interval", "4",
-                   "--sga-score", "update",
-                   "--sga-selection-method", "histogram",
-                   "--sga-selection-ratio-percent", "10",
-                   "--sga-optimizer", "adamw",
-                   "--sga-backend", "torch_pipelined_index"])
-    canon_ns = validate_sga_flat(explicit_from_args(args))
-    assert canonical_flat_json(canon_direct) == canonical_flat_json(canon_ns)
+    cfg = _cfg_with_sga(dict(
+        ENABLED, sga_cycle_decouple_full_sync_interval_and_period=True,
+        sga_cycle_full_sync_interval=4, sga_cycle_period=8))
+    ns_launcher = _ns_from_flags(_flags_of(cfg))
+    hand = ["--sga-enabled", "true",
+            "--sga-cycle-start-iter", "20",
+            "--sga-cycle-period", "8",
+            "--sga-cycle-decouple-full-sync-interval-and-period",
+            "true", "--sga-cycle-full-sync-interval", "4",
+            "--sga-score", "update",
+            "--sga-selection-method", "histogram",
+            "--sga-selection-ratio-percent", "10",
+            "--sga-optimizer", "adamw",
+            "--sga-backend", "torch_pipelined_index"]
+    ns_hand = _ns_from_flags(hand)
+    assert _raw_json(ns_launcher) == _raw_json(ns_hand)
     print("ok: decoupled cycle round-trips through the flags")
 
 
 def test_percent_resolves_train_side():
     """start_iter_percent is a real flag resolved against train_iters at
     validation time (the launcher pre-resolves with the yaml's value)."""
-    flat = {k: v for k, v in ENABLED.items()
-            if k != "sga_cycle_start_iter"}
-    flat["sga_cycle_start_iter_percent"] = 0.4
-    canon = validate_sga_flat(flat, train_iters=5000)
-    assert canon["sga_cycle_start_iter"] == 20
-    assert "sga_cycle_start_iter_percent" not in canon  # resolved away
-    print("ok: percent resolves train-side and leaves the canonical form")
+    tokens = [tok for k, v in ENABLED.items() if k != "sga_cycle_start_iter"
+              for tok in ("--" + k.replace("_", "-"), str(v))]
+    tokens += ["--sga-cycle-start-iter-percent", "0.4"]
+    ns = _ns_from_flags(tokens, train_iters=5000)
+    assert ns.sga_cycle_start_iter == 20
+    assert ns.sga_cycle_start_iter_percent is None  # resolved away
+    print("ok: percent resolves train-side onto the namespace")
 
 
 def test_no_input_disabled_and_flags_inert():
-    """No sga flags at all: every dest at its default, the explicit diff is
-    empty and validation reads disabled-clean (dense, byte-identical)."""
+    """No sga flags at all: every dest at its default, validation reads
+    disabled and runs zero checks (dense, byte-identical)."""
     args = _parse([])
-    assert explicit_from_args(args) == {}
-    assert validate_sga_flat(explicit_from_args(args)) is None
+    assert args.sga_enabled is False
+    validate_sga_args(_ns_from_flags([]))
     # waist contract: inactive without sga_enabled
-    assert getattr(args, "sga_enabled", False) is False
     print("ok: zero-flag run is dense-clean")
 
 
@@ -211,24 +234,25 @@ def test_disabled_yaml_emits_single_flag():
     cfg = _cfg_with_sga({"sga_enabled": False})
     tokens = _flags_of(cfg)
     assert tokens == ["--sga-enabled", "false"]
-    assert _canon_from_namespace(tokens) is None
-    # an explicit sga_backend (even 'dense', the default) is a set key on
-    # the yaml route and errors while disabled
+    validate_sga_args(_ns_from_flags(tokens))  # disabled: zero checks
+    # an explicit sga_backend under disabled is silently ignored
+    # (megatron semantics: a disabled feature's sub-args are never
+    # validated)
     cfg2 = _cfg_with_sga({"sga_enabled": False, "sga_backend": "dense"})
-    expect_error(lambda: validate_sga_flat(
-        OmegaConf.to_container(cfg2.sga, resolve=True)),
-        "sga_backend is set but sga_enabled is false")
-    print("ok: disabled yaml emits exactly one flag; set keys error")
+    validate_sga_args(_ns_from_flags(_flags_of(cfg2)))
+    print("ok: disabled yaml emits exactly one flag; extra keys ignored")
 
 
-def test_cli_disabled_with_extra_flags_rejected():
-    """The flag route enforces the same disabled-cleanliness contract as
-    the yaml route: any --sga-* flag without --sga-enabled true fails
-    loud (never silently dense)."""
-    args = _parse(["--sga-backend", "torch_pipelined_index"])
-    expect_error(lambda: validate_sga_flat(explicit_from_args(args)),
-                 "sga_backend is set but sga_enabled is false")
-    print("ok: CLI disabled + extra flags rejected loud")
+def test_cli_disabled_with_extra_flags_accepted_silently():
+    """The flag route carries the same disabled semantics as the yaml
+    route: any --sga-* flag without --sga-enabled true is silently
+    ignored (megatron semantics: a disabled feature's sub-args are
+    never validated)."""
+    ns = _parse(["--sga-backend", "torch_pipelined_index"])
+    ns.train_iters = 5000
+    ns.pipeline_model_parallel_size = 1
+    validate_sga_args(ns)  # must not raise
+    print("ok: CLI disabled + extra flags silently ignored")
 
 
 def test_unknown_flat_values_rejected():
@@ -246,41 +270,41 @@ def test_unknown_flat_values_rejected():
 
 def test_explicit_false_and_null_spellings():
     """bools carry explicit false; the nullable warmup accepts null."""
-    args = _parse(["--sga-enabled", "true", "--sga-score", "update",
-                   "--sga-selection-method", "adaptive",
-                   "--sga-selection-ratio-percent", "10",
-                   "--sga-optimizer", "adamw",
-                   "--sga-backend", "torch_pipelined_index",
-                   "--sga-shadow", "false",
-                   "--sga-selection-adaptive-warmup-syncs", "null"])
-    explicit = explicit_from_args(args)
-    assert explicit["sga_selection_adaptive_warmup_syncs"] is None
-    canon = validate_sga_flat(explicit)
-    assert canon["sga_selection_adaptive_warmup_syncs"] is None
-    assert canon["sga_shadow"] is False
+    ns = _ns_from_flags([
+        "--sga-enabled", "true", "--sga-score", "update",
+        "--sga-selection-method", "adaptive",
+        "--sga-selection-ratio-percent", "10",
+        "--sga-optimizer", "adamw",
+        "--sga-backend", "torch_pipelined_index",
+        "--sga-shadow", "false",
+        "--sga-selection-adaptive-warmup-syncs", "null"])
+    assert ns.sga_selection_adaptive_warmup_syncs is None
+    assert ns.sga_shadow is False
     print("ok: explicit false and null spellings survive the pipeline")
 
 
 def test_legacy_nested_keys_are_unknown():
-    """A pre-flat nested section fails loud at the prefix gate (there is
-    no short form and no nested section), never as a silently-ignored
-    config; a prefixed but undeclared key still fails as unknown."""
+    """A pre-flat nested section fails loud at the launcher's prefix gate
+    (there is no short form and no nested section), never as a
+    silently-ignored config; a prefixed but undeclared key fails with
+    the unknown-key refusal."""
+    from sga.launcher.backend_megatron import _prevalidate_sga
+
     for legacy in ("cycle", "selection", "score", "trace", "checks"):
-        flat = dict(ENABLED)
-        flat[legacy] = {"start_iter": 1}
-        expect_error(lambda l=legacy: validate_sga_flat(flat),
+        cfg = _cfg_with_sga(dict(ENABLED, **{legacy: {"start_iter": 1}}))
+        expect_error(lambda c=cfg: _prevalidate_sga(c),
                      "must be the full flat sga_* names")
-    flat = dict(ENABLED)
-    flat["sga_cycle_legacy"] = 1
-    expect_error(lambda: validate_sga_flat(flat), "unknown keys")
+    cfg = _cfg_with_sga(dict(ENABLED, sga_cycle_legacy=1))
+    expect_error(lambda: _prevalidate_sga(cfg), "unknown sga: key")
     print("ok: legacy nested keys rejected at the prefix gate")
 
 
 def test_typo_plugin_param_rejected():
-    base = dict(ENABLED)
-    expect_error(lambda: validate_sga_flat({**base,
-                                             "sga_selection_ration": 10.0}),
-                 "unknown keys")
+    from sga.launcher.backend_megatron import _prevalidate_sga
+
+    expect_error(lambda: _prevalidate_sga(
+        _cfg_with_sga(dict(ENABLED, sga_selection_ration=10.0))),
+        "unknown sga: key")
     expect_error(lambda: _parse([
         "--sga-enabled", "true", "--sga-score", "update",
         "--sga-selection-method", "histogram",
@@ -290,8 +314,8 @@ def test_typo_plugin_param_rejected():
         "--sga-selection-histogram-mdoe", "fast"]),
         "unrecognized arguments")
     # a DECLARED flag with a typo'd VALUE fails at parse (argparse IS part
-    # of the shared validator; the yaml route hits the same check in
-    # validation — pinned in test_config.py)
+    # of the shared validator; the yaml route hits the same check in the
+    # launcher pre-validation — pinned in test_config.py)
     expect_error(lambda: _parse([
         "--sga-enabled", "true", "--sga-score", "update",
         "--sga-selection-method", "histogram",
@@ -309,51 +333,44 @@ def _run_all():
     print("ALL ARGUMENT TESTS PASSED")
 
 
-
-
 def test_always_sync_layers_dual_form():
     """The list-kind always-sync flag: a yaml string list and the
-    comma-joined CLI token (the launcher's list spelling) canonicalize
-    to the SAME parsed pattern list."""
-    flat = dict(ENABLED, sga_always_sync_layers=["embed", "norm"])
-    cfg = _cfg_with_sga(dict(flat))
-    canon_direct = validate_sga_flat(
-        OmegaConf.to_container(cfg.sga, resolve=True), train_iters=5000)
-    assert canon_direct["sga_always_sync_layers"] == ["embed", "norm"]
+    comma-joined CLI token (the launcher's list spelling) parse to the
+    SAME sorted pattern list on the namespace."""
+    cfg = _cfg_with_sga(dict(ENABLED, sga_always_sync_layers=["embed", "norm"]))
     tokens = _flags_of(cfg)
     assert tokens[tokens.index("--sga-always-sync-layers") + 1] == "embed,norm"
-    canon_ns = _canon_from_namespace(tokens)
-    assert canon_ns["sga_always_sync_layers"] == ["embed", "norm"]
-    assert canonical_flat_json(canon_direct) == canonical_flat_json(canon_ns)
-    print("ok: always-sync layers list <-> comma token canonicalize identically")
+    ns_launcher = _ns_from_flags(tokens)
+    assert ns_launcher.sga_always_sync_layers == ["embed", "norm"]
+    ns_hand = _ns_from_flags(
+        _flags_of(_cfg_with_sga(dict(ENABLED)))
+        + ["--sga-always-sync-layers", "norm,embed"])
+    assert ns_hand.sga_always_sync_layers == ["embed", "norm"]
+    assert _raw_json(ns_launcher) == _raw_json(ns_hand)
+    print("ok: always-sync layers list <-> comma token parse identically")
 
 
 def test_always_sync_layers_empty_is_off_on_both_routes():
     """The yaml [] OFF spelling round-trips: the launcher emits it as the
     single empty token (",".join([])), and BOTH that token and a
-    hand-written empty flag value canonicalize to None — identical to
-    the unset flag (the broken-join defense only refuses holes BETWEEN
-    patterns, never the whole-empty spelling)."""
+    hand-written empty flag value parse to None — identical to the unset
+    flag (the broken-join defense only refuses holes BETWEEN patterns,
+    never the whole-empty spelling)."""
     cfg = _cfg_with_sga(dict(ENABLED, sga_always_sync_layers=[]))
-    # yaml route: the empty list itself is an OFF spelling
-    canon_direct = validate_sga_flat(
-        OmegaConf.to_container(cfg.sga, resolve=True), train_iters=5000)
-    assert canon_direct["sga_always_sync_layers"] is None
-    # launcher route: [] is emitted as the single empty token
     tokens = _flags_of(cfg)
     assert tokens[tokens.index("--sga-always-sync-layers") + 1] == ""
-    canon_ns = _canon_from_namespace(tokens)
-    assert canon_ns["sga_always_sync_layers"] is None
+    ns_launcher = _ns_from_flags(tokens)
+    assert ns_launcher.sga_always_sync_layers is None
     # a hand-written empty flag value is that same token
-    canon_cli = _canon_from_namespace(
+    ns_cli = _ns_from_flags(
         _flags_of(_cfg_with_sga(dict(ENABLED)))
         + ["--sga-always-sync-layers", ""])
-    assert canon_cli["sga_always_sync_layers"] is None
+    assert ns_cli.sga_always_sync_layers is None
     # all three spellings are identical to the unset flag
-    unset = _canon_from_namespace(_flags_of(_cfg_with_sga(dict(ENABLED))))
-    assert canonical_flat_json(canon_direct) == canonical_flat_json(unset)
-    assert canonical_flat_json(canon_ns) == canonical_flat_json(unset)
-    assert canonical_flat_json(canon_cli) == canonical_flat_json(unset)
+    ns_unset = _ns_from_flags(_flags_of(_cfg_with_sga(dict(ENABLED))))
+    assert ns_unset.sga_always_sync_layers is None
+    assert _raw_json(ns_launcher) == _raw_json(ns_unset)
+    assert _raw_json(ns_cli) == _raw_json(ns_unset)
     print("ok: empty list / empty token <-> off equivalence on both routes")
 
 

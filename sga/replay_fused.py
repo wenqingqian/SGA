@@ -723,7 +723,7 @@ def run_fused_branch(args, ctx, t0):
             "--fused requires --dense-cache (the dense arm is consumed from "
             "the cache; a first run populates it automatically)")
     # mirror the classic path: registry order + unknown-name rejection
-    allowed = list(R.SCORES)
+    allowed = list(R.all_score_names())
     if args.score_names:
         unknown = [s for s in args.score_names if s not in allowed]
         if unknown:

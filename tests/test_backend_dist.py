@@ -33,8 +33,16 @@ sys.path.insert(0, SGA_ROOT)
 
 from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
+from sga.config import set_args
+from sga.config.validation import sga_defaults
 from sga.engine import SGAEngineError
 from sga.support import BucketSupport
+
+
+def _seed(**over):
+    """Seed the sga singleton for a zero-arg backend build
+    (backends read their knobs off sga.config.get_args())."""
+    set_args(SimpleNamespace(**{**sga_defaults(), **over}))
 
 
 def _engine_like():
@@ -67,7 +75,8 @@ def main():
 
     # --- masked backend (writeback emission) -------------------------------
     g_mask = local.clone()
-    ret_mask = TorchPipelinedMaskBackend({"sga_backend_mask_slices": 2}).allreduce_sparse(
+    _seed()
+    ret_mask = TorchPipelinedMaskBackend().allreduce_sparse(
         g_mask, support, group, factor, op, key=0)
     active = support.mask_u8 > 0
     assert ret_mask is None, "writeback backend must return None"
@@ -77,7 +86,8 @@ def main():
 
     # --- indexed backend (compact emission) --------------------------------
     g_idx = local.clone()
-    ret_idx = TorchPipelinedIndexBackend({}).allreduce_sparse(
+    _seed()
+    ret_idx = TorchPipelinedIndexBackend().allreduce_sparse(
         g_idx, support, group, factor, op, key=0)
     assert isinstance(ret_idx, torch.Tensor), (
         "compact backend must return the values view (a Tensor)"
@@ -97,8 +107,8 @@ def main():
     # written-back buffer must equal the mask backend's bitwise (same
     # payload elements in ascending order, same per-element SUMs) ---
     g_wb = local.clone()
-    ret_wb = TorchPipelinedIndexBackend(
-        {"sga_backend_emission": "writeback"}).allreduce_sparse(
+    _seed(sga_backend_emission="writeback")
+    ret_wb = TorchPipelinedIndexBackend().allreduce_sparse(
             g_wb, support, group, factor, op, key=0)
     assert ret_wb is None, "writeback emission must return None"
     assert torch.equal(g_wb[~active], local[~active]), "residual changed"
@@ -131,12 +141,13 @@ def main():
     bsupport = BucketSupport(bmask.to(device), block_size=x,
                              block_spans=spans)
     g_blk = local.clone()
-    ret_blk = TorchPipelinedIndexBackend(
-        {"sga_backend_emission": "writeback"}).allreduce_sparse(
+    _seed(sga_backend_emission="writeback")
+    ret_blk = TorchPipelinedIndexBackend().allreduce_sparse(
             g_blk, bsupport, group, factor, op, key=2)
     assert ret_blk is None, "block writeback must return None"
     g_bmask = local.clone()
-    TorchPipelinedMaskBackend({"sga_backend_mask_slices": 2}).allreduce_sparse(
+    _seed()
+    TorchPipelinedMaskBackend().allreduce_sparse(
         g_bmask, BucketSupport(bmask.to(device)), group, factor, op, key=2)
     bact = bmask.to(device) > 0
     assert torch.equal(g_blk[~bact], local[~bact]), "block residual changed"
@@ -149,8 +160,8 @@ def main():
     bempty = BucketSupport(torch.zeros(n, dtype=torch.uint8, device=device),
                            block_size=x, block_spans=[(0, n)])
     g_be = local.clone()
-    assert TorchPipelinedIndexBackend(
-        {"sga_backend_emission": "writeback"}).allreduce_sparse(
+    _seed(sga_backend_emission="writeback")
+    assert TorchPipelinedIndexBackend().allreduce_sparse(
             g_be, bempty, group, factor, op, key=3) is None
     assert torch.equal(g_be, local)
 
@@ -158,14 +169,16 @@ def main():
     # belt; config validation is the front gate, pinned in
     # test_config_flat)
     try:
-        TorchPipelinedIndexBackend({"sga_backend_emission": "compact"}).allreduce_sparse(
+        _seed(sga_backend_emission="compact")
+        TorchPipelinedIndexBackend().allreduce_sparse(
             local.clone(), bsupport, group, factor, op, key=4)
         raise AssertionError("compact emission accepted a block support")
     except ValueError as e:
         assert "writeback" in str(e), e
     from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
     try:
-        NcclPipelinedIndexBackend({}).allreduce_sparse(
+        _seed()
+        NcclPipelinedIndexBackend().allreduce_sparse(
             local.clone(), bsupport, group, factor, op, key=4)
         raise AssertionError("nccl accepted a block-granular support")
     except ValueError as e:
@@ -176,7 +189,8 @@ def main():
     if lib:
         from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
 
-        be = NcclPipelinedIndexBackend({})
+        _seed()
+        be = NcclPipelinedIndexBackend()
         be.prepare(group, device=device)
         be.prepare(group, device=device)  # idempotent: one comm per group
         assert len(be._comms) == 1
@@ -192,7 +206,8 @@ def main():
 
         # a second backend instance exercising the factor-1.0 fast path:
         # no pre-scale, plain SUM over 2 ranks
-        be3 = NcclPipelinedIndexBackend({})
+        _seed()
+        be3 = NcclPipelinedIndexBackend()
         be3.prepare(group, device=device)
         g_fast = local.clone()
         be3.allreduce_sparse(g_fast, support, group, 1.0, op, key=10)
@@ -208,9 +223,10 @@ def main():
     # --- empty support is a clean no-op ------------------------------------
     empty = BucketSupport(torch.zeros(n, dtype=torch.uint8, device=device))
     g_empty = local.clone()
-    ret_m = TorchPipelinedMaskBackend({"sga_backend_mask_slices": 2}).allreduce_sparse(
+    _seed()
+    ret_m = TorchPipelinedMaskBackend().allreduce_sparse(
         g_empty, empty, group, factor, op, key=1)
-    ret_i = TorchPipelinedIndexBackend({}).allreduce_sparse(
+    ret_i = TorchPipelinedIndexBackend().allreduce_sparse(
         g_empty, empty, group, factor, op, key=1)
     assert ret_m is None
     # zero-selection is an EMPTY TENSOR on compact backends (never None —
@@ -220,8 +236,8 @@ def main():
     # writeback emission: zero-selection is None (the writeback signature
     # the engine keys on) and the buffer stays untouched
     g_empty2 = local.clone()
-    ret_wb_empty = TorchPipelinedIndexBackend(
-        {"sga_backend_emission": "writeback"}).allreduce_sparse(
+    _seed(sga_backend_emission="writeback")
+    ret_wb_empty = TorchPipelinedIndexBackend().allreduce_sparse(
             g_empty2, empty, group, factor, op, key=1)
     assert ret_wb_empty is None
     assert torch.equal(g_empty2, local)

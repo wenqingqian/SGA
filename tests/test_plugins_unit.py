@@ -9,8 +9,11 @@ Covers:
 - topk: histogram threshold == exact torch.kthvalue threshold,
   mask equality, k rounding bound, three-tier geometry + chunking;
 - adaptive controller band logic, clamps and lifecycle;
-- declaration-based combination validation + build injection + decl coverage
-  (incl. the emission registration gate and the compact capability rule);
+- the class-registry face: zero-arg builds off the seeded singleton,
+  duplicate-registration refusal, curated unknown-name errors, the
+  self-declared backend class facts, and the score-name/kernel-branch
+  alignment (a registered score without a _TRITON_SCORE_MAP entry fails
+  loud at optimizer construction).
 
 Run: python tests/test_plugins_unit.py  (or pytest tests/test_plugins_unit.py)
 """
@@ -24,20 +27,26 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from sga.config import set_args
+from sga.config.validation import sga_defaults
 from sga.plugins import (
-    BackendDecl,
-    OptimizerDecl,
-    _register,
-    get_backend_plugin_decl,
-    get_optimizer_decl,
-    get_selection_decl,
+    build_backend_plugin,
+    build_optimizer,
+    build_selection,
+    plugin_class,
+    register_backend_plugin,
     register_default_plugins,
-    validate_combination,
+    register_optimizer,
+    register_selection,
 )
 from sga.plugins.optimizer import OptContext
-from sga.plugins.optimizer.adamw import SgaAdamW, adamw_grad_correct
+from sga.plugins.optimizer.adamw import (
+    SgaAdamW,
+    _TRITON_SCORE_MAP,
+    adamw_grad_correct,
+)
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch
-from sga.plugins.scores import SCRATCH_SCORES, get_score_spec, score_names
+from sga.plugins.scores import get_score_spec, score_names
 from sga.plugins.selection._exact import select_masks_exact_kthvalue
 from sga.plugins.selection._histogram import (
     _HIST_BINS,
@@ -48,15 +57,18 @@ from sga.plugins.selection._histogram import (
 from sga.plugins.selection.topk import TopkSelection
 
 
-def _method_allows(method: str, key: str) -> bool:
-    """Is `key` a legal topk param under `method`? (topk's own literal
-    per-method vocabularies: base params always, guarded params under
-    the method that unlocks them.)"""
-    guarded = {"sga_selection_histogram_mode": "histogram",
-               "sga_selection_adaptive_warmup_syncs": "adaptive",
-               "sga_selection_adaptive_warmup_mode": "adaptive"}
-    return (key in ("sga_selection_method", "sga_selection_ratio_percent")
-            or (key in guarded and guarded[key] == method))
+def _seed(**over):
+    """Seed the sga args singleton for a zero-arg plugin build
+    (declared defaults + a buildable sga_score + overrides)."""
+    ns = SimpleNamespace(**{**sga_defaults(), "sga_score": "update", **over})
+    set_args(ns)
+    return ns
+
+
+def _seed_sel(method="histogram", ratio=10.0, **over):
+    return _seed(sga_selection_method=method, sga_selection_ratio_percent=ratio,
+                 **over)
+
 
 torch.manual_seed(0)
 
@@ -73,9 +85,8 @@ class _Ctx:
 def test_old_selection_name_fails_loud():
     """circular_topk (the pre-rename name of topk) must fail with the
     curated unknown-plugin error — not a KeyError from the dispatch dict."""
-    from sga.plugins import build_selection
     try:
-        build_selection("circular_topk", {"sga_selection_ratio_percent": 20.0})
+        build_selection("circular_topk")
         raise AssertionError("old name accepted")
     except ValueError as e:
         assert "circular_topk" in str(e) and "['topk']" in str(e), e
@@ -83,20 +94,17 @@ def test_old_selection_name_fails_loud():
 
 
 def test_old_backend_name_fails_loud():
-    """Pre-unification backend names must fail with a migration hint that
-    names the reproducing configuration — not a silent dict miss."""
-    from sga.plugins import get_backend_plugin_decl
-    for old, hint in (
-        ("indexed_sparse", "high_priority_group: false"),
-        ("pipelined_idx_sorted", "high_priority_group: true, index_slices: 3"),
-        ("masked_pipelined", "torch_pipelined_mask"),
-    ):
+    """Pre-unification backend names read as plain unknown-plugin errors
+    listing the registered backends (the absorbed names carry no migration
+    machinery anymore — the unified plugins ARE the configuration)."""
+    for old in ("indexed_sparse", "pipelined_idx_sorted", "masked_pipelined"):
         try:
-            get_backend_plugin_decl(old)
+            build_backend_plugin(old)
             raise AssertionError(f"old name accepted: {old}")
         except ValueError as e:
-            assert old in str(e) and hint in str(e), (old, e)
-    print("ok: old backend names fail loud with migration hints")
+            assert old in str(e), (old, e)
+            assert "torch_pipelined_mask" in str(e), (old, e)
+    print("ok: old backend names fail loud with the registered list")
 
 
 def test_registry_contents():
@@ -104,6 +112,7 @@ def test_registry_contents():
     for name in score_names():
         spec = get_score_spec(name)
         assert callable(spec.formula) and spec.doc
+        assert isinstance(spec.scratch, bool)
     try:
         get_score_spec("nope")
         raise AssertionError("unknown score accepted")
@@ -156,8 +165,8 @@ def test_score_formulas_match_fp64_oracles():
 def test_score_formula_scratch_routing_bitwise():
     """scratch-routed evaluation is bitwise identical to the freshly-allocated
     one (the out= chains must be op-for-op the same elementwise sequence),
-    outputs never alias the scratch pair, the unused-scratch scores (outside
-    SCRATCH_SCORES) ignore the pair entirely, and records of DIFFERENT numel
+    outputs never alias the scratch pair, the scratch=False scores
+    (abs_g/abs_m) ignore the pair entirely, and records of DIFFERENT numel
     AND rank share ONE pair sized to the max (the [:n].view_as(w) narrowing
     keeps out= ops off the shared buffers' shape — a resize would shrink the
     pair under the next, larger record). The whole scratch-routed evaluation
@@ -187,10 +196,9 @@ def test_score_formula_scratch_routing_bitwise():
         assert torch.equal(fresh, with_scratch), name
         assert with_scratch.data_ptr() != scratch[0].data_ptr()
         assert with_scratch.data_ptr() != scratch[1].data_ptr()
-    assert SCRATCH_SCORES == frozenset(
-        n for n in score_names() if get_score_spec(n).scratch
-    )
-    assert SCRATCH_SCORES == frozenset(("update", "coi"))
+    # the spec scratch flags ARE the derived scratch set (single source)
+    assert {n_ for n_ in score_names() if get_score_spec(n_).scratch} \
+        == frozenset(("update", "coi"))
 
     # the wd-free variant must ALSO return a fresh tensor with a caller
     # scratch (never alias the pair — per-param outputs are held
@@ -277,7 +285,7 @@ def test_grad_correct_sparse_fusion_semantics():
             p, m, v = torch.randn(n), torch.randn(n) * .1, torch.rand(n) * .1
 
             p1, g1, m1, v1 = p.clone(), g0.clone(), m.clone(), v.clone()
-            grad_correct_torch(p1, g1, m1, v1, mask=mask, emit_mode=None,
+            grad_correct_torch(p1, g1, m1, v1, mask=mask, emit_score=None,
                                coeff=coeff, clear=True, fold=fold,
                                interval=float(interval), **kw)
 
@@ -285,7 +293,7 @@ def test_grad_correct_sparse_fusion_semantics():
             g2 = g0.clone()
             if coeff != 1.0:
                 g2 = torch.where(mask > 0, g2 * coeff, g2)
-            grad_correct_torch(p2, g2, m2, v2, mask=mask, emit_mode=None,
+            grad_correct_torch(p2, g2, m2, v2, mask=mask, emit_score=None,
                                clear=True, fold=fold,
                                interval=float(interval), **kw)
 
@@ -312,11 +320,26 @@ def test_histogram_matches_exact_method():
 
 
 def test_topk_k_rounding():
-    sel = TopkSelection({"sga_selection_method": "histogram", "sga_selection_ratio_percent": 10.0})
+    _seed_sel(method="histogram", ratio=10.0)
+    sel = TopkSelection()
     n = 1000
     assert sel.k_for(n) == 100
     # rounding bound from k = max(1, round(n * r)): |selected/n - r| <= 0.5/n
     assert abs(sel.k_for(999) / 999 - 0.10) <= 0.5 / 999 + 1e-12
+
+
+def test_topk_bogus_method_refused():
+    """Direct construction (set_args) bypasses argparse's choices: an
+    unknown sga_selection_method must fail loud at the dispatch, not fall
+    through to the exact impl (validation's choices gate covers the flag
+    routes; this is the constructor backstop, like the ratio guard)."""
+    _seed_sel(method="bogus", ratio=10.0)
+    try:
+        TopkSelection()
+        raise AssertionError("bogus method accepted")
+    except ValueError as e:
+        assert "adaptive|exact|histogram" in str(e) and "'bogus'" in str(e), e
+    print("ok: topk bogus method refuses at the dispatch")
 
 
 def test_warmup_sync_target_anchor():
@@ -325,15 +348,16 @@ def test_warmup_sync_target_anchor():
     T iters from the run start leaves max(0, (N*T - 1 - start) // T) gated
     syncs for a selection starting at start_iter; a late start (window
     already over) leaves a single bootstrap; an unset window yields None."""
-    sel = TopkSelection({"sga_selection_method": "adaptive", "sga_selection_ratio_percent": 40.0,
-                                 "sga_selection_adaptive_warmup_syncs": 5})
+    _seed_sel(method="adaptive", ratio=40.0,
+              sga_selection_adaptive_warmup_syncs=5)
+    sel = TopkSelection()
     assert sel.warmup_sync_target(start_iter=0, period=4) == 4  # syncs at 4,8,12,16
     assert sel.warmup_sync_target(start_iter=6, period=4) == (20 - 1 - 6) // 4
     assert sel.warmup_sync_target(start_iter=25, period=4) == 0
 
-    unset = TopkSelection({"sga_selection_method": "adaptive", "sga_selection_ratio_percent": 40.0,
-                                   "sga_selection_adaptive_warmup_syncs": None})
-    assert unset.params["sga_selection_adaptive_warmup_syncs"] is None
+    _seed_sel(method="adaptive", ratio=40.0,
+              sga_selection_adaptive_warmup_syncs=None)
+    unset = TopkSelection()
     assert unset.warmup_sync_target(start_iter=0, period=4) is None
 
     # null syncs + no engine anchor (warmup_target=None): the gate
@@ -341,8 +365,9 @@ def test_warmup_sync_target_anchor():
     # takes over (an earlier revision crashed here with max(None, 1))
     torch.manual_seed(4)
     grads = [torch.randn(2048)]
-    sel0 = TopkSelection({"sga_selection_method": "adaptive", "sga_selection_ratio_percent": 10.0,
-                          "sga_selection_adaptive_warmup_syncs": None})
+    _seed_sel(method="adaptive", ratio=10.0,
+              sga_selection_adaptive_warmup_syncs=None)
+    sel0 = TopkSelection()
     masks = sel0.select(_Ctx(grads, comm_group=None, warmup_target=None))
     assert sum(int(torch.count_nonzero(m).item()) for m in masks) > 0
     assert sel0.tau is not None and sel0.tau > 0.0
@@ -431,15 +456,19 @@ def test_hist_tiers_geometry_and_chunking():
     b3 = int(torch.searchsorted(torch.cumsum(hist * 3, 0), r1 * 3).item())
     assert b1 == b3
 
-    # selection plumbing: histogram_mode flows through, unknown modes rejected
-    sel = TopkSelection({"sga_selection_method": "histogram", "sga_selection_ratio_percent": 10.0,
-                        "sga_selection_histogram_mode": "fast"})
+    # selection plumbing: histogram_mode flows through the singleton;
+    # unknown modes are rejected by the impl constructor (the flag route
+    # is guarded by the argparse choices — test_config_flat pins those)
+    _seed_sel(method="histogram", ratio=10.0,
+              sga_selection_histogram_mode="fast")
+    sel = TopkSelection()
     sel.select(_Ctx(grads, comm_group=None))
     bits = torch.tensor(sel.last_threshold, dtype=torch.float32).view(torch.int32).item()
     assert (bits & ((1 << 19) - 1)) == 0
     try:
-        TopkSelection({"sga_selection_method": "histogram", "sga_selection_ratio_percent": 10.0,
-                        "sga_selection_histogram_mode": "turbo"})
+        sel.select(_Ctx(grads, comm_group=None, warmup_target=None))
+        from sga.plugins.selection._histogram import HistogramSelect
+        HistogramSelect("turbo")
         raise AssertionError("unknown histogram_mode accepted")
     except ValueError:
         pass
@@ -450,7 +479,7 @@ def test_histogram_block_selection():
     """Block-granular histogram selection: block-mean/max
     reduce, real-length tail blocks, mask expansion structure, k_blocks
     rounding, exact-vs-histogram threshold identity on block scores,
-    empty-view tolerance, and constructor/foreign-key guards."""
+    empty-view tolerance, and the impl constructor guards."""
     import sga.plugins.selection._histogram as _h
     from sga.plugins.selection._histogram import (
         HistogramSelect, _block_reduce_views)
@@ -541,14 +570,18 @@ def test_histogram_block_selection():
     assert masks[1].dtype == torch.uint8 and masks[1].numel() == 0
     assert masks[0].numel() == 48
 
-    # --- TopkSelection plumbing + constructor/foreign-key guards ---
-    sel = TopkSelection({"sga_selection_method": "histogram", "sga_selection_ratio_percent": 10.0,
-                         "sga_selection_block_size": 16})
-    assert sel.block_size == 16 and sel.params["sga_selection_block_reduce"] == "mean"
-    assert TopkSelection({"sga_selection_method": "histogram",
-                          "sga_selection_ratio_percent": 10.0}).block_size == 1
-    assert TopkSelection({"sga_selection_method": "exact",
-                          "sga_selection_ratio_percent": 10.0}).block_size == 1
+    # --- TopkSelection plumbing off the singleton: block knobs flow to
+    #     the impl; under a non-histogram method block_size is silently
+    #     ignored (config validation owns the curated refusal) ---
+    _seed_sel(method="histogram", ratio=10.0, sga_selection_block_size=16)
+    sel = TopkSelection()
+    assert sel.block_size == 16
+    assert sel._impl.block_reduce == "mean"  # declared default flowed through
+    _seed_sel(method="histogram", ratio=10.0)
+    assert TopkSelection().block_size == 1
+    _seed_sel(method="exact", ratio=10.0, sga_selection_block_size=16)
+    assert TopkSelection().block_size == 1  # exact has no block impl
+    # impl constructor guards (direct construction bypasses argparse)
     for bad in (0, 3, True, -16, 2048):
         try:
             HistogramSelect("exact", block_size=bad)
@@ -561,12 +594,6 @@ def test_histogram_block_selection():
         raise AssertionError("bad block_reduce accepted")
     except ValueError:
         pass
-    try:
-        TopkSelection({"sga_selection_method": "exact", "sga_selection_ratio_percent": 10.0,
-                       "sga_selection_block_size": 16})
-        raise AssertionError("block_size accepted under method=exact")
-    except ValueError as e:
-        assert "do not belong" in str(e)
     print("ok: block histogram selection (reduce/tail/structure/k_blocks)")
 
 
@@ -588,10 +615,13 @@ def test_adaptive_threshold_band_and_clamps():
 
 def test_topk_adaptive_lifecycle():
     """Bootstrap -> gated warmup -> persistent tau feedback -> collapse
-    re-bootstrap (v3.1 semantics, default fast-mode warmup histogram)."""
+    re-bootstrap (v3.1 semantics, default fast-mode warmup histogram).
+    The singleton carries the knobs (a sibling-method knob is silently
+    ignored — megatron dead-config semantics, pinned in test_config_flat)."""
     torch.manual_seed(12)
     grads = [torch.randn(4096), torch.randn(1000)]
-    sel = TopkSelection({"sga_selection_method": "adaptive", "sga_selection_ratio_percent": 10.0})
+    _seed_sel(method="adaptive", ratio=10.0)
+    sel = TopkSelection()
     assert sel._impl.warmup_mode == "fast"
 
     # 1) bootstrap from the warmup-mode histogram; tau is its bin edge
@@ -640,24 +670,8 @@ def test_topk_adaptive_lifecycle():
     assert sel.tau > 0.0, sel.tau
     assert sel.tau == _bin_edge_float(1, 19), sel.tau  # fast mode floor
     assert all(int(torch.count_nonzero(m).item()) for m in masks)
-
-    # per-method vocabulary: a foreign method's knob is rejected loudly —
-    # it would be silently dead under the configured method (full product)
-    for method in ("adaptive", "exact", "histogram"):
-        for key, val in (("sga_selection_histogram_mode", "exact"),
-                         ("sga_selection_adaptive_warmup_syncs", 3),
-                         ("sga_selection_adaptive_warmup_mode", "fast")):
-            cfg = {"sga_selection_method": method, "sga_selection_ratio_percent": 10.0, key: val}
-            if _method_allows(method, key):
-                TopkSelection(cfg)  # legal under its own method
-                continue
-            try:
-                TopkSelection(cfg)
-                raise AssertionError(f"{method} + {key} accepted")
-            except ValueError as e:
-                assert key in str(e) and method in str(e), e
     print("ok: topk adaptive lifecycle (bootstrap/warmup/tau/collapse/"
-          "tau-zero latch) + per-method foreign-key rejection")
+          "tau-zero latch)")
 
 
 # ------------------------------------------------- score emission (full step)
@@ -689,7 +703,8 @@ class _RecCtx:
 
 def test_score_emission_matches_oracles():
     """Each emitted score, its buffer swap, and the applied update match a
-    hand oracle on pre/post-commit state (fallback path, CPU)."""
+    hand oracle on pre/post-commit state (fallback path, CPU). The emit
+    score arrives via the singleton (sga_score), not a build argument."""
     torch.manual_seed(3)
     n, b1, b2, step = 512, 0.9, 0.95, 7
     bc1, bc2 = 1 - b1 ** step, 1 - b2 ** step
@@ -701,7 +716,9 @@ def test_score_emission_matches_oracles():
         w = param0.clone().requires_grad_(False)
         g = grad0.clone().requires_grad_(False)
         rec = _Rec(w, g)
-        opt = SgaAdamW({"sga_optimizer_residual_mean": False}, emit_score=mode)
+        _seed(sga_score=mode)
+        opt = SgaAdamW()
+        assert opt.emit_score == mode
         opt.full_step(_RecCtx([rec]))
 
         # m0/v0 start at zero here (state is lazily created)
@@ -727,8 +744,8 @@ def test_score_emission_matches_oracles():
     g = grad0.clone().requires_grad_(False)
     rec = _Rec(w, g)
     rec._state = {"exp_avg": m0.clone(), "exp_avg_sq": v0.clone()}
-    opt = SgaAdamW({}, emit_score="coi")
-    opt.full_step(_RecCtx([rec]))
+    _seed(sga_score="coi")
+    SgaAdamW().full_step(_RecCtx([rec]))
     oracles = _formula_oracles(param0, m0, v0, grad0, b1, b2, 1e-8, 1e-2,
                                bc1, bc2)
     m_new = b1 * m0 + (1 - b1) * grad0
@@ -782,7 +799,8 @@ def test_sparse_step_end_state_invariant():
         ctx = OptContext(records=[rec], phase="sparse", bucket_states=[],
                          fold_window=fold_window, next_step_is_full=next_full,
                          apply_coeff=0.5)
-        opt = SgaAdamW({"sga_optimizer_residual_mean": residual_mean})
+        _seed(sga_optimizer_residual_mean=residual_mean)
+        opt = SgaAdamW()
         opt.sparse_step(ctx)
 
         assert torch.all(rec.grad.data[active] == 0)
@@ -811,88 +829,86 @@ def test_sparse_step_end_state_invariant():
     # degenerate mask-less bucket: reset zeroes it even on a sparse step
     bare = _Bucket(torch.randn(n), None)
     ctx = OptContext(records=[], phase="sparse", bucket_states=[bare])
-    SgaAdamW({}).reset(ctx, was_full=False)
+    _seed()
+    SgaAdamW().reset(ctx, was_full=False)
     assert torch.all(bare.grad_data == 0)
 
 
 def test_compact_search_param_resolution():
-    """compact_search: default 'table' (the benchmark-adjudicated prod
-    form), enum validated loudly, bisection accepted. Silent no-op on
-    writeback-emission runs / torch fallback is the DECL's documented
-    contract (they never reach the compact merge-join)."""
-    assert SgaAdamW({}).compact_search == "table"
-    assert SgaAdamW({"sga_optimizer_compact_search": "bisection"}).compact_search == "bisection"
-    try:
-        SgaAdamW({"sga_optimizer_compact_search": "quadtree"})
-        raise AssertionError("bogus compact_search accepted")
-    except ValueError as e:
-        assert "compact_search" in str(e), e
-    print("ok: compact_search resolution (default table, enum validated)")
+    """compact_search: the declared default 'table' (the benchmark-adjudicated
+    prod form) and 'bisection' both flow through the singleton (the enum
+    itself is the argparse choices' business on the flag routes — pinned in
+    test_config_flat's golden table). Silent no-op on writeback-emission
+    runs / torch fallback is the documented contract (they never reach the
+    compact merge-join; the CPU dispatch pin is below)."""
+    _seed()
+    assert SgaAdamW().compact_search == "table"
+    _seed(sga_optimizer_compact_search="bisection")
+    assert SgaAdamW().compact_search == "bisection"
+    print("ok: compact_search resolution (default table)")
 
 
 def test_backend_emission_param_resolution():
-    """sga_backend emission: 'auto' (the flag default) resolves to each
-    backend's inherent form — compact ONLY on torch_pipelined_index;
-    explicit 'compact' on the writeback-inherent backends is refused with
-    a pointer (direct-construction backstop; the flag-layer rule catches
-    real runs earlier); bogus values fail the enum loudly."""
+    """sga_backend emission off the singleton: 'auto' (the flag default)
+    resolves to each backend's inherent form — compact ONLY on
+    torch_pipelined_index; explicit 'compact' on the writeback-inherent
+    backends is refused with a pointer (direct-construction backstop; the
+    config-layer rule catches real runs earlier)."""
     from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
     from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
     from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
 
-    assert TorchPipelinedIndexBackend({}).emission == "compact"
-    assert TorchPipelinedIndexBackend(
-        {"sga_backend_emission": "writeback"}).emission == "writeback"
-    assert TorchPipelinedIndexBackend(
-        {"sga_backend_emission": "compact"}).emission == "compact"
-    assert TorchPipelinedMaskBackend({}).emission == "writeback"
-    assert TorchPipelinedMaskBackend(
-        {"sga_backend_emission": "writeback"}).emission == "writeback"
-    # mask_slices: the declared default expands to 2, and an explicit 0
-    # (silently normalized to 2 before the flat config) fails loud
-    assert TorchPipelinedMaskBackend({})._mask_slices == 2  # declared default
+    _seed()
+    assert TorchPipelinedIndexBackend().emission == "compact"
+    _seed(sga_backend_emission="writeback")
+    assert TorchPipelinedIndexBackend().emission == "writeback"
+    _seed(sga_backend_emission="compact")
+    assert TorchPipelinedIndexBackend().emission == "compact"
+    _seed()
+    assert TorchPipelinedMaskBackend().emission == "writeback"
+    assert TorchPipelinedMaskBackend()._mask_slices == 2  # declared default
+    _seed(sga_backend_mask_slices=0)
     try:
-        TorchPipelinedMaskBackend({"sga_backend_mask_slices": 0})
+        TorchPipelinedMaskBackend()
         raise AssertionError("mask_slices 0 accepted")
     except ValueError as e:
-        assert "mask_slices must be >= 1" in str(e), e
-    assert NcclPipelinedIndexBackend({}).emission == "writeback"
+        assert "mask_slices must be an int >= 1" in str(e), e
+    _seed()
+    assert NcclPipelinedIndexBackend().emission == "writeback"
     for cls in (TorchPipelinedMaskBackend, NcclPipelinedIndexBackend):
+        _seed(sga_backend_emission="compact")
         try:
-            cls({"sga_backend_emission": "compact"})
+            cls()
             raise AssertionError(f"compact accepted by {cls.__name__}")
         except ValueError as e:
             assert "only supported" in str(e)
             assert "torch_pipelined_index" in str(e), e
-    try:
-        TorchPipelinedIndexBackend({"sga_backend_emission": "quadtree"})
-        raise AssertionError("bogus emission accepted")
-    except ValueError as e:
-        assert "quadtree" in str(e), e
-    print("ok: backend emission resolution (auto->inherent, compact tpi-only)")
-
-
-def test_validate_combination_emission_value_aware():
-    """The compact-capability rule keys on the RESOLVED emission, not the
-    decl field: torch_pipelined_index (decl emission=compact) with an
-    explicit writeback may pair with a non-compact optimizer; explicit
-    compact still requires consumes_compact."""
-    backend = get_backend_plugin_decl("torch_pipelined_index")
-    non_consumer = OptimizerDecl(
-        name="fake", reset_mode="selective", consumes_compact=False,
-        emittable_scores=frozenset({"update"}))
-    # decl says compact; the run says writeback -> legal
-    validate_combination("update", get_selection_decl("topk"), non_consumer,
-                         backend, backend_emission="writeback")
-    # auto/None -> the decl's inherent compact -> still requires the consumer
-    for em in (None, "auto"):
+    # out-of-vocabulary emission refuses BY NAME before resolution on all
+    # three backends (riding the resolution verbatim it would desync the
+    # engine's compact routing — silent gradient loss on the singleton
+    # route)
+    for cls in (TorchPipelinedIndexBackend, TorchPipelinedMaskBackend,
+                NcclPipelinedIndexBackend):
+        _seed(sga_backend_emission="bogus")
         try:
-            validate_combination("update", get_selection_decl("topk"),
-                                 non_consumer, backend, backend_emission=em)
-            raise AssertionError("non-consumer accepted under compact")
+            cls()
+            raise AssertionError(f"bogus emission accepted by {cls.__name__}")
         except ValueError as e:
-            assert "consumes_compact" in str(e), e
-    print("ok: combination check resolves emission by value")
+            assert "auto|compact|writeback" in str(e) and "'bogus'" in str(e), e
+    # slice guards: a fractional count refuses instead of int()-truncating
+    _seed(sga_backend_index_slices=2.9)
+    try:
+        TorchPipelinedIndexBackend()
+        raise AssertionError("fractional index_slices accepted")
+    except ValueError as e:
+        assert "index_slices must be an int >= 1" in str(e), e
+    _seed(sga_backend_mask_slices=2.9)
+    try:
+        TorchPipelinedMaskBackend()
+        raise AssertionError("fractional mask_slices accepted")
+    except ValueError as e:
+        assert "mask_slices must be an int >= 1" in str(e), e
+    print("ok: backend emission resolution (auto->inherent, compact tpi-only)")
 
 
 class _CompactRec(_Rec):
@@ -908,12 +924,12 @@ def test_compact_search_cpu_compact_dispatch():
     """Fallback contract pin: compact_search='table' must take the
     torch fallback SILENTLY on the CPU compact path — the eager
     bucket.dir_table build (a triton assert, or a CUDA kernel launched on
-    CPU tensors) must never run before the fallback engages (the DECL's
-    "silently ignored on ... the torch fallback path" contract). Drives
-    SgaAdamW.sparse_step -> _records_pass_compact with compact_values on
-    CPU tensors: the 'table' end state must be bitwise the 'bisection' end
-    state, and the values must actually be consumed (the fallback is not
-    a silent no-op)."""
+    CPU tensors) must never run before the fallback engages (the
+    documented "silently ignored on ... the torch fallback path"
+    contract). Drives SgaAdamW.sparse_step -> _records_pass_compact with
+    compact_values on CPU tensors: the 'table' end state must be bitwise
+    the 'bisection' end state, and the values must actually be consumed
+    (the fallback is not a silent no-op)."""
     from sga.support import BucketSupport, Support
 
     torch.manual_seed(23)
@@ -931,7 +947,8 @@ def test_compact_search_cpu_compact_dispatch():
                          bucket_states=[], fold_window=8,
                          next_step_is_full=False, apply_coeff=0.5,
                          compact_values={id(bs): values.clone()})
-        SgaAdamW({"sga_optimizer_compact_search": compact_search}).sparse_step(ctx)
+        _seed(sga_optimizer_compact_search=compact_search)
+        SgaAdamW().sparse_step(ctx)
         return rec
 
     rec_tab = run("table")
@@ -953,16 +970,16 @@ def test_compact_search_cpu_compact_dispatch():
 
 def test_grad_correct_sparse_fusion_knob_guard():
     """The fusion knobs are sparse-step-only: the dispatch refuses them on
-    full steps (emit_mode) and without a mask — owned message, before any
+    full steps (emit_score) and without a mask — owned message, before any
     buffer work."""
     n = 32
     kw = dict(lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=1e-2,
               step=5)
     p, g, m, v = (torch.randn(n) for _ in range(4))
-    for kwargs in (dict(emit_mode=None, mask=None, coeff=0.5),
-                   dict(emit_mode=None, mask=None, clear=True),
-                   dict(emit_mode=None, mask=None, fold=True),
-                   dict(emit_mode=0, mask=(torch.rand(n) < .5).to(torch.uint8),
+    for kwargs in (dict(emit_score=None, mask=None, coeff=0.5),
+                   dict(emit_score=None, mask=None, clear=True),
+                   dict(emit_score=None, mask=None, fold=True),
+                   dict(emit_score="update", mask=(torch.rand(n) < .5).to(torch.uint8),
                         clear=True)):
         try:
             adamw_grad_correct(p.clone(), g.clone(), m.clone(), v.clone(),
@@ -996,8 +1013,10 @@ def test_full_step_dual_lr_semantics():
                            g0.clone().requires_grad_(False), mask)
         rec_c = _SparseRec(w.clone().requires_grad_(False),
                            g0.clone().requires_grad_(False), None)
-        opt_split = SgaAdamW({"sga_optimizer_full_sync_inactive_lr_scale": scale})
-        opt_plain = SgaAdamW({})
+        _seed(sga_optimizer_full_sync_inactive_lr_scale=scale)
+        opt_split = SgaAdamW()
+        _seed()
+        opt_plain = SgaAdamW()
         opt_split.full_step(_RecCtx([rec_a]))
         opt_plain.full_step(_RecCtx([rec_b]))
         opt_split.full_step(_RecCtx([rec_c]))
@@ -1036,14 +1055,16 @@ def test_full_step_dual_lr_semantics():
                        g0.clone().requires_grad_(False), mask)
     rec_p = _SparseRec(w.clone().requires_grad_(False),
                        g0.clone().requires_grad_(False), mask)
-    SgaAdamW({"sga_optimizer_full_sync_inactive_lr_scale": 0.5},
-             emit_score="abs_g").full_step(_RecCtx([rec_s]))
-    SgaAdamW({}, emit_score="abs_g").full_step(_RecCtx([rec_p]))
+    _seed(sga_score="abs_g", sga_optimizer_full_sync_inactive_lr_scale=0.5)
+    SgaAdamW().full_step(_RecCtx([rec_s]))
+    _seed(sga_score="abs_g")
+    SgaAdamW().full_step(_RecCtx([rec_p]))
     assert torch.equal(rec_s.grad.data, rec_p.grad.data)
 
     # default knob (1.0): full_step must not consult the mask at all —
     # _Rec.mask_u8() raises by contract, so this call passing IS the pin
-    SgaAdamW({}).full_step(_RecCtx([_Rec(torch.randn(n), torch.randn(n))]))
+    _seed()
+    SgaAdamW().full_step(_RecCtx([_Rec(torch.randn(n), torch.randn(n))]))
     print("ok: full-step dual-lr semantics (commit/score mask-blind, "
           "tail exactly lr*scale, mask-less = plain lr, named score "
           "bitwise)")
@@ -1051,22 +1072,22 @@ def test_full_step_dual_lr_semantics():
 
 def test_grad_correct_dual_lr_knob_guard():
     """inactive_lr_scale is full-step-with-mask only: refused on sparse
-    steps (emit_mode=None), without a mask, and when negative/non-finite —
+    steps (emit_score=None), without a mask, and when negative/non-finite —
     owned messages, before any buffer work; the sparse-fusion guard
     precedes this one, and the dormant masked-commit hybrid (mask + full
-    step at scale 1.0) is refused outright; the constructor repeats the
-    domain guard for direct construction (tests/replay bypass config
-    validation)."""
+    step at scale 1.0) is refused outright; the optimizer constructor
+    repeats the domain guard for direct construction (tests/replay bypass
+    config validation)."""
     n = 32
     kw = dict(lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=1e-2,
               step=5)
     p, g, m, v = (torch.randn(n) for _ in range(4))
     mask = (torch.rand(n) < .5).to(torch.uint8)
-    for kwargs in (dict(emit_mode=None, mask=mask, inactive_lr_scale=0.5),
-                   dict(emit_mode=0, mask=None, inactive_lr_scale=0.5),
-                   dict(emit_mode=0, mask=mask, inactive_lr_scale=-1.0),
-                   dict(emit_mode=0, mask=mask, inactive_lr_scale=float("inf")),
-                   dict(emit_mode=0, mask=mask, inactive_lr_scale=float("nan"))):
+    for kwargs in (dict(emit_score=None, mask=mask, inactive_lr_scale=0.5),
+                   dict(emit_score="update", mask=None, inactive_lr_scale=0.5),
+                   dict(emit_score="update", mask=mask, inactive_lr_scale=-1.0),
+                   dict(emit_score="update", mask=mask, inactive_lr_scale=float("inf")),
+                   dict(emit_score="update", mask=mask, inactive_lr_scale=float("nan"))):
         try:
             adamw_grad_correct(p.clone(), g.clone(), m.clone(), v.clone(),
                                **kwargs, **kw)
@@ -1078,7 +1099,7 @@ def test_grad_correct_dual_lr_knob_guard():
     # combined coeff+clear+mask+scale violation reports the sparse-step rule
     try:
         adamw_grad_correct(p.clone(), g.clone(), m.clone(), v.clone(),
-                           emit_mode=0, mask=mask, coeff=0.5, clear=True,
+                           emit_score="update", mask=mask, coeff=0.5, clear=True,
                            inactive_lr_scale=0.5, **kw)
     except ValueError as e:
         assert "requires a sparse step" in str(e), e
@@ -1088,7 +1109,7 @@ def test_grad_correct_dual_lr_knob_guard():
     # produces it): mask + full step without a split is refused outright
     try:
         adamw_grad_correct(p.clone(), g.clone(), m.clone(), v.clone(),
-                           emit_mode=0, mask=mask, inactive_lr_scale=1.0,
+                           emit_score="update", mask=mask, inactive_lr_scale=1.0,
                            **kw)
     except ValueError as e:
         assert "masked-commit full step" in str(e), e
@@ -1096,10 +1117,11 @@ def test_grad_correct_dual_lr_knob_guard():
         raise AssertionError("hybrid masked-commit full step was accepted")
     # legal combination (full step + mask) runs; the constructor's own
     # domain guard fires for direct construction
-    adamw_grad_correct(p, g, m, v, mask=mask, emit_mode=0,
+    adamw_grad_correct(p, g, m, v, mask=mask, emit_score="update",
                        inactive_lr_scale=0.5, **kw)
+    _seed(sga_optimizer_full_sync_inactive_lr_scale=-0.5)
     try:
-        SgaAdamW({"sga_optimizer_full_sync_inactive_lr_scale": -0.5})
+        SgaAdamW()
     except ValueError as e:
         assert "full_sync_inactive_lr_scale" in str(e), e
     else:
@@ -1108,122 +1130,91 @@ def test_grad_correct_dual_lr_knob_guard():
           "hybrid)")
 
 
-# ----------------------------------------------------- combination validation
+# ----------------------------------------------------- registry / build face
 
-def test_combination_validator_and_build_injection():
-    from sga.plugins import (
-        OptimizerDecl,
-        build_backend_plugin,
-        build_optimizer,
-        build_selection,
-        get_backend_plugin_decl,
-        get_optimizer_decl,
-        get_selection_decl,
-        registered_names,
-        register_default_plugins,
-        validate_combination,
-    )
+def test_registry_and_build_face():
+    """The class-registry face: idempotent default fill, in-function
+    duplicate refusal, curated unknown-name errors listing the registered
+    names, zero-arg builds reading the seeded singleton, and every
+    registered backend class self-declaring its handoff facts (the engine
+    and config validation route on them)."""
+    from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
+    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
+    from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
 
     register_default_plugins()
-    opt_decl = get_optimizer_decl("adamw")
-    for name in ("update", "coi", "abs_g", "abs_m"):
-        assert name in opt_decl.emittable_scores
-        validate_combination(name, get_selection_decl("topk"),
-                             opt_decl, get_backend_plugin_decl("torch_pipelined_index"))
-    # an unknown score name is rejected with the registered list
+    register_default_plugins()  # idempotent
+
+    # duplicate registration fails loud per axis
+    for reg, name, cls in (
+            (register_selection, "topk", TopkSelection),
+            (register_optimizer, "adamw", SgaAdamW),
+            (register_backend_plugin, "torch_pipelined_index",
+             TorchPipelinedIndexBackend)):
+        try:
+            reg(name, cls)
+            raise AssertionError(f"duplicate {name} accepted")
+        except ValueError as e:
+            assert name in str(e), e
+
+    # unknown names fail with the registered list, per axis
+    for axis, bogus in (("selection", "nope"), ("optimizer", "nope"),
+                        ("backend", "nope")):
+        try:
+            plugin_class(axis, bogus)
+            raise AssertionError(f"{axis} unknown accepted")
+        except ValueError as e:
+            assert f"Unknown SGA {axis} plugin" in str(e), e
+            assert "Registered:" in str(e), e
+
+    # zero-arg builds read the singleton: the seeded score flows to the
+    # optimizer's emit_score; the seeded method dispatches the impl
+    _seed()
+    opt = build_optimizer("adamw")
+    assert isinstance(opt, SgaAdamW) and opt.emit_score == "update"
+    _seed_sel(method="histogram", ratio=40.0)
+    sel = build_selection("topk")
+    assert isinstance(sel, TopkSelection) and sel.method == "histogram"
+    _seed()
+    be = build_backend_plugin("torch_pipelined_index")
+    assert isinstance(be, TorchPipelinedIndexBackend)
+
+    # backend class facts: consumes + inherent_emission, pinned per class
+    for cls, consumes, inherent in (
+            (TorchPipelinedIndexBackend, "idx", "compact"),
+            (TorchPipelinedMaskBackend, "mask", "writeback"),
+            (NcclPipelinedIndexBackend, "idx", "writeback")):
+        assert cls.consumes == consumes, cls.__name__
+        assert cls.inherent_emission == inherent, cls.__name__
+        _seed()
+        assert cls().emission == inherent  # auto -> inherent
+    print("ok: registry face (idempotent fill, duplicates, unknown names, "
+          "zero-arg builds, class facts)")
+
+
+def test_score_kernel_branch_alignment():
+    """A registered score without a _TRITON_SCORE_MAP entry would silently
+    skip materialization and rank raw grads: the map's key set IS the
+    registry's, and the optimizer constructor refuses an unbranched name
+    at build time (the loud end of the same contract)."""
+    assert set(_TRITON_SCORE_MAP) == set(score_names())
+    assert sorted(_TRITON_SCORE_MAP.values()) == list(range(len(score_names())))
+    _seed(sga_score="bogus")
     try:
-        validate_combination("nope", get_selection_decl("topk"),
-                             opt_decl, get_backend_plugin_decl("torch_pipelined_index"))
-        raise AssertionError("unknown score accepted")
+        SgaAdamW()
+        raise AssertionError("unbranched score accepted at build time")
     except ValueError as e:
-        assert "nope" in str(e) and "abs_g" in str(e), e
-    # a registry score outside the optimizer's emittable set is
-    # offline-only: configs must reject it (simulated via a decl whose
-    # emittable set lacks the name — exactly the future offline-candidate
-    # promotion gate)
-    non_emitting = OptimizerDecl(name="stub", emittable_scores=frozenset())
+        assert "no EMIT_MODE branch" in str(e) and "bogus" in str(e), e
+    # the wrapper owns the same refusal before any buffer work
+    n = 8
     try:
-        validate_combination("abs_m", get_selection_decl("topk"),
-                             non_emitting,
-                             get_backend_plugin_decl("torch_pipelined_index"))
-        raise AssertionError("offline-only score accepted")
+        adamw_grad_correct(torch.randn(n), torch.randn(n), torch.randn(n),
+                           torch.randn(n), 1e-3, 0.9, 0.95, 1e-8, 0.0, 1,
+                           emit_score="bogus")
+        raise AssertionError("unbranched score accepted by the wrapper")
     except ValueError as e:
-        assert "emittable" in str(e), e
-    # (the cycle-calendar legality rules moved to sga.config.validation
-    # with the flat keys — pinned in test_config.py)
-
-    # build injection: the optimizer instance carries the requested emission
-    opt = build_optimizer("adamw", {}, emit_score="abs_m")
-    assert opt.emit_score == "abs_m"
-    default_opt = build_optimizer("adamw", {})
-    assert default_opt.emit_score == "update"
-    try:
-        build_optimizer("adamw", {}, emit_score="nope")
-        raise AssertionError("unemittable score accepted at build time")
-    except ValueError:
-        pass
-
-    # every BUILT plugin object exposes its declaration (the engine reads
-    # e.g. backend.decl.consumes at the first reselection — a class missing
-    # its decl must fail here, not on the cluster)
-    names = registered_names()
-    assert names["score"] == score_names()
-    assert names["optimizer"] == ["adamw"]
-    assert names["selection"] == ["topk"]
-    for n in names["backend"]:
-        be = build_backend_plugin(n, {})
-        assert be.decl.consumes in ("mask", "idx"), n
-    for n in names["optimizer"]:
-        assert hasattr(build_optimizer(n, {}), "decl"), n
-    for n in names["selection"]:
-        assert hasattr(build_selection(n, {"sga_selection_method": "histogram", "sga_selection_ratio_percent": 40.0}), "decl"), n
-    print("ok: combination validator + build injection + decl coverage")
-
-
-def test_emission_declaration_and_compact_capability():
-    """Emission-legality validation: a typo'd emission is refused at
-    REGISTRATION (the engine routes by exact equality, so 'comapct' would
-    otherwise silently behave as writeback while the backend skips the
-    writeback scatter), and a compact-emission backend combined with an
-    optimizer that does not declare consumes_compact is refused at config
-    time (the communicated values would never reach the m/v commit)."""
-
-    seen = {}
-    try:
-        for bad in ("comapct", "write", "", None):
-            try:
-                _register("backend", seen, "stub",
-                          BackendDecl(name="stub", emission=bad))
-                raise AssertionError(f"emission {bad!r} accepted at registration")
-            except ValueError as e:
-                assert "emission" in str(e) and "compact" in str(e), e
-        _register("backend", seen, "stub",
-                  BackendDecl(name="stub", emission="compact"))  # legal passes
-        assert isinstance(seen["stub"].emission, str)
-    finally:
-        pass
-
-    register_default_plugins()
-    compact = get_backend_plugin_decl("torch_pipelined_index")
-    assert compact.emission == "compact"
-    assert get_optimizer_decl("adamw").consumes_compact is True
-    # the shipped pair is legal (also covered by the emittable-scores loop
-    # above, restated here so the capability rule's PASS case is explicit)
-    validate_combination("update", get_selection_decl("topk"),
-                         get_optimizer_decl("adamw"), compact)
-    # an optimizer WITHOUT the compact commit: refused on the compact
-    # backend, fine on writeback backends
-    stub = OptimizerDecl(name="stub", emittable_scores=frozenset({"update"}))
-    try:
-        validate_combination("update", get_selection_decl("topk"), stub,
-                             compact)
-        raise AssertionError("compact backend without consumes_compact accepted")
-    except ValueError as e:
-        assert "consumes_compact" in str(e), e
-        assert "m/v commit" in str(e), e
-    validate_combination("update", get_selection_decl("topk"), stub,
-                         get_backend_plugin_decl("torch_pipelined_mask"))
-    print("ok: emission registration gate + compact capability rule")
+        assert "no _grad_correct_kernel branch" in str(e), e
+    print("ok: score registry == kernel branch map (fail-loud at build)")
 
 
 # ------------------------------------------------------------------- support

@@ -10,8 +10,8 @@ includes Megatron-LM):
 - without sga_enabled=true (including a stock namespace that carries no
   sga_* attributes at all) the waist never builds an engine, never imports
   ``sga``, and attach/grad_sync/optimizer_step are inert;
-- _config_from_args collects the sga_* attributes (its own override switch
-  excluded) and keys off sga_enabled alone.
+- the enabled gate keys off sga_enabled alone (the waist knows nothing
+  about the other sga_* attributes — build_engine copies what it needs).
 
 Run in the container: PYTHONPATH=SGA:Megatron-LM python tests/test_waist_inert.py
 """
@@ -101,7 +101,7 @@ def test_inactive_without_config():
     # run carries sga_enabled=false — both must be inert
     saved = _with_args(sga_allow_config_override=False, sga_enabled=False)
     try:
-        assert sga_waist._config_from_args() is None
+        assert sga_waist._sga_enabled() is False
         assert sga_waist._get_engine() is None
         assert sga_waist.active() is False
         assert sga_waist.attach(_Any()) is None
@@ -109,7 +109,7 @@ def test_inactive_without_config():
         assert sga_waist.optimizer_step(_Any(), [_Any()], 1) is None
         assert "sga.runtime" not in sys.modules  # never imported when inert
         _mt.get_args = lambda: SimpleNamespace(x=1)  # stock: no sga_* at all
-        assert sga_waist._config_from_args() is None
+        assert sga_waist._sga_enabled() is False
     finally:
         _mt.get_args = saved
         _restore_modules(snapshot)
@@ -149,9 +149,8 @@ def test_api_version_mismatch_rejected_at_build():
     try:
         from sga.runtime import SGA_API_VERSION, build_engine
 
-        flat = {"sga_enabled": True}
         try:
-            build_engine(flat, api_version=SGA_API_VERSION + 1)
+            build_engine(api_version=SGA_API_VERSION + 1)
             raise AssertionError("API-version mismatch was not rejected")
         except ValueError as e:
             assert "version" in str(e), e
@@ -159,17 +158,18 @@ def test_api_version_mismatch_rejected_at_build():
         _restore_modules(snapshot)
 
 
-def test_config_from_args_collects_flat_attrs():
+def test_enabled_gate_keys_off_sga_enabled_alone():
     _reset_waist()
     saved = _with_args(sga_enabled=True, sga_cycle_period=8,
                        sga_allow_config_override=False, unrelated=42)
     try:
-        cfg = sga_waist._config_from_args()
-        assert cfg == {"sga_enabled": True, "sga_cycle_period": 8}, cfg
+        assert sga_waist._sga_enabled() is True
         # disabled runs never reach the sga package
         _mt.get_args = lambda: SimpleNamespace(
             sga_enabled=False, sga_cycle_period=8)
-        assert sga_waist._config_from_args() is None
+        assert sga_waist._sga_enabled() is False
+        _mt.get_args = lambda: SimpleNamespace(x=1)  # absent spelling
+        assert sga_waist._sga_enabled() is False
     finally:
         _mt.get_args = saved
         _reset_waist()

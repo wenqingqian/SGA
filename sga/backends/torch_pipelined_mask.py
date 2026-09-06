@@ -19,46 +19,44 @@ synchronous).
 
 import torch
 
-from sga.plugins import BackendDecl, expand_plugin_params
-
-DECL = BackendDecl(
-    name="torch_pipelined_mask",
-    consumes="mask",
-)
-
-# This backend's own vocabulary: its params as FULL flat dests (defaults
-# and required-ness live in the argparse declarations).
-PARAMS = ("sga_backend_mask_slices", "sga_backend_emission")
+from sga.config import get_args
+from sga.plugins import resolve_emission
 
 
 class TorchPipelinedMaskBackend:
     """Consumes the mask form of a bucket's support."""
 
-    decl = DECL
+    consumes = "mask"
+    inherent_emission = "writeback"
 
-    def __init__(self, params: dict):
-        params = expand_plugin_params(
-            PARAMS, dict(params), "sga_backend (torch_pipelined_mask)")
+    def __init__(self):
+        args = get_args()
         # Emission is inherent here (writeback): the communicated values
         # are scattered back into the dense grad buffer for the masked
         # optimizer kernel. 'auto' (the flag default) resolves to that;
         # an explicit 'writeback' is the same thing spelled out; an
         # explicit 'compact' is refused with a pointer — compact
-        # emission is a torch_pipelined_index capability (the flag-layer
-        # rule catches it earlier in real runs; this is the
+        # emission is a torch_pipelined_index capability (the config
+        # validation rule catches it earlier in real runs; this is the
         # direct-construction backstop).
-        emission = params["sga_backend_emission"]
+        emission = args.sga_backend_emission
         if emission == "compact":
             raise ValueError(
-                "sga_backend (torch_pipelined_mask): emission 'compact' is only supported "
-                "by torch_pipelined_index; this backend is "
+                "sga_backend (torch_pipelined_mask): emission 'compact' is "
+                "only supported by torch_pipelined_index; this backend is "
                 "writeback-inherent (set sga_backend: "
                 "torch_pipelined_index to switch emission)")
-        self.emission = self.decl.resolve_emission(emission)
-        self._mask_slices = int(params["sga_backend_mask_slices"])
-        if self._mask_slices < 1:
+        if emission not in (None, "auto", "writeback"):
+            # same direct-construction backstop: an out-of-vocabulary
+            # spelling must fail here, not ride the resolution verbatim
             raise ValueError(
-                f"mask_slices must be >= 1, got {self._mask_slices}")
+                "sga_backend_emission must be auto|compact|writeback "
+                f"(got {emission!r})")
+        self.emission = resolve_emission(emission, self.inherent_emission)
+        s = args.sga_backend_mask_slices
+        if not isinstance(s, int) or isinstance(s, bool) or s < 1:
+            raise ValueError(f"mask_slices must be an int >= 1, got {s!r}")
+        self._mask_slices = s
 
     def allreduce_sparse(self, grad_data: torch.Tensor, support,
                          comm_group, gradient_scaling_factor: float,

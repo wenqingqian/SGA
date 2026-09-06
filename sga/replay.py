@@ -83,7 +83,7 @@ import torch
 
 # The score set IS the framework registry (single namespace, formulas
 # included); replay defines no score names of its own.
-from sga.plugins.scores import SCORES, get_score_spec
+from sga.plugins.scores import get_score_spec, score_names as all_score_names
 
 # Bump on ANY change to replay arithmetic or semantics (score formulas,
 # clip/norm handling, dtype rules, ...). Part of the dense-cache key: a stale
@@ -272,7 +272,7 @@ def compute_scores_flat(w_parts, m_parts, v_parts, g_parts, offsets, N, meta,
     per-group hyperparameters (new traces); absent, the global meta scalars
     apply to every param (legacy behavior).
     """
-    score_names = score_names or list(SCORES)
+    score_names = score_names or list(all_score_names())
     specs = {s: get_score_spec(s) for s in score_names}
     gb1, gb2 = float(meta["adam_beta1"]), float(meta["adam_beta2"])
     geps, gwd = float(meta["adam_eps"]), float(meta["weight_decay"])
@@ -1159,7 +1159,7 @@ def process_branch(t0, ctx, args):
 
     # ---- scores ---------------------------------------------------------
     cycle_mode = args.replay_mode == "cycle"
-    allowed = list(SCORES)
+    allowed = list(all_score_names())
     if args.score_names:
         unknown = [s for s in args.score_names if s not in allowed]
         if unknown:

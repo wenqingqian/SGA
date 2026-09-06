@@ -15,7 +15,6 @@ import shlex
 
 from omegaconf import DictConfig, OmegaConf
 
-from sga.config import validate_run_config
 from sga.launcher.backend_base import BackendBase
 from sga.launcher.utils import (
     flatten_dict_to_args,
@@ -26,6 +25,113 @@ from sga.launcher.utils import (
     setup_logging_dirs,
 )
 from sga.logger import logger
+
+
+def _sga_section_to_flags(config) -> list:
+    """Render the yaml ``sga:`` section into the exact ``--sga-*`` flag
+    list the training entry will see (FLAT keys — the same vocabulary as
+    the flags, underscores instead of hyphens). The sga_ prefix contract
+    is re-asserted at this transport point: every yaml sga: key IS the
+    full flat dest, no short form exists."""
+    sga = OmegaConf.to_container(config.sga, resolve=True)
+    assert all(isinstance(k, str) and k.startswith("sga_") for k in sga), (
+        f"sga: keys must be the full flat sga_* names (got {sorted(sga)})")
+    from sga.config.arguments import sga_int_or_null
+    from sga.config.validation import sga_actions
+
+    flags = []
+    for dest in sorted(sga):
+        value = sga[dest]
+        action = sga_actions()[dest]  # unknown keys already rejected by parse
+        if value is None:
+            if dest == "sga_enabled":
+                raise ValueError(
+                    "sga_enabled is explicitly null in the sga: section — "
+                    "spell it true or false (null silently means disabled "
+                    "here)")
+            if action.type is sga_int_or_null:
+                flags.extend([action.option_strings[0], "null"])
+            # any other flag's explicit null IS the unset spelling —
+            # leave it at the declared default (emitting a literal would
+            # fail its typing)
+            continue
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        elif isinstance(value, (list, tuple)):
+            value = ",".join(str(v) for v in value)
+        else:
+            value = str(value)
+        flags.extend([action.option_strings[0], value])
+    return flags
+
+
+def _prevalidate_sga(config) -> None:
+    """Launch-time pre-validation of the ``sga:`` section: parse the very
+    flags about to be emitted with the REAL parser (one argparse code
+    path — the training entry sees identical values), then run the same
+    ``validate_sga_args`` build_engine will run. Fails fast before any
+    process is spawned; disabled configs validate trivially (megatron
+    semantics: zero checks under sga_enabled false)."""
+    sga = config.get("sga", None)
+    if sga is None:
+        raise ValueError(
+            "Config is missing the 'sga:' section (declare it with just "
+            "sga_enabled: false for pure dense training)."
+        )
+    # A scalar/ill-typed section would die inside OmegaConf.to_container
+    # with an opaque internal error — refuse it by name; an EMPTY mapping
+    # is the missing section wearing braces and meets the same loudness.
+    if isinstance(sga, DictConfig):
+        sga = OmegaConf.to_container(sga, resolve=True)
+    if not isinstance(sga, dict):
+        raise ValueError(
+            f"sga section must be a mapping (got {type(sga).__name__})")
+    if not sga:
+        raise ValueError(
+            "Config has an empty 'sga:' section (declare it with just "
+            "sga_enabled: false for pure dense training)."
+        )
+    # `sga:` must not leak into the megatron arg flattening; the launcher
+    # only reads train.{system,model,data}, but assert the boundary here
+    # so a future flatten change cannot silently start forwarding it.
+    assert "sga" not in OmegaConf.to_container(config.train, resolve=True), \
+        "sga section leaked into train.*"
+
+    import argparse
+
+    from sga.config.arguments import add_sga_args
+    from sga.config.validation import validate_sga_args
+
+    class _LoudParser(argparse.ArgumentParser):
+        """argparse's own complaints (typing, choices) as ValueError with
+        the FLAG NAMED — a bare SystemExit(2) would swallow the message
+        and name no key."""
+
+        def error(self, message):
+            raise ValueError(message)
+
+    parser = _LoudParser(add_help=False)
+    add_sga_args(parser)
+    try:
+        ns = parser.parse_args(_sga_section_to_flags(config))
+    except KeyError as e:  # a yaml key no declared flag owns
+        raise ValueError(
+            f"unknown sga: key {e} — the keys must be the full flat sga_* "
+            "flag dests declared in sga/config/arguments.py") from None
+    # The two non-sga keys validation reads, from the same run config —
+    # selected through both train subtrees in _get_args_megatron's
+    # flattening order (system first, model overrides): the shipped
+    # layout carries pipeline_model_parallel_size under train.system,
+    # and a single-subtree select would leave the pp>1 rule dead at
+    # launch time.
+    it = OmegaConf.select(config, "train.system.train_iters", default=None)
+    ns.train_iters = OmegaConf.select(
+        config, "train.model.train_iters", default=it)
+    pp = OmegaConf.select(
+        config, "train.system.pipeline_model_parallel_size", default=1)
+    ns.pipeline_model_parallel_size = OmegaConf.select(
+        config, "train.model.pipeline_model_parallel_size", default=pp)
+    validate_sga_args(ns)
 
 
 def _get_args_megatron(config: DictConfig):
@@ -46,32 +152,12 @@ def _get_args_megatron(config: DictConfig):
     # Flatten the dictionary to a list of arguments
     args = flatten_dict_to_args(new_config_dict, ignore_keys)
 
-    # The sga: section (FLAT keys — the same vocabulary as the --sga-*
-    # flags, underscores instead of hyphens) becomes the visible flags
-    # themselves: validated here at launch time (fail-fast before any
-    # process is spawned; the training entry re-validates on its parsed
-    # namespace). There is no translation layer and no JSON form.
-    from sga.config.validation import sga_actions
-
-    validate_run_config(config)
-    sga = OmegaConf.to_container(config.sga, resolve=True)
-    # The sga_ prefix contract, re-asserted at the transport point
-    # (validate_run_config above is the parse-time gate): every yaml sga:
-    # key IS the full flat dest, no short form exists.
-    assert all(isinstance(k, str) and k.startswith("sga_") for k in sga), (
-        f"sga: keys must be the full flat sga_* names (got {sorted(sga)})")
-    for dest in sorted(sga):
-        value = sga[dest]
-        action = sga_actions()[dest]  # unknown keys already rejected above
-        if value is None:
-            value = "null"  # the explicit-null spelling (sga_int_or_null)
-        elif isinstance(value, bool):
-            value = "true" if value else "false"
-        elif isinstance(value, (list, tuple)):
-            value = ",".join(str(v) for v in value)
-        else:
-            value = str(value)
-        args.extend([action.option_strings[0], value])
+    # The sga: section becomes the visible flags themselves, pre-validated
+    # here (fail-fast before any process is spawned; the training entry
+    # re-validates on its parsed namespace). There is no translation
+    # layer and no JSON form.
+    _prevalidate_sga(config)
+    args.extend(_sga_section_to_flags(config))
 
     return args
 

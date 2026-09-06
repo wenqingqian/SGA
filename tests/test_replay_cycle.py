@@ -194,7 +194,7 @@ def _run_module(tmpdir, name, w0, m0, v0, t0, W, score_name, ratio_pct, T,
     score_flats = soa.compute_scores_flat(
         w_parts, m_parts, v_parts, g_parts, offsets, N, meta,
         chunk_mb=1, device="cpu",
-        score_names=list(soa.SCORES),
+        score_names=list(soa.all_score_names()),
         update_includes_wd=True)
     k = max(1, int(round(ratio_pct / 100.0 * N)))
     sel0, _ = soa.select_topk_flat(score_flats[score_name], k)
@@ -254,7 +254,7 @@ def test_no_fold_within_window():
     lrs = [4e-5] * W
     with tempfile.TemporaryDirectory() as td:
         name, w0, m0, v0 = _make_trace(td, pre, lrs, 0.0, t0, n)
-        for score in soa.SCORES:
+        for score in soa.all_score_names():
             num_at = _run_module(td, name, w0, m0, v0, t0, W, score, 25.0,
                                  T=W + 1)
             ref = _ref_num_at(w0, m0, v0, pre, lrs, 0.0, t0, score, 25.0,
@@ -275,7 +275,7 @@ def test_multicycle_with_clipping():
     clip = 0.3
     with tempfile.TemporaryDirectory() as td:
         name, w0, m0, v0 = _make_trace(td, pre, lrs, clip, t0, n)
-        for score in soa.SCORES:
+        for score in soa.all_score_names():
             trace = []
             num_at = _run_module(td, name, w0, m0, v0, t0, W, score, 50.0, 2,
                                  sel_trace=trace)
@@ -332,7 +332,7 @@ def test_branch_score_formulas():
             chunk_mb=1, device="cpu", update_includes_wd=True)
 
     flats = _flats(count - 1)
-    for name in soa.SCORES:
+    for name in soa.all_score_names():
         got = flats[name]
         want = _ref_score(name, w.double(), m.double(), v.double(),
                           g.double(), count)
@@ -344,7 +344,7 @@ def test_branch_score_formulas():
     # zero-state edge (t0=0, state_absent: zero moments, upcoming commit 1)
     m, v = torch.zeros_like(m), torch.zeros_like(v)
     flats0 = _flats(0)
-    for name in soa.SCORES:
+    for name in soa.all_score_names():
         want = _ref_score(name, w.double(), torch.zeros(n, dtype=torch.float64),
                           torch.zeros(n, dtype=torch.float64), g.double(), 1)
         err = (flats0[name].double() - want).abs().max()

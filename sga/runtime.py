@@ -1,21 +1,21 @@
 # Copyright (c) 2026, SGA framework contributors.
 """Engine builder — the single entry the fork's sga_waist imports.
 
-``build_engine(config, api_version)`` validates the flat ``sga_*`` config
-against the plugin registries (declaration-based, no scheme names),
-enforces the config-time assertion set against the megatron args,
-constructs the four plugin objects and returns the SGAEngine. Failures
+``build_engine(api_version)`` copies the megatron namespace's ``sga_*``
+attrs into the sga args singleton, runs the megatron-style config
+validation on it, enforces the config-time assertion set against the
+megatron args, constructs the four plugin objects (zero-arg — each reads
+its own knobs off the singleton) and returns the SGAEngine. Failures
 surface HERE (during model construction), never at the first optimizer
 step.
 """
 
+import json
+
 import torch
 
-from sga.config.validation import (
-    canonical_flat_json,
-    explicit_from_flat,
-    validate_sga_flat,
-)
+from sga.config import copy_from_megatron_args, get_args, sga_config_attrs
+from sga.config.validation import validate_sga_args
 
 SGA_API_VERSION = 2
 
@@ -142,22 +142,10 @@ def _assert_args_compatible() -> None:
                  "is decoupled AdamW)")
 
 
-def build_engine(flat: dict, api_version: int):
-    """Validate + assemble the engine from the flat ``sga_*`` dict the
-    fork waist collected off the parsed megatron namespace (flags ARE the
-    transport — there is no JSON form anymore)."""
-    from sga.plugins import (
-        build_backend_plugin,
-        build_optimizer,
-        build_selection,
-        get_backend_plugin_decl,
-        get_optimizer_decl,
-        get_score_spec,
-        get_selection_decl,
-        register_default_plugins,
-        validate_combination,
-    )
-
+def build_engine(api_version: int):
+    """Validate + assemble the engine from the megatron namespace the fork
+    waist lives inside (the parsed ``sga_*`` flags ARE the config — flags
+    are the transport; there is no other form)."""
     # Hard-coupled to megatron's get_args() by design: the fork waist is
     # this builder's only caller. The version check deliberately precedes
     # the megatron import so a mismatch raises even without megatron
@@ -168,67 +156,36 @@ def build_engine(flat: dict, api_version: int):
             f"sga package speaks v{SGA_API_VERSION}"
         )
 
-    # The waist hands the RAW namespace collection (argparse defaults
-    # included); validation consumes the explicit diff.
-    from megatron.training import get_args
+    from megatron.training import get_args as megatron_get_args
 
-    args = get_args()
-    canonical = validate_sga_flat(
-        explicit_from_flat(flat),
-        train_iters=getattr(args, "train_iters", None))
-    if canonical is None:
-        raise ValueError(
-            "build_engine called with a disabled/absent SGA configuration "
-            "(the waist must key off sga_enabled)"
-        )
+    # Seed the sga args singleton: the megatron namespace's sga_* attrs
+    # (a copy — later mutation of the megatron namespace does not leak
+    # into the engine) plus the two non-sga keys the config reads.
+    copy_from_megatron_args(megatron_get_args())
 
-    # The always-sync patterns are matched PER RANK against the attached
-    # stage's params only: under pp > 1 the endpoint and middle ranks see
-    # different param sets, so the per-rank attach guards cannot be
-    # world-honest — v1 pins pp == 1 for this axis (the engine-side
-    # guards stay correct under that pin).
-    if (canonical["sga_always_sync_layers"] is not None
-            and getattr(args, "pipeline_model_parallel_size", 1) > 1):
+    # Single validation pass (megatron validate_args style: value-level
+    # rules, write-backs onto the singleton, disabled → zero checks — the
+    # waist only calls in when sga_enabled anyway). Includes the plugin
+    # name lookups and the cross-axis emission rule.
+    validate_sga_args()
+
+    # Defense-in-depth (unreachable via the waist, which gates on
+    # sga_enabled): a disabled call would sail through the zero-check
+    # validation above and die inside the optimizer constructor with a
+    # misleading error.
+    if not get_args().sga_enabled:
         raise ValueError(
-            "sga_always_sync_layers: always-sync layer matching is "
-            "per-rank over the attached stage's params (with pipeline "
-            "parallelism > 1 the endpoint and middle ranks see different "
-            "param sets); v1 pins pipeline_model_parallel_size == 1 — "
-            "drop the flag or run with pp == 1")
+            "build_engine called with SGA disabled (the waist must key "
+            "off sga_enabled)")
 
     _assert_args_compatible()
 
-    # Defensive re-derivation (validation already checked membership and
-    # the cross-axis rules; the decls are needed for construction anyway).
-    score_name = canonical["sga_score"]
-    selection_name = canonical["sga_selection"]
-    optimizer_name = canonical["sga_optimizer"]
-    backend_name = canonical["sga_backend"]
+    cfg = get_args()
+    from sga.plugins import build_backend_plugin, build_optimizer, build_selection
 
-    register_default_plugins()
-    get_score_spec(score_name)  # unknown score fails with the registered list
-    selection_decl = get_selection_decl(selection_name)
-    optimizer_decl = get_optimizer_decl(optimizer_name)
-    backend_decl = get_backend_plugin_decl(backend_name)
-
-    # backend_emission must match the flat layer's resolution, else the two
-    # validation layers contradict each other for explicit non-auto values
-    validate_combination(score_name, selection_decl, optimizer_decl,
-                         backend_decl,
-                         backend_emission=canonical["sga_backend_emission"])
-
-    # Plugin constructors receive the explicit-default diff of the
-    # canonical, sliced to their axis by full-name vocabulary membership
-    # (build_* internals); each expands its declared defaults through
-    # expand_plugin_params, so a spelling equal to the default lands in
-    # the same final values either way.
-    explicit = explicit_from_flat(canonical)
-    selection = build_selection(selection_name, explicit)
-    # Scores are materialized by the optimizer template on full steps; inject
-    # WHICH score to emit so the kernel picks the right mode (the validator
-    # above already proved the template can emit it).
-    opt = build_optimizer(optimizer_name, explicit, emit_score=score_name)
-    backend = build_backend_plugin(backend_name, explicit)
+    selection = build_selection(cfg.sga_selection)
+    opt = build_optimizer(cfg.sga_optimizer)
+    backend = build_backend_plugin(cfg.sga_backend)
 
     # Optional backend-owned runtime validation, probed generically (the
     # same optional-hook discipline as adapt()/wants_force_full()): topology
@@ -236,14 +193,14 @@ def build_engine(flat: dict, api_version: int):
     # plugin — never as name-keyed branches in this shared builder.
     validate = getattr(backend, "validate_runtime", None)
     if callable(validate):
-        from megatron.training import get_args
-        validate(get_args())
+        validate(megatron_get_args())
 
     from sga.engine import SGAEngine
 
-    engine = SGAEngine(canonical, score_name, selection, opt, backend)
+    engine = SGAEngine(cfg.sga_score, selection, opt, backend)
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         print(f"[SGA] engine built (API v{api_version}); config: "
-              f"{canonical_flat_json(canonical)}", flush=True)
+              f"{json.dumps(sga_config_attrs(cfg), sort_keys=True)}",
+              flush=True)
     return engine

@@ -6,108 +6,78 @@ Strict-ratio global topk over the optimizer-materialized score magnitudes:
 the pool is the engine-filtered eligible subset — forced params never
 compete, and ``n_total`` (like every ratio statistic) is the eligible
 count (see ``SelectionContext``). The selection ALGORITHM is the
-``method`` parameter, dispatched to a per-method impl file:
+``sga_selection_method`` flag, dispatched to a per-method impl file:
 
-- ``method: histogram`` (+ ``histogram_mode: exact|balanced|fast``):
-  bit-pattern histogram select (``_histogram.py``). Per-rank histograms of
-  the top bits of |score| fp32 bit patterns are SUM-allreduced over the comm
-  group; with replicated inputs the merged histogram is exactly ``world``
-  times the local one and the select math is scale-invariant, so every rank
-  derives the identical bin and threshold BY CONSTRUCTION (tied boundary
-  values are all selected — masks ``|score| >= thresh``). The default
-  (``exact`` mode) does NOT OR-merge the final masks: it leans on
-  bitwise-replicated inputs plus the engine's layer-2 abort on divergence —
-  merging there too would trade a crash for consistency at the cost of an
-  extra uint8 allreduce per reselection, which v1 declines deliberately.
+- ``method: histogram`` (+ ``sga_selection_histogram_mode``:
+  exact|balanced|fast): bit-pattern histogram select (``_histogram.py``).
+  Per-rank histograms of the top bits of |score| fp32 bit patterns are
+  SUM-allreduced over the comm group; with replicated inputs the merged
+  histogram is exactly ``world`` times the local one and the select math
+  is scale-invariant, so every rank derives the identical bin and
+  threshold BY CONSTRUCTION (tied boundary values are all selected —
+  masks ``|score| >= thresh``). The default (``exact`` mode) does NOT
+  OR-merge the final masks: it leans on bitwise-replicated inputs plus
+  the engine's layer-2 abort on divergence — merging there too would
+  trade a crash for consistency at the cost of an extra uint8 allreduce
+  per reselection, which v1 declines deliberately.
 - ``method: exact`` (``_exact.py``): full-model cat + torch.kthvalue +
   mask OR-merge. One consistency tier above the histogram family: OR-merge
   TOLERATES residual cross-rank numerical divergence instead of aborting
   (costs O(model) temporaries + a full-model uint8 mask allreduce).
-- ``method: adaptive`` (+ ``adaptive_warmup_syncs``/``adaptive_warmup_mode``,
-  ``_adaptive.py``): persistent-tau controller — gated histogram warmup,
-  then log-space dead-band feedback toward the target ratio.
+- ``method: adaptive`` (+ ``sga_selection_adaptive_warmup_syncs`` /
+  ``sga_selection_adaptive_warmup_mode``, ``_adaptive.py``): persistent-tau
+  controller — gated histogram warmup, then log-space dead-band feedback
+  toward the target ratio.
 
-Params of one method are foreign keys under another and rejected at build
-time (their knobs have no effect there — a silently-dead knob is worse than
-a loud refusal); the per-method vocabularies are this plugin's own (the
-literal UNLOCKS table in this module mirrors the config-side rule).
-Historical note: this subject was previously registered as
-``circular_topk``.
+Every knob is read straight off ``sga.config.get_args()`` (config
+validation owns required-ness, choices and the method gates — the
+constructor keeps only the ratio's domain guard and the dispatch's final
+else, the two things a direct-construction namespace bypassing argparse
+could still get wrong).
 
 "Circular" (the support is regenerated once per cycle period T at the
 full-sync boundary and persists unchanged in between; non-topk coordinates
 accumulate as residual, folded by the optimizer's reset contract at the
 next boundary) is ENGINE-CYCLE semantics, not a property of this selector —
-hence the bare registration name ``topk``.
+hence the bare registration name ``topk`` (registered historically as
+``circular_topk``).
 """
 
-from sga.config.validation import declared_choices
-from sga.plugins import SelectionDecl, expand_plugin_params
+from sga.config import get_args
 from sga.plugins.selection._adaptive import AdaptiveTau
 from sga.plugins.selection._exact import ExactKthvalue
 from sga.plugins.selection._histogram import HistogramSelect
 
-DECL = SelectionDecl(name="topk", output_form="mask")
-
-# topk's own vocabulary: its params as FULL flat dests (defaults and
-# required-ness live in the argparse declarations — a None default means
-# required); UNLOCKS says which method each guarded param belongs to.
-PARAMS = ("sga_selection_method", "sga_selection_ratio_percent",
-          "sga_selection_histogram_mode",
-          "sga_selection_adaptive_warmup_syncs",
-          "sga_selection_adaptive_warmup_mode",
-          "sga_selection_block_size", "sga_selection_block_reduce")
-UNLOCKS = {"histogram": ("sga_selection_histogram_mode",
-                         "sga_selection_block_size",
-                         "sga_selection_block_reduce"),
-           "adaptive": ("sga_selection_adaptive_warmup_syncs",
-                        "sga_selection_adaptive_warmup_mode")}
-
 
 class TopkSelection:
 
-    decl = DECL
-
-    def __init__(self, params: dict):
-        raw = dict(params)  # pre-expansion view (explicit keys only)
-        method = raw.get("sga_selection_method")
-        # Dead-config check FIRST, gated on a KNOWN method: a missing or
-        # invalid method must surface as the shared validator's
-        # required/choices error, not as a dead-config refusal (which would
-        # name the raw value and mask the real problem).
-        methods = declared_choices("sga_selection_method")
-        if method in methods:
-            own = UNLOCKS.get(method, ())
-            dead = sorted(p for ps in UNLOCKS.values() for p in ps
-                          if p in raw and p not in own)
-            if dead:
-                raise ValueError(
-                    f"sga_selection (topk): params {dead} do not belong to "
-                    f"method '{method}' (it takes {sorted(own) or 'no extra params'}) — "
-                    "under this method they would be silently dead; drop them "
-                    "or switch the method"
-                )
-        params = expand_plugin_params(PARAMS, raw, "sga_selection (topk)")
-        self.params = params
-        self.method = method
-        self.ratio_percent = float(params["sga_selection_ratio_percent"])
+    def __init__(self):
+        args = get_args()
+        self.method = args.sga_selection_method
+        self.ratio_percent = float(args.sga_selection_ratio_percent)
         assert 0.0 < self.ratio_percent < 100.0, (
             f"ratio_percent must be in (0, 100), got {self.ratio_percent}"
         )
-        if method == "adaptive":
-            warmup_syncs = params["sga_selection_adaptive_warmup_syncs"]
+        if self.method == "adaptive":
+            warmup_syncs = args.sga_selection_adaptive_warmup_syncs
             self._impl = AdaptiveTau(
                 self.ratio_percent,
                 int(warmup_syncs) if warmup_syncs is not None else None,
-                params["sga_selection_adaptive_warmup_mode"],
+                args.sga_selection_adaptive_warmup_mode,
             )
-        elif method == "histogram":
+        elif self.method == "histogram":
             self._impl = HistogramSelect(
-                params["sga_selection_histogram_mode"],
-                block_size=int(params["sga_selection_block_size"]),
-                block_reduce=params["sga_selection_block_reduce"])
-        else:
+                args.sga_selection_histogram_mode,
+                block_size=int(args.sga_selection_block_size),
+                block_reduce=args.sga_selection_block_reduce)
+        elif self.method == "exact":
             self._impl = ExactKthvalue()
+        else:
+            # direct-construction backstop (argparse choices own the flag
+            # routes): a bogus method must not fall through to exact
+            raise ValueError(
+                "sga_selection_method must be adaptive|exact|histogram "
+                f"(got {self.method!r})")
         self.last_threshold = None
 
     @property
@@ -151,4 +121,3 @@ class TopkSelection:
         )
         self.last_threshold = thresh
         return masks
-

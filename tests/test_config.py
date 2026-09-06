@@ -3,10 +3,13 @@
 
 The yaml ``sga:`` section speaks the SAME flat vocabulary as the --sga-*
 flags (underscores instead of hyphens); validation lives in
-sga/config/validation.py. These tests pin the section contract: disabled
-semantics, axis requirements, engine sections
-(cycle/checks/always_sync/trace), percent resolution, combination
-rejection and the flag emission shape.
+sga/config/validation.py (``validate_sga_args``, megatron validate_args
+style: value-level rules on an args namespace, write-backs onto it).
+The launcher pre-validates by parsing the very flags it is about to emit
+(``_prevalidate_sga``) — one argparse code path with the training entry.
+These tests pin the section contract: disabled semantics (zero checks),
+axis requirements, engine knobs (cycle/checks/always_sync/trace), percent
+resolution, value rules and the flag emission shape.
 """
 
 import os
@@ -17,9 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omegaconf import OmegaConf
 
-from sga.config import validate_run_config
-from sga.config.validation import validate_sga_flat
-from sga.launcher.backend_megatron import _get_args_megatron
+from sga.config.validation import validate_sga_args
+from sga.launcher.backend_megatron import _get_args_megatron, _prevalidate_sga
 
 BASE = """
 experiment:
@@ -53,10 +55,32 @@ def expect_error(fn, needle):
     raise SystemExit(f"expected error containing '{needle}'")
 
 
-def _canonical(cfg):
-    """The validated canonical flat dict (the ONE object the engine, the
-    config print and the resume guard all read)."""
-    return validate_run_config(cfg)
+def _ns_of(cfg):
+    """The launch-time namespace: parse the emitted flags with the real
+    parser (exactly what _prevalidate_sga does), attach the two non-sga
+    keys (through both train subtrees, flattening order — the same
+    selects _prevalidate_sga runs), validate (write-backs land on the
+    namespace)."""
+    import argparse
+
+    from sga.config.arguments import add_sga_args
+
+    tokens, it = [], iter(_get_args_megatron(cfg))
+    for tok in it:
+        if tok.startswith("--sga-"):
+            tokens.extend([tok, next(it)])
+    parser = argparse.ArgumentParser(add_help=False)
+    add_sga_args(parser)
+    ns = parser.parse_args(tokens)
+    sys_it = OmegaConf.select(cfg, "train.system.train_iters", default=None)
+    ns.train_iters = OmegaConf.select(cfg, "train.model.train_iters",
+                                      default=sys_it)
+    sys_pp = OmegaConf.select(
+        cfg, "train.system.pipeline_model_parallel_size", default=1)
+    ns.pipeline_model_parallel_size = OmegaConf.select(
+        cfg, "train.model.pipeline_model_parallel_size", default=sys_pp)
+    validate_sga_args(ns)
+    return ns
 
 
 def _enable_standard(cfg):
@@ -72,7 +96,7 @@ def _enable_standard(cfg):
 
 def test_all_off_dense_ok():
     cfg, _ = make_base()
-    validate_run_config(cfg)
+    _prevalidate_sga(cfg)
     print("ok: all-off dense config validates")
 
 
@@ -84,79 +108,76 @@ def test_enabled_field_named_in_error():
                                   "sga_optimizer": "adamw",
                                   "sga_backend": "torch_pipelined_index",
                                   "sga_bogus_key": 1})
-    expect_error(lambda: validate_run_config(cfg), "sga_bogus_key")
+    expect_error(lambda: _prevalidate_sga(cfg), "sga_bogus_key")
     print("ok: unknown key is named in the error")
 
 
 def test_fourfield_combination_resolves():
     cfg, _ = make_base()
     _enable_standard(cfg)
-    canon = _canonical(cfg)
-    assert canon["sga_selection"] == "topk"
-    assert canon["sga_selection_method"] == "histogram"
-    assert canon["sga_selection_ratio_percent"] == 30.0
-    assert canon["sga_optimizer"] == "adamw"
-    # the canonical is complete by construction (defaults applied)
-    assert canon["sga_cycle_period"] == 8
-    assert canon["sga_checks_count_guard"] is True
-    assert canon["sga_shadow"] is False and canon["sga_shadow_score"] is True
-    assert canon["sga_trace_dir"] is None  # trace collector off
-    print("ok: four-field combination resolves to the canonical flat dict")
+    ns = _ns_of(cfg)
+    assert ns.sga_selection == "topk"
+    assert ns.sga_selection_method == "histogram"
+    assert ns.sga_selection_ratio_percent == 30.0
+    assert ns.sga_optimizer == "adamw"
+    # the namespace is complete by construction (argparse defaults filled)
+    assert ns.sga_cycle_period == 8
+    assert ns.sga_checks_count_guard is True
+    assert ns.sga_shadow is False and ns.sga_shadow_score is True
+    assert ns.sga_trace_dir is None  # trace collector off
+    print("ok: four-field combination resolves onto the namespace")
 
 
 def test_checks_validation():
     """sga_checks_count_guard carries the consistency-machinery toggle
-    (default on); a non-bool value and an unknown checks key are named in
-    the error, and any checks key is rejected when the engine is off."""
+    (default on); a non-bool value is named in the parse error."""
     cfg, _ = make_base()
     _enable_standard(cfg)
-    canon = _canonical(cfg)
-    assert canon["sga_checks_count_guard"] is True
+    ns = _ns_of(cfg)
+    assert ns.sga_checks_count_guard is True
 
     cfg.sga.sga_checks_count_guard = False
-    canon = _canonical(cfg)
-    assert canon["sga_checks_count_guard"] is False
+    ns = _ns_of(cfg)
+    assert ns.sga_checks_count_guard is False
 
     cfg.sga.sga_checks_count_guard = "no"
-    expect_error(lambda: validate_run_config(cfg), "bool")
+    expect_error(lambda: _prevalidate_sga(cfg), "true' or 'false")
+    # any checks key under a disabled config is silently ignored now
+    # (megatron semantics: zero checks below sga_enabled=false)
     cfg2, _ = make_base()
     OmegaConf.update(cfg2, "sga.sga_checks_count_guard", False)
-    expect_error(lambda: validate_run_config(cfg2), "sga_enabled is false")
-    print("ok: checks validation (default / flag / bad type / off)")
+    _prevalidate_sga(cfg2)
+    print("ok: checks validation (default / flag / bad type / off-ignored)")
 
 
 def test_trace_validation():
     """sga_trace_dir configures the engine-side trace collector: dir
     required, branch_points normalized from comma string or list, window
-    default 100; unknown trace keys named; rejected when the engine is
-    off."""
+    default 100; unknown trace keys named."""
     cfg, _ = make_base()
     _enable_standard(cfg)
-    canon = _canonical(cfg)
-    assert canon["sga_trace_dir"] is None  # absent -> collector off
+    ns = _ns_of(cfg)
+    assert ns.sga_trace_dir is None  # absent -> collector off
 
     cfg.sga.sga_trace_dir = "/tmp/sga-trace-x"
     cfg.sga.sga_trace_branch_points = "50, 10,50"
-    canon = _canonical(cfg)
-    assert canon["sga_trace_dir"] == "/tmp/sga-trace-x"
-    assert canon["sga_trace_branch_points"] == [10, 50]  # sorted, deduped
-    assert canon["sga_trace_window"] == 100
+    ns = _ns_of(cfg)
+    assert ns.sga_trace_dir == "/tmp/sga-trace-x"
+    assert ns.sga_trace_branch_points == [10, 50]  # sorted, deduped
+    assert ns.sga_trace_window == 100
 
     cfg.sga.sga_trace_branch_points = [7, "3"]
-    canon = _canonical(cfg)
-    assert canon["sga_trace_branch_points"] == [3, 7]
+    ns = _ns_of(cfg)
+    assert ns.sga_trace_branch_points == [3, 7]
 
     cfg.sga.sga_trace_window = 0
-    expect_error(lambda: validate_run_config(cfg), "window")
-    cfg2, _ = make_base()
-    OmegaConf.update(cfg2, "sga.sga_trace_dir", "/tmp/x")
-    expect_error(lambda: validate_run_config(cfg2), "sga_enabled is false")
+    expect_error(lambda: _prevalidate_sga(cfg), "window")
 
     cfg3, _ = make_base()
     _enable_standard(cfg3)
     OmegaConf.update(cfg3, "sga.sga_trace_bogus", 1)
-    expect_error(lambda: validate_run_config(cfg3), "unknown keys")
-    print("ok: trace validation (dir/branch/window/unknown/off)")
+    expect_error(lambda: _prevalidate_sga(cfg3), "sga_trace_bogus")
+    print("ok: trace validation (dir/branch/window/unknown)")
 
 
 def test_start_iter_percent_resolves():
@@ -165,89 +186,92 @@ def test_start_iter_percent_resolves():
     del cfg.sga.sga_cycle_start_iter
     cfg.sga.sga_cycle_start_iter_percent = 1.6  # of train_iters 2 below
     OmegaConf.update(cfg, "train.model.train_iters", 5000)
-    engine_cfg = _canonical(cfg)
-    assert engine_cfg["sga_cycle_start_iter"] == 80  # round(0.016*5000)
+    ns = _ns_of(cfg)
+    assert ns.sga_cycle_start_iter == 80  # round(0.016*5000)
 
     # both spellings at once is a conflict (explicit start_iter present)
     cfg.sga.sga_cycle_start_iter = 5
-    expect_error(lambda: validate_run_config(cfg), "not both")
+    expect_error(lambda: _prevalidate_sga(cfg), "not both")
     # percent needs the train_iters context
     cfg4, _ = make_base()
     _enable_standard(cfg4)
     del cfg4.sga.sga_cycle_start_iter
     cfg4.sga.sga_cycle_start_iter_percent = 10.0
-    expect_error(lambda: validate_run_config(cfg4), "train_iters")
+    expect_error(lambda: _prevalidate_sga(cfg4), "train_iters")
     print("ok: start_iter_percent resolves / conflicts / needs context")
 
 
 def test_illegal_combination_rejected():
-    # unknown score name is rejected with the registered list
+    # unknown score name is rejected by the argparse choices at parse time
     cfg, _ = make_base()
     _enable_standard(cfg)
     cfg.sga.sga_score = "update_ratio"  # the pre-rename name must fail
-    expect_error(lambda: validate_run_config(cfg),
-                 "must be one of ['abs_g', 'abs_m', 'coi', 'update']")
+    expect_error(lambda: _prevalidate_sga(cfg), "invalid choice")
     # cycle-calendar legality: an explicit full_sync_interval is illegal
     # without the decouple switch (including the exact legacy fsi=0
     # spelling); decoupled values must be strict divisors
     cfg.sga.sga_score = "abs_m"
     cfg.sga.sga_cycle_full_sync_interval = 4
-    expect_error(lambda: validate_run_config(cfg), "full_sync_interval")
+    expect_error(lambda: _prevalidate_sga(cfg), "full_sync_interval")
     cfg.sga.sga_cycle_full_sync_interval = 0
-    expect_error(lambda: validate_run_config(cfg),
+    expect_error(lambda: _prevalidate_sga(cfg),
                  "leave sga_cycle_full_sync_interval unset")
     cfg.sga.sga_cycle_full_sync_interval = None
     cfg.sga.sga_cycle_decouple_full_sync_interval_and_period = True
-    expect_error(lambda: validate_run_config(cfg), "full_sync_interval")
+    expect_error(lambda: _prevalidate_sga(cfg), "full_sync_interval")
     cfg.sga.sga_cycle_full_sync_interval = 3
-    expect_error(lambda: validate_run_config(cfg), "full_sync_interval")
+    expect_error(lambda: _prevalidate_sga(cfg), "full_sync_interval")
     # the legal decoupled spelling round-trips
     cfg.sga.sga_cycle_full_sync_interval = 4
-    canon = _canonical(cfg)
-    assert canon["sga_cycle_full_sync_interval"] == 4
+    ns = _ns_of(cfg)
+    assert ns.sga_cycle_full_sync_interval == 4
     print("ok: illegal combinations rejected (unknown score / cycle rules)")
 
 
 def test_optimizer_dual_lr_scale_rules():
     """The boundary dual-lr knob's strict assertions: a finite
     float >= 0 is required (0.0 is legal — the freeze-the-tail ablation
-    extreme), and a scale != 1.0 is refused under shadow (bitwise
+    extreme; nan/inf are refused — argparse's float typing would accept
+    their spellings), and a scale != 1.0 is refused under shadow (bitwise
     stock-replication contract) and under sga_cycle_period 1 (no sparse
-    rounds — dead config, refused instead of silently ignored); the
-    disabled-clean contract covers sga_enabled false."""
+    rounds — dead config, refused instead of silently ignored)."""
     base = {"sga_enabled": True, "sga_score": "update",
             "sga_selection_method": "exact",
             "sga_selection_ratio_percent": 10.0,
             "sga_backend": "torch_pipelined_index",
             "sga_cycle_period": 8}
+
+    def _ns(**over):
+        from types import SimpleNamespace
+
+        from sga.config.validation import sga_defaults
+
+        ns = SimpleNamespace(**{**sga_defaults(), **base, **over})
+        ns.train_iters = 5000
+        ns.pipeline_model_parallel_size = 1
+        validate_sga_args(ns)
+        return ns
+
     for spelling in (0.5, 0.0, 2):
-        canon = validate_sga_flat(
-            dict(base, sga_optimizer_full_sync_inactive_lr_scale=spelling))
-        assert canon["sga_optimizer_full_sync_inactive_lr_scale"] \
-            == float(spelling)
-    # the canonical default rides along when unset
-    assert validate_sga_flat(dict(base))[
-        "sga_optimizer_full_sync_inactive_lr_scale"] == 1.0
-    expect_error(lambda: validate_sga_flat(
-        dict(base, sga_optimizer_full_sync_inactive_lr_scale=-0.5)),
-        "must be >= 0.0")
-    expect_error(lambda: validate_sga_flat(
-        dict(base, sga_optimizer_full_sync_inactive_lr_scale=float("nan"))),
-        "finite float")
-    expect_error(lambda: validate_sga_flat(
-        dict(base, sga_optimizer_full_sync_inactive_lr_scale=float("inf"))),
-        "finite float")
-    expect_error(lambda: validate_sga_flat(
-        dict(base, sga_optimizer_full_sync_inactive_lr_scale=0.5,
-             sga_shadow=True)), "sga_shadow")
-    expect_error(lambda: validate_sga_flat(
-        dict(base, sga_cycle_period=1,
-             sga_optimizer_full_sync_inactive_lr_scale=0.5)),
-        "sga_cycle_period 1")
-    expect_error(lambda: validate_sga_flat(
-        {"sga_enabled": False,
-         "sga_optimizer_full_sync_inactive_lr_scale": 0.5}),
-        "sga_enabled is false")
+        ns = _ns(sga_optimizer_full_sync_inactive_lr_scale=spelling)
+        assert ns.sga_optimizer_full_sync_inactive_lr_scale == float(spelling)
+    # the declared default rides along when unset
+    assert _ns().sga_optimizer_full_sync_inactive_lr_scale == 1.0
+    expect_error(lambda: _ns(
+        sga_optimizer_full_sync_inactive_lr_scale=-0.5), ">= 0.0")
+    expect_error(lambda: _ns(
+        sga_optimizer_full_sync_inactive_lr_scale=float("nan")), "finite")
+    expect_error(lambda: _ns(
+        sga_optimizer_full_sync_inactive_lr_scale=float("inf")), "finite")
+    expect_error(lambda: _ns(
+        sga_optimizer_full_sync_inactive_lr_scale=0.5, sga_shadow=True),
+        "sga_shadow")
+    expect_error(lambda: _ns(
+        sga_cycle_period=1,
+        sga_optimizer_full_sync_inactive_lr_scale=0.5), "sga_cycle_period 1")
+    # disabled: zero checks — the knob is silently ignored
+    ns = _ns(sga_enabled=False, sga_optimizer_full_sync_inactive_lr_scale=0.5)
+    assert ns.sga_optimizer_full_sync_inactive_lr_scale == 0.5
     print("ok: dual-lr scale rules (domain / shadow / period=1 / disabled)")
 
 
@@ -258,15 +282,80 @@ def test_sparse_backend_required_when_enabled():
                                   "sga_selection_ratio_percent": 30.0,
                                   "sga_optimizer": "adamw",
                                   "sga_backend": "dense"})
-    expect_error(lambda: validate_run_config(cfg), "dense")
+    expect_error(lambda: _prevalidate_sga(cfg), "dense")
     print("ok: backend dense rejected when enabled")
 
 
 def test_missing_sga_section():
     cfg, _ = make_base()
     del cfg.sga
-    expect_error(lambda: validate_run_config(cfg), "missing the 'sga:'")
+    expect_error(lambda: _prevalidate_sga(cfg), "missing the 'sga:'")
     print("ok: missing sga section is loud")
+
+
+def test_ill_typed_and_empty_sga_sections():
+    """A scalar/list section would die inside OmegaConf.to_container with
+    an opaque internal error, and an empty mapping would silently
+    validate as dense — both must meet the missing-section loudness
+    (named ValueError) at the launch door."""
+    for bad in (True, "str", [1, 2]):
+        cfg, _ = make_base()
+        cfg.sga = bad
+        expect_error(lambda c=cfg: _prevalidate_sga(c),
+                     "sga section must be a mapping")
+    cfg, _ = make_base()
+    cfg.sga = {}
+    expect_error(lambda: _prevalidate_sga(cfg), "empty 'sga:' section")
+    print("ok: scalar/list/empty sga sections refuse loud, by name")
+
+
+def test_shipped_layout_subtree_reads():
+    """The two non-sga keys validation reads are selected through BOTH
+    train subtrees in the flattening order (system first, model
+    overrides): the SHIPPED layout carries pipeline_model_parallel_size
+    under train.system (all llama3 examples), so a single-subtree select
+    left the always-sync pp>1 rule dead at launch time for shipped
+    configs (build_engine only refused after spawn)."""
+    cfg, _ = make_base()
+    _enable_standard(cfg)
+    cfg.sga.sga_always_sync_layers = ["embed"]
+    cfg.train.system.pipeline_model_parallel_size = 2
+    expect_error(lambda: _prevalidate_sga(cfg), "pp == 1")
+    # ...and a system-level train_iters feeds the percent resolution the
+    # same way (the shipped examples carry it under train.model, which
+    # the override leg of the same select keeps working)
+    cfg2, _ = make_base()
+    _enable_standard(cfg2)
+    del cfg2.sga.sga_cycle_start_iter
+    cfg2.sga.sga_cycle_start_iter_percent = 1.6
+    cfg2.train.system.train_iters = 5000
+    ns = _ns_of(cfg2)
+    assert ns.sga_cycle_start_iter == 80  # round(0.016*5000)
+    print("ok: pp/train_iters reach validation from train.system too")
+
+
+def test_null_master_switch_refused():
+    """A yaml null on the master switch is a typo, not an OFF spelling:
+    it must refuse loud instead of rendering no --sga-enabled flag (a
+    dense launch with the whole SGA section silently ignored — the
+    null-as-unset mechanism stays for every non-master key)."""
+    cfg, _ = make_base()
+    _enable_standard(cfg)
+    cfg.sga.sga_enabled = None
+    expect_error(lambda: _prevalidate_sga(cfg),
+                 "sga_enabled is explicitly null")
+    # a null on a NON-master key keeps the unset spelling (no token is
+    # rendered for it — the refusal is scoped to sga_enabled)
+    from sga.launcher.backend_megatron import _sga_section_to_flags
+    cfg2, _ = make_base()
+    _enable_standard(cfg2)
+    cfg2.sga.sga_optimizer_compact_search = None
+    cfg2.sga.sga_backend_emission = None
+    tokens = _sga_section_to_flags(cfg2)
+    assert "--sga-enabled" in tokens
+    assert "--sga-optimizer-compact-search" not in tokens
+    assert "--sga-backend-emission" not in tokens
+    print("ok: null master switch refuses loud; non-master nulls unset")
 
 
 def test_unknown_backend_lists_valid():
@@ -275,30 +364,31 @@ def test_unknown_backend_lists_valid():
             "sga_selection_ratio_percent": 10.0,
             "sga_optimizer": "adamw",
             "sga_backend": "masked_pipelined"}
-    expect_error(lambda: validate_sga_flat(flat),
-                 "absorbed in the backend unification")
-    print("ok: absorbed backend name lists the migration hint")
+    cfg, _ = make_base()
+    cfg.sga = flat
+    expect_error(lambda: _prevalidate_sga(cfg),
+                 "Unknown SGA backend plugin 'masked_pipelined'")
+    print("ok: absorbed backend name reads as unknown, registered list shown")
 
 
-def test_disabled_rejects_any_other_explicit_key():
-    for key, value in (("sga_shadow", True),
-                       ("sga_cycle_period", 8),
-                       ("sga_selection_method", "histogram"),
-                       ("sga_trace_dir", "/tmp/x")):
-        expect_error(lambda k=key, v=value: validate_sga_flat(
-            {"sga_enabled": False, key: v}), "sga_enabled is false")
-    # no exception anymore: an explicit sga_backend key is set config
-    # while disabled, whatever its value (dense included)
-    expect_error(lambda: validate_sga_flat(
-        {"sga_enabled": False, "sga_backend": "dense"}),
-        "sga_enabled is false")
-    print("ok: disabled config rejects every other explicit key")
+def test_disabled_ignores_other_keys():
+    """Megatron semantics: a disabled feature's sub-args are
+    never validated — every explicit key under sga_enabled=false is
+    silently ignored (the old disabled-cleanliness contract is gone)."""
+    cfg, _ = make_base()
+    OmegaConf.update(cfg, "sga", {"sga_enabled": False, "sga_shadow": True,
+                                  "sga_cycle_period": 8,
+                                  "sga_selection_method": "histogram",
+                                  "sga_trace_dir": "/tmp/x",
+                                  "sga_backend": "dense"})
+    _prevalidate_sga(cfg)  # zero checks, no exception
+    print("ok: disabled config silently ignores every other key")
 
 
 def test_sga_never_reaches_megatron_cmdline():
     """The sga: section must never leak into the train.* flatten: the
     launcher only forwards train.{system,model,data} as megatron args and
-    the boundary assert inside validation backs it."""
+    the boundary assert inside pre-validation backs it."""
     cfg, _ = make_base()
     _enable_standard(cfg)
     args = _get_args_megatron(cfg)
@@ -341,90 +431,88 @@ def test_flatten_bool_semantics():
     print("ok: booleans flatten to true/false spellings")
 
 
-def test_plugin_param_vocabulary():
-    """A key no flag declares is loud at validation; a declared key of
-    ANOTHER plugin is loud there too — validation owns name attribution
-    now (any explicitly-set key must belong to the SELECTED plugin of
-    its axis, whatever its value, declared default included);
-    constructors keep the same rejection as the direct-construction
-    backstop (replay/tests)."""
+def test_plugin_param_dead_config_semantics():
+    """Megatron dead-config semantics: a key no flag declares is
+    loud at parse; a declared key of ANOTHER plugin (or under another
+    selection method) is silently ignored — EXCEPT the curated exception
+    (block_size under a non-histogram method refuses)."""
     base = {"sga_enabled": True, "sga_score": "update",
             "sga_selection_method": "histogram",
             "sga_selection_ratio_percent": 10.0,
             "sga_optimizer": "adamw",
             "sga_backend": "torch_pipelined_index"}
-    expect_error(lambda: validate_sga_flat({**base, "sga_selection_bogus": 1}),
-                 "unknown keys")
-    expect_error(lambda: validate_sga_flat({**base, "sga_score_extra": 1}),
-                 "unknown keys")
-    # a sibling backend plugin's param is refused at validation, naming
-    # the plugin that owns it — at a non-default value...
-    expect_error(lambda: validate_sga_flat({**base, "sga_backend_mask_slices": 3}),
-                 "torch_pipelined_mask")
-    # ...and at its declared default too: the explicit-but-at-default
-    # spelling would otherwise be value-diffed away silently before the
-    # constructor's rejection could see it (the R1 regression)
-    expect_error(lambda: validate_sga_flat({**base, "sga_backend_mask_slices": 2}),
-                 "torch_pipelined_mask")
-    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
+    cfg, _ = make_base()
+    cfg.sga = {**base, "sga_selection_bogus": 1}
+    expect_error(lambda: _prevalidate_sga(cfg), "sga_selection_bogus")
+    cfg.sga = {**base, "sga_score_extra": 1}
+    expect_error(lambda: _prevalidate_sga(cfg), "sga_score_extra")
+    # a sibling backend plugin's param is dead config under this backend:
+    # silently ignored, at a non-default value and at its default alike
+    cfg.sga = {**base, "sga_backend_mask_slices": 3}
+    _prevalidate_sga(cfg)
+    cfg.sga = {**base, "sga_backend_mask_slices": 2}
+    _prevalidate_sga(cfg)
+    # the curated exception: block_size is histogram-only
+    cfg.sga = {**base, "sga_selection_block_size": 4,
+               "sga_backend_emission": "writeback"}
+    _prevalidate_sga(cfg)  # histogram + writeback pairing: legal
+    cfg.sga = dict(base, sga_selection_method="exact",
+                   sga_selection_block_size=4)
+    expect_error(lambda: _prevalidate_sga(cfg), "sga_selection_block_size")
+    print("ok: typos loud; sibling/method keys silently ignored; block_size "
+          "is the curated exception")
 
-    expect_error(
-        lambda: TorchPipelinedIndexBackend({"sga_backend_mask_slices": 3}),
-        "unknown params ['sga_backend_mask_slices']")
-    print("ok: typos and sibling-plugin keys loud at validation, plugin "
-          "vocab backstop at build")
 
-
-def test_float_spelling_canonicalized():
-    """ratio 10 vs 10.0 canonicalize identically (resume-safe)."""
-    base = {"sga_enabled": True, "sga_score": "update",
-            "sga_selection_method": "histogram",
-            "sga_selection_ratio_percent": 10,
-            "sga_optimizer": "adamw",
-            "sga_backend": "torch_pipelined_index"}
-    canon = validate_sga_flat(dict(base))
-    assert canon["sga_selection_ratio_percent"] == 10.0
-    assert isinstance(canon["sga_selection_ratio_percent"], float)
-    print("ok: float spellings canonicalize")
+def test_float_spelling_normalized():
+    """ratio 10 vs 10.0 parse identically (argparse float typing)."""
+    cfg, _ = make_base()
+    cfg.sga = {"sga_enabled": True, "sga_score": "update",
+               "sga_selection_method": "histogram",
+               "sga_selection_ratio_percent": 10,
+               "sga_optimizer": "adamw",
+               "sga_backend": "torch_pipelined_index"}
+    ns = _ns_of(cfg)
+    assert ns.sga_selection_ratio_percent == 10.0
+    assert isinstance(ns.sga_selection_ratio_percent, float)
+    print("ok: float spellings normalize through the parser")
 
 
 def test_wrong_types_fail_loud():
-    """C1 pin: the yaml route feeds raw user values through _coerce
-    (argparse typing is bypassed), so wrong-typed values must fail loud
-    with the key named — a yaml true/false never becomes 1/0, a float
-    never truncates for an int dest, numeric strings are not ints, and
-    float dests reject non-finite values."""
+    """The yaml route renders values into flag STRINGS and re-parses them
+    with the real argparse typing, so wrong-typed values fail loud with
+    the flag named (and nan/inf spellings pass float typing — validation's
+    value rules refuse them)."""
     base = {"sga_enabled": True, "sga_score": "update",
             "sga_selection_method": "histogram",
             "sga_selection_ratio_percent": 10.0,
             "sga_optimizer": "adamw",
             "sga_backend": "torch_pipelined_index"}
-    expect_error(lambda: validate_sga_flat({**base, "sga_cycle_period": True}),
-                 "sga_cycle_period must be a valid int (got True)")
-    expect_error(lambda: validate_sga_flat({**base, "sga_backend_index_slices": 3.9}),
-                 "sga_backend_index_slices must be a valid int (got 3.9)")
-    expect_error(lambda: validate_sga_flat({**base, "sga_cycle_period": "8"}),
-                 "sga_cycle_period must be a valid int (got '8')")
-    expect_error(lambda: validate_sga_flat(
-        {**base, "sga_selection_ratio_percent": True}),
-        "sga_selection_ratio_percent must be a valid float (got True)")
-    expect_error(lambda: validate_sga_flat({**base, "sga_trace_window": True}),
-                 "sga_trace_window must be a valid int (got True)")
-    expect_error(lambda: validate_sga_flat(
-        {**base, "sga_selection_adaptive_warmup_syncs": True}),
-        "sga_selection_adaptive_warmup_syncs must be a valid int_or_null "
-        "(got True)")
-    expect_error(lambda: validate_sga_flat(
-        {**base, "sga_selection_ratio_percent": float("nan")}),
-        "sga_selection_ratio_percent must be a finite float (got nan)")
-    # integral floats are still rejected for int dests (8.0 is a float)
-    expect_error(lambda: validate_sga_flat({**base, "sga_backend_index_slices": 3.0}),
-                 "sga_backend_index_slices must be a valid int (got 3.0)")
+    cfg, _ = make_base()
+
+    def _with(**over):
+        c, _ = make_base()
+        c.sga = {**base, **over}
+        return c
+
+    expect_error(lambda: _prevalidate_sga(_with(sga_cycle_period=True)),
+                 "--sga-cycle-period")
+    expect_error(lambda: _prevalidate_sga(_with(sga_backend_index_slices=3.9)),
+                 "--sga-backend-index-slices")
+    expect_error(lambda: _prevalidate_sga(_with(sga_selection_ratio_percent="abc")),
+                 "--sga-selection-ratio-percent")
+    expect_error(lambda: _prevalidate_sga(_with(sga_trace_window=True)),
+                 "--sga-trace-window")
+    expect_error(lambda: _prevalidate_sga(_with(sga_selection_adaptive_warmup_syncs=True)),
+                 "--sga-selection-adaptive-warmup-syncs")
+    # nan passes argparse float typing; the value rule refuses it
+    expect_error(lambda: _prevalidate_sga(
+        _with(sga_selection_ratio_percent=float("nan"))),
+        "finite float in (0, 100)")
     print("ok: wrong-typed yaml values fail loud (bool/float/str/nan)")
 
 
 def test_shipped_examples_validate():
-    """Every shipped example yaml passes validation as-is (a renamed or
+    """Every shipped example yaml passes pre-validation as-is (a renamed or
     removed flag left behind in an example would otherwise surface only
     at a user's launch)."""
     import glob
@@ -435,7 +523,7 @@ def test_shipped_examples_validate():
     assert examples, "no shipped examples found"
     for path in examples:
         cfg = OmegaConf.load(path)
-        validate_run_config(cfg)  # must not raise (None = dense example)
+        _prevalidate_sga(cfg)  # must not raise
     print(f"ok: all {len(examples)} shipped examples validate")
 
 
@@ -444,8 +532,6 @@ def _run_all():
         if name.startswith("test_") and callable(fn):
             fn()
     print("ALL CONFIG TESTS PASSED")
-
-
 
 
 def test_list_kind_flag_emits_comma_token():

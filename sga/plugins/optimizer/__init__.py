@@ -4,15 +4,15 @@
 An optimizer template owns the ENTIRE inner optimizer step for ALL params
 (torch's ``optimizer.step()`` cannot step a subset of param_groups, and the
 SGA kernels update m/v at every coordinate every step). It also owns the
-post-update selective buffer reset semantics
-(declared via ``reset_mode``); the reset has exactly ONE execution site —
-the end of ``engine.optimizer_step``.
+post-update selective buffer reset semantics; the reset has exactly ONE
+execution site — the end of ``engine.optimizer_step``.
 
 Score materialization is part of the same template: on full-sync steps the
 commit kernel writes the configured score (see the score registry) into the
 fp32 main-grad copy, where the engine's reselection reads it (the
-optimizer->score handoff). Which scores a template can emit is declared on
-its ``OptimizerDecl.emittable_scores``.
+optimizer->score handoff). Which scores a template can emit is the
+template's own kernel-branch inventory (``_TRITON_SCORE_MAP`` in
+``adamw.py`` — a configured score outside it fails loud at construction).
 """
 
 from dataclasses import dataclass, field

@@ -5,18 +5,23 @@ Stub legacy checkpoints under temp dirs; verifies the fail-closed cluster:
 
 - rank resolution comes from the RANK env var (pre-distributed-init), and
   non-zero ranks never load anything;
-- identical configs pass even under spelling variance (percent vs
-  absolute start_iter, int vs float ratio — canonical comparison);
+- identical configs pass (RAW comparison, defaults-filled: an older
+  checkpoint missing a newer key compares against its default — forward
+  compatible);
+- a DIFFERENT SPELLING of the same cycle anchor (percent vs absolute
+  start_iter) refuses: the raw compare is deliberately spelling-faithful
+  (deliberately), and a percent spelling anchors to its side's own
+  train_iters, which rides the comparison;
 - differing / absent saved sga arguments refuse the resume (SystemExit);
   a legacy DENSE checkpoint cannot silently resume under active SGA, a
   JSON-era checkpoint (retired --sga-config string) is refused with a
   pointed message, and so is a flatargs-era v1 namespace (the same
   string alongside the all-None sga_* attrs its default=None flags
   saved);
-- a checkpoint saved before a parameter rename carries retired keys;
-  since explicit_from_flat drops them before the comparison, the guard
-  detects them directly and refuses with a pointed message instead of
-  letting both sides canonicalize to the current defaults;
+- a checkpoint saved before a parameter rename carries retired keys; the
+  guard detects them directly and refuses with a pointed message instead
+  of letting the defaults-fill swallow a config the checkpoint never ran
+  with;
 - unreadable/incomplete checkpoints and unsupported layouts fail CLOSED
   (refuse) instead of proceeding -- --sga-allow-config-override is the only
   escape hatch, and it exempts every case;
@@ -163,8 +168,8 @@ def test_identical_and_spelling_variant_configs_pass():
     tmp = tempfile.mkdtemp(prefix="sga-resume-ok-")
     make_ckpt(tmp)  # exact same flat attrs
     _with_rank(0, lambda: _sga_resume_guard(_Args(load=tmp)))  # must not raise
-    # spelling variants canonicalize equal: percent vs absolute start_iter
-    # and int vs float ratio
+    # the same non-default spelling on BOTH sides still passes (raw
+    # compare, both sides carry identical attrs): percent + int ratio
     variant = dict(CURRENT)
     del variant["sga_cycle_start_iter"]
     variant["sga_cycle_start_iter_percent"] = 0.4  # of 5000 -> 20
@@ -173,29 +178,32 @@ def test_identical_and_spelling_variant_configs_pass():
     make_ckpt(tmp2, saved_config=variant)
     _with_rank(0, lambda: _sga_resume_guard(
         _Args(load=tmp2, config=variant)))
-    print("ok: identical + spelling-variant saved configs pass")
+    print("ok: identical + same-spelling saved configs pass")
 
 
-def test_cross_spelling_sides_pass_and_train_iters_drift_refuses():
-    """R4: percent-vs-absolute canonicalization across SIDES — the
-    checkpoint carries one spelling, the resume flags the other — plus
-    the R1 pin: a percent spelling saved under train_iters=5000 refuses
-    when the resume extends train_iters (the effective cycle anchor
-    moves 20 -> 40; the guard must be fail-closed, not re-anchor)."""
+def test_cross_spelling_sides_refuse_and_train_iters_drift_refuses():
+    """Raw compare: percent-vs-absolute across SIDES refuses (a
+    different spelling is a different config — the percent side also
+    carries its own train_iters anchor), and a percent spelling saved
+    under train_iters=5000 refuses when the resume extends train_iters
+    (the effective cycle anchor would move 20 -> 40; fail-closed, not
+    re-anchored)."""
     abs_config = dict(CURRENT)  # sga_cycle_start_iter: 20
     pct_config = dict(CURRENT)
     del pct_config["sga_cycle_start_iter"]
     pct_config["sga_cycle_start_iter_percent"] = 0.4  # of 5000 -> 20
-    # (a) saved absolute, resumed percent
+    # (a) saved absolute, resumed percent: different spelling -> refuse
     tmp = tempfile.mkdtemp(prefix="sga-resume-xabs-")
     make_ckpt(tmp, saved_config=abs_config)
-    _with_rank(0, lambda: _sga_resume_guard(
-        _Args(load=tmp, config=pct_config)))  # must not raise
-    # (b) reverse direction: saved percent, resumed absolute
+    expect_exit(lambda: _with_rank(
+        0, lambda: _sga_resume_guard(
+            _Args(load=tmp, config=pct_config))), "differs")
+    # (b) reverse direction: saved percent, resumed absolute -> refuse
     tmp2 = tempfile.mkdtemp(prefix="sga-resume-xpct-")
     make_ckpt(tmp2, saved_config=pct_config)
-    _with_rank(0, lambda: _sga_resume_guard(
-        _Args(load=tmp2, config=abs_config)))  # must not raise
+    expect_exit(lambda: _with_rank(
+        0, lambda: _sga_resume_guard(
+            _Args(load=tmp2, config=abs_config))), "differs")
     # (c) same percent spelling on both sides, but the saved namespace's
     # own train_iters=5000 vs the resume's 10000: refuse with "differs"
     tmp3 = tempfile.mkdtemp(prefix="sga-resume-tidrift-")
@@ -204,7 +212,7 @@ def test_cross_spelling_sides_pass_and_train_iters_drift_refuses():
         0, lambda: _sga_resume_guard(
             _Args(load=tmp3, config=pct_config, train_iters=10000))),
         "differs")
-    print("ok: cross-spelling sides pass; changed train_iters refuses")
+    print("ok: cross-spelling sides refuse; changed train_iters refuses")
 
 
 def test_differing_config_refuses():
@@ -219,9 +227,9 @@ def test_differing_config_refuses():
 def test_retired_key_checkpoint_refuses_pointedly():
     """A checkpoint saved before a parameter rename carries keys no
     current flag declares (here the slice params' pre-rename spelling).
-    explicit_from_flat drops them before the comparison, which would
-    canonicalize both sides to the current defaults and accept — the
-    guard must detect the retired keys and refuse instead."""
+    The defaults-fill would only ever compare them as an extra-vs-missing
+    difference; the guard detects the retired keys directly and refuses
+    with the pointed message."""
     tmp = tempfile.mkdtemp(prefix="sga-resume-renamed-")
     make_ckpt(tmp, saved_config=dict(CURRENT, sga_backend_slices=3))
     expect_exit(lambda: _with_rank(
@@ -316,11 +324,13 @@ def test_nonzero_rank_never_loads():
 
 
 def test_always_sync_layers_resume_legs():
-    """The always-sync axis rides the canonical comparison: a
-    checkpoint saved WITHOUT the key refuses a current config that sets
-    it (fail-closed), and the two legal spellings of the same value
-    (comma token on the saved side, list-typed attr on the current side)
-    compare equal."""
+    """The always-sync axis rides the raw comparison: a checkpoint saved
+    WITHOUT the key refuses a current config that sets it (fail-closed),
+    and the raw compare is spelling-faithful — a comma token vs a list
+    (or a whitespace variant) are DIFFERENT values on the wire and
+    refuse; the exact same spelling passes. (Production namespaces carry
+    the argparse comma token on both sides; the list spelling exists only
+    on hand-crafted or yaml-derived saved namespaces.)"""
     with tempfile.TemporaryDirectory() as tmp:
         make_ckpt(tmp)  # CURRENT: no sga_always_sync_layers attr
         current = dict(CURRENT, sga_always_sync_layers="embed,norm")
@@ -330,32 +340,38 @@ def test_always_sync_layers_resume_legs():
     with tempfile.TemporaryDirectory() as tmp:
         saved = dict(CURRENT, sga_always_sync_layers="embed,norm")
         make_ckpt(tmp, saved_config=saved)
-        current = dict(CURRENT, sga_always_sync_layers=["embed", "norm"])
-        _with_rank(0, lambda: _sga_resume_guard(_Args(load=tmp,
-                                                      config=current)))
-        # and a different pattern list still refuses
+        _with_rank(0, lambda: _sga_resume_guard(
+            _Args(load=tmp, config=saved)))  # same spelling: passes
+        # a different pattern list still refuses
         expect_exit(lambda: _with_rank(
             0, lambda: _sga_resume_guard(
                 _Args(load=tmp,
                       config=dict(CURRENT,
-                                  sga_always_sync_layers=["norm"])))),
+                                  sga_always_sync_layers="norm")))),
+            "differs")
+        # and the list spelling of the SAME value refuses too (raw wire
+        # compare: "embed,norm" != ["embed", "norm"])
+        expect_exit(lambda: _with_rank(
+            0, lambda: _sga_resume_guard(
+                _Args(load=tmp,
+                      config=dict(CURRENT,
+                                  sga_always_sync_layers=["embed", "norm"])))),
             "differs")
     with tempfile.TemporaryDirectory() as tmp:
-        # whitespace spelling is the same canonical list (per-element
-        # strip is part of the parse, so "embed, norm" == ["embed", "norm"])
+        # identical whitespace spelling on both sides passes
         saved = dict(CURRENT, sga_always_sync_layers="embed, norm")
         make_ckpt(tmp, saved_config=saved)
-        current = dict(CURRENT, sga_always_sync_layers="embed,norm")
         _with_rank(0, lambda: _sga_resume_guard(
-            _Args(load=tmp, config=current)))  # must not raise
-    print("ok: always-sync resume legs (absent key refuses, spellings equal)")
+            _Args(load=tmp,
+                  config=dict(CURRENT, sga_always_sync_layers="embed, norm"))))
+    print("ok: always-sync resume legs (absent key refuses, raw spellings)")
 
 
 if __name__ == "__main__":
     test_model_build_chain_is_stock()
     test_always_sync_layers_resume_legs()
     test_identical_and_spelling_variant_configs_pass()
-    test_cross_spelling_sides_pass_and_train_iters_drift_refuses()
+    test_cross_spelling_sides_refuse_and_train_iters_drift_refuses()
     test_differing_config_refuses()
     test_retired_key_checkpoint_refuses_pointedly()
     test_absent_saved_config_refuses()

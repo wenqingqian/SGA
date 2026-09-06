@@ -2,27 +2,21 @@
 """Score registry: the single source of truth for SGA score names and math.
 
 A score is a named importance signal over optimizer state. The registry maps
-each name to its emission mode (the ``Score`` enum), its pure-torch formula
-and documentation — no classes, no per-score files. The same names are spoken
-by the online config (``sga.score.name``), the offline replay CLI
-(``--score-names``) and the analysis tooling: one namespace, no translation
-layers. Adding a score touches exactly TWO places: one entry here, and (for
-online use) one branch in the optimizer kernel.
+each name to its pure-torch formula and documentation — no classes, no
+per-score files. The same names are spoken by the online config
+(``--sga-score``), the offline replay CLI (``--score-names``) and the
+analysis tooling: one namespace, no translation layers. The registry is
+registered-data style (``register_score`` + ``register_default_scores``,
+idempotent), the same idiom as the class-plugin registries in
+``sga/plugins/__init__.py``.
 
-``Score(IntEnum)`` is the namespace: member names ARE the score names and the
-int value is the compile-time branch the kernel switches on (Triton takes
-constexpr ints only, so the kernel spells them as bare ints with name
-comments; tests/test_kernels_gpu.py pins the mapping by name). The emission
-mode is an INTRINSIC property of the score — it says which math gets
-materialized, independent of any host optimizer. This does NOT reverse the
-rule that online usability is declared per optimizer template
-(``OptimizerDecl.emittable_scores``): a template declares the kernel-branch
-subset it implements, and today's single template implements every non-OFFLINE
-branch, so its emittable set is derived here. When a second template appears,
-its emittable set is the intersection of its own branch subset with the
-registry's online modes. ``Score.OFFLINE`` (-1) is the sentinel for
-offline-only candidates: replay can evaluate them, configs reject them;
-promotion = assigning a real mode + adding the kernel branch, nothing else.
+Adding an ONLINE score touches exactly TWO places: one entry here, and one
+branch in the optimizer kernel (``_TRITON_SCORE_MAP`` + the kernel's
+``EMIT_MODE`` if-chain live together in ``sga/plugins/optimizer/adamw.py``;
+a registered score without a map entry fails loud at optimizer
+construction, never silently mis-materializes). A replay-only score needs
+only the entry here — but then no config may select it usefully; keep
+research candidates out of the registry until they have their branch.
 
 Each formula computes the score from one coordinate's pre-commit state:
 
@@ -46,43 +40,21 @@ the sqrt result, coi's ``inner``, the ``weight_decay * w`` term — but they
 die within the call, so the caching allocator bounds the high-water.
 Formulas that return before touching any temp ignore the pair (scratch=False:
 abs_g/abs_m). Returned tensors never alias ``scratch``: per-param outputs
-are held simultaneously by callers' views lists. ``SCRATCH_SCORES`` is the
-derived name set of scratch=True entries.
+are held simultaneously by callers' views lists.
 """
 
 from dataclasses import dataclass
-from enum import IntEnum
-from typing import Callable, Optional, Tuple
+from typing import Callable
 
 import torch
 
 
-class Score(IntEnum):
-    """Full-step emission modes; member names ARE the online score names.
-
-    The int is the kernel's compile-time branch (EMIT_MODE constexpr).
-    OFFLINE is the sentinel for offline-only candidates (no kernel branch);
-    its -1 deliberately reuses the kernel's sparse-step EMIT_MODE sentinel —
-    safe because the optimizer wrapper rejects OFFLINE host-side before the
-    sparse path maps emit_mode=None to -1 at launch (a direct kernel call
-    with -1 would be a sparse step, not an error).
-    """
-
-    update = 0
-    abs_g = 1
-    abs_m = 2
-    coi = 3
-    OFFLINE = -1
-
-
 @dataclass(frozen=True)
 class ScoreSpec:
-    """One registry entry: emission mode + formula + doc + scratch flag
-    (see module docstring). The name is NOT repeated here — it is the
-    registry key, tied to the enum member name by the load-time check below.
-    """
+    """One registry entry: formula + doc + scratch flag. The name is NOT
+    repeated here — it is the registration key (the config-facing score
+    name and the replay CLI name)."""
 
-    score: Score
     # (w, m, v, g, beta1, beta2, eps, weight_decay, bias_correction1,
     #  bias_correction2, update_includes_wd, scratch) -> score tensor
     formula: Callable[..., torch.Tensor]
@@ -90,7 +62,57 @@ class ScoreSpec:
     scratch: bool = False
 
 
-def _resolve_scratch(w: torch.Tensor, scratch: Optional[Tuple]):
+_SCORES: dict = {}
+
+
+def register_score(name: str, spec: ScoreSpec) -> None:
+    """Register one score; duplicate names fail loud at registration."""
+    if name in _SCORES:
+        raise ValueError(f"duplicate score registration '{name}'")
+    _SCORES[name] = spec
+
+
+def register_default_scores() -> None:
+    """Idempotent registration of the built-in scores (per-name, so a
+    test that pre-registers a custom score does not block the defaults)."""
+    _SCORES.setdefault("update", ScoreSpec(
+        formula=_formula_update,
+        doc="the SIGNED AdamW weight update wd*w + U(g) (U(g) from the "
+            "pre-commit moments and this step's gradient, upcoming-commit "
+            "bias corrections); consumers rank by absolute value",
+        scratch=True,
+    ))
+    _SCORES.setdefault("abs_g", ScoreSpec(
+        formula=_formula_abs_g,
+        doc="|g| of the committed, fully-synced gradient",
+    ))
+    _SCORES.setdefault("abs_m", ScoreSpec(
+        formula=_formula_abs_m,
+        doc="|m| of the pre-commit first moment",
+    ))
+    _SCORES.setdefault("coi", ScoreSpec(
+        formula=_formula_coi,
+        doc="counterfactual optimizer impact |U(g) - U(0)| (wd cancels)",
+        scratch=True,
+    ))
+
+
+def get_score_spec(name: str) -> ScoreSpec:
+    register_default_scores()
+    try:
+        return _SCORES[name]
+    except KeyError:
+        raise ValueError(
+            f"Unknown SGA score '{name}'. Registered: {score_names()}"
+        ) from None
+
+
+def score_names():
+    register_default_scores()
+    return sorted(_SCORES)
+
+
+def _resolve_scratch(w: torch.Tensor, scratch):
     # Narrow to [:w.numel()].view_as(w): the contract permits numel >=
     # w.numel() (callers share ONE flat max-numel pair across params), and an
     # out= op on a size-mismatched tensor would RESIZE the shared buffer in
@@ -195,64 +217,9 @@ def _formula_coi(w, m, v, g, beta1, beta2, eps, weight_decay,
     return result.abs()
 
 
-SCORES = {
-    "update": ScoreSpec(
-        score=Score.update,
-        formula=_formula_update,
-        doc="the SIGNED AdamW weight update wd*w + U(g) (U(g) from the "
-            "pre-commit moments and this step's gradient, upcoming-commit "
-            "bias corrections); consumers rank by absolute value",
-        scratch=True,
-    ),
-    "abs_g": ScoreSpec(
-        score=Score.abs_g,
-        formula=_formula_abs_g,
-        doc="|g| of the committed, fully-synced gradient",
-    ),
-    "abs_m": ScoreSpec(
-        score=Score.abs_m,
-        formula=_formula_abs_m,
-        doc="|m| of the pre-commit first moment",
-    ),
-    "coi": ScoreSpec(
-        score=Score.coi,
-        formula=_formula_coi,
-        doc="counterfactual optimizer impact |U(g) - U(0)| (wd cancels)",
-        scratch=True,
-    ),
-}
-
-# The enum is the namespace: an online entry's key IS its mode's member name
-# (offline candidates key under their candidate name with score=OFFLINE).
-# Explicit raise, not assert: this guard is the only thing tying registry
-# keys to enum member names and must survive ``python -O``.
-for _name, _spec in SCORES.items():
-    if not (_spec.score is Score.OFFLINE or _spec.score.name == _name):
-        raise ValueError(
-            f"score '{_name}' keyed differently from its mode "
-            f"Score.{_spec.score.name} — the enum member name IS the score name"
-        )
-if SCORES:  # symmetric guard: no loop variables exist when the registry is empty
-    del _name, _spec
-
-# Names whose formulas route temporaries through the scratch pair (derived;
-# see the module docstring). Callers may skip the pair allocation for others.
-SCRATCH_SCORES = frozenset(n for n, s in SCORES.items() if s.scratch)
-
-
-def emittable_score_names() -> frozenset:
-    """Scores with an online emission mode (every non-OFFLINE entry)."""
-    return frozenset(n for n, s in SCORES.items() if s.score is not Score.OFFLINE)
-
-
-def get_score_spec(name: str) -> ScoreSpec:
-    try:
-        return SCORES[name]
-    except KeyError:
-        raise ValueError(
-            f"Unknown SGA score '{name}'. Registered: {score_names()}"
-        ) from None
-
-
-def score_names():
-    return sorted(SCORES)
+# Populate the built-ins at import: a caller could otherwise
+# pre-register a custom formula under a built-in name before the lazy fill
+# ran, silently divorcing the registry from the optimizer's fixed
+# _TRITON_SCORE_MAP branch. After this call, register_score on a built-in
+# name fails loud through the duplicate check.
+register_default_scores()
