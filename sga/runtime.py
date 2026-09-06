@@ -142,49 +142,6 @@ def _assert_args_compatible() -> None:
                  "is decoupled AdamW)")
 
 
-def materialize_engine_config(canonical: dict) -> dict:
-    """The engine's internal NESTED read shape, assembled from the
-    validated canonical flat dict (engine.py's historical contract — the
-    rest of the pipeline is flat end to end). Axis sections carry the
-    explicit non-default params only; plugin constructors expand their
-    declared defaults through the plugins' ``expand_plugin_params``, so a
-    spelling equal to the default lands in the same final values either
-    way.
-    """
-    explicit = explicit_from_flat(canonical)
-
-    def _axis(axis):
-        prefix = f"sga_{axis}_"
-        params = {dest[len(prefix):]: explicit[dest]
-                  for dest in explicit if dest.startswith(prefix)}
-        return {"name": canonical[f"sga_{axis}"], **params}
-
-    engine_config = {
-        "cycle": {
-            "start_iter": canonical["sga_cycle_start_iter"],
-            "period": canonical["sga_cycle_period"],
-            "decouple_full_sync_interval_and_period":
-                canonical["sga_cycle_decouple_full_sync_interval_and_period"],
-            "full_sync_interval": canonical["sga_cycle_full_sync_interval"],
-        },
-        "checks": {"count_guard": canonical["sga_checks_count_guard"]},
-        "always_sync": {"layers": canonical["sga_always_sync_layers"]},
-        "shadow": canonical["sga_shadow"],
-        "shadow_score": canonical["sga_shadow_score"],
-        "score": _axis("score"),
-        "selection": _axis("selection"),
-        "optimizer": _axis("optimizer"),
-        "backend": _axis("backend"),
-    }
-    if canonical["sga_trace_dir"] is not None:
-        engine_config["trace"] = {
-            "dir": canonical["sga_trace_dir"],
-            "branch_points": canonical["sga_trace_branch_points"],
-            "window": canonical["sga_trace_window"],
-        }
-    return engine_config
-
-
 def build_engine(flat: dict, api_version: int):
     """Validate + assemble the engine from the flat ``sga_*`` dict the
     fork waist collected off the parsed megatron namespace (flags ARE the
@@ -224,14 +181,13 @@ def build_engine(flat: dict, api_version: int):
             "build_engine called with a disabled/absent SGA configuration "
             "(the waist must key off sga_enabled)"
         )
-    engine_config = materialize_engine_config(canonical)
 
     # The always-sync patterns are matched PER RANK against the attached
     # stage's params only: under pp > 1 the endpoint and middle ranks see
     # different param sets, so the per-rank attach guards cannot be
     # world-honest — v1 pins pp == 1 for this axis (the engine-side
     # guards stay correct under that pin).
-    if (canonical.get("sga_always_sync_layers") is not None
+    if (canonical["sga_always_sync_layers"] is not None
             and getattr(args, "pipeline_model_parallel_size", 1) > 1):
         raise ValueError(
             "sga_always_sync_layers: always-sync layer matching is "
@@ -244,10 +200,10 @@ def build_engine(flat: dict, api_version: int):
 
     # Defensive re-derivation (validation already checked membership and
     # the cross-axis rules; the decls are needed for construction anyway).
-    score_name = engine_config["score"]["name"]
-    selection_name = engine_config["selection"]["name"]
-    optimizer_name = engine_config["optimizer"]["name"]
-    backend_name = engine_config["backend"]["name"]
+    score_name = canonical["sga_score"]
+    selection_name = canonical["sga_selection"]
+    optimizer_name = canonical["sga_optimizer"]
+    backend_name = canonical["sga_backend"]
 
     register_default_plugins()
     get_score_spec(score_name)  # unknown score fails with the registered list
@@ -259,15 +215,20 @@ def build_engine(flat: dict, api_version: int):
     # validation layers contradict each other for explicit non-auto values
     validate_combination(score_name, selection_decl, optimizer_decl,
                          backend_decl,
-                         backend_emission=canonical.get("sga_backend_emission"))
+                         backend_emission=canonical["sga_backend_emission"])
 
-    selection = build_selection(selection_name, dict(engine_config["selection"]))
+    # Plugin constructors receive the explicit-default diff of the
+    # canonical, sliced to their axis by full-name vocabulary membership
+    # (build_* internals); each expands its declared defaults through
+    # expand_plugin_params, so a spelling equal to the default lands in
+    # the same final values either way.
+    explicit = explicit_from_flat(canonical)
+    selection = build_selection(selection_name, explicit)
     # Scores are materialized by the optimizer template on full steps; inject
     # WHICH score to emit so the kernel picks the right mode (the validator
     # above already proved the template can emit it).
-    opt = build_optimizer(optimizer_name, dict(engine_config["optimizer"]),
-                          emit_score=score_name)
-    backend = build_backend_plugin(backend_name, dict(engine_config["backend"]))
+    opt = build_optimizer(optimizer_name, explicit, emit_score=score_name)
+    backend = build_backend_plugin(backend_name, explicit)
 
     # Optional backend-owned runtime validation, probed generically (the
     # same optional-hook discipline as adapt()/wants_force_full()): topology
@@ -280,7 +241,7 @@ def build_engine(flat: dict, api_version: int):
 
     from sga.engine import SGAEngine
 
-    engine = SGAEngine(engine_config, score_name, selection, opt, backend)
+    engine = SGAEngine(canonical, score_name, selection, opt, backend)
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         print(f"[SGA] engine built (API v{api_version}); config: "

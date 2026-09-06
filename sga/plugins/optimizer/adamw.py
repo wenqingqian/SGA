@@ -76,6 +76,11 @@ DECL = OptimizerDecl(
     emittable_scores=emittable_score_names(),
 )
 
+# adamw's own vocabulary: its params as FULL flat dests (defaults and
+# required-ness live in the argparse declarations).
+PARAMS = ("sga_optimizer_residual_mean", "sga_optimizer_compact_search",
+          "sga_optimizer_full_sync_inactive_lr_scale")
+
 # The bare-int EMIT_MODE branches _grad_correct_kernel implements below.
 # Load-time tie between the DERIVED emittable set above and that hardcoded
 # branch coverage: a score registered without a branch here would pass every
@@ -827,12 +832,10 @@ class SgaAdamW:
     decl = DECL
 
     def __init__(self, params: dict, emit_score: Optional[str] = None):
-        params = expand_plugin_params(
-            "sga_optimizer_",
-            ("residual_mean", "compact_search", "full_sync_inactive_lr_scale"),
-            dict(params), "sga_optimizer (adamw)")
+        params = expand_plugin_params(PARAMS, dict(params),
+                                      "sga_optimizer (adamw)")
         self.params = params
-        self.residual_mean = bool(params["residual_mean"])
+        self.residual_mean = bool(params["sga_optimizer_residual_mean"])
         # Compact-path idx alignment search: 'table' seeds both
         # lower_bound brackets from the per-cycle directory table;
         # 'bisection' is the plain full-depth form. Dispatched per call
@@ -840,7 +843,7 @@ class SgaAdamW:
         # writeback-emission runs (they never reach
         # _records_pass_compact) and on the torch fallback (it ignores
         # the table).
-        self.compact_search = params["compact_search"]
+        self.compact_search = params["sga_optimizer_compact_search"]
         # Boundary dual-lr: on full-sync steps the apply runs at
         # lr * scale on the mask-inactive (never-communicated) coords.
         # 1.0 keeps the single-lr behavior bit-identical; the shadow/period
@@ -848,7 +851,7 @@ class SgaAdamW:
         # direct construction (tests/replay); the negative leg is the
         # reachable one — non-finite is already refused by _coerce upstream.
         self.full_sync_inactive_lr_scale = float(
-            params["full_sync_inactive_lr_scale"])
+            params["sga_optimizer_full_sync_inactive_lr_scale"])
         # -0.0 normalizes to 0.0: the same tail freeze, without the
         # sign-of-zero flips on params that are exactly -0.0
         if self.full_sync_inactive_lr_scale == 0.0:
@@ -995,15 +998,15 @@ class SgaAdamW:
         the same pass. Writeback backends keep the masked kernel with the
         fused clear (semantics unchanged)."""
         fold = self.residual_mean and ctx.next_step_is_full
-        if getattr(ctx, "compact_values", None):
+        if ctx.compact_values:
             self._records_pass_compact(
-                ctx, coeff=float(getattr(ctx, "apply_coeff", 1.0)),
+                ctx, coeff=float(ctx.apply_coeff),
                 fold=fold, interval=float(ctx.fold_window),
             )
             return
         self._records_pass(
             ctx, emit_mode=None, use_mask=True,
-            coeff=float(getattr(ctx, "apply_coeff", 1.0)),
+            coeff=float(ctx.apply_coeff),
             clear=True, fold=fold, interval=float(ctx.fold_window),
         )
 

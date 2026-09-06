@@ -74,6 +74,11 @@ DECL = BackendDecl(
     emission="compact",
 )
 
+# This backend's own vocabulary: its params as FULL flat dests (defaults
+# and required-ness live in the argparse declarations).
+PARAMS = ("sga_backend_high_priority_group", "sga_backend_index_slices",
+          "sga_backend_emission")
+
 # Escape hatch for the resume fail-closed in twin mode. Parsed as exactly
 # "1": any other value — "yes" included — keeps the safe refusal. Must be
 # set identically on every rank (export via env.sh, not per-node): a
@@ -101,20 +106,18 @@ class TorchPipelinedIndexBackend:
 
     def __init__(self, params: dict):
         params = expand_plugin_params(
-            "sga_backend_", ("high_priority_group", "index_slices", "emission"),
-            dict(params), "sga_backend (torch_pipelined_index)")
+            PARAMS, dict(params), "sga_backend (torch_pipelined_index)")
         # Emission switch: how the sparse allreduce hands its result to
         # the optimizer. 'auto' (the flag default) resolves to this
         # backend's inherent compact form; explicit 'writeback' restores
         # the historical choreography (see allreduce_sparse). The DECL's
-        # emission field is the declared inherent default the engine
+        # emission field is the declared inherent default the resolution
         # falls back to; the RESOLVED instance attribute is what the
         # engine routes on.
-        self.emission = params["emission"]
-        if self.emission == "auto":
-            self.emission = "compact"
-        self._hiprio = bool(params["high_priority_group"])
-        self._slices = int(params["index_slices"])
+        self.emission = self.decl.resolve_emission(
+            params["sga_backend_emission"])
+        self._hiprio = bool(params["sga_backend_high_priority_group"])
+        self._slices = int(params["sga_backend_index_slices"])
         if self._slices < 1:
             raise ValueError(f"index_slices must be >= 1, got {self._slices}")
         self._gather_bufs: dict = {}  # bucket key -> persistent compact buffer

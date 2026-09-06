@@ -67,7 +67,7 @@ def main():
 
     # --- masked backend (writeback emission) -------------------------------
     g_mask = local.clone()
-    ret_mask = TorchPipelinedMaskBackend({"mask_slices": 2}).allreduce_sparse(
+    ret_mask = TorchPipelinedMaskBackend({"sga_backend_mask_slices": 2}).allreduce_sparse(
         g_mask, support, group, factor, op, key=0)
     active = support.mask_u8 > 0
     assert ret_mask is None, "writeback backend must return None"
@@ -98,7 +98,7 @@ def main():
     # payload elements in ascending order, same per-element SUMs) ---
     g_wb = local.clone()
     ret_wb = TorchPipelinedIndexBackend(
-        {"emission": "writeback"}).allreduce_sparse(
+        {"sga_backend_emission": "writeback"}).allreduce_sparse(
             g_wb, support, group, factor, op, key=0)
     assert ret_wb is None, "writeback emission must return None"
     assert torch.equal(g_wb[~active], local[~active]), "residual changed"
@@ -132,11 +132,11 @@ def main():
                              block_spans=spans)
     g_blk = local.clone()
     ret_blk = TorchPipelinedIndexBackend(
-        {"emission": "writeback"}).allreduce_sparse(
+        {"sga_backend_emission": "writeback"}).allreduce_sparse(
             g_blk, bsupport, group, factor, op, key=2)
     assert ret_blk is None, "block writeback must return None"
     g_bmask = local.clone()
-    TorchPipelinedMaskBackend({"mask_slices": 2}).allreduce_sparse(
+    TorchPipelinedMaskBackend({"sga_backend_mask_slices": 2}).allreduce_sparse(
         g_bmask, BucketSupport(bmask.to(device)), group, factor, op, key=2)
     bact = bmask.to(device) > 0
     assert torch.equal(g_blk[~bact], local[~bact]), "block residual changed"
@@ -150,7 +150,7 @@ def main():
                            block_size=x, block_spans=[(0, n)])
     g_be = local.clone()
     assert TorchPipelinedIndexBackend(
-        {"emission": "writeback"}).allreduce_sparse(
+        {"sga_backend_emission": "writeback"}).allreduce_sparse(
             g_be, bempty, group, factor, op, key=3) is None
     assert torch.equal(g_be, local)
 
@@ -158,7 +158,7 @@ def main():
     # belt; config validation is the front gate, pinned in
     # test_config_flat)
     try:
-        TorchPipelinedIndexBackend({"emission": "compact"}).allreduce_sparse(
+        TorchPipelinedIndexBackend({"sga_backend_emission": "compact"}).allreduce_sparse(
             local.clone(), bsupport, group, factor, op, key=4)
         raise AssertionError("compact emission accepted a block support")
     except ValueError as e:
@@ -208,7 +208,7 @@ def main():
     # --- empty support is a clean no-op ------------------------------------
     empty = BucketSupport(torch.zeros(n, dtype=torch.uint8, device=device))
     g_empty = local.clone()
-    ret_m = TorchPipelinedMaskBackend({"mask_slices": 2}).allreduce_sparse(
+    ret_m = TorchPipelinedMaskBackend({"sga_backend_mask_slices": 2}).allreduce_sparse(
         g_empty, empty, group, factor, op, key=1)
     ret_i = TorchPipelinedIndexBackend({}).allreduce_sparse(
         g_empty, empty, group, factor, op, key=1)
@@ -221,7 +221,7 @@ def main():
     # the engine keys on) and the buffer stays untouched
     g_empty2 = local.clone()
     ret_wb_empty = TorchPipelinedIndexBackend(
-        {"emission": "writeback"}).allreduce_sparse(
+        {"sga_backend_emission": "writeback"}).allreduce_sparse(
             g_empty2, empty, group, factor, op, key=1)
     assert ret_wb_empty is None
     assert torch.equal(g_empty2, local)

@@ -43,6 +43,7 @@ from test_engine_unit import (
     _ABS_M,
     _FakeChunk,
     _FakeMPOpt,
+    _flat_config,
     _ReplicaWorld,
     _UPDATE,
 )
@@ -86,12 +87,13 @@ class _ShadowCapableMPOpt(_FakeMPOpt):
         return super().prepare_grads()
 
 
-def _build_shadow_engine(combo, cycle=None, shadow_score=True):
+def _build_shadow_engine(combo, config_extra=None, shadow_score=True):
     selection = build_selection(combo["selection"], dict(combo["selection_params"]))
     opt = build_optimizer(combo["opt"], dict(combo["opt_params"]),
                           emit_score=combo["score"])
-    eng = SGAEngine({"cycle": cycle or dict(combo["cycle"]),
-                     "shadow": True, "shadow_score": shadow_score},
+    config = {**combo["config"], **(config_extra or {}),
+              "sga_shadow": True, "sga_shadow_score": shadow_score}
+    eng = SGAEngine(_flat_config(config),
                     combo["score"], selection, opt, combo["backend"])
     eng._dp_cp_group = lambda: None
     return eng
@@ -145,7 +147,8 @@ def test_shadow_numerics_equal_stock_loop():
     mp_sh = _ShadowCapableMPOpt(chunk_sh)
     mp_st = _ShadowCapableMPOpt(chunk_st)
     eng = _build_shadow_engine(
-        _ABS_M, cycle={"start_iter": 0, "period": 1},
+        _ABS_M, config_extra={"sga_cycle_start_iter": 0,
+                              "sga_cycle_period": 1},
         shadow_score=True)
     eng.attach(chunk_sh)
 
@@ -208,12 +211,13 @@ def test_shadow_rng_guard_raises():
     torch.manual_seed(3)
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
-    selection = build_selection("topk", {"method": "histogram", "ratio_percent": 30.0})
+    selection = build_selection("topk", {"sga_selection_method": "histogram",
+                            "sga_selection_ratio_percent": 30.0})
     opt = build_optimizer("adamw", {}, emit_score="abs_m")
-    eng = SGAEngine({"cycle": {"start_iter": 0, "period": 1,
-                               },
-                     "shadow": True}, "abs_m", selection, opt,
-                    _ABS_M["backend"])
+    eng = SGAEngine(_flat_config({"sga_cycle_start_iter": 0,
+                                  "sga_cycle_period": 1,
+                                  "sga_shadow": True}),
+                    "abs_m", selection, opt, _ABS_M["backend"])
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
     orig = engine_mod.readonly_score
@@ -381,7 +385,8 @@ def test_shadow_peek_matches_stock_fusedadam_step():
 
     mp.optimizer.step = fused_style_step
     eng = _build_shadow_engine(
-        _ABS_M, cycle={"start_iter": 0, "period": 1},
+        _ABS_M, config_extra={"sga_cycle_start_iter": 0,
+                              "sga_cycle_period": 1},
         shadow_score=True)
     eng.attach(chunk)
     gen = torch.Generator().manual_seed(11)
@@ -407,7 +412,8 @@ def test_shadow_peek_value_tracks_upcoming_commit_torch_adamw():
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
     eng = _build_shadow_engine(
-        _ABS_M, cycle={"start_iter": 0, "period": 1},
+        _ABS_M, config_extra={"sga_cycle_start_iter": 0,
+                              "sga_cycle_period": 1},
         shadow_score=True)
     eng.attach(chunk)
     gen = torch.Generator().manual_seed(19)
@@ -446,8 +452,8 @@ def test_shadow_probe_config_never_builds_records_or_state():
             chunk = _FakeChunk()
             mp = _ShadowCapableMPOpt(chunk)
             eng = _build_shadow_engine(
-                _ABS_M, cycle={"start_iter": 0, "period": 2,
-                               },
+                _ABS_M, config_extra={"sga_cycle_start_iter": 0,
+                                      "sga_cycle_period": 2},
                 shadow_score=False)
             eng.attach(chunk)
             refresh_calls = []
@@ -498,8 +504,8 @@ def test_shadow_metrics_reselected_tracks_boundary_reselection():
             chunk = _FakeChunk()
             mp = _ShadowCapableMPOpt(chunk)
             eng = _build_shadow_engine(
-                _ABS_M, cycle={"start_iter": 0, "period": 2,
-                               },
+                _ABS_M, config_extra={"sga_cycle_start_iter": 0,
+                                      "sga_cycle_period": 2},
                 shadow_score=True)
             eng.attach(chunk)
             gen = torch.Generator().manual_seed(17)
@@ -548,9 +554,7 @@ def _cfg_with(**sga_overrides):
 
 
 def _sga_section_to_config(cfg):
-    from sga.runtime import materialize_engine_config
-    canonical = validate_run_config(cfg)
-    return None if canonical is None else materialize_engine_config(canonical)
+    return validate_run_config(cfg)
 
 
 def _expect_error(cfg, needle):
@@ -563,16 +567,16 @@ def _expect_error(cfg, needle):
 
 
 def test_loader_shadow_validation():
-    # sections materialize complete: shadow defaults carry real values
-    # (False == the old absent-by-meaning key; engine .get defaults match)
+    # the canonical is complete by construction: shadow defaults carry
+    # real values
     out = _sga_section_to_config(_cfg_with(shadow=True))
-    assert out["shadow"] is True and out["shadow_score"] is True
+    assert out["sga_shadow"] is True and out["sga_shadow_score"] is True
 
     out = _sga_section_to_config(_cfg_with(shadow=False))
-    assert out["shadow"] is False  # plain live
+    assert out["sga_shadow"] is False  # plain live
 
     out = _sga_section_to_config(_cfg_with(shadow=True, shadow_score=False))
-    assert out["shadow_score"] is False
+    assert out["sga_shadow_score"] is False
 
     _expect_error(_cfg_with(shadow="yes"), "bool")
     _expect_error(_cfg_with(shadow_score=False), "sga_shadow is not true")
@@ -595,12 +599,13 @@ def test_shadow_rng_guard_cuda_half_raises():
     torch.manual_seed(3)
     chunk = _FakeChunk()
     mp = _ShadowCapableMPOpt(chunk)
-    selection = build_selection("topk", {"method": "histogram", "ratio_percent": 30.0})
+    selection = build_selection("topk", {"sga_selection_method": "histogram",
+                            "sga_selection_ratio_percent": 30.0})
     opt = build_optimizer("adamw", {}, emit_score="abs_m")
-    eng = SGAEngine({"cycle": {"start_iter": 0, "period": 1,
-                               },
-                     "shadow": True}, "abs_m", selection, opt,
-                    _ABS_M["backend"])
+    eng = SGAEngine(_flat_config({"sga_cycle_start_iter": 0,
+                                  "sga_cycle_period": 1,
+                                  "sga_shadow": True}),
+                    "abs_m", selection, opt, _ABS_M["backend"])
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
 
@@ -715,7 +720,8 @@ def test_shadow_activates_without_idx_materialization():
     # pre-first-commit moments would tie at 0 everywhere and select all)
     combo = dict(_ABS_M, score="update")
     eng = _build_shadow_engine(
-        combo, cycle={"start_iter": 0, "period": 1},
+        combo, config_extra={"sga_cycle_start_iter": 0,
+                             "sga_cycle_period": 1},
         shadow_score=True)
     eng.attach(chunk)
     gen = torch.Generator().manual_seed(5)
@@ -744,10 +750,11 @@ def test_shadow_always_sync_inherits_eligible_interception():
     mp = _ShadowCapableMPOpt(chunk)
     selection = build_selection("topk", dict(_ALWAYS["selection_params"]))
     opt = build_optimizer("adamw", {}, emit_score="abs_g")
-    eng = SGAEngine({"cycle": {"start_iter": 0, "period": 1},
-                     "shadow": True, "shadow_score": True,
-                     "always_sync": _ALWAYS["always_sync"]},
-                    "abs_g", selection, opt, _ALWAYS["backend"])
+    eng = SGAEngine(
+        _flat_config({**_ALWAYS["config"], "sga_cycle_start_iter": 0,
+                      "sga_cycle_period": 1, "sga_shadow": True,
+                      "sga_shadow_score": True}),
+        "abs_g", selection, opt, _ALWAYS["backend"])
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
     gen = torch.Generator().manual_seed(5)

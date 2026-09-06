@@ -49,14 +49,19 @@ from sga.plugins.selection._histogram import HistogramSelect
 
 DECL = SelectionDecl(name="topk", output_form="mask")
 
-# topk's own vocabulary: which suffix params it takes (defaults and
+# topk's own vocabulary: its params as FULL flat dests (defaults and
 # required-ness live in the argparse declarations — a None default means
 # required); UNLOCKS says which method each guarded param belongs to.
-PARAMS = ("method", "ratio_percent", "histogram_mode",
-          "adaptive_warmup_syncs", "adaptive_warmup_mode",
-          "block_size", "block_reduce")
-UNLOCKS = {"histogram": ("histogram_mode", "block_size", "block_reduce"),
-           "adaptive": ("adaptive_warmup_syncs", "adaptive_warmup_mode")}
+PARAMS = ("sga_selection_method", "sga_selection_ratio_percent",
+          "sga_selection_histogram_mode",
+          "sga_selection_adaptive_warmup_syncs",
+          "sga_selection_adaptive_warmup_mode",
+          "sga_selection_block_size", "sga_selection_block_reduce")
+UNLOCKS = {"histogram": ("sga_selection_histogram_mode",
+                         "sga_selection_block_size",
+                         "sga_selection_block_reduce"),
+           "adaptive": ("sga_selection_adaptive_warmup_syncs",
+                        "sga_selection_adaptive_warmup_mode")}
 
 
 class TopkSelection:
@@ -65,7 +70,7 @@ class TopkSelection:
 
     def __init__(self, params: dict):
         raw = dict(params)  # pre-expansion view (explicit keys only)
-        method = raw.get("method")
+        method = raw.get("sga_selection_method")
         # Dead-config check FIRST, gated on a KNOWN method: a missing or
         # invalid method must surface as the shared validator's
         # required/choices error, not as a dead-config refusal (which would
@@ -82,26 +87,25 @@ class TopkSelection:
                     "under this method they would be silently dead; drop them "
                     "or switch the method"
                 )
-        params = expand_plugin_params("sga_selection_", PARAMS, raw,
-                                      "sga_selection (topk)")
+        params = expand_plugin_params(PARAMS, raw, "sga_selection (topk)")
         self.params = params
         self.method = method
-        self.ratio_percent = float(params["ratio_percent"])
+        self.ratio_percent = float(params["sga_selection_ratio_percent"])
         assert 0.0 < self.ratio_percent < 100.0, (
             f"ratio_percent must be in (0, 100), got {self.ratio_percent}"
         )
         if method == "adaptive":
-            warmup_syncs = params["adaptive_warmup_syncs"]
+            warmup_syncs = params["sga_selection_adaptive_warmup_syncs"]
             self._impl = AdaptiveTau(
                 self.ratio_percent,
                 int(warmup_syncs) if warmup_syncs is not None else None,
-                params["adaptive_warmup_mode"],
+                params["sga_selection_adaptive_warmup_mode"],
             )
         elif method == "histogram":
             self._impl = HistogramSelect(
-                params["histogram_mode"],
-                block_size=int(params["block_size"]),
-                block_reduce=params["block_reduce"])
+                params["sga_selection_histogram_mode"],
+                block_size=int(params["sga_selection_block_size"]),
+                block_reduce=params["sga_selection_block_reduce"])
         else:
             self._impl = ExactKthvalue()
         self.last_threshold = None

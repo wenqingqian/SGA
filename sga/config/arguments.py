@@ -340,6 +340,6 @@ def _add_sga_backend_args(parser: argparse.ArgumentParser):
         help="torch_pipelined_index only: number of idx slices pipelined "
              "against the allreduces (enforced >= 1). Default 2.")
     group.add_argument(
-        "--sga-backend-mask-slices", type=int, default=0,
+        "--sga-backend-mask-slices", type=int, default=2,
         help="torch_pipelined_mask only: mask slices pipelined against "
-             "NCCL ops (0 = auto, i.e. 2). Default 0.")
+             "NCCL ops (must be >= 1). Default 2.")

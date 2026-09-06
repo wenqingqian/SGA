@@ -53,12 +53,10 @@ def expect_error(fn, needle):
     raise SystemExit(f"expected error containing '{needle}'")
 
 
-def _engine(cfg):
-    """The nested read shape the engine used to get from
-    validate_run_config; now assembled by the runtime."""
-    from sga.runtime import materialize_engine_config
-    canonical = validate_run_config(cfg)
-    return None if canonical is None else materialize_engine_config(canonical)
+def _canonical(cfg):
+    """The validated canonical flat dict (the ONE object the engine, the
+    config print and the resume guard all read)."""
+    return validate_run_config(cfg)
 
 
 def _enable_standard(cfg):
@@ -93,16 +91,17 @@ def test_enabled_field_named_in_error():
 def test_fourfield_combination_resolves():
     cfg, _ = make_base()
     _enable_standard(cfg)
-    engine_cfg = _engine(cfg)
-    assert engine_cfg["selection"] == {"name": "topk", "method": "histogram",
-                                       "ratio_percent": 30.0}
-    assert engine_cfg["optimizer"] == {"name": "adamw"}
-    # engine sections materialize complete (defaults applied)
-    assert engine_cfg["cycle"]["period"] == 8
-    assert engine_cfg["checks"] == {"count_guard": True}
-    assert engine_cfg["shadow"] is False and engine_cfg["shadow_score"] is True
-    assert "trace" not in engine_cfg
-    print("ok: four-field combination resolves to the engine config")
+    canon = _canonical(cfg)
+    assert canon["sga_selection"] == "topk"
+    assert canon["sga_selection_method"] == "histogram"
+    assert canon["sga_selection_ratio_percent"] == 30.0
+    assert canon["sga_optimizer"] == "adamw"
+    # the canonical is complete by construction (defaults applied)
+    assert canon["sga_cycle_period"] == 8
+    assert canon["sga_checks_count_guard"] is True
+    assert canon["sga_shadow"] is False and canon["sga_shadow_score"] is True
+    assert canon["sga_trace_dir"] is None  # trace collector off
+    print("ok: four-field combination resolves to the canonical flat dict")
 
 
 def test_checks_validation():
@@ -111,12 +110,12 @@ def test_checks_validation():
     the error, and any checks key is rejected when the engine is off."""
     cfg, _ = make_base()
     _enable_standard(cfg)
-    engine_cfg = _engine(cfg)
-    assert engine_cfg["checks"] == {"count_guard": True}
+    canon = _canonical(cfg)
+    assert canon["sga_checks_count_guard"] is True
 
     cfg.sga.sga_checks_count_guard = False
-    engine_cfg = _engine(cfg)
-    assert engine_cfg["checks"] == {"count_guard": False}
+    canon = _canonical(cfg)
+    assert canon["sga_checks_count_guard"] is False
 
     cfg.sga.sga_checks_count_guard = "no"
     expect_error(lambda: validate_run_config(cfg), "bool")
@@ -133,19 +132,19 @@ def test_trace_validation():
     off."""
     cfg, _ = make_base()
     _enable_standard(cfg)
-    engine_cfg = _engine(cfg)
-    assert "trace" not in engine_cfg  # absent -> collector off
+    canon = _canonical(cfg)
+    assert canon["sga_trace_dir"] is None  # absent -> collector off
 
     cfg.sga.sga_trace_dir = "/tmp/sga-trace-x"
     cfg.sga.sga_trace_branch_points = "50, 10,50"
-    engine_cfg = _engine(cfg)
-    assert engine_cfg["trace"] == {"dir": "/tmp/sga-trace-x",
-                                   "branch_points": [10, 50],  # sorted, deduped
-                                   "window": 100}
+    canon = _canonical(cfg)
+    assert canon["sga_trace_dir"] == "/tmp/sga-trace-x"
+    assert canon["sga_trace_branch_points"] == [10, 50]  # sorted, deduped
+    assert canon["sga_trace_window"] == 100
 
     cfg.sga.sga_trace_branch_points = [7, "3"]
-    engine_cfg = _engine(cfg)
-    assert engine_cfg["trace"]["branch_points"] == [3, 7]
+    canon = _canonical(cfg)
+    assert canon["sga_trace_branch_points"] == [3, 7]
 
     cfg.sga.sga_trace_window = 0
     expect_error(lambda: validate_run_config(cfg), "window")
@@ -166,8 +165,8 @@ def test_start_iter_percent_resolves():
     del cfg.sga.sga_cycle_start_iter
     cfg.sga.sga_cycle_start_iter_percent = 1.6  # of train_iters 2 below
     OmegaConf.update(cfg, "train.model.train_iters", 5000)
-    engine_cfg = _engine(cfg)
-    assert engine_cfg["cycle"]["start_iter"] == 80  # round(0.016*5000)
+    engine_cfg = _canonical(cfg)
+    assert engine_cfg["sga_cycle_start_iter"] == 80  # round(0.016*5000)
 
     # both spellings at once is a conflict (explicit start_iter present)
     cfg.sga.sga_cycle_start_iter = 5
@@ -204,8 +203,8 @@ def test_illegal_combination_rejected():
     expect_error(lambda: validate_run_config(cfg), "full_sync_interval")
     # the legal decoupled spelling round-trips
     cfg.sga.sga_cycle_full_sync_interval = 4
-    engine_cfg = _engine(cfg)
-    assert engine_cfg["cycle"]["full_sync_interval"] == 4
+    canon = _canonical(cfg)
+    assert canon["sga_cycle_full_sync_interval"] == 4
     print("ok: illegal combinations rejected (unknown score / cycle rules)")
 
 
@@ -344,9 +343,11 @@ def test_flatten_bool_semantics():
 
 def test_plugin_param_vocabulary():
     """A key no flag declares is loud at validation; a declared key of
-    ANOTHER plugin is the plugin's own business — validation (values
-    only, no name attribution) passes it, the owning constructor
-    rejects it at build time."""
+    ANOTHER plugin is loud there too — validation owns name attribution
+    now (any explicitly-set key must belong to the SELECTED plugin of
+    its axis, whatever its value, declared default included);
+    constructors keep the same rejection as the direct-construction
+    backstop (replay/tests)."""
     base = {"sga_enabled": True, "sga_score": "update",
             "sga_selection_method": "histogram",
             "sga_selection_ratio_percent": 10.0,
@@ -356,13 +357,22 @@ def test_plugin_param_vocabulary():
                  "unknown keys")
     expect_error(lambda: validate_sga_flat({**base, "sga_score_extra": 1}),
                  "unknown keys")
-    canon = validate_sga_flat({**base, "sga_backend_mask_slices": 3})
-    assert canon["sga_backend_mask_slices"] == 3  # validation is silent
+    # a sibling backend plugin's param is refused at validation, naming
+    # the plugin that owns it — at a non-default value...
+    expect_error(lambda: validate_sga_flat({**base, "sga_backend_mask_slices": 3}),
+                 "torch_pipelined_mask")
+    # ...and at its declared default too: the explicit-but-at-default
+    # spelling would otherwise be value-diffed away silently before the
+    # constructor's rejection could see it (the R1 regression)
+    expect_error(lambda: validate_sga_flat({**base, "sga_backend_mask_slices": 2}),
+                 "torch_pipelined_mask")
     from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 
-    expect_error(lambda: TorchPipelinedIndexBackend({"mask_slices": 3}),
-                 "unknown params ['mask_slices']")
-    print("ok: declared-flag typos loud at validation, plugin vocab at build")
+    expect_error(
+        lambda: TorchPipelinedIndexBackend({"sga_backend_mask_slices": 3}),
+        "unknown params ['sga_backend_mask_slices']")
+    print("ok: typos and sibling-plugin keys loud at validation, plugin "
+          "vocab backstop at build")
 
 
 def test_float_spelling_canonicalized():

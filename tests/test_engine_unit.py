@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
 from sga.engine import BucketState, CycleManager, SGAEngine, SGAEngineError
+from sga.config.validation import sga_defaults
 from sga.plugins import build_optimizer, build_selection
 from sga.plugins.optimizer import OptContext, ParamRecord
 from sga.support import BucketSupport, Support
@@ -48,7 +49,8 @@ torch.manual_seed(0)
 def test_cycle_boundary_full_pattern():
     # Boundaries are STRUCTURALLY full (reselection must read dense-averaged,
     # rank-identical scores) — no optimizer declaration involved anymore.
-    cm = CycleManager(start_iter=20, period=8)
+    cm = CycleManager(start_iter=20, period=8, decouple=False,
+                      full_sync_interval=None)
     fulls = [s for s in range(1, 61) if cm.is_full(s)]
     assert [s for s in fulls if s <= 20] == list(range(1, 21))  # bootstrap
     assert [s for s in fulls if s > 20] == [28, 36, 44, 52, 60]
@@ -99,7 +101,8 @@ def test_cycle_constructor_contracts():
     # decouple=False: boundaries are structurally full, an explicit
     # interval has no meaning there and must fail loud
     try:
-        CycleManager(start_iter=0, period=8, full_sync_interval=4)
+        CycleManager(start_iter=0, period=8, decouple=False,
+                     full_sync_interval=4)
     except AssertionError:
         pass
     else:
@@ -148,7 +151,7 @@ def test_payload_scaling_preserves_residual_bitwise():
     grad = grad0.clone()
     factor = 0.125  # power of two -> scaling is exact, comparison bitwise
 
-    backend = TorchPipelinedMaskBackend({"mask_slices": 2})
+    backend = TorchPipelinedMaskBackend({"sga_backend_mask_slices": 2})
     with _ReplicaWorld(world=4):
         backend.allreduce_sparse(grad, support, None, factor,
                                  torch.distributed.ReduceOp.SUM, key=0)
@@ -171,7 +174,7 @@ def test_adamw_reset_folds_residual_by_decoupled_fold_window():
     does both the clear and the fold). A revert to the period
     divisor would leave every residual coordinate 2x too large on the
     decoupled calendar."""
-    opt = build_optimizer("adamw", {"residual_mean": True})
+    opt = build_optimizer("adamw", {"sga_optimizer_residual_mean": True})
     n = 256
     mask = torch.zeros(n, dtype=torch.uint8)
     mask[::4] = 1  # communicated this cycle
@@ -218,7 +221,7 @@ def test_full_step_dual_lr_boundary_pin():
     consults ctx.compact_values (the compact (idx, values) handoff is
     sparse-step-only). A mask-less bucket (bootstrap / degenerate = fully
     communicated) keeps plain lr."""
-    opt_split = build_optimizer("adamw", {"full_sync_inactive_lr_scale": 0.5})
+    opt_split = build_optimizer("adamw", {"sga_optimizer_full_sync_inactive_lr_scale": 0.5})
     opt_plain = build_optimizer("adamw", {})
     n = 256
     mask = torch.zeros(n, dtype=torch.uint8)
@@ -274,8 +277,8 @@ def test_torch_pipelined_index_modes_and_mechanics():
     legacy bucket-midpoint split, grow-only buffers hold, prepare() is
     twin-mode-gated, and validate_runtime only constrains twin mode."""
     plain = TorchPipelinedIndexBackend({})          # hiprio=False, S=2
-    twin = TorchPipelinedIndexBackend({"high_priority_group": True,
-                                       "index_slices": 3})
+    twin = TorchPipelinedIndexBackend({"sga_backend_high_priority_group": True,
+                                       "sga_backend_index_slices": 3})
     assert plain.decl.consumes == "idx"  # engine activates by this attribute
     assert plain.decl.name == "torch_pipelined_index"
 
@@ -305,7 +308,7 @@ def test_torch_pipelined_index_modes_and_mechanics():
     assert plain._bounds(support, k) == [(0, support.split), (support.split, k)]
     assert twin._bounds(support, k) == [(i * k // 3, (i + 1) * k // 3)
                                         for i in range(3)]
-    assert TorchPipelinedIndexBackend({"index_slices": 3})._bounds(support, k) == \
+    assert TorchPipelinedIndexBackend({"sga_backend_index_slices": 3})._bounds(support, k) == \
         [(i * k // 3, (i + 1) * k // 3) for i in range(3)]
 
     # grow-only discipline: a smaller second cycle keeps the same capacity
@@ -334,7 +337,7 @@ def test_torch_pipelined_index_modes_and_mechanics():
     assert twin._group_for(sentinel) is sentinel
     assert twin._group_for(None) is None
     try:
-        TorchPipelinedIndexBackend({"index_slices": 0})
+        TorchPipelinedIndexBackend({"sga_backend_index_slices": 0})
         raise AssertionError("index_slices=0 accepted")
     except ValueError as e:
         assert "index_slices must be >= 1" in str(e), e
@@ -386,7 +389,7 @@ def test_resume_fail_closed_refusal_and_hermetic_override():
                 tensor_model_parallel_size=1,
                 context_parallel_size=1,
                 expert_model_parallel_size=1)
-    be = TorchPipelinedIndexBackend({"high_priority_group": True})
+    be = TorchPipelinedIndexBackend({"sga_backend_high_priority_group": True})
     be_plain = TorchPipelinedIndexBackend({})
     with tempfile.TemporaryDirectory() as td:
         ckpt = os.path.join(td, "checkpoints")
@@ -440,7 +443,7 @@ def test_nccl_pipelined_index_decl_and_loud_gates():
     # invocation): no slicing vocabulary remains (the plugin takes no
     # params), and a stale config carrying it fails loud
     try:
-        NcclPipelinedIndexBackend({"index_slices": 3})
+        NcclPipelinedIndexBackend({"sga_backend_index_slices": 3})
         raise AssertionError("stale slicing param accepted")
     except ValueError:
         pass
@@ -707,11 +710,12 @@ class _FakeMPOpt:
 _UPDATE = {
     "score": "update",
     "selection": "topk",
-    "selection_params": {"method": "histogram", "ratio_percent": 30.0},
+    "selection_params": {"sga_selection_method": "histogram",
+                         "sga_selection_ratio_percent": 30.0},
     "opt": "adamw",
-    "opt_params": {"residual_mean": False},
-    "cycle": {"start_iter": 0, "period": 3},
-    "backend": TorchPipelinedMaskBackend({"mask_slices": 2}),
+    "opt_params": {"sga_optimizer_residual_mean": False},
+    "config": {"sga_cycle_start_iter": 0, "sga_cycle_period": 3},
+    "backend": TorchPipelinedMaskBackend({"sga_backend_mask_slices": 2}),
 }
 
 # The named-score combo: abs_m materializes into the grad buffer with the
@@ -719,22 +723,30 @@ _UPDATE = {
 _ABS_M = {
     "score": "abs_m",
     "selection": "topk",
-    "selection_params": {"method": "histogram", "ratio_percent": 30.0},
+    "selection_params": {"sga_selection_method": "histogram",
+                         "sga_selection_ratio_percent": 30.0},
     "opt": "adamw",
-    "opt_params": {"residual_mean": False},
-    "cycle": {"start_iter": 2, "period": 3},
+    "opt_params": {"sga_optimizer_residual_mean": False},
+    "config": {"sga_cycle_start_iter": 2, "sga_cycle_period": 3},
     "backend": TorchPipelinedIndexBackend({}),
 }
+
+
+def _flat_config(over=None):
+    """A complete canonical-shaped flat dict for direct engine
+    construction: the declared defaults plus the test's overlays (the
+    same contract the validated canonical fulfills in production)."""
+    cfg = dict(sga_defaults())
+    cfg.update(over or {})
+    return cfg
 
 
 def _build_engine(combo):
     selection = build_selection(combo["selection"], dict(combo["selection_params"]))
     opt = build_optimizer(combo["opt"], dict(combo["opt_params"]),
                           emit_score=combo["score"])
-    cfg = {"cycle": combo["cycle"]}
-    if "always_sync" in combo:
-        cfg["always_sync"] = combo["always_sync"]
-    eng = SGAEngine(cfg, combo["score"], selection, opt, combo["backend"])
+    eng = SGAEngine(_flat_config(combo["config"]), combo["score"],
+                    selection, opt, combo["backend"])
     eng._dp_cp_group = lambda: None  # single-process: skip cross-rank layers
     return eng
 
@@ -937,7 +949,7 @@ def test_reselect_boundary_orders_reset_before_activation():
     opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
                           emit_score=_UPDATE["score"])
     events = []
-    eng = SGAEngine({"cycle": dict(_UPDATE["cycle"])}, _UPDATE["score"],
+    eng = SGAEngine(_flat_config(dict(_UPDATE["config"])), _UPDATE["score"],
                     _DisjointSelection(events), opt, _UPDATE["backend"])
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
@@ -1010,10 +1022,10 @@ def test_block_support_assembly_and_prefetch():
     from sga.support import block_idx_from_mask
 
     combo = dict(_UPDATE)
-    combo["selection_params"] = {"method": "histogram",
-                                 "ratio_percent": 30.0,
-                                 "block_size": 4}
-    combo["backend"] = TorchPipelinedIndexBackend({"emission": "writeback"})
+    combo["selection_params"] = {"sga_selection_method": "histogram",
+                                 "sga_selection_ratio_percent": 30.0,
+                                 "sga_selection_block_size": 4}
+    combo["backend"] = TorchPipelinedIndexBackend({"sga_backend_emission": "writeback"})
     numel_per = 64
     eng, chunk, mp, log = _run_flow(combo, steps=6, numel_per=numel_per)
     sup = eng._active_support.buckets[0]
@@ -1122,7 +1134,7 @@ def test_grad_norm_bypass_forces_next_full():
     mp = _FakeMPOpt(chunk)
     opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
                           emit_score=_UPDATE["score"])
-    eng = SGAEngine({"cycle": dict(_UPDATE["cycle"])}, _UPDATE["score"],
+    eng = SGAEngine(_flat_config(dict(_UPDATE["config"])), _UPDATE["score"],
                     _BypassSelection(), opt, _UPDATE["backend"])
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
@@ -1193,7 +1205,7 @@ def test_generic_optional_hooks_fire():
     selection = _HookSelection()
     opt = build_optimizer("adamw", {}, emit_score="abs_g")
     eng = SGAEngine(
-        {"cycle": {"start_iter": 0, "period": 1}},
+        _flat_config({"sga_cycle_start_iter": 0, "sga_cycle_period": 1}),
         "abs_g", selection, opt, backend)
     eng._dp_cp_group = lambda: None  # single-process: skip cross-rank layers
 
@@ -1220,10 +1232,11 @@ def test_count_guard_once_per_cycle_and_flag_off():
     per-step checks re-verify identical numbers). checks.count_guard=false
     (the legacy skip flag's counterpart) disables it entirely."""
     def _run_and_count(config_extra):
-        selection = build_selection("topk", {"method": "histogram", "ratio_percent": 30.0})
-        opt = build_optimizer("adamw", {"residual_mean": False},
+        selection = build_selection("topk", {"sga_selection_method": "histogram",
+                                             "sga_selection_ratio_percent": 30.0})
+        opt = build_optimizer("adamw", {"sga_optimizer_residual_mean": False},
                               emit_score="update")
-        eng = SGAEngine({"cycle": dict(_ABS_M["cycle"]), **config_extra},
+        eng = SGAEngine(_flat_config({**_ABS_M["config"], **config_extra}),
                         "update", selection, opt, TorchPipelinedIndexBackend({}))
         eng._dp_cp_group = lambda: None
         calls = []
@@ -1248,7 +1261,7 @@ def test_count_guard_once_per_cycle_and_flag_off():
     # guard ON: fires at the two activations (steps 5, 8), never on the
     # sparse grad_sync steps in between
     assert history == [0, 0, 0, 0, 1, 1, 1, 2, 2], history
-    history = _run_and_count({"checks": {"count_guard": False}})
+    history = _run_and_count({"sga_checks_count_guard": False})
     assert history == [0] * 9, history
     print("ok: count guard once per cycle (activations only); flag disables")
 
@@ -1409,12 +1422,13 @@ _AS_PATTERNS = ["embedding", "output_layer"]
 _ALWAYS = {
     "score": "update",
     "selection": "topk",
-    "selection_params": {"method": "histogram", "ratio_percent": 30.0},
+    "selection_params": {"sga_selection_method": "histogram",
+                         "sga_selection_ratio_percent": 30.0},
     "opt": "adamw",
-    "opt_params": {"residual_mean": False},
-    "cycle": {"start_iter": 0, "period": 3},
-    "backend": TorchPipelinedMaskBackend({"mask_slices": 2}),
-    "always_sync": {"layers": list(_AS_PATTERNS)},
+    "opt_params": {"sga_optimizer_residual_mean": False},
+    "backend": TorchPipelinedMaskBackend({"sga_backend_mask_slices": 2}),
+    "config": {"sga_cycle_start_iter": 0, "sga_cycle_period": 3,
+               "sga_always_sync_layers": list(_AS_PATTERNS)},
 }
 
 
@@ -1438,7 +1452,8 @@ def test_always_sync_attach_two_tier_zero_match():
     hit); matching EVERY parameter refuses the empty competition pool."""
     def _attach_with(layers, names=_AS_NAMES):
         chunk = _FakeChunk(n_params=len(names), names=names)
-        combo = dict(_ALWAYS, always_sync={"layers": layers})
+        combo = dict(_ALWAYS, config={**_ALWAYS["config"],
+                                      "sga_always_sync_layers": layers})
         eng = _build_engine(combo)
         eng.attach(chunk)
         return eng, chunk
@@ -1495,9 +1510,11 @@ def test_always_sync_selection_sees_eligible_pool_only():
             return self.inner.select(ctx)
 
     for method in ("histogram", "exact", "adaptive"):
-        params = {"method": method, "ratio_percent": 30.0}
+        params = {"sga_selection_method": method,
+                "sga_selection_ratio_percent": 30.0}
         if method == "adaptive":
-            params["adaptive_warmup_syncs"] = None  # controller from step 1
+            # controller from step 1
+            params["sga_selection_adaptive_warmup_syncs"] = None
         combo = dict(_ALWAYS, selection_params=params)
         chunk = _FakeChunk(n_params=len(_AS_NAMES), names=_AS_NAMES)
         mp = _FakeMPOpt(chunk)
@@ -1552,10 +1569,12 @@ def test_always_sync_default_off_matches_plain_engine():
     mentioned the axis."""
     torch.manual_seed(7)
     plain_eng, plain_chunk = _as_flow(
-        dict(_ALWAYS, always_sync=None), steps=4)
+        dict(_ALWAYS, config={**_ALWAYS["config"],
+                              "sga_always_sync_layers": None}), steps=4)
     torch.manual_seed(7)
     off_eng, off_chunk = _as_flow(
-        {k: v for k, v in _ALWAYS.items() if k != "always_sync"}, steps=4)
+        dict(_ALWAYS, config={"sga_cycle_start_iter": 0,
+                              "sga_cycle_period": 3}), steps=4)
     torch.manual_seed(7)
     named_eng, named_chunk = _as_flow(_ALWAYS, steps=4)  # control: differs
     assert torch.equal(plain_eng._bucket_states[0].active_mask_u8,
@@ -1601,8 +1620,9 @@ def test_always_sync_sparse_step_residual_mean_clears_forced():
     double-discount coords that never accumulated residual), while the
     eligible uncommunicated residual folds by exactly the fold window
     (4, a power of two — the comparison stays bitwise)."""
-    combo = dict(_ALWAYS, cycle={"start_iter": 0, "period": 4},
-                 opt_params={"residual_mean": True})
+    combo = dict(_ALWAYS,
+                 config={**_ALWAYS["config"], "sga_cycle_period": 4},
+                 opt_params={"sga_optimizer_residual_mean": True})
     chunk = _FakeChunk(n_params=len(_AS_NAMES), names=_AS_NAMES)
     mp = _FakeMPOpt(chunk)
     eng = _build_engine(combo)
@@ -1645,7 +1665,9 @@ def test_always_sync_attach_log_and_overlapping_patterns():
 
     def _attach_logged(layers):
         chunk = _FakeChunk(n_params=len(_AS_NAMES), names=_AS_NAMES)
-        eng = _build_engine(dict(_ALWAYS, always_sync={"layers": layers}))
+        eng = _build_engine(dict(
+            _ALWAYS, config={**_ALWAYS["config"],
+                             "sga_always_sync_layers": layers}))
         buf = io.StringIO()
         with redirect_stdout(buf):
             eng.attach(chunk)

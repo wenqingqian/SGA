@@ -36,7 +36,7 @@ optimizer template's full-step kernel emits and hands them to the selection
 DIRECTLY — no score object sits on the data path, so there is nothing to
 skip and nothing to keep in sync with the kernel's math.
 
-Shadow mode (sga.shadow) bypasses the whole contract above: the step is a
+Shadow mode (sga_shadow) bypasses the whole contract above: the step is a
 literal replication of the stock MixedPrecisionOptimizer.step() (stock
 clip included — the engine's masked clip is NOT bitwise stock), with only
 insertions that are read-only with respect to model/optimizer training
@@ -50,7 +50,6 @@ import os
 
 import torch
 
-from sga.config.validation import engine_section_defaults, sga_defaults
 from sga.kernels import (
     compact_norm_sq_contribution,
     masked_norm_sq_contribution,
@@ -67,16 +66,6 @@ from sga.trace import TraceCollector
 
 class SGAEngineError(RuntimeError):
     """Raised on cross-rank inconsistency or contract violations."""
-
-
-# Catalog defaults (the ONLY defaults — engine-side .get fallbacks read
-# these, never a restated literal; sga/config/arguments.py).
-_CYCLE_DEFAULTS = engine_section_defaults("cycle")
-_CHECKS_DEFAULTS = engine_section_defaults("checks")
-_ALWAYS_DEFAULTS = engine_section_defaults("always_sync")
-_TOP_DEFAULTS = {"shadow": sga_defaults()["sga_shadow"],
-                 "shadow_score": sga_defaults()["sga_shadow_score"]}
-
 
 
 class BucketState:
@@ -134,8 +123,8 @@ class CycleManager:
     reselect.
     """
 
-    def __init__(self, start_iter: int, period: int, decouple: bool = False,
-                 full_sync_interval: int = None):
+    def __init__(self, start_iter: int, period: int, decouple: bool,
+                 full_sync_interval: int):
         assert period >= 1
         if decouple:
             assert (full_sync_interval is not None
@@ -188,6 +177,11 @@ class SGAEngine:
     """Engine over the plugin objects; built by sga.runtime.build_engine."""
 
     def __init__(self, config: dict, score_name: str, selection, opt, backend):
+        """``config`` is the validated CANONICAL flat dict (every
+        ``sga_*`` dest at its resolved, typed value — complete by
+        construction, so reads below are direct key lookups with no
+        fallback machinery; the same object feeds the config print and
+        the resume guard)."""
         self.config = config
         self.score_name = score_name
         self.selection = selection
@@ -204,15 +198,11 @@ class SGAEngine:
             "score and the optimizer's materialized score must coincide"
         )
 
-        cycle = config.get("cycle", {})
         self._cycle = CycleManager(
-            start_iter=int(cycle.get("start_iter", _CYCLE_DEFAULTS["start_iter"])),
-            period=int(cycle.get("period", _CYCLE_DEFAULTS["period"])),
-            decouple=bool(cycle.get("decouple_full_sync_interval_and_period",
-                                    _CYCLE_DEFAULTS["decouple_full_sync_interval_and_period"])),
-            full_sync_interval=(int(cycle["full_sync_interval"])
-                                if cycle.get("full_sync_interval") is not None
-                                else None),
+            start_iter=config["sga_cycle_start_iter"],
+            period=config["sga_cycle_period"],
+            decouple=config["sga_cycle_decouple_full_sync_interval_and_period"],
+            full_sync_interval=config["sga_cycle_full_sync_interval"],
         )
         self._chunks = {}                 # id(chunk) -> chunk
         self._bucket_states = []          # global ordered list (Support alignment)
@@ -240,31 +230,31 @@ class SGAEngine:
         self._step_forced = False
         self._mp_opt = None
         self._log_num_zeros = None        # resolved from args at first step
-        # Layer-1 count guard toggle (checks.count_guard, default on). The
-        # guard runs once per cycle at support activation — within a cycle
-        # the support is immutable and its counts are cached, so per-step
-        # re-checks re-verify identical numbers.
-        self._count_guard = bool(config.get("checks", {}).get(
-            "count_guard", _CHECKS_DEFAULTS["count_guard"]))
+        # Layer-1 count guard toggle (sga_checks_count_guard, default on).
+        # The guard runs once per cycle at support activation — within a
+        # cycle the support is immutable and its counts are cached, so
+        # per-step re-checks re-verify identical numbers.
+        self._count_guard = config["sga_checks_count_guard"]
         # Always-sync layers (the per-parameter dense axis): None = off.
         # Resolved against attached param names at attach
         # (_always_sync_attach_check); the forced ids drive the selection
         # interception in _run_selection.
-        always_cfg = config.get("always_sync", None) or {}
-        layers = always_cfg.get("layers", _ALWAYS_DEFAULTS["layers"])
-        self._always_sync_layers = list(layers) if layers else None
+        layers = config["sga_always_sync_layers"]
+        self._always_sync_layers = list(layers) if layers is not None else None
         self._forced_param_ids = set()
-        # Trace collector: None unless sga.trace.dir is set — the dump slot
+        # Trace collector: None unless sga_trace_dir is set — the dump slot
         # below then costs one None-check per step (zero-overhead-when-off).
-        trace_cfg = config.get("trace", None)
-        self._trace = TraceCollector(trace_cfg) if trace_cfg is not None else None
-        # Shadow mode (sga.shadow): replicate the stock step() literally and
+        self._trace = (TraceCollector(
+            dir=config["sga_trace_dir"],
+            branch_points=config["sga_trace_branch_points"],
+            window=config["sga_trace_window"])
+            if config["sga_trace_dir"] is not None else None)
+        # Shadow mode (sga_shadow): replicate the stock step() literally and
         # only READ state at cycle boundaries. shadow_score=false strips even
         # the read-only scoring (the stock-replication probe configuration:
         # bitwise risk lives in the replication machinery, not the reads).
-        self._shadow = bool(config.get("shadow", _TOP_DEFAULTS["shadow"]))
-        self._shadow_score = bool(config.get("shadow_score",
-                                             _TOP_DEFAULTS["shadow_score"]))
+        self._shadow = config["sga_shadow"]
+        self._shadow_score = config["sga_shadow_score"]
         self._metrics_file = os.environ.get("SGA_METRICS_FILE")
         self._rank = 0
         if torch.distributed.is_initialized():

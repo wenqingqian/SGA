@@ -11,11 +11,15 @@ legal combinations and NO scheme names anywhere in the engine.
 
 Plugin PARAMS: the flat flags live in ``sga/config/arguments.py`` (plain
 add_argument lines); which params belong to which plugin is EACH PLUGIN'S
-OWN business — constructors expand their params through
+OWN business — each plugin module declares its full flat dests in its
+``PARAMS`` tuple and constructors expand their params through
 ``expand_plugin_params`` below (defaults come from the flag declarations,
 never restated; unknown/missing params fail loud). There is no central
-plugin-param table anywhere; config-side validation checks values, never
-name attribution.
+plugin-param table anywhere; config-side validation checks values plus one
+name-attribution rule — an explicitly-set key owned by a NON-selected plugin
+is rejected on sight (a sibling plugin's parameter is dead config; see
+sga/config/validation.py). Names carry no structure: PARAMS entries are
+complete dests, read directly — nothing is prefixed, stripped or derived.
 
 Declaration facts used by the validator (see ``validate_combination``):
   - Optimizer.emittable_scores: the score names this template's full-step
@@ -102,6 +106,14 @@ class BackendDecl:
     # points and registries are unchanged — folded into the v2 flat-args
     # API rather than bumping it).
     emission: Literal["writeback", "compact"] = "writeback"
+
+    def resolve_emission(self, value):
+        """The effective emission for a flat ``sga_backend_emission``
+        value: None/'auto' -> this backend's inherent emission; an
+        explicit value passes through (legality is the config layer's).
+        The ONE home of the auto-resolution rule — constructors and the
+        combination validator both read it here."""
+        return self.emission if value in (None, "auto") else value
 
 
 _SELECTIONS: dict = {}
@@ -209,9 +221,7 @@ def validate_combination(score_name: str, selection: SelectionDecl,
             f"{sorted(optimizer.emittable_scores) or 'nothing'}) — the score "
             "is offline-only under this optimizer"
         )
-    effective_emission = (backend_emission
-                          if backend_emission not in (None, "auto")
-                          else backend.emission)
+    effective_emission = backend.resolve_emission(backend_emission)
     if effective_emission == "compact" and not optimizer.consumes_compact:
         problems.append(
             f"backend '{backend.name}' resolves to emission='compact' but "
@@ -225,60 +235,76 @@ def validate_combination(score_name: str, selection: SelectionDecl,
 
 
 def build_selection(name, params):
-    from sga.plugins.selection.topk import TopkSelection
+    from sga.plugins.selection.topk import PARAMS as TOPK_PARAMS, TopkSelection
 
     register_default_plugins()
-    params = _resolved("selection", name, params)  # curated unknown-name error
-    return {"topk": TopkSelection}[name](params)
+    _lookup(_SELECTIONS, name, "selection")  # curated unknown-name error
+    classes = {"topk": TopkSelection}
+    return classes[name](_axis_params((TOPK_PARAMS,), params))
 
 
 def build_optimizer(name, params, emit_score: str = None):
-    from sga.plugins.optimizer.adamw import SgaAdamW
+    from sga.plugins.optimizer.adamw import PARAMS as ADAMW_PARAMS, SgaAdamW
 
     register_default_plugins()
-    params = _resolved("optimizer", name, params)  # curated unknown-name error
-    return {"adamw": SgaAdamW}[name](params, emit_score=emit_score)
+    _lookup(_OPTIMIZERS, name, "optimizer")  # curated unknown-name error
+    classes = {"adamw": SgaAdamW}
+    return classes[name](_axis_params((ADAMW_PARAMS,), params),
+                         emit_score=emit_score)
 
 
 def build_backend_plugin(name, params):
-    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
-    from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
-    from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
+    from sga.backends.nccl_pipelined_index import (
+        PARAMS as NPI_PARAMS,
+        NcclPipelinedIndexBackend,
+    )
+    from sga.backends.torch_pipelined_index import (
+        PARAMS as TPI_PARAMS,
+        TorchPipelinedIndexBackend,
+    )
+    from sga.backends.torch_pipelined_mask import (
+        PARAMS as TPM_PARAMS,
+        TorchPipelinedMaskBackend,
+    )
 
     register_default_plugins()
-    params = _resolved("backend", name, params)  # curated unknown-name error
-    return {
+    get_backend_plugin_decl(name)  # owns the _RENAMED_BACKENDS hints
+    classes = {
         "torch_pipelined_index": TorchPipelinedIndexBackend,
         "torch_pipelined_mask": TorchPipelinedMaskBackend,
         "nccl_pipelined_index": NcclPipelinedIndexBackend,
-    }[name](params)
+    }
+    return classes[name](_axis_params(
+        (TPI_PARAMS, TPM_PARAMS, NPI_PARAMS), params))
 
 
-def _resolved(axis, name, params):
-    """Curated unknown-plugin error + name strip; the CONSTRUCTOR stays the
-    single resolver (defaults expand once, explicit-vs-default stays
-    distinguishable for cross-param legality like topk's per-method
-    dead-config refusal)."""
-    if axis == "backend":
-        get_backend_plugin_decl(name)  # owns the _RENAMED_BACKENDS hints
-    else:
-        registry = {"selection": _SELECTIONS, "optimizer": _OPTIMIZERS}[axis]
-        _lookup(registry, name, axis)
-    params = dict(params)
-    params.pop("name", None)
-    return params
+def _axis_params(param_vocabs, params):
+    """Slice the explicit flat dict down to one axis: the union of the
+    axis' plugin vocabularies (full flat dests, each declared in the
+    plugin's own ``PARAMS``). Keys outside every vocabulary belong to
+    another axis and are not routed here; a key owned by a SIBLING
+    plugin of this axis is rejected at validation on the config route;
+    for direct construction (replay/tests) it survives this slice and
+    is rejected by the selected constructor's own unknown-param check
+    (fail loud)."""
+    vocab = set().union(*(set(v) for v in param_vocabs))
+    return {dest: value for dest, value in params.items() if dest in vocab}
 
 
-def expand_plugin_params(dest_prefix, param_names, params, owner):
-    """A plugin constructor's single read path: its suffix-keyed explicit
-    params -> full defaults. Defaults and value legality (type/choices)
-    come from the flag declarations (``sga.config.validation`` — single
-    source, never restated); a param whose declared default is None is
-    REQUIRED. Each plugin owns its own vocabulary — unknown params,
-    missing required ones and wrong-valued ones fail loud here, at
-    build time (an explicit-but-at-default foreign key may be diffed
-    away before the constructor — ``materialize_engine_config`` re-diffs
-    the canonical down to explicit non-defaults)."""
+def expand_plugin_params(param_names, params, owner):
+    """A plugin constructor's single read path: its explicit params (full
+    flat dests) -> full defaults. Defaults and value legality
+    (type/choices) come from the flag declarations
+    (``sga.config.validation`` — single source, never restated); a param
+    whose declared default is None is REQUIRED. Each plugin owns its own
+    vocabulary — unknown params, missing required ones and wrong-valued
+    ones fail loud here, at build time (an explicit-but-at-default
+    foreign key may be diffed away before the constructor — the engine
+    builder re-diffs the canonical down to explicit non-defaults — but
+    the config route now rejects sibling-plugin keys at validation
+    regardless of value, so that carve-out is reachable only via direct
+    construction, whose params reach the unknown-param check undiffed
+    and fail loud)."""
     from sga.config.validation import _coerce, sga_defaults
 
     names = tuple(param_names)
@@ -289,11 +315,12 @@ def expand_plugin_params(dest_prefix, param_names, params, owner):
     defaults = sga_defaults()
     full = {}
     for name in names:
-        if dest_prefix + name not in defaults:
+        if name not in defaults:
             raise ValueError(
-                f"{owner}: unknown declaration destination "
-                f"{dest_prefix + name!r} (is the dest_prefix correct?)")
-        full[name] = defaults[dest_prefix + name]
+                f"{owner}: param {name!r} is not a declared flag (the "
+                "plugin PARAMS vocabulary must name dests declared in "
+                "sga/config/arguments.py)")
+        full[name] = defaults[name]
     for name in sorted(names):
         if full[name] is None and name not in params:
             raise ValueError(f"{owner}: param '{name}' is required")
@@ -301,7 +328,7 @@ def expand_plugin_params(dest_prefix, param_names, params, owner):
     # the config route already coerced every explicit value; this re-run
     # is idempotent there and guards direct construction (replay/tests)
     for name in params:
-        full[name] = _coerce(dest_prefix + name, full[name])
+        full[name] = _coerce(name, full[name])
     return full
 
 

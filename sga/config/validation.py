@@ -15,27 +15,29 @@ cycle/trace/shadow rules, registered plugin names, topk's per-method
 rules). Per-plugin parameters are each plugin's own business: their
 vocabularies and defaults live with the plugins
 (``sga/plugins/__init__.py:expand_plugin_params``), never in a central
-table — a declared-but-foreign param is rejected by the owning
-constructor at build time (caveat: an explicit-but-at-default foreign
-key may be diffed away before the constructor, since
-``materialize_engine_config`` re-diffs the canonical down to explicit
-non-defaults). Note the two notions of "explicit" on the yaml route,
-intentional per the layer split: the topk dead-config guard fires on
-key presence in the explicit input, while the constructor route
-consumes the explicit-default diff of the canonical.
+table — but an explicitly-set key owned by a NON-selected plugin is
+rejected here regardless of value (a sibling plugin's parameter is
+dead config, and the value-diff of the engine builder would otherwise
+absorb an explicit-but-at-default spelling before the constructor's
+build-time rejection could see it). Note the two notions of "explicit"
+on the yaml route, intentional per the layer split: the topk
+dead-config guard and the plugin-ownership gate fire on key presence
+in the explicit input, while the constructor route consumes the
+explicit-default diff of the canonical.
 
 Inputs are EXPLICIT-key dicts (only what the user actually wrote): the
 launcher passes the yaml ``sga:`` section verbatim; the training side
 passes ``explicit_from_args(args)`` (the argparse-defaults diff — with
 real defaults filled in by argparse, "flag absent" is indistinguishable
 from "flag at default", and the two are semantically identical anyway).
+Every key must BE the full flat name — the ``sga_`` prefix is asserted
+at the door, and there is no short form anywhere.
 
 Output: the canonical FLAT dict (every dest at its resolved, typed
-value; percent resolved away) used for the engine's config print and the
-resume guard comparison. The
-engine's internal NESTED read shape is assembled from the canonical by
-``sga.runtime.materialize_engine_config`` — validation itself is flat
-in, flat out.
+value; percent resolved away) — the ONE object the engine's config
+print, the resume guard comparison AND the SGAEngine itself read.
+Validation is flat in, flat out; nothing derives a second shape from
+the canonical.
 
 Disabled-clean input returns ``None``.
 """
@@ -73,16 +75,10 @@ def declared_choices(dest: str) -> tuple:
     return tuple(getattr(sga_actions()[dest], "choices", None) or ())
 
 
-def engine_section_defaults(section: str) -> dict:
-    """{key: default} for one engine section
-    (``cycle``/``checks``/``always_sync``/``trace``,
-    prefix stripped) — the fallback single source for engine-side reads."""
-    prefix = f"sga_{section}_"
-    # cycle picks up the vestigial start_iter_percent key (None default):
-    # harmless parity — the canonical form resolves it away and no engine
-    # read consumes it.
-    return {dest[len(prefix):]: action.default
-            for dest, action in sga_actions().items() if dest.startswith(prefix)}
+# The trace-activation set, spelled out in full (names carry no
+# structure, so there is no prefix rule for "the trace keys"): setting
+# any of these keys activates the collector.
+_TRACE_KEYS = ("sga_trace_dir", "sga_trace_branch_points", "sga_trace_window")
 
 
 def _param_kind(dest: str):
@@ -247,11 +243,42 @@ def parse_layer_patterns(raw):
     return sorted(out) or None
 
 
+def _plugin_param_owners():
+    """dest -> ((axis, plugin), ...) over every built-in plugin's PARAMS
+    vocabulary (function-local imports: sga.plugins.selection.topk imports
+    this module at top level for ``declared_choices`` — hoisting these
+    imports would close the cycle)."""
+    from sga.backends.nccl_pipelined_index import PARAMS as NPI_PARAMS
+    from sga.backends.torch_pipelined_index import PARAMS as TPI_PARAMS
+    from sga.backends.torch_pipelined_mask import PARAMS as TPM_PARAMS
+    from sga.plugins.optimizer.adamw import PARAMS as ADAMW_PARAMS
+    from sga.plugins.selection.topk import PARAMS as TOPK_PARAMS
+    owners = {}
+    for axis, plugin, dests in (
+            ("selection", "topk", TOPK_PARAMS),
+            ("optimizer", "adamw", ADAMW_PARAMS),
+            ("backend", "torch_pipelined_index", TPI_PARAMS),
+            ("backend", "torch_pipelined_mask", TPM_PARAMS),
+            ("backend", "nccl_pipelined_index", NPI_PARAMS)):
+        for dest in dests:
+            owners.setdefault(dest, []).append((axis, plugin))
+    return {dest: tuple(v) for dest, v in owners.items()}
+
+
 def validate_sga_flat(flat: dict, train_iters=None):
     """Validate an explicit-key flat dict -> the canonical flat dict, or
     None when disabled-clean. Raises ValueError naming the offending key
     on any problem."""
     actions = sga_actions()
+    non_prefixed = sorted(
+        (k for k in flat
+         if not isinstance(k, str) or not k.startswith("sga_")),
+        key=repr)
+    if non_prefixed:
+        raise ValueError(
+            f"sga: keys must be the full flat sga_* names (got "
+            f"{non_prefixed}) — there is no short form and no nested "
+            "section; spell the flag dest in full")
     unknown = sorted(set(flat) - set(actions))
     if unknown:
         raise ValueError(
@@ -279,6 +306,30 @@ def validate_sga_flat(flat: dict, train_iters=None):
         raise ValueError(
             "sga_enabled is true but sga_backend is still 'dense' (the "
             "SGA-off default) — name a sparse backend")
+
+    # --- plugin param ownership: an explicitly set key must be owned by
+    # the SELECTED plugin of its axis — a sibling plugin's parameter is
+    # dead config, and the explicit-but-at-default spelling would
+    # otherwise be value-diffed away silently before the constructor's
+    # build-time rejection could see it ---
+    owners = _plugin_param_owners()
+    chosen = {
+        "selection": typed.get("sga_selection", defaults["sga_selection"]),
+        "optimizer": typed.get("sga_optimizer", defaults["sga_optimizer"]),
+        "backend": typed.get("sga_backend", defaults["sga_backend"]),
+    }
+    for dest in sorted(flat):
+        owner_list = owners.get(dest)
+        if not owner_list:
+            continue
+        axis = owner_list[0][0]  # sharing is within one axis only
+        if chosen[axis] not in {plugin for _, plugin in owner_list}:
+            names = ", ".join(plugin for _, plugin in owner_list)
+            raise ValueError(
+                f"sga: {dest} is a parameter of the {names} {axis} "
+                f"plugin, but sga_{axis} selects {chosen[axis]!r} — "
+                "remove the key or select the plugin it belongs to "
+                "(a sibling plugin's parameter is silently dead config)")
 
     # --- cycle (incl. percent resolution and the decouple calendar) ---
     if typed.get("sga_cycle_start_iter_percent") is not None:
@@ -325,8 +376,7 @@ def validate_sga_flat(flat: dict, train_iters=None):
             "period % full_sync_interval == 0")
 
     # --- trace (setting any trace key activates the collector) ---
-    trace_present = any(dest in typed for dest in actions
-                        if dest.startswith("sga_trace_"))
+    trace_present = any(dest in typed for dest in _TRACE_KEYS)
     branch_points = None
     if trace_present:
         tdir = typed.get("sga_trace_dir")

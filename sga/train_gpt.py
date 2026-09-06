@@ -79,9 +79,9 @@ def _sga_resume_guard(args) -> None:
     """
     import logging
 
-    if not getattr(args, "sga_enabled", False) or not getattr(args, "load", None):
+    if not args.sga_enabled or not args.load:
         return
-    if getattr(args, "sga_allow_config_override", False):
+    if args.sga_allow_config_override:
         return
 
     logger = logging.getLogger(__name__)

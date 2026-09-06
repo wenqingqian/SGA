@@ -198,7 +198,8 @@ def test_adaptive_warmup_gate_and_consecutive_reset():
     bad = torch.zeros(1000, dtype=torch.uint8)
     bad[:800] = 1   # 80% >> target -> gate fails
 
-    sel = TopkSelection({"method": "adaptive", "ratio_percent": 40.0})
+    sel = TopkSelection({"sga_selection_method": "adaptive",
+                            "sga_selection_ratio_percent": 40.0})
     seq = [(0.6, [good]), (0.6, [good]), (0.6, [bad]), (0.6, [good])]
     with mock.patch.object(
         adapt_mod, "select_masks_histogram", side_effect=seq):
@@ -211,7 +212,8 @@ def test_adaptive_warmup_gate_and_consecutive_reset():
         sel.select(_SelCtx(grads, warmup_target=3))
         assert sel.warmup_passed == 1
 
-    sel2 = TopkSelection({"method": "adaptive", "ratio_percent": 40.0})
+    sel2 = TopkSelection({"sga_selection_method": "adaptive",
+                            "sga_selection_ratio_percent": 40.0})
     with mock.patch.object(
         adapt_mod, "select_masks_histogram", return_value=(0.6, [good])
     ) as hist:
@@ -231,7 +233,8 @@ def test_adaptive_tau_feedback_and_collapse_mode():
     guard re-bootstraps in the CONFIGURED warmup mode."""
     grads = [torch.linspace(-1, 1, 1000)]
 
-    sel = TopkSelection({"method": "adaptive", "ratio_percent": 40.0})
+    sel = TopkSelection({"sga_selection_method": "adaptive",
+                            "sga_selection_ratio_percent": 40.0})
     sel._impl.tau = 0.5           # 50% selected -> over target
     sel._impl.warmup_passed = 5   # past the default warmup
     masks = sel.select(_SelCtx(grads))
@@ -239,7 +242,8 @@ def test_adaptive_tau_feedback_and_collapse_mode():
     assert torch.equal(masks[0], (grads[0].abs() >= 0.5).to(torch.uint8))
     assert math.isclose(sel.tau, 0.5 * 1.25 ** 0.5, rel_tol=1e-12)
 
-    sel2 = TopkSelection({"method": "adaptive", "ratio_percent": 40.0})
+    sel2 = TopkSelection({"sga_selection_method": "adaptive",
+                            "sga_selection_ratio_percent": 40.0})
     sel2._impl.tau = 0.6           # 40% selected, in band
     sel2._impl.warmup_passed = 5
     sel2.select(_SelCtx(grads))
@@ -247,8 +251,9 @@ def test_adaptive_tau_feedback_and_collapse_mode():
 
     # collapse: nothing passes tau -> re-bootstrap in the warmup mode
     canned = (0.6, [(grads[0].abs() >= 0.6).to(torch.uint8)])
-    sel3 = TopkSelection({"method": "adaptive", "ratio_percent": 40.0,
-                                  "adaptive_warmup_mode": "exact"})
+    sel3 = TopkSelection({"sga_selection_method": "adaptive",
+                            "sga_selection_ratio_percent": 40.0,
+                            "sga_selection_adaptive_warmup_mode": "exact"})
     sel3._impl.tau = 1e9
     sel3._impl.warmup_passed = 5
     with mock.patch.object(

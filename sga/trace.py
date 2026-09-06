@@ -49,20 +49,17 @@ dump window the unselected coords hold the raw accumulated residual
 (pack clears only the communicated positions) — same semantic as the
 writeback path, nothing dump-visible changes.
 
-Enabled by ``sga.trace.dir`` (yaml); absent (default) disables collection
-entirely: the engine holds ``_trace = None`` and the slot costs one
-None-check per step (zero-overhead-when-off, asserted structurally in
-tests; the ≤0.5% step-time gate is measured in the single-node validation).
+Enabled by ``sga_trace_dir`` (yaml ``sga:`` section); absent (default)
+disables collection entirely: the engine holds ``_trace = None`` and the
+slot costs one None-check per step (zero-overhead-when-off, asserted
+structurally in tests; the ≤0.5% step-time gate is measured in the
+single-node validation).
 """
 
 import os
 from typing import Dict, List, Optional
 
 import torch
-
-from sga.config.validation import engine_section_defaults
-
-_TRACE_DEFAULTS = engine_section_defaults("trace")
 
 
 def parse_branch_points(spec) -> List[int]:
@@ -131,12 +128,17 @@ def _catalog_mismatch(old, expected: dict):
 
 
 class TraceCollector:
-    """Per-engine trace state; constructed only when sga.trace.dir is set."""
+    """Per-engine trace state; constructed only when sga_trace_dir is set.
 
-    def __init__(self, cfg: dict):
-        self.dir = cfg["dir"]
-        self.branch_points = parse_branch_points(cfg.get("branch_points"))
-        self.window = int(cfg.get("window", _TRACE_DEFAULTS["window"]))
+    The engine passes the canonical values of ``sga_trace_dir`` /
+    ``sga_trace_branch_points`` / ``sga_trace_window`` straight through
+    (already typed and validated; ``parse_branch_points`` below is the
+    idempotent guard for direct construction)."""
+
+    def __init__(self, dir: str, branch_points, window: int):
+        self.dir = dir
+        self.branch_points = parse_branch_points(branch_points)
+        self.window = int(window)
         self._entries: Optional[list] = None   # [(name, rec, group_index)]
         self._catalog_written = False          # per process (resume-safe)
 

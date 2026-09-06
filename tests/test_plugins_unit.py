@@ -52,10 +52,10 @@ def _method_allows(method: str, key: str) -> bool:
     """Is `key` a legal topk param under `method`? (topk's own literal
     per-method vocabularies: base params always, guarded params under
     the method that unlocks them.)"""
-    guarded = {"histogram_mode": "histogram",
-               "adaptive_warmup_syncs": "adaptive",
-               "adaptive_warmup_mode": "adaptive"}
-    return (key in ("method", "ratio_percent")
+    guarded = {"sga_selection_histogram_mode": "histogram",
+               "sga_selection_adaptive_warmup_syncs": "adaptive",
+               "sga_selection_adaptive_warmup_mode": "adaptive"}
+    return (key in ("sga_selection_method", "sga_selection_ratio_percent")
             or (key in guarded and guarded[key] == method))
 
 torch.manual_seed(0)
@@ -75,7 +75,7 @@ def test_old_selection_name_fails_loud():
     curated unknown-plugin error — not a KeyError from the dispatch dict."""
     from sga.plugins import build_selection
     try:
-        build_selection("circular_topk", {"ratio_percent": 20.0})
+        build_selection("circular_topk", {"sga_selection_ratio_percent": 20.0})
         raise AssertionError("old name accepted")
     except ValueError as e:
         assert "circular_topk" in str(e) and "['topk']" in str(e), e
@@ -312,7 +312,7 @@ def test_histogram_matches_exact_method():
 
 
 def test_topk_k_rounding():
-    sel = TopkSelection({"method": "histogram", "ratio_percent": 10.0})
+    sel = TopkSelection({"sga_selection_method": "histogram", "sga_selection_ratio_percent": 10.0})
     n = 1000
     assert sel.k_for(n) == 100
     # rounding bound from k = max(1, round(n * r)): |selected/n - r| <= 0.5/n
@@ -325,15 +325,15 @@ def test_warmup_sync_target_anchor():
     T iters from the run start leaves max(0, (N*T - 1 - start) // T) gated
     syncs for a selection starting at start_iter; a late start (window
     already over) leaves a single bootstrap; an unset window yields None."""
-    sel = TopkSelection({"method": "adaptive", "ratio_percent": 40.0,
-                                 "adaptive_warmup_syncs": 5})
+    sel = TopkSelection({"sga_selection_method": "adaptive", "sga_selection_ratio_percent": 40.0,
+                                 "sga_selection_adaptive_warmup_syncs": 5})
     assert sel.warmup_sync_target(start_iter=0, period=4) == 4  # syncs at 4,8,12,16
     assert sel.warmup_sync_target(start_iter=6, period=4) == (20 - 1 - 6) // 4
     assert sel.warmup_sync_target(start_iter=25, period=4) == 0
 
-    unset = TopkSelection({"method": "adaptive", "ratio_percent": 40.0,
-                                   "adaptive_warmup_syncs": None})
-    assert unset.params["adaptive_warmup_syncs"] is None
+    unset = TopkSelection({"sga_selection_method": "adaptive", "sga_selection_ratio_percent": 40.0,
+                                   "sga_selection_adaptive_warmup_syncs": None})
+    assert unset.params["sga_selection_adaptive_warmup_syncs"] is None
     assert unset.warmup_sync_target(start_iter=0, period=4) is None
 
     # null syncs + no engine anchor (warmup_target=None): the gate
@@ -341,8 +341,8 @@ def test_warmup_sync_target_anchor():
     # takes over (an earlier revision crashed here with max(None, 1))
     torch.manual_seed(4)
     grads = [torch.randn(2048)]
-    sel0 = TopkSelection({"method": "adaptive", "ratio_percent": 10.0,
-                          "adaptive_warmup_syncs": None})
+    sel0 = TopkSelection({"sga_selection_method": "adaptive", "sga_selection_ratio_percent": 10.0,
+                          "sga_selection_adaptive_warmup_syncs": None})
     masks = sel0.select(_Ctx(grads, comm_group=None, warmup_target=None))
     assert sum(int(torch.count_nonzero(m).item()) for m in masks) > 0
     assert sel0.tau is not None and sel0.tau > 0.0
@@ -432,14 +432,14 @@ def test_hist_tiers_geometry_and_chunking():
     assert b1 == b3
 
     # selection plumbing: histogram_mode flows through, unknown modes rejected
-    sel = TopkSelection({"method": "histogram", "ratio_percent": 10.0,
-                        "histogram_mode": "fast"})
+    sel = TopkSelection({"sga_selection_method": "histogram", "sga_selection_ratio_percent": 10.0,
+                        "sga_selection_histogram_mode": "fast"})
     sel.select(_Ctx(grads, comm_group=None))
     bits = torch.tensor(sel.last_threshold, dtype=torch.float32).view(torch.int32).item()
     assert (bits & ((1 << 19) - 1)) == 0
     try:
-        TopkSelection({"method": "histogram", "ratio_percent": 10.0,
-                        "histogram_mode": "turbo"})
+        TopkSelection({"sga_selection_method": "histogram", "sga_selection_ratio_percent": 10.0,
+                        "sga_selection_histogram_mode": "turbo"})
         raise AssertionError("unknown histogram_mode accepted")
     except ValueError:
         pass
@@ -542,13 +542,13 @@ def test_histogram_block_selection():
     assert masks[0].numel() == 48
 
     # --- TopkSelection plumbing + constructor/foreign-key guards ---
-    sel = TopkSelection({"method": "histogram", "ratio_percent": 10.0,
-                         "block_size": 16})
-    assert sel.block_size == 16 and sel.params["block_reduce"] == "mean"
-    assert TopkSelection({"method": "histogram",
-                          "ratio_percent": 10.0}).block_size == 1
-    assert TopkSelection({"method": "exact",
-                          "ratio_percent": 10.0}).block_size == 1
+    sel = TopkSelection({"sga_selection_method": "histogram", "sga_selection_ratio_percent": 10.0,
+                         "sga_selection_block_size": 16})
+    assert sel.block_size == 16 and sel.params["sga_selection_block_reduce"] == "mean"
+    assert TopkSelection({"sga_selection_method": "histogram",
+                          "sga_selection_ratio_percent": 10.0}).block_size == 1
+    assert TopkSelection({"sga_selection_method": "exact",
+                          "sga_selection_ratio_percent": 10.0}).block_size == 1
     for bad in (0, 3, True, -16):
         try:
             HistogramSelect("exact", block_size=bad)
@@ -561,8 +561,8 @@ def test_histogram_block_selection():
     except ValueError:
         pass
     try:
-        TopkSelection({"method": "exact", "ratio_percent": 10.0,
-                       "block_size": 16})
+        TopkSelection({"sga_selection_method": "exact", "sga_selection_ratio_percent": 10.0,
+                       "sga_selection_block_size": 16})
         raise AssertionError("block_size accepted under method=exact")
     except ValueError as e:
         assert "do not belong" in str(e)
@@ -590,7 +590,7 @@ def test_topk_adaptive_lifecycle():
     re-bootstrap (v3.1 semantics, default fast-mode warmup histogram)."""
     torch.manual_seed(12)
     grads = [torch.randn(4096), torch.randn(1000)]
-    sel = TopkSelection({"method": "adaptive", "ratio_percent": 10.0})
+    sel = TopkSelection({"sga_selection_method": "adaptive", "sga_selection_ratio_percent": 10.0})
     assert sel._impl.warmup_mode == "fast"
 
     # 1) bootstrap from the warmup-mode histogram; tau is its bin edge
@@ -643,10 +643,10 @@ def test_topk_adaptive_lifecycle():
     # per-method vocabulary: a foreign method's knob is rejected loudly —
     # it would be silently dead under the configured method (full product)
     for method in ("adaptive", "exact", "histogram"):
-        for key, val in (("histogram_mode", "exact"),
-                         ("adaptive_warmup_syncs", 3),
-                         ("adaptive_warmup_mode", "fast")):
-            cfg = {"method": method, "ratio_percent": 10.0, key: val}
+        for key, val in (("sga_selection_histogram_mode", "exact"),
+                         ("sga_selection_adaptive_warmup_syncs", 3),
+                         ("sga_selection_adaptive_warmup_mode", "fast")):
+            cfg = {"sga_selection_method": method, "sga_selection_ratio_percent": 10.0, key: val}
             if _method_allows(method, key):
                 TopkSelection(cfg)  # legal under its own method
                 continue
@@ -700,7 +700,7 @@ def test_score_emission_matches_oracles():
         w = param0.clone().requires_grad_(False)
         g = grad0.clone().requires_grad_(False)
         rec = _Rec(w, g)
-        opt = SgaAdamW({"residual_mean": False}, emit_score=mode)
+        opt = SgaAdamW({"sga_optimizer_residual_mean": False}, emit_score=mode)
         opt.full_step(_RecCtx([rec]))
 
         # m0/v0 start at zero here (state is lazily created)
@@ -781,7 +781,7 @@ def test_sparse_step_end_state_invariant():
         ctx = OptContext(records=[rec], phase="sparse", bucket_states=[],
                          fold_window=fold_window, next_step_is_full=next_full,
                          apply_coeff=0.5)
-        opt = SgaAdamW({"residual_mean": residual_mean})
+        opt = SgaAdamW({"sga_optimizer_residual_mean": residual_mean})
         opt.sparse_step(ctx)
 
         assert torch.all(rec.grad.data[active] == 0)
@@ -820,9 +820,9 @@ def test_compact_search_param_resolution():
     writeback-emission runs / torch fallback is the DECL's documented
     contract (they never reach the compact merge-join)."""
     assert SgaAdamW({}).compact_search == "table"
-    assert SgaAdamW({"compact_search": "bisection"}).compact_search == "bisection"
+    assert SgaAdamW({"sga_optimizer_compact_search": "bisection"}).compact_search == "bisection"
     try:
-        SgaAdamW({"compact_search": "quadtree"})
+        SgaAdamW({"sga_optimizer_compact_search": "quadtree"})
         raise AssertionError("bogus compact_search accepted")
     except ValueError as e:
         assert "compact_search" in str(e), e
@@ -841,22 +841,30 @@ def test_backend_emission_param_resolution():
 
     assert TorchPipelinedIndexBackend({}).emission == "compact"
     assert TorchPipelinedIndexBackend(
-        {"emission": "writeback"}).emission == "writeback"
+        {"sga_backend_emission": "writeback"}).emission == "writeback"
     assert TorchPipelinedIndexBackend(
-        {"emission": "compact"}).emission == "compact"
+        {"sga_backend_emission": "compact"}).emission == "compact"
     assert TorchPipelinedMaskBackend({}).emission == "writeback"
     assert TorchPipelinedMaskBackend(
-        {"emission": "writeback"}).emission == "writeback"
+        {"sga_backend_emission": "writeback"}).emission == "writeback"
+    # mask_slices: the declared default expands to 2, and an explicit 0
+    # (silently normalized to 2 before the flat config) fails loud
+    assert TorchPipelinedMaskBackend({})._mask_slices == 2  # declared default
+    try:
+        TorchPipelinedMaskBackend({"sga_backend_mask_slices": 0})
+        raise AssertionError("mask_slices 0 accepted")
+    except ValueError as e:
+        assert "mask_slices must be >= 1" in str(e), e
     assert NcclPipelinedIndexBackend({}).emission == "writeback"
     for cls in (TorchPipelinedMaskBackend, NcclPipelinedIndexBackend):
         try:
-            cls({"emission": "compact"})
+            cls({"sga_backend_emission": "compact"})
             raise AssertionError(f"compact accepted by {cls.__name__}")
         except ValueError as e:
             assert "only supported" in str(e)
             assert "torch_pipelined_index" in str(e), e
     try:
-        TorchPipelinedIndexBackend({"emission": "quadtree"})
+        TorchPipelinedIndexBackend({"sga_backend_emission": "quadtree"})
         raise AssertionError("bogus emission accepted")
     except ValueError as e:
         assert "quadtree" in str(e), e
@@ -922,7 +930,7 @@ def test_compact_search_cpu_compact_dispatch():
                          bucket_states=[], fold_window=8,
                          next_step_is_full=False, apply_coeff=0.5,
                          compact_values={id(bs): values.clone()})
-        SgaAdamW({"compact_search": compact_search}).sparse_step(ctx)
+        SgaAdamW({"sga_optimizer_compact_search": compact_search}).sparse_step(ctx)
         return rec
 
     rec_tab = run("table")
@@ -987,7 +995,7 @@ def test_full_step_dual_lr_semantics():
                            g0.clone().requires_grad_(False), mask)
         rec_c = _SparseRec(w.clone().requires_grad_(False),
                            g0.clone().requires_grad_(False), None)
-        opt_split = SgaAdamW({"full_sync_inactive_lr_scale": scale})
+        opt_split = SgaAdamW({"sga_optimizer_full_sync_inactive_lr_scale": scale})
         opt_plain = SgaAdamW({})
         opt_split.full_step(_RecCtx([rec_a]))
         opt_plain.full_step(_RecCtx([rec_b]))
@@ -1027,7 +1035,7 @@ def test_full_step_dual_lr_semantics():
                        g0.clone().requires_grad_(False), mask)
     rec_p = _SparseRec(w.clone().requires_grad_(False),
                        g0.clone().requires_grad_(False), mask)
-    SgaAdamW({"full_sync_inactive_lr_scale": 0.5},
+    SgaAdamW({"sga_optimizer_full_sync_inactive_lr_scale": 0.5},
              emit_score="abs_g").full_step(_RecCtx([rec_s]))
     SgaAdamW({}, emit_score="abs_g").full_step(_RecCtx([rec_p]))
     assert torch.equal(rec_s.grad.data, rec_p.grad.data)
@@ -1090,7 +1098,7 @@ def test_grad_correct_dual_lr_knob_guard():
     adamw_grad_correct(p, g, m, v, mask=mask, emit_mode=0,
                        inactive_lr_scale=0.5, **kw)
     try:
-        SgaAdamW({"full_sync_inactive_lr_scale": -0.5})
+        SgaAdamW({"sga_optimizer_full_sync_inactive_lr_scale": -0.5})
     except ValueError as e:
         assert "full_sync_inactive_lr_scale" in str(e), e
     else:
@@ -1167,7 +1175,7 @@ def test_combination_validator_and_build_injection():
     for n in names["optimizer"]:
         assert hasattr(build_optimizer(n, {}), "decl"), n
     for n in names["selection"]:
-        assert hasattr(build_selection(n, {"method": "histogram", "ratio_percent": 40.0}), "decl"), n
+        assert hasattr(build_selection(n, {"sga_selection_method": "histogram", "sga_selection_ratio_percent": 40.0}), "decl"), n
     print("ok: combination validator + build injection + decl coverage")
 
 

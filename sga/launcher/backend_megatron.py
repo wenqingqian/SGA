@@ -55,6 +55,11 @@ def _get_args_megatron(config: DictConfig):
 
     validate_run_config(config)
     sga = OmegaConf.to_container(config.sga, resolve=True)
+    # The sga_ prefix contract, re-asserted at the transport point
+    # (validate_run_config above is the parse-time gate): every yaml sga:
+    # key IS the full flat dest, no short form exists.
+    assert all(isinstance(k, str) and k.startswith("sga_") for k in sga), (
+        f"sga: keys must be the full flat sga_* names (got {sorted(sga)})")
     for dest in sorted(sga):
         value = sga[dest]
         action = sga_actions()[dest]  # unknown keys already rejected above

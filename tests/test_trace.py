@@ -25,19 +25,23 @@ from sga.trace import TraceCollector, _canonical_name, parse_branch_points
 from test_engine_unit import (
     _FakeChunk,
     _FakeMPOpt,
+    _flat_config,
     _ReplicaWorld,
     _UPDATE,
 )
 
 
-def _build_traced_engine(trace_cfg, chunk, cycle=None, backend=None):
+def _build_traced_engine(dir, branch_points, window, chunk,
+                         config_extra=None, backend=None):
     selection = build_selection(_UPDATE["selection"],
                                 dict(_UPDATE["selection_params"]))
     opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
                           emit_score=_UPDATE["score"])
-    eng = SGAEngine({"cycle": cycle or dict(_UPDATE["cycle"]),
-                     "trace": trace_cfg},
-                    _UPDATE["score"], selection, opt,
+    config = {**_UPDATE["config"], **(config_extra or {}),
+              "sga_trace_dir": dir,
+              "sga_trace_branch_points": branch_points,
+              "sga_trace_window": window}
+    eng = SGAEngine(_flat_config(config), _UPDATE["score"], selection, opt,
                     backend or _UPDATE["backend"])
     eng._dp_cp_group = lambda: None
     eng.attach(chunk)
@@ -109,11 +113,10 @@ def test_zero_overhead_when_off_structural():
                                 dict(_UPDATE["selection_params"]))
     opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
                           emit_score=_UPDATE["score"])
-    eng = SGAEngine({"cycle": dict(_UPDATE["cycle"])}, _UPDATE["score"],
-                    selection, opt, _UPDATE["backend"])
+    eng = SGAEngine(_flat_config(dict(_UPDATE["config"])),
+                    _UPDATE["score"], selection, opt, _UPDATE["backend"])
     assert eng._trace is None
-    eng2 = _build_traced_engine(
-        {"dir": "/tmp/sga-trace-never", "branch_points": [], "window": 100}, chunk)
+    eng2 = _build_traced_engine("/tmp/sga-trace-never", [], 100, chunk)
     assert isinstance(eng2._trace, TraceCollector)
     print("PASS test_zero_overhead_when_off_structural")
 
@@ -126,8 +129,7 @@ def test_dump_slot_before_optimizer_and_post_clip():
     with tempfile.TemporaryDirectory() as td:
         chunk = _prefixed_chunk()
         mp = _FakeMPOpt(chunk)
-        eng = _build_traced_engine(
-            {"dir": td, "branch_points": [0], "window": 1}, chunk)
+        eng = _build_traced_engine(td, [0], 1, chunk)
 
         calls = {"opt": 0, "dump": None}
         orig_full = eng.opt.full_step
@@ -207,8 +209,7 @@ def test_dump_contents_window_and_state():
             [{"params": [mp.main_params[0]], "lr": 1e-3, "weight_decay": 1e-2},
              {"params": [mp.main_params[1]], "lr": 2e-3, "weight_decay": 0.0}],
             betas=(0.9, 0.95), eps=1e-8)
-        eng = _build_traced_engine(
-            {"dir": td, "branch_points": [0, 2], "window": 2}, chunk)
+        eng = _build_traced_engine(td, [0, 2], 2, chunk)
         # capture the moments exactly as the dump slot sees them (post-run
         # rec._state has later commits applied and cannot be compared against)
         seen = {}
@@ -282,8 +283,7 @@ def test_absolute_numbering_resume_safe():
                    sentinel)
         chunk = _prefixed_chunk()
         mp = _FakeMPOpt(chunk)
-        eng = _build_traced_engine(
-            {"dir": td, "branch_points": [10], "window": 2}, chunk)
+        eng = _build_traced_engine(td, [10], 2, chunk)
         # resume: the first optimizer_step this process sees is iteration 10
         _drive_steps(eng, chunk, mp, [10, 11])
         files = set(os.listdir(td))
@@ -301,8 +301,7 @@ def test_absolute_numbering_resume_safe():
         }}, os.path.join(td, "catalog.pt"))
         chunk = _prefixed_chunk()
         mp = _FakeMPOpt(chunk)
-        eng = _build_traced_engine(
-            {"dir": td, "branch_points": [10], "window": 2}, chunk)
+        eng = _build_traced_engine(td, [10], 2, chunk)
         try:
             _drive_steps(eng, chunk, mp, [10])
             raise AssertionError("mismatched catalog.pt accepted")
@@ -331,7 +330,7 @@ def test_bind_param_group_contract():
     rec = _Rec(model_p, main_p)
     eng = SimpleNamespace(_chunks={"c": chunk}, _records=[rec])
     collector = TraceCollector(
-        {"dir": "/tmp/sga-trace-never", "branch_points": [], "window": 1})
+        dir="/tmp/sga-trace-never", branch_points=[], window=1)
 
     # main param in NO optimizer group
     mp_opt = SimpleNamespace(optimizer=SimpleNamespace(param_groups=[]))
@@ -365,8 +364,7 @@ def test_rank_gate():
     with tempfile.TemporaryDirectory() as td:
         chunk = _prefixed_chunk()
         mp = _FakeMPOpt(chunk)
-        eng = _build_traced_engine(
-            {"dir": td, "branch_points": [0], "window": 1}, chunk)
+        eng = _build_traced_engine(td, [0], 1, chunk)
         eng._rank = 1
         _drive_steps(eng, chunk, mp, [0])
         assert os.listdir(td) == []
@@ -387,8 +385,9 @@ def test_meta_carries_engine_phase():
         # period 2: reselect at every even boundary (steps 2, 4); odd steps
         # after the first reselect are sparse
         eng = _build_traced_engine(
-            {"dir": td, "branch_points": [0], "window": 4}, chunk,
-            cycle={"start_iter": 0, "period": 2})
+            td, [0], 4, chunk,
+            config_extra={"sga_cycle_start_iter": 0,
+                          "sga_cycle_period": 2})
         _drive_steps(eng, chunk, mp, [0, 1, 2, 3])
         phases = {}
         for s in range(4):
@@ -406,10 +405,12 @@ def test_meta_carries_engine_phase():
                                     dict(_UPDATE["selection_params"]))
         opt = build_optimizer(_UPDATE["opt"], dict(_UPDATE["opt_params"]),
                               emit_score=_UPDATE["score"])
-        eng = SGAEngine({"cycle": dict(_UPDATE["cycle"]), "shadow": True,
-                         "trace": {"dir": td, "branch_points": [0],
-                                   "window": 1}},
-                        _UPDATE["score"], selection, opt, _UPDATE["backend"])
+        eng = SGAEngine(
+            _flat_config({**_UPDATE["config"], "sga_shadow": True,
+                          "sga_trace_dir": td,
+                          "sga_trace_branch_points": [0],
+                          "sga_trace_window": 1}),
+            _UPDATE["score"], selection, opt, _UPDATE["backend"])
         eng._dp_cp_group = lambda: None
         eng.attach(chunk)
         mp = _ShadowCapableMPOpt(chunk)
@@ -442,8 +443,9 @@ def test_sparse_dump_dualpath_content():
         # period 2: steps 0/1 bootstrap full, 2 boundary full + reselect,
         # 3 the sparse step inside the [0, 4) dump window
         eng = _build_traced_engine(
-            {"dir": td, "branch_points": [0], "window": 4}, chunk,
-            cycle={"start_iter": 0, "period": 2})
+            td, [0], 4, chunk,
+            config_extra={"sga_cycle_start_iter": 0,
+                          "sga_cycle_period": 2})
 
         seen = {}
         orig_sparse = eng.opt.sparse_step
@@ -525,8 +527,9 @@ def test_sparse_dump_compact_rebuild_content():
         # same cadence as test_sparse_dump_dualpath_content: period 2,
         # steps 0/1/2 full, 3 the sparse step inside the [0, 4) window
         eng = _build_traced_engine(
-            {"dir": td, "branch_points": [0], "window": 4}, chunk,
-            cycle={"start_iter": 0, "period": 2},
+            td, [0], 4, chunk,
+            config_extra={"sga_cycle_start_iter": 0,
+                          "sga_cycle_period": 2},
             backend=TorchPipelinedIndexBackend({}))
 
         seen = {}
@@ -608,8 +611,9 @@ def test_sparse_dump_compact_restore_on_dump_exception():
         # same cadence as test_sparse_dump_compact_rebuild_content: period 2,
         # steps 0/1/2 full, 3 the sparse step inside the [0, 4) window
         eng = _build_traced_engine(
-            {"dir": td, "branch_points": [0], "window": 4}, chunk,
-            cycle={"start_iter": 0, "period": 2},
+            td, [0], 4, chunk,
+            config_extra={"sga_cycle_start_iter": 0,
+                          "sga_cycle_period": 2},
             backend=TorchPipelinedIndexBackend({}))
 
         with _ReplicaWorld(world=1):

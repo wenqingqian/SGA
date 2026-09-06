@@ -70,6 +70,9 @@ DECL = BackendDecl(
     consumes="idx",
 )
 
+# This backend's own vocabulary: its params as FULL flat dests.
+PARAMS = ("sga_backend_emission",)
+
 # Path to the nccl-sar sparse library exporting ncclSparseAllReduce (the
 # fork's ncclAllReduce signature differs from stock, so it can never be
 # picked up via the normal loader). env.sh is the single source of truth
@@ -110,9 +113,8 @@ class NcclPipelinedIndexBackend:
     def __init__(self, params: dict):
         # Validation-only beyond emission (this backend takes no other
         # params): unknown keys fail here, loudly.
-        params = expand_plugin_params(
-            "sga_backend_", ("emission",), dict(params),
-            "sga_backend (nccl_pipelined_index)")
+        params = expand_plugin_params(PARAMS, dict(params),
+                                      "sga_backend (nccl_pipelined_index)")
         # Emission is inherent here (writeback): the communicated values
         # are scattered back into the dense grad buffer for the masked
         # optimizer kernel. 'auto' (the flag default) resolves to that;
@@ -121,14 +123,14 @@ class NcclPipelinedIndexBackend:
         # emission is a torch_pipelined_index capability (the flag-layer
         # rule catches it earlier in real runs; this is the
         # direct-construction backstop).
-        emission = params["emission"]
+        emission = params["sga_backend_emission"]
         if emission == "compact":
             raise ValueError(
                 "sga_backend (nccl_pipelined_index): emission 'compact' is only supported "
                 "by torch_pipelined_index; this backend is "
                 "writeback-inherent (set sga_backend: "
                 "torch_pipelined_index to switch emission)")
-        self.emission = "writeback"
+        self.emission = self.decl.resolve_emission(emission)
 
         # comm_group -> _RawComm. Keyed by the group OBJECT with a strong
         # reference held on both sides (an id() key could collide after a

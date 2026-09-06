@@ -191,8 +191,6 @@ def test_percent_resolves_train_side():
             if k != "sga_cycle_start_iter"}
     flat["sga_cycle_start_iter_percent"] = 0.4
     canon = validate_sga_flat(flat, train_iters=5000)
-    from sga.runtime import materialize_engine_config
-    assert materialize_engine_config(canon)["cycle"]["start_iter"] == 20
     assert canon["sga_cycle_start_iter"] == 20
     assert "sga_cycle_start_iter_percent" not in canon  # resolved away
     print("ok: percent resolves train-side and leaves the canonical form")
@@ -264,13 +262,18 @@ def test_explicit_false_and_null_spellings():
 
 
 def test_legacy_nested_keys_are_unknown():
-    """A pre-flat nested section fails loud as unknown keys, never as a
-    silently-ignored config."""
+    """A pre-flat nested section fails loud at the prefix gate (there is
+    no short form and no nested section), never as a silently-ignored
+    config; a prefixed but undeclared key still fails as unknown."""
     for legacy in ("cycle", "selection", "score", "trace", "checks"):
         flat = dict(ENABLED)
         flat[legacy] = {"start_iter": 1}
-        expect_error(lambda l=legacy: validate_sga_flat(flat), "unknown keys")
-    print("ok: legacy nested keys rejected as unknown")
+        expect_error(lambda l=legacy: validate_sga_flat(flat),
+                     "must be the full flat sga_* names")
+    flat = dict(ENABLED)
+    flat["sga_cycle_legacy"] = 1
+    expect_error(lambda: validate_sga_flat(flat), "unknown keys")
+    print("ok: legacy nested keys rejected at the prefix gate")
 
 
 def test_typo_plugin_param_rejected():
