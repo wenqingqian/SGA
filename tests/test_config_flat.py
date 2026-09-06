@@ -447,6 +447,24 @@ def test_inv5_block_backend_cross_field_rules():
     print("ok: block comm-path cross-field refusals (nccl, tpi non-writeback)")
 
 
+def test_inv5_block_fast_mode_refusal():
+    """fast + block is refused: fast's lower-edge threshold over-selects
+    and the block payload amplifies it past the ratio contract
+    (measured realized 0.253 vs the 0.20 target). balanced/exact carry
+    blocks; fast at element granularity stays legal."""
+    base = {"sga_selection_block_size": 16,
+            "sga_backend": "torch_pipelined_mask"}
+    expect_error(
+        lambda: validate_sga_args(
+            _seed({**base, "sga_selection_histogram_mode": "fast"})),
+        "over-selection")
+    validate_sga_args(_seed(
+        {**base, "sga_selection_histogram_mode": "balanced"}))
+    # fast at element granularity (block_size at its default): legal
+    validate_sga_args(_seed({"sga_selection_histogram_mode": "fast"}))
+    print("ok: fast+block refused; balanced+block and fast+element legal")
+
+
 def test_inv5_method_required_and_choices_on_real_routes():
     """A missing method surfaces as the required error on the namespace
     route; a bogus value is refused by the parser's choices on the two

@@ -332,6 +332,24 @@ def validate_sga_args(args=None) -> None:
         # (block communication) would silently degrade to element-level
         # transport or hit element-granular consumers.
         if block_size > 1:
+            # fast places the threshold at the crossing bin's LOWER edge
+            # (systematic over-selection) and a block payload amplifies
+            # it: x elements ride every over-selected block off a
+            # narrower block-score distribution — measured realized
+            # ratio 0.253 vs the 0.20 target, a silent breach of the
+            # ratio contract.
+            # TODO(fast-block): sound once the threshold moves to the
+            # crossing bin's midpoint/upper edge — that is its own plan;
+            # lift this gate there.
+            if args.sga_selection_histogram_mode == "fast":
+                raise ValueError(
+                    "sga_selection_block_size > 1 with "
+                    "sga_selection_histogram_mode 'fast': fast places the "
+                    "threshold at the crossing bin's lower edge and the "
+                    "block payload amplifies the systematic "
+                    "over-selection (measured realized ratio 0.253 vs "
+                    "0.20 target) — use 'balanced' or 'exact', or keep "
+                    "block_size 1")
             if args.sga_backend == "nccl_pipelined_index":
                 raise ValueError(
                     "sga_selection_block_size > 1 with backend "
