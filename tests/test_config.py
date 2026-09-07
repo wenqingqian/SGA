@@ -485,10 +485,12 @@ def test_flatten_bool_semantics():
     cfg, _ = make_base()
     _enable_standard(cfg)
     cfg.sga.sga_optimizer_residual_mean = True
+    cfg.sga.sga_selection_topk_histogram_add_global_allreduce = True
     args = _get_args_megatron(cfg)
     flags = {args[i]: args[i + 1] for i in range(len(args) - 1)
              if args[i].startswith("--sga-")}
     assert flags["--sga-optimizer-residual-mean"] == "true"
+    assert flags["--sga-selection-topk-histogram-add-global-allreduce"] == "true"
     print("ok: booleans flatten to true/false spellings")
 
 

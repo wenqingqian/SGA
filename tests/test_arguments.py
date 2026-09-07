@@ -110,9 +110,9 @@ def _raw_json(attrs_owner):
 
 def test_flag_table_declared_in_arguments_py():
     """The vocabulary IS the add_argument set: every dest hyphenates to its
-    flag and the historical surface is pinned (35 dests)."""
+    flag and the historical surface is pinned (36 dests)."""
     actions = sga_actions()
-    assert len(actions) == 35, sorted(actions)
+    assert len(actions) == 36, sorted(actions)
     for dest, action in actions.items():
         assert action.option_strings == ["--" + dest.replace("_", "-")], dest
     assert set(sga_defaults()) == {
@@ -128,6 +128,7 @@ def test_flag_table_declared_in_arguments_py():
         "sga_score",
         "sga_selection", "sga_selection_method",
         "sga_selection_ratio_percent", "sga_selection_histogram_mode",
+        "sga_selection_topk_histogram_add_global_allreduce",
         "sga_selection_adaptive_warmup_syncs",
         "sga_selection_adaptive_warmup_mode",
         "sga_selection_block_size", "sga_selection_block_reduce",
@@ -138,7 +139,7 @@ def test_flag_table_declared_in_arguments_py():
         "sga_backend_high_priority_group",
         "sga_backend_index_slices", "sga_backend_mask_slices",
     }
-    print("ok: 35 flat flags declared, hyphenation 1:1")
+    print("ok: 36 flat flags declared, hyphenation 1:1")
 
 
 def test_dual_form_equivalence():

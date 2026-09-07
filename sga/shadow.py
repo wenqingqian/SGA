@@ -14,10 +14,12 @@ the optimizer kernel's torch reference elementwise.
 
 The shadow support never touches communication: grad sync stays stock and
 the optimizer template never runs. The reselection itself runs the same
-selection collectives as live (topk histogram's SUM allreduce,
-exact method's mask MAX), plus the engine's scalar consistency checks over
-shadow state (count/checksum/norm-spread allreduces, which do not involve
-training tensors).
+selection collectives as live (topk histogram's SUM allreduce when
+``sga_selection_topk_histogram_add_global_allreduce`` is on — both modes
+construct the selector from the same args, so the gate cannot desync
+them; exact method's mask MAX), plus the engine's scalar consistency
+checks over shadow state (count/checksum/norm-spread allreduces, which do
+not involve training tensors).
 """
 
 import torch

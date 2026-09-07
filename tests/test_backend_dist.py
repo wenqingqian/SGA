@@ -16,7 +16,9 @@ prototype's methodology:
   backend — a Tensor, not None, so the engine can tell zero-selection
   apart from a writeback backend);
 - the engine's layer-1 count check passes on identical supports and REFUSES
-  (raises, no collective mismatch) on diverged ones.
+  (raises, no collective mismatch) on diverged ones;
+- the rank-split histogram-allreduce gate: both ranks refuse
+  loudly instead of splitting collective participation.
 
 Run: python tests/test_backend_dist.py   (re-execs itself under torchrun)
 """
@@ -262,6 +264,36 @@ def main():
         raise AssertionError("diverged support counts were not refused")
     except SGAEngineError:
         pass
+
+    # --- rank-split histogram allreduce gate: loud symmetric abort -------
+    # One rank flag-on and one flag-off would split collective
+    # participation at the first reselection (one enters the histogram
+    # SUM, the other advances) — an undiagnosable hang. The one-time
+    # packed MIN/MAX probe in TopkSelection.select must refuse on BOTH
+    # ranks, naming the flag.
+    from sga.plugins.selection.topk import TopkSelection
+
+    _seed(sga_selection_method="histogram",
+          sga_selection_ratio_percent=30.0,
+          sga_selection_topk_histogram_add_global_allreduce=bool(rank == 0))
+    split = TopkSelection()
+    try:
+        split.select(SimpleNamespace(
+            grad_views=[torch.ones(64, device=device)], comm_group=group))
+        raise AssertionError("rank-split gate was not refused")
+    except ValueError as e:
+        assert "sga_selection_topk_histogram_add_global_allreduce" in str(e), e
+
+    # Agreement restored (both off, the default): the probe passes once and
+    # the select itself runs the local-histogram path — no collective, no
+    # hang; the barrier proves both ranks reached the end.
+    _seed(sga_selection_method="histogram", sga_selection_ratio_percent=30.0)
+    agree = TopkSelection()
+    masks = agree.select(SimpleNamespace(
+        grad_views=[torch.linspace(-1, 1, 1024, device=device)],
+        comm_group=group))
+    assert len(masks) == 1 and masks[0].numel() == 1024
+    dist.barrier()
 
     if rank == 0:
         print("test_backend_dist: ALL PASS (2-rank CUDA)")

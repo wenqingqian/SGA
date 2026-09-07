@@ -265,6 +265,20 @@ def _add_sga_selection_args(parser: argparse.ArgumentParser):
         choices=("balanced", "exact", "fast"),
         help="method=histogram only: geometry tier. Default exact.")
     group.add_argument(
+        "--sga-selection-topk-histogram-add-global-allreduce",
+        type=sga_bool, default=False,
+        help="histogram-family selects only (method=histogram and the "
+             "adaptive warmup): SUM-allreduce the per-rank score histograms "
+             "over the comm group before the threshold select. false "
+             "(default) selects from the local histogram alone (world=1 "
+             "semantics) — bit-identical to the merged form under the "
+             "engine's replicated full-sync scores (scale-invariant select "
+             "math); the engine's mask consistency check aborts loudly if "
+             "inputs ever diverge. true restores the merged-histogram form "
+             "(the ported scheme_xp behavior). A dead knob under "
+             "method=exact — silently ignored there (megatron dead-config "
+             "semantics).")
+    group.add_argument(
         "--sga-selection-adaptive-warmup-syncs", type=sga_int_or_null,
         default=5,
         help="method=adaptive only: gated warmup selects before the "

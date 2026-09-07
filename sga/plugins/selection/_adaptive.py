@@ -7,7 +7,8 @@ gated warmup. Dead band ±_ADAPT_BAND around the target ratio; out-of-band
 steps are log-space (measured/target)**_ADAPT_LOG_GAIN — self-scaling, gentle
 at the band edge, fast when far — clamped to [_ADAPT_MAX_DOWN, _ADAPT_MAX_UP]
 per step. Warmup and collapse re-bootstrapping reuse the histogram entry
-(select_masks_histogram) in the configured warmup-mode geometry.
+(select_masks_histogram) in the configured warmup-mode geometry, under its
+``global_allreduce`` gate (the add-global-allreduce flag, default false).
 """
 
 import torch
@@ -84,15 +85,20 @@ class AdaptiveTau:
     deterministic update.
     """
 
-    def __init__(self, ratio_percent: float, warmup_syncs, warmup_mode: str):
+    def __init__(self, ratio_percent: float, warmup_syncs, warmup_mode: str,
+                 global_allreduce: bool = True):
         if warmup_mode not in _HIST_MODES:
             raise ValueError(
                 f"unknown adaptive_warmup_mode: {warmup_mode!r} "
                 f"(expected one of {sorted(_HIST_MODES)})"
             )
+        if not isinstance(global_allreduce, bool):
+            raise ValueError(
+                f"global_allreduce must be a bool, got {global_allreduce!r}")
         self.target_ratio = ratio_percent / 100.0
         self.warmup_syncs = warmup_syncs  # None disables the warmup gate
         self.warmup_mode = warmup_mode
+        self.global_allreduce = global_allreduce
         self.tau = None
         self.warmup_passed = 0
 
@@ -143,7 +149,8 @@ class AdaptiveTau:
 
         if self.tau is None or self.warmup_passed < required:
             thresh, masks = select_masks_histogram(
-                grads, k, comm_group, mode=self.warmup_mode)
+                grads, k, comm_group, mode=self.warmup_mode,
+                global_allreduce=self.global_allreduce)
             self.tau = self._clamp(thresh)
             measured = (sum(_count_on(m) for m in masks)
                         / sum(g.numel() for g in grads))
@@ -158,7 +165,8 @@ class AdaptiveTau:
                     / sum(g.numel() for g in grads))
         if measured == 0.0 or self.tau <= 0.0:
             thresh, masks = select_masks_histogram(
-                grads, k, comm_group, mode=self.warmup_mode)
+                grads, k, comm_group, mode=self.warmup_mode,
+                global_allreduce=self.global_allreduce)
             self.tau = self._clamp(thresh)
             return self.tau, masks
 

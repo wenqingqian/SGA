@@ -9,7 +9,8 @@ survives is the capability surface the migration promised:
 
 - the bit-pattern histogram select: exact tier bit-exact vs torch.kthvalue
   across adversarial distributions and k extremes, world-replica scale
-  invariance, monotone bin ordering;
+  invariance, monotone bin ordering, and the global-allreduce gate (the
+  local-only select issues no collective and is bitwise the merged form);
 - the approximate tiers' production closeness (balanced within 0.5pp, fast
   within 2pp of the exact count) and the all-equal degenerate;
 - the adaptive threshold v3.1: dead-band wobble, log-space steps + clamps,
@@ -37,6 +38,7 @@ from sga.plugins.optimizer.adamw import adamw_grad_correct
 from sga.plugins.optimizer.adamw_torch import grad_correct_torch
 from sga.plugins.selection._histogram import (
     _HIST_BINS,
+    HistogramSelect,
     _abs_bit_top16,
     _build_histogram,
     _histogram_select_threshold,
@@ -114,6 +116,138 @@ def test_top16_monotone_and_sign_stripped():
     assert (top[1:] >= top[:-1]).all()
     assert torch.equal(_abs_bit_top16(-vals), top)
     print("ok: top16 monotone in |x|, sign bit stripped")
+
+
+# ---------------------------------------------- global-allreduce gate flag
+
+def test_global_allreduce_gate_skips_collective():
+    """global_allreduce=False (the add-global-allreduce flag's default)
+    issues NO collective even with dist initialized and a comm_group — and
+    under replicated inputs (the engine's full-sync scores) the local-only
+    select is bit-identical to the merged (world-scaled) form, every tier.
+    The k corners include k=n, which drives the approximate tiers' rank
+    formula through max(1, round(...)==0) before the world multiply."""
+    N = 100_003
+    g = torch.Generator().manual_seed(7)
+    x = torch.randn(N, generator=g) * 1e-3
+    x[::991] *= 50.0
+    grads = [x[:N // 2].contiguous(), x[N // 2:].contiguous()]
+    n = sum(gv.numel() for gv in grads)
+    world = 4
+    grp = object()
+    calls = []
+
+    def fake_all_reduce(t, op=None, group=None):
+        calls.append((op, group))
+        t.mul_(world)  # an exact int64 merge of `world` identical replicas
+
+    with mock.patch.object(torch.distributed, "is_initialized",
+                           return_value=True), \
+         mock.patch.object(torch.distributed, "all_reduce",
+                           side_effect=fake_all_reduce), \
+         mock.patch.object(torch.distributed, "get_world_size",
+                           return_value=world):
+        for mode in ("exact", "balanced", "fast"):
+            for k in (1, int(round(n * 0.3)), n):
+                calls.clear()
+                t_off, m_off = select_masks_histogram(
+                    grads, k, grp, mode=mode, global_allreduce=False)
+                assert calls == [], (mode, k, calls)
+                t_on, m_on = select_masks_histogram(
+                    grads, k, grp, mode=mode, global_allreduce=True)
+                assert calls == [(torch.distributed.ReduceOp.SUM, grp)], (
+                    mode, k, calls)
+                assert t_off == t_on, (mode, k)
+                for a, b in zip(m_off, m_on):
+                    assert torch.equal(a, b), (mode, k)
+    print("ok: gate skips the collective; local select == merged bitwise")
+
+
+def test_global_allreduce_gate_block_path():
+    """The block-granular select threads the gate identically: off issues
+    no collective and the expanded element masks are bitwise the merged
+    form's (block32 + balanced, the production block geometry)."""
+    N = 8192
+    x = torch.randn(N, generator=torch.Generator().manual_seed(11)) * 1e-3
+    x[::37] *= 30.0
+    grads = [x.contiguous()]
+    k = int(round(N * 0.4))
+    world = 4
+    grp = object()
+    calls = []
+
+    def fake_all_reduce(t, op=None, group=None):
+        calls.append((op, group))
+        t.mul_(world)
+
+    with mock.patch.object(torch.distributed, "is_initialized",
+                           return_value=True), \
+         mock.patch.object(torch.distributed, "all_reduce",
+                           side_effect=fake_all_reduce), \
+         mock.patch.object(torch.distributed, "get_world_size",
+                           return_value=world):
+        sel_off = HistogramSelect("balanced", block_size=32,
+                                  block_reduce="mean", global_allreduce=False)
+        sel_on = HistogramSelect("balanced", block_size=32,
+                                 block_reduce="mean", global_allreduce=True)
+        t_off, m_off = sel_off.select(grads, k, grp, None)
+        assert calls == [], calls
+        t_on, m_on = sel_on.select(grads, k, grp, None)
+        assert len(calls) == 1, calls
+        assert t_off == t_on
+        assert torch.equal(m_off[0], m_on[0])
+    print("ok: block path threads the gate (off == on bitwise)")
+
+
+def test_topk_selection_reads_global_allreduce_flag():
+    """TopkSelection wires the add-global-allreduce flag into both
+    histogram-family impls (the flag's single runtime reader); non-bool
+    values are refused by both impl constructors' strictness guards."""
+    for method in ("histogram", "adaptive"):
+        for flag in (False, True):
+            set_args(SimpleNamespace(**{
+                **sga_defaults(),
+                "sga_selection_method": method,
+                "sga_selection_ratio_percent": 30.0,
+                "sga_selection_topk_histogram_add_global_allreduce": flag,
+            }))
+            sel = TopkSelection()
+            assert sel._impl.global_allreduce is flag, (method, flag)
+    for bad in (1, "true", None):
+        for ctor in (lambda b: HistogramSelect("exact", global_allreduce=b),
+                     lambda b: adapt_mod.AdaptiveTau(
+                         40.0, 5, "fast", global_allreduce=b)):
+            try:
+                ctor(bad)
+                raise AssertionError(
+                    f"non-bool global_allreduce accepted: {bad!r}")
+            except ValueError:
+                pass
+    print("ok: topk selection wires the flag; non-bool gate values refused")
+
+
+def test_adaptive_warmup_threads_global_allreduce():
+    """AdaptiveTau's histogram warmup AND collapse re-bootstrap selects
+    inherit the global_allreduce wiring (the constructor argument reaches
+    every select_masks_histogram call)."""
+    grads = [torch.linspace(-1, 1, 1000)]
+    seen = []
+    real = adapt_mod.select_masks_histogram
+
+    def spy(*a, **kw):
+        seen.append(kw.get("global_allreduce", "__missing__"))
+        return real(*a, **kw)
+
+    with mock.patch.object(adapt_mod, "select_masks_histogram",
+                           side_effect=spy):
+        impl = adapt_mod.AdaptiveTau(40.0, None, "fast",
+                                     global_allreduce=False)
+        impl.select(grads, 400, None, None)  # warmup bootstrap (call 1)
+        impl.tau = 1e9                       # above every |g| -> measured 0
+        impl.warmup_passed = 1               # past the warmup gate
+        impl.select(grads, 400, None, None)  # collapse re-bootstrap (call 2)
+        assert seen == [False, False], seen
+    print("ok: adaptive warmup + collapse thread global_allreduce through")
 
 
 # ------------------------------------------------- approximate tiers (tier 2)

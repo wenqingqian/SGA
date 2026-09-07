@@ -2,13 +2,22 @@
 """Bit-pattern histogram top-k select, in three geometry tiers.
 
 Ported verbatim from scheme_xp: per-rank histograms of the top N bits of the
-|x| fp32 bit patterns are SUM-allreduced over the comm group — with
+|x| fp32 bit patterns may be SUM-allreduced over the comm group (the
+``global_allreduce`` gate — default OFF, see the next paragraph) — with
 replicated inputs the merged histogram is exactly ``world`` times the local
 one and the select math is scale-invariant, so every rank derives the
 identical bin/threshold BY CONSTRUCTION (tied boundary values are all
 selected). Non-negative fp32 values sort identically to their int32 bit
 patterns, so an exact ``torch.kthvalue`` on the crossing bin's candidates
 alone yields the bit-exact same threshold as over all elements.
+
+The SUM allreduce is gated by ``global_allreduce`` (wired from the
+``sga_selection_topk_histogram_add_global_allreduce`` flag, default false):
+with replicated inputs the merged histogram is only ``world`` times the
+local one, so the local histogram alone derives the identical bin/threshold
+and the collective is skippable — the engine's mask consistency check
+aborts if the replication premise ever breaks. ``global_allreduce=True``
+restores the merged form (the ported scheme_xp behavior).
 
 Tiers (``mode``):
 
@@ -132,12 +141,18 @@ def _histogram_select_threshold(hist, k, world, grads, shift=_HIST_SHIFT) -> flo
     return torch.kthvalue(cand, kk).values.item()
 
 
-def select_masks_histogram(grads, k, comm_group, mode="exact"):
+def select_masks_histogram(grads, k, comm_group, mode="exact",
+                           global_allreduce=True):
     """Topk masks on the given per-element scores via a bit-pattern histogram.
 
     Returns (threshold, masks): per-grad uint8 masks; ``threshold`` is the
     exact value for ``exact`` mode, otherwise the crossing bin's lower edge
-    (used for logging and as the adaptive path's tau bootstrap).
+    (used for logging and as the adaptive path's tau bootstrap). With
+    ``global_allreduce=False`` the per-rank histogram is used as-is (world=1
+    semantics) — under the engine's replicated full-sync scores this derives
+    the identical threshold the merged form would. The keyword defaults to
+    True so direct callers keep the merged form; the flag's default False
+    is applied by ``TopkSelection`` (topk.py).
     """
     try:
         shift, nbins, stride = _HIST_MODES[mode]
@@ -145,12 +160,17 @@ def select_masks_histogram(grads, k, comm_group, mode="exact"):
         raise ValueError(f"unknown histogram_mode: {mode!r}") from None
 
     hist = _build_histogram(grads, shift, nbins, stride)
-    if comm_group is not None and torch.distributed.is_initialized():
+    if (global_allreduce and comm_group is not None
+            and torch.distributed.is_initialized()):
         torch.distributed.all_reduce(
             hist, op=torch.distributed.ReduceOp.SUM, group=comm_group
         )
         world = torch.distributed.get_world_size(comm_group)
     else:
+        # No merge requested (global_allreduce=False, the flag default) or
+        # no group/dist to merge over: select on the local histogram
+        # (world=1) — identical to the merged form under the replicated-
+        # input scale invariance described above.
         world = 1
 
     if mode == "exact":
@@ -232,7 +252,7 @@ class HistogramSelect:
     """
 
     def __init__(self, mode: str = "exact", block_size: int = 1,
-                 block_reduce: str = "mean"):
+                 block_reduce: str = "mean", global_allreduce: bool = True):
         if mode not in _HIST_MODES:
             raise ValueError(
                 f"unknown histogram_mode: {mode!r} "
@@ -248,19 +268,25 @@ class HistogramSelect:
             raise ValueError(
                 f"block_reduce must be 'mean' or 'max', got "
                 f"{block_reduce!r}")
+        if not isinstance(global_allreduce, bool):
+            raise ValueError(
+                f"global_allreduce must be a bool, got {global_allreduce!r}")
         self.mode = mode
         self.block_size = block_size
         self.block_reduce = block_reduce
+        self.global_allreduce = global_allreduce
 
     def select(self, grads, k, comm_group, warmup_target=None):
         if self.block_size == 1:
             return select_masks_histogram(grads, k, comm_group,
-                                          mode=self.mode)
+                                          mode=self.mode,
+                                          global_allreduce=self.global_allreduce)
         x = self.block_size
         k_blocks = max(1, int(round(k / x)))
         bviews = _block_reduce_views(grads, x, self.block_reduce)
         thresh, bmasks = select_masks_histogram(bviews, k_blocks,
-                                                comm_group, mode=self.mode)
+                                                comm_group, mode=self.mode,
+                                                global_allreduce=self.global_allreduce)
         masks = [bm.repeat_interleave(x)[:g.numel()]
                  for bm, g in zip(bmasks, grads)]
         return thresh, masks

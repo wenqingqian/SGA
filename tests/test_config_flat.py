@@ -318,6 +318,7 @@ def test_inv4_historical_surface_pinned():
         "sga_selection_method": (None, "str", ("adaptive", "exact", "histogram")),
         "sga_selection_ratio_percent": (None, "float", ()),
         "sga_selection_histogram_mode": ("exact", "str", ("balanced", "exact", "fast")),
+        "sga_selection_topk_histogram_add_global_allreduce": (False, "bool", ()),
         "sga_selection_adaptive_warmup_syncs": (5, "int_or_null", ()),
         "sga_selection_adaptive_warmup_mode": ("fast", "str", ("balanced", "exact", "fast")),
         "sga_selection_block_size": (1, "int", ()),
