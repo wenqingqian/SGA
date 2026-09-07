@@ -22,11 +22,15 @@ ranking selects store magnitudes.)
 
 Replay modes:
 - ``zerofill``: frozen support, zero-filled q each step (original offline
-  semantics);
+  semantics), replayed in-process;
 - ``cycle``: residual accumulation + boundary full-sync fold + mask
   re-selection every --cycle-len steps (offline twin of the online cyclic
-  semantics). Boundary steps are dense, so d@1 is structurally 0 — the
-  informative within-cycle horizons start at H=2.
+  semantics), always served by the fused single-pass engine
+  (sga/replay_fused.py) and therefore requiring --dense-cache (populated
+  automatically on the first run). Boundary steps are dense, so d@1 is
+  structurally 0 — the informative within-cycle horizons start at H=2.
+  The classic in-process cycle replay was removed; single-shard fused
+  runs reproduced it bitwise (pinned by an e2e tiny-trace comparison).
 
 Evaluation: distortion(H) = ||w_sparse - w_dense||/||w_dense - w0|| against
 the dense replay arm; NDCG@k / recall@k / missed_label_mass /
@@ -58,7 +62,7 @@ PYTHONPATH):
 
     python -m sga.replay --trace-dir <dir> --branch-point 40 \
         --replay-mode cycle --cycle-len 20 --ratios 10,20 --horizons 1,10 \
-        --score-names abs_m,update --out report.json
+        --score-names abs_m,update --dense-cache <cache-dir> --out report.json
 
     # replay-machinery validation against real state dumps:
     python -m sga.replay --trace-dir <dir> --self-check 40 60
@@ -263,9 +267,9 @@ def compute_scores_flat(w_parts, m_parts, v_parts, g_parts, offsets, N, meta,
     All chunk arithmetic is carried in torch.float64. ``g`` is the logged
     (post-unscale/post-clip) gradient consumed by the commit at step t0.
 
-    ``update_includes_wd=True`` (cycle mode) switches ``update`` to the
-    online-exact full-sync selection score |wd*w + U(g)| (the materialized
-    grad-correct update of the upcoming commit); the default reproduces the
+    ``update_includes_wd=True`` (the online-exact full-sync selection
+    score) switches ``update`` to |wd*w + U(g)| — the materialized
+    grad-correct update of the upcoming commit; the default reproduces the
     original offline scores.
 
     ``hp_parts`` (optional) maps param name -> (beta1, beta2, eps, wd) for
@@ -843,177 +847,19 @@ def sparse_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons
     return num_at
 
 
-# ----------------------------------------------------------------------------
-# cycle replay (residual accumulation + periodic full-sync fold + mask
-# re-selection at every cycle boundary) — the offline twin of the online
-# cyclic semantics
-# ----------------------------------------------------------------------------
-
-def _fresh_state(t, dev):
-    """Copy a cpu reference tensor onto dev; never alias the original (the
-    branch-state w0/m0/v0 are shared across replay arms)."""
-    out = t.to(dev)
-    if out is t:
-        out = out.clone()
-    return out
-
-
-def sparse_replay_cycle(params, g_files, window_steps, base_meta, t0,
-                        eff_horizons, score_name, k, cycle_len, sel0, snap_d,
-                        replay_dtype, chunk_mb, device, sel_trace=None,
-                        upcast_bf16=False, norm_fp32=False):
-    """Sparse replay with residual accumulation and cycle-boundary mask
-    re-selection — the offline twin of the online cyclic semantics:
-
-    - ``si % cycle_len == 0`` (full-sync boundary, incl. si=0): the folded
-      pre-clip gradient ``g_pre + residual`` is clipped by its own global
-      norm and committed densely; the residual is cleared; the next cycle's
-      support is re-selected as the top-k of ``score_name`` computed from the
-      pre-commit state and the folded gradient (at si=0 the precomputed
-      branch-point selection ``sel0`` is used instead — identical semantics,
-      scores from the branch state dump).
-    - other steps (masked): ``q = g_pre ⊙ sel`` clipped by its own norm;
-      the unselected pre-clip gradient accumulates into the residual.
-
-    With ``cycle_len == 1`` every step is a boundary, i.e. the trajectory is
-    exactly the dense one. Note the boundary step itself is dense, so d@1 is
-    structurally 0 — the informative within-cycle horizons start at H=2.
-
-    ``sel_trace`` (optional list) collects (si, sel_cpu_bool_clone) at each
-    re-selection for debugging/tests. Returns {h: num(H)} like sparse_replay.
-    """
-    (names, offs, N) = _replay_meta(params, base_meta)
-    chunk_n = _chunk_elems(chunk_mb, torch.finfo(replay_dtype).bits // 8)
-    dev = device
-    for prm in params:
-        prm["ms"] = _fresh_state(prm["m0"], dev)
-        prm["vs"] = _fresh_state(prm["v0"], dev)
-        prm["ws"] = _fresh_state(prm["w0"], dev)
-        prm["res"] = torch.zeros(prm["n"], dtype=replay_dtype, device=dev)
-    sel = sel0
-    if sel_trace is not None:
-        sel_trace.append((-1, sel0.clone()))
-    num_at = {}
-    W = len(window_steps)
-    for si, gstep in enumerate(window_steps):
-        gdict = _load_g(g_files, gstep, upcast_bf16)
-        gmeta = gdict["meta"]
-        gp = gdict["payload"]
-        coef_dense, _flag = coef_dense_for(gmeta)
-        clip_grad = float(gmeta.get("clip_grad", 0.0))
-        count = t0 + si + 1
-        boundary = (si % cycle_len == 0)
-
-        # pass 1: global norm of this step's pre-clip q
-        qn2 = 0.0
-        for prm in params:
-            name, o, n = prm["name"], prm["off"], prm["n"]
-            gt = gp.get(name)
-            if gt is None and not boundary:
-                continue
-            g = torch.zeros(n, dtype=torch.float32) if gt is None else gt.reshape(-1)
-            for a in range(0, n, chunk_n):
-                b = min(n, a + chunk_n)
-                g_pre = g[a:b].to(dev) / coef_dense
-                if boundary:
-                    q_pre = g_pre + prm["res"][a:b]
-                else:
-                    q_pre = g_pre * sel[o + a: o + b].to(dev)
-                if norm_fp32:
-                    # res may live in replay_dtype (fp64) — the fp32-norm
-                    # variant quantizes q_pre to fp32 BEFORE squaring, by
-                    # design (that quantization IS the perturbation).
-                    q32 = q_pre.to(torch.float32)
-                    qn2 += float((q32 * q32).sum())
-                else:
-                    qn2 += float((q_pre.double() ** 2.0).sum())
-        qnorm = math.sqrt(qn2)
-        coef = 1.0
-        if clip_grad > 0.0:
-            coef = min(1.0, clip_grad / (qnorm + 1.0e-6))
-
-        # boundary pass 2 (only when a later step can still use the new
-        # mask): score from the pre-commit state + folded post-clip gradient,
-        # then re-select. Skipped at si=0 (sel0 already encodes it) and when
-        # no masked step remains in the window.
-        if boundary and si > 0 and si + 1 < W:
-            spec = get_score_spec(score_name)
-            score_flat = torch.empty(N, dtype=torch.float32)
-            for prm in params:
-                name, o, n = prm["name"], prm["off"], prm["n"]
-                b1, b2, eps, wd = prm["b1"], prm["b2"], prm["eps"], prm["wd"]
-                bc1c = 1.0 - b1 ** count
-                bc2c = 1.0 - b2 ** count
-                gt = gp.get(name)
-                g = (torch.zeros(n, dtype=torch.float32) if gt is None
-                     else gt.reshape(-1))
-                for a in range(0, n, chunk_n):
-                    b = min(n, a + chunk_n)
-                    q = ((g[a:b].to(dev) / coef_dense) + prm["res"][a:b]) * coef
-                    # the materialized form may be signed (update) — the
-                    # topk select ranks by magnitude
-                    sc = spec.formula(prm["ws"][a:b], prm["ms"][a:b],
-                                      prm["vs"][a:b], q, b1, b2, eps, wd,
-                                      bc1c, bc2c, update_includes_wd=True)
-                    score_flat[o + a: o + b] = sc.abs().float().cpu()
-            sel, _thresh = select_topk_flat(score_flat, k)
-            del score_flat
-            if sel_trace is not None:
-                sel_trace.append((si, sel.clone()))
-
-        # pass 3 (commit): apply q on all coords; maintain the residual
-        for prm in params:
-            name, o, n = prm["name"], prm["off"], prm["n"]
-            lr = _lr_for_step(gmeta, prm["group"])
-            b1, b2, eps, wd = prm["b1"], prm["b2"], prm["eps"], prm["wd"]
-            bc1c = 1.0 - b1 ** count
-            bc2c = 1.0 - b2 ** count
-            gt = gp.get(name)
-            g = torch.zeros(n, dtype=torch.float32) if gt is None else gt.reshape(-1)
-            ms, vs, ws, res = prm["ms"], prm["vs"], prm["ws"], prm["res"]
-            for a in range(0, n, chunk_n):
-                b = min(n, a + chunk_n)
-                g_pre = g[a:b].to(dev) / coef_dense
-                if boundary:
-                    q = (g_pre + res[a:b]) * coef
-                    res[a:b] = 0.0
-                else:
-                    sel_c = sel[o + a: o + b].to(dev)
-                    q = g_pre * sel_c * coef
-                    res[a:b] += g_pre * (~sel_c)
-                if replay_dtype != torch.float32:
-                    q = q.to(replay_dtype)
-                _adam_step_inplace(q, ms[a:b], vs[a:b], ws[a:b], None,
-                                   lr, wd, b1, b2, bc1c, bc2c, eps)
-
-        if (si + 1) in eff_horizons:
-            num2 = 0.0
-            snap = snap_d[si + 1]
-            for prm in params:
-                ws, wd_, n = prm["ws"], snap[prm["name"]], prm["n"]
-                for a in range(0, n, chunk_n):
-                    b = min(n, a + chunk_n)
-                    d = (ws[a:b] - wd_[a:b].to(dev)).double()
-                    num2 += float((d * d).sum())
-            num_at[si + 1] = math.sqrt(num2)
-    for prm in params:
-        for key in ("ms", "vs", "ws", "res"):
-            prm.pop(key, None)
-    if dev != "cpu":
-        torch.cuda.empty_cache()
-    return num_at
-
 
 # ----------------------------------------------------------------------------
 # dense replay artifact cache (--dense-cache)
 # ----------------------------------------------------------------------------
 
 def _dense_cache_ident(trace_dir, t0, window_steps, eff_horizons,
-                       replay_dtype, trace_dtype):
+                       replay_dtype, trace_dtype, dense_engine):
     """Identity of one branch's dense replay artifacts. The trace path stands
     for the trace content (dumps are immutable); window/horizons/dtype change
-    the saved artifacts; REPLAY_SEMANTIC_VERSION fences caches across replay
-    semantic edits."""
+    the saved artifacts; dense_engine fences the two dense engines apart
+    (dense_replay quantizes horizon diffs to fp32 before squaring,
+    dense_replay_dev does not — a shared ident would silently mix them);
+    REPLAY_SEMANTIC_VERSION fences caches across replay semantic edits."""
     return "|".join([
         f"semver={REPLAY_SEMANTIC_VERSION}",
         f"trace={trace_dir}",
@@ -1022,6 +868,7 @@ def _dense_cache_ident(trace_dir, t0, window_steps, eff_horizons,
         f"horizons={','.join(str(h) for h in eff_horizons)}",
         f"dtype={replay_dtype}",
         f"trace_dtype={trace_dtype}",
+        f"dense_engine={dense_engine}",
     ])
 
 
@@ -1158,7 +1005,6 @@ def process_branch(t0, ctx, args):
     horiz_steps = {str(h): max(1, min(h, W)) for h in args.horizons}
 
     # ---- scores ---------------------------------------------------------
-    cycle_mode = args.replay_mode == "cycle"
     allowed = list(all_score_names())
     if args.score_names:
         unknown = [s for s in args.score_names if s not in allowed]
@@ -1172,7 +1018,7 @@ def process_branch(t0, ctx, args):
     score_flats = compute_scores_flat(
         w_parts, m_parts, v_parts, g_parts, offsets, N, meta,
         args.chunk_mb, args.device, score_names=score_names,
-        update_includes_wd=cycle_mode,
+        update_includes_wd=False,
         hp_parts={p["name"]: (p["b1"], p["b2"], p["eps"], p["wd"])
                   for p in params},
     )
@@ -1188,7 +1034,8 @@ def process_branch(t0, ctx, args):
     cached = None
     if args.dense_cache:
         ident = _dense_cache_ident(trace_dir, t0, window_steps, eff_horizons,
-                                   replay_dtype, args.trace_dtype)
+                                   replay_dtype, args.trace_dtype,
+                                   "dev" if use_dev else "cpu")
         cached = load_dense_cache(args.dense_cache, ident)
     if cached is not None:
         label_total = cached["label_total"]
@@ -1248,14 +1095,7 @@ def process_branch(t0, ctx, args):
         for sname in score_names:
             sc_flat = score_flats[sname]
             sel, thresh = select_topk_flat(sc_flat, k)
-            if cycle_mode:
-                num_at = sparse_replay_cycle(
-                    params, g_files, window_steps, meta, t0, eff_horizons,
-                    sname, k, args.cycle_len, sel, snap_d, replay_dtype,
-                    args.chunk_mb, args.device,
-                    upcast_bf16=upcast_bf16, norm_fp32=norm_fp32,
-                )
-            elif use_dev:
+            if use_dev:
                 num_at = sparse_replay_dev(
                     params, g_files, window_steps, meta, t0, eff_horizons, sel,
                     snap_d, replay_dtype, args.chunk_mb, args.device,
@@ -1553,31 +1393,30 @@ def main(argv=None):
     ap.add_argument("--replay-mode", default="zerofill",
                     choices=["zerofill", "cycle"],
                     help="zerofill (default): frozen mask, zero-filled q each "
-                         "step (original offline semantics). cycle: residual "
-                         "accumulation + full-sync fold + mask re-selection "
-                         "every --cycle-len steps (offline twin of the online "
-                         "cyclic semantics)")
+                         "step (original offline semantics), replayed "
+                         "in-process. cycle: residual accumulation + "
+                         "full-sync fold + mask re-selection every "
+                         "--cycle-len steps (offline twin of the online "
+                         "cyclic semantics), always served by the fused "
+                         "single-pass engine — requires --dense-cache (a "
+                         "first run populates it automatically)")
     ap.add_argument("--cycle-len", type=int, default=20,
                     help="T: full-sync / mask re-selection interval for "
                          "--replay-mode cycle (window boundary si=0 is always "
                          "a full-sync step)")
     ap.add_argument("--fused", action="store_true",
-                    help="fused single-pass engine (requires --replay-mode "
-                         "cycle + --dense-cache): all score x ratio arms "
-                         "advance the window in lockstep — one window read "
-                         "per config group — sharded across --fused-shards "
-                         "processes. Single-shard runs reproduce the classic "
-                         "report bitwise; multi-shard runs deviate only by "
-                         "cross-shard fp64 scalar-sum reordering (the frozen "
-                         "pure-reorder band)")
+                    help="(deprecated no-op: --replay-mode cycle now always "
+                         "runs the fused engine; kept so existing command "
+                         "lines keep working)")
     ap.add_argument("--fused-shards", type=int, default=8,
-                    help="shard process count for --fused (shard r uses "
-                         "cuda:r; the window read, the streaming AdamW state "
-                         "and the top-k select are split across shards)")
+                    help="shard process count for --replay-mode cycle "
+                         "(fused engine; shard r uses cuda:r; the window "
+                         "read, the streaming AdamW state and the top-k "
+                         "select are split across shards)")
     ap.add_argument("--fused-max-configs", type=int, default=12,
                     help="arms (score x ratio) advanced per fused window "
-                         "pass (config group size; state memory per group "
-                         "scales with this)")
+                         "pass in --replay-mode cycle (config group size; "
+                         "state memory per group scales with this)")
     ap.add_argument("--score-names", default=None,
                     help="comma list restricting the score set (validated "
                          "against the framework score registry). Default: all "
@@ -1592,12 +1431,44 @@ def main(argv=None):
     # Option-value gate before any work: every invalid value is rejected with
     # its option named, instead of surfacing as an incidental deep exception
     # (si % cycle_len) or a silently empty report (',' branch specs).
-    if args.replay_mode == "cycle" and args.cycle_len < 1:
+    if args.cycle_len < 1:
+        # cycle mode needs a positive full-sync interval; under zerofill the
+        # knob is unused but still echoed into the report config, so the
+        # gate covers both modes
         raise ValueError(f"--cycle-len must be >= 1, got {args.cycle_len}")
+    if args.replay_mode == "cycle" and args.self_check is not None:
+        # cycle dispatches to run_fused_branch, which the self-check path
+        # never reaches — reject the combination by name instead of
+        # silently running the dense self-check
+        raise ValueError(
+            "--replay-mode cycle cannot be combined with --self-check")
+    if args.replay_mode == "cycle" and not args.dense_cache:
+        # behavior change vs the removed classic in-process cycle replay,
+        # which ran without a cache; named loudly instead of silently
+        # re-reading the window per arm
+        raise ValueError(
+            "--replay-mode cycle requires --dense-cache (the classic "
+            "in-process cycle replay that ran without a cache was removed; "
+            "the fused engine consumes the dense artifacts from the cache "
+            "and populates it on the first run)")
+    if args.fused and args.replay_mode != "cycle":
+        raise ValueError(
+            "--fused is deprecated (cycle mode now always runs the fused "
+            "engine) and --replay-mode zerofill has no fused form")
     if args.chunk_mb < 1:
         raise ValueError(f"--chunk-mb must be >= 1, got {args.chunk_mb}")
     if args.window < 1:
         raise ValueError(f"--window must be >= 1, got {args.window}")
+    # fused-only knobs (shard count / configs per fused window pass):
+    # unused under zerofill but still echoed into the report config, so an
+    # invalid value is rejected here with the option named;
+    # run_fused_branch re-checks both for direct programmatic callers
+    if args.fused_shards < 1:
+        raise ValueError(
+            f"--fused-shards must be >= 1, got {args.fused_shards}")
+    if args.fused_max_configs < 1:
+        raise ValueError(
+            f"--fused-max-configs must be >= 1, got {args.fused_max_configs}")
     for tok in args.ratios.split(","):
         if tok.strip():
             r = float(tok)
@@ -1627,10 +1498,6 @@ def main(argv=None):
         raise ValueError(
             "--dense-cache cannot be combined with --self-check "
             "(the self-check must actually replay the window)")
-    if args.fused and args.self_check is not None:
-        # the remaining fused gates live in run_fused_branch, which the
-        # branch dispatch reaches; the self-check path returns before it
-        raise ValueError("--fused cannot be combined with --self-check")
 
     trace_dir = os.path.abspath(args.trace_dir)
     catalog, names, offsets, N, state_files, g_files = discover_trace(trace_dir)
@@ -1687,7 +1554,7 @@ def main(argv=None):
 
     branch_results = {}
     for t0 in branch_pts:
-        if args.fused:
+        if args.replay_mode == "cycle":
             from sga.replay_fused import run_fused_branch
             branch_results[str(t0)] = run_fused_branch(args, ctx, t0)
         else:
@@ -1708,6 +1575,7 @@ def main(argv=None):
             "replay_mode": args.replay_mode,
             "cycle_len": args.cycle_len,
             "fused": args.fused,
+            "fused_effective": args.fused or args.replay_mode == "cycle",
             "fused_shards": args.fused_shards,
             "fused_max_configs": args.fused_max_configs,
             "score_names": args.score_names,

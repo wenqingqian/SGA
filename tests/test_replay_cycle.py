@@ -5,22 +5,27 @@ Run from anywhere (CPU only, torch + stdlib):
 
     python SGA/tests/test_replay_cycle.py
 
-The cycle replay (sga.replay.sparse_replay_cycle) is the offline twin of the
-online cyclic semantics: masked steps communicate ``q = g ⊙ sel`` (clipped by
-the masked norm) and accumulate the unselected pre-clip gradient into a
-residual; every ``cycle_len`` steps a full-sync boundary commits
-``q = g + residual`` (clipped by the folded norm), clears the residual, and
-re-selects the next cycle's mask from the boundary score computed on the
-pre-commit state.
+The cycle semantics (offline twin of the online cyclic semantics) are served
+by the fused single-pass engine (sga.replay_fused, --replay-mode cycle):
+masked steps communicate ``q = g ⊙ sel`` (clipped by the masked norm) and
+accumulate the unselected pre-clip gradient into a residual; every
+``cycle_len`` steps a full-sync boundary commits ``q = g + residual``
+(clipped by the folded norm), clears the residual, and re-selects the next
+cycle's mask from the boundary score computed on the pre-commit state.
+The classic in-process cycle engine (sparse_replay_cycle) was removed; this
+suite's FROM-SPEC REFERENCE (reference_cycle below) is the sole independent
+spec anchor for the semantics — the fused engine is validated against it
+(the pre-deletion classic engine is reproducible from the old tag).
 
 Tests (ported from the legacy oracle suite, importing sga.replay):
 1. T=1 degenerates to the dense trajectory (distortion exactly 0).
 2. T > window: residual accumulates but never folds (fixed mask from the
    branch selection) — matches an independent reference loop.
 3. Multi-cycle hand example (T=2, 6 steps, clipping active): w/m/v and the
-   residual/fold math match a from-spec reference; mask re-selection fires
-   at the expected boundaries.
-4. Boundary re-selection actually changes the support when momentum flips.
+   residual/fold math match a from-spec reference.
+4. Boundary re-selection actually changes the support when momentum flips
+   (the frozen-mask counterfactual diverges; the engine follows the
+   re-selecting reference).
 5. Branch-point score formulas (registry, fp64) match direct fp64 references
    for every registered score, including the zero-moment t0=0 edge.
 6. Determinism: two identical runs produce bitwise-equal distortion numbers.
@@ -36,7 +41,10 @@ Tests (ported from the legacy oracle suite, importing sga.replay):
     --overwrite removes stale out-of-range files.
 11. --self-check provenance: --trace-dtype is threaded into the dense replay
     and echoed in the report; bf16 payloads without the flag are rejected.
+12. --norm-dtype fp32: clip-inactive runs are bitwise identical, clip-active
+    runs stay within the fp32-norm band.
 """
+import argparse
 import glob
 import io
 import json
@@ -92,47 +100,66 @@ def _ref_score(name, w, m, v, g, count, b1=B1, b2=B2):
 
 
 def _topk_mask(sc, k):
-    idx = torch.topk(sc, k).indices
-    mask = torch.zeros(sc.numel(), dtype=torch.bool)
-    mask[idx] = True
+    # index-ordered tie-fill — the selection contract pinned by
+    # test_select_topk_flat_contract: among coords tied at the k-th value,
+    # the FIRST ones by flat index win. torch.topk does NOT guarantee this
+    # on ties (it returns a different tie set on all-equal scores), so the
+    # reference implements the contract itself.
+    v = torch.kthvalue(sc, sc.numel() - k + 1).values
+    mask = sc > v
+    need = k - int(mask.sum())
+    if need:
+        tied = (sc == v).nonzero(as_tuple=True)[0]
+        mask[tied[:need]] = True
     return mask
 
 
-def reference_cycle(w0, m0, v0, pre_grads, lrs, clip, t0, score_name, k, T):
+def reference_cycle(w0, m0, v0, logged_grads, grad_norms, lrs, clip, t0,
+                    score_name, k, T, reselect=True, branch_grad=None):
     """From-spec reference: returns (dense_w_at_each_step, sparse_w_at_each_step).
 
-    ``pre_grads`` are the PRE-clip gradients (the logged trace gradient is
-    pre * coef_dense; coef_dense is what the dense run applied).
-    """
-    # dense trajectory
+    ``logged_grads`` are the POST-CLIP gradients as logged in the trace
+    (what the dense run committed); ``grad_norms`` are the per-step norms
+    the trace meta carries. The sparse path reconstructs the pre-clip
+    gradient via g / coef_dense with coef_dense = min(1, clip /
+    (grad_norm + 1e-6)) — the replay contract; the reference consumes the
+    trace inputs, not the idealized pre-clip gradients.
+    ``reselect=False`` freezes the mask after the branch selection — the
+    counterfactual used to prove that boundary re-selection is
+    load-bearing (test_boundary_reselect_changes_mask).
+    ``branch_grad`` is the gradient the branch STATE dump carries (what
+    the engine's branch-point selection consumes)."""
+    # dense trajectory: the logged (already clipped) gradient as committed
     md, vd, wdt = m0.clone(), v0.clone(), w0.clone()
     dense_ws = []
-    for si, g in enumerate(pre_grads):
+    for si, g in enumerate(logged_grads):
         count = t0 + si + 1
-        coef = 1.0
-        if clip > 0.0:
-            coef = min(1.0, clip / (float(g.norm()) + 1.0e-6))
-        wdt, md, vd = _adamw(wdt, md, vd, g * coef, lrs[si], count)
+        wdt, md, vd = _adamw(wdt, md, vd, g, lrs[si], count)
         dense_ws.append(wdt.clone())
     # sparse cycle trajectory
     ms, vs, ws = m0.clone(), v0.clone(), w0.clone()
     res = torch.zeros_like(w0)
-    q0 = pre_grads[0]
-    if clip > 0.0:
-        q0 = q0 * min(1.0, clip / (float(q0.norm()) + 1.0e-6))
-    sel = _topk_mask(_ref_score(score_name, ws, ms, vs, q0, t0 + 1), k)
+    q0 = branch_grad
+    # the branch-point selection consumes the state dump's g as-is (it is
+    # already post-clip); fp64 math / fp32 storage per the registry
+    # contract, index-ordered tie-fill per the select contract
+    sel = _topk_mask(_ref_score(score_name, ws, ms, vs, q0, t0 + 1)
+                     .float(), k)
     sparse_ws = []
-    for si, g in enumerate(pre_grads):
+    for si, g_logged in enumerate(logged_grads):
         count = t0 + si + 1
+        coef_dense = min(1.0, clip / (grad_norms[si] + 1.0e-6)) \
+            if clip > 0.0 else 1.0
+        g = g_logged / coef_dense
         if si % T == 0:
             q_pre = g + res
             coef = 1.0
             if clip > 0.0:
                 coef = min(1.0, clip / (float(q_pre.norm()) + 1.0e-6))
             q = q_pre * coef
-            if si > 0 and si + 1 < len(pre_grads):
+            if reselect and si > 0 and si + 1 < len(logged_grads):
                 sc = _ref_score(score_name, ws, ms, vs, q, count)
-                sel = _topk_mask(sc, k)
+                sel = _topk_mask(sc.float(), k)
             res = torch.zeros_like(res)
         else:
             coef = 1.0
@@ -163,13 +190,16 @@ def _make_trace(tmpdir, pre_grads, lrs, clip, t0, n):
     m0 = torch.randn(n, dtype=torch.float32) * 0.1
     v0 = torch.rand(n, dtype=torch.float32) * 0.01 + 1e-4
     g0_logged = None
+    logged_all, norms = [], []
     for si, pre in enumerate(pre_grads):
         step = t0 + si
         norm = float(pre.norm())
+        norms.append(norm)
         coef = 1.0
         if clip > 0.0:
             coef = min(1.0, clip / (norm + 1.0e-6))
         logged = (pre * coef).float()
+        logged_all.append(logged)
         meta = {"lr": [lrs[si]], "grad_norm": norm, "clip_grad": clip,
                 "adam_beta1": B1, "adam_beta2": B2, "adam_eps": EPS,
                 "weight_decay": WD, "step": step}
@@ -181,47 +211,51 @@ def _make_trace(tmpdir, pre_grads, lrs, clip, t0, n):
                          "g": {name: g0_logged}},
              "meta": {**BASE_META, "step": t0}}
     torch.save(state, os.path.join(tmpdir, f"step_{t0:06d}_state.pt"))
-    return name, w0, m0, v0
+    return name, w0, m0, v0, logged_all, norms
 
 
 def _run_module(tmpdir, name, w0, m0, v0, t0, W, score_name, ratio_pct, T,
-                replay_dtype=torch.float64, sel_trace=None,
-                upcast_bf16=False, norm_fp32=False):
-    """Run the module's dense + cycle sparse replays; return num_at {h: num}."""
-    catalog, names, offsets, N, state_files, g_files = soa.discover_trace(tmpdir)
-    meta, params, w_parts, m_parts, v_parts, g_parts = soa.build_branch_state(
-        state_files[t0], names, replay_dtype)
-    score_flats = soa.compute_scores_flat(
-        w_parts, m_parts, v_parts, g_parts, offsets, N, meta,
-        chunk_mb=1, device="cpu",
-        score_names=list(soa.all_score_names()),
-        update_includes_wd=True)
-    k = max(1, int(round(ratio_pct / 100.0 * N)))
-    sel0, _ = soa.select_topk_flat(score_flats[score_name], k)
-    window_steps = list(range(t0, t0 + W))
-    eff = set(range(1, W + 1))
-    for prm in params:
-        prm["w"] = prm["w0"].clone()
-        prm["m"] = prm["m0"].clone()
-        prm["v"] = prm["v0"].clone()
-        prm["label"] = torch.zeros(prm["n"], dtype=replay_dtype)
-    _label, _den, _recon, snap_d = soa.dense_replay(
-        params, g_files, window_steps, meta, t0, eff, replay_dtype, 1, "cpu",
-        upcast_bf16=upcast_bf16)
-    num_at = soa.sparse_replay_cycle(
-        params, g_files, window_steps, meta, t0, eff, score_name, k, T, sel0,
-        snap_d, replay_dtype, 1, "cpu", sel_trace=sel_trace,
-        upcast_bf16=upcast_bf16, norm_fp32=norm_fp32)
-    return num_at
+                replay_dtype=torch.float64, upcast_bf16=False,
+                norm_fp32=False):
+    """Run the fused engine (single shard, inline, cpu) for one score x
+    ratio arm via run_fused_branch — the direct call returns the RAW branch
+    dict (no 8-decimal sanitize), so num_at keeps full fp64 precision — and
+    return num_at {h: num} as distortion[h] * den[h]."""
+    from sga import replay_fused
+
+    catalog, names, offsets, N, state_files, g_files = soa.discover_trace(
+        tmpdir)
+    ctx = {"trace_dir": os.path.abspath(tmpdir), "names": names,
+           "offsets": offsets, "N": N, "state_files": state_files,
+           "g_files": g_files, "catalog": catalog}
+    args = argparse.Namespace(
+        replay_mode="cycle", self_check=None,
+        dense_cache=os.path.join(tmpdir, "dense_cache"),
+        score_names=[score_name], fused_shards=1, fused_max_configs=12,
+        ratios=[ratio_pct], horizons=list(range(1, W + 1)), window=W,
+        cycle_len=T,
+        replay_dtype=("fp64" if replay_dtype is torch.float64 else "fp32"),
+        trace_dtype=("bf16" if upcast_bf16 else "fp32"),
+        norm_dtype=("fp32" if norm_fp32 else "fp64"),
+        chunk_mb=1, device="cpu", seed=1234, verbose=False,
+    )
+    br = replay_fused.run_fused_branch(args, ctx, t0)
+    den = br["replay"]["den_norm_at_horizon"]
+    dist = br["per_ratio"][str(ratio_pct)]["scores"][score_name]["distortion"]
+    return {int(h): (None if dist[str(h)] is None
+                     else dist[str(h)] * den[str(h)])
+            for h in range(1, W + 1)}
 
 
-def _ref_num_at(w0, m0, v0, pre_grads, lrs, clip, t0, score_name, ratio_pct, T):
+def _ref_num_at(w0, m0, v0, logged, norms, lrs, clip, t0, score_name,
+                ratio_pct, T):
     k = max(1, int(round(ratio_pct / 100.0 * w0.numel())))
     dense_ws, sparse_ws = reference_cycle(
         w0.double(), m0.double(), v0.double(),
-        [g.double() for g in pre_grads], lrs, clip, t0, score_name, k, T)
+        [g.double() for g in logged], norms, lrs, clip, t0, score_name, k, T,
+        branch_grad=logged[0].double())
     return {h: float((sparse_ws[h - 1] - dense_ws[h - 1]).norm())
-            for h in range(1, len(pre_grads) + 1)}
+            for h in range(1, len(logged) + 1)}
 
 
 def _close(a, b, tol):
@@ -239,8 +273,10 @@ def test_T1_is_dense():
     pre = [torch.randn(n) * 0.01 for _ in range(W)]
     lrs = [5e-5] * W
     with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0 = _make_trace(td, pre, lrs, 1.0, t0, n)
+        name, w0, m0, v0, _logged, _norms = _make_trace(td, pre, lrs, 1.0, t0, n)
         num_at = _run_module(td, name, w0, m0, v0, t0, W, "coi", 50.0, 1)
+    # exactness relies on coef_dense == 1.0 (clip inactive in this fixture);
+    # with active clipping T=1 is dense only up to the reconstruction band
     for h, v in num_at.items():
         assert v == 0.0, f"T=1 must be dense; d@{h} = {v}"
     print("PASS test_T1_is_dense")
@@ -253,11 +289,11 @@ def test_no_fold_within_window():
     pre = [torch.randn(n) * 0.02 for _ in range(W)]
     lrs = [4e-5] * W
     with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0 = _make_trace(td, pre, lrs, 0.0, t0, n)
+        name, w0, m0, v0, logged, norms = _make_trace(td, pre, lrs, 0.0, t0, n)
         for score in soa.all_score_names():
             num_at = _run_module(td, name, w0, m0, v0, t0, W, score, 25.0,
                                  T=W + 1)
-            ref = _ref_num_at(w0, m0, v0, pre, lrs, 0.0, t0, score, 25.0,
+            ref = _ref_num_at(w0, m0, v0, logged, norms, lrs, 0.0, t0, score, 25.0,
                               T=W + 1)
             for h in range(1, W + 1):
                 assert _close(num_at[h], ref[h], 1e-9), (
@@ -274,24 +310,22 @@ def test_multicycle_with_clipping():
     lrs = [5e-5, 4.5e-5, 4e-5, 3.5e-5, 3e-5, 2.5e-5]
     clip = 0.3
     with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0 = _make_trace(td, pre, lrs, clip, t0, n)
+        name, w0, m0, v0, logged, norms = _make_trace(td, pre, lrs, clip, t0, n)
         for score in soa.all_score_names():
-            trace = []
-            num_at = _run_module(td, name, w0, m0, v0, t0, W, score, 50.0, 2,
-                                 sel_trace=trace)
-            ref = _ref_num_at(w0, m0, v0, pre, lrs, clip, t0, score, 50.0, 2)
+            num_at = _run_module(td, name, w0, m0, v0, t0, W, score, 50.0, 2)
+            ref = _ref_num_at(w0, m0, v0, logged, norms, lrs, clip, t0, score, 50.0, 2)
             for h in range(1, W + 1):
                 assert _close(num_at[h], ref[h], 1e-9), (
                     f"{score} d@{h}: module {num_at[h]} vs ref {ref[h]}")
-            # boundaries at si=0 (sel0, trace entry -1), si=2, si=4
-            # (si+1 < W so re-selection happens)
-            assert [s for s, _ in trace] == [-1, 2, 4], (
-                f"{score}: re-selection boundaries {trace!r}")
     print("PASS test_multicycle_with_clipping")
 
 
 def test_boundary_reselect_changes_mask():
-    """A momentum flip between boundaries must change the selected support."""
+    """A momentum flip between boundaries must change the selected support.
+    The fused engine exposes no selection hook, so this is pinned
+    behaviorally: the re-selecting from-spec reference and the frozen-mask
+    counterfactual (reselect=False) diverge on this fixture, and the engine
+    tracks the re-selecting one."""
     torch.manual_seed(3)
     t0, W, n = 1600, 5, 4
     # step 0 pushes coords 0-1; steps 1..4 push coords 2-3 hard, so the
@@ -299,15 +333,30 @@ def test_boundary_reselect_changes_mask():
     pre = [torch.tensor([1.0, 1.0, 0.01, 0.01])]
     pre += [torch.tensor([0.01, 0.01, 1.0, 1.0]) for _ in range(W - 1)]
     lrs = [5e-5] * W
+    score, ratio_pct, T = "abs_g", 50.0, 2
+    k = max(1, int(round(ratio_pct / 100.0 * n)))
     with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0 = _make_trace(td, pre, lrs, 0.0, t0, n)
-        trace = []
-        _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 50.0, 2,
-                    sel_trace=trace)
-    sel0 = trace[0][1]
-    sel2 = trace[1][1]
-    assert sel0[:2].all() and not sel0[2:].any(), f"sel0={sel0}"
-    assert sel2[2:].all() and not sel2[:2].any(), f"sel@si2={sel2}"
+        name, w0, m0, v0, logged, norms = _make_trace(td, pre, lrs, 0.0, t0, n)
+        # re-selecting vs frozen references on the real fixture state
+        _, resel_ws = reference_cycle(w0.double(), m0.double(), v0.double(),
+                                      [g.double() for g in logged], norms,
+                                      lrs, 0.0, t0, score, k, T,
+                                      branch_grad=logged[0].double())
+        _, frozen_ws = reference_cycle(w0.double(), m0.double(), v0.double(),
+                                       [g.double() for g in logged], norms,
+                                       lrs, 0.0, t0, score, k, T,
+                                       reselect=False,
+                                       branch_grad=logged[0].double())
+        # the two references must genuinely diverge (masks rotated)
+        assert any(not torch.equal(a, b)
+                   for a, b in zip(resel_ws, frozen_ws)), \
+            "fixture failed: frozen-mask and re-selecting references agree"
+        # the engine follows the re-selecting reference, not the frozen one
+        num_at = _run_module(td, name, w0, m0, v0, t0, W, score, ratio_pct, T)
+        ref = _ref_num_at(w0, m0, v0, logged, norms, lrs, 0.0, t0, score, ratio_pct, T)
+        for h in range(1, W + 1):
+            assert _close(num_at[h], ref[h], 1e-9), (
+                f"d@{h}: module {num_at[h]} vs re-selecting ref {ref[h]}")
     print("PASS test_boundary_reselect_changes_mask")
 
 
@@ -360,7 +409,7 @@ def test_determinism():
     pre = [torch.randn(n) * 0.02 for _ in range(W)]
     lrs = [5e-5] * W
     with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0 = _make_trace(td, pre, lrs, 1.0, t0, n)
+        name, w0, m0, v0, _logged, _norms = _make_trace(td, pre, lrs, 1.0, t0, n)
         a = _run_module(td, name, w0, m0, v0, t0, W, "coi", 20.0, 2)
         b = _run_module(td, name, w0, m0, v0, t0, W, "coi", 20.0, 2)
     assert a == b, f"non-deterministic replay: {a} vs {b}"
@@ -527,6 +576,12 @@ def test_cli_rejects_invalid_options():
     base = ["--trace-dir", "/nonexistent-sga-trace-dir"]
     cases = [
         (["--replay-mode", "cycle", "--cycle-len", "0"], "--cycle-len"),
+        # the loud post-consolidation gate: classic cycle-without-cache was
+        # removed; cycle now always routes to the fused engine, which
+        # consumes --dense-cache (populated on the first run)
+        (["--replay-mode", "cycle", "--branch-point", "5"], "--dense-cache"),
+        # --fused is a deprecated no-op, but only where it ever made sense
+        (["--fused"], "--fused is deprecated"),
         (["--chunk-mb", "0"], "--chunk-mb"),
         (["--window", "0"], "--window"),
         (["--horizons", "0"], "--horizons"),
@@ -563,6 +618,10 @@ def test_print_summary_zero_distortion():
     met = report["branch_results"][str(t0)]["per_ratio"]["50.0"]["scores"]
     for m in met.values():
         assert m["distortion"] == {"2": None}
+    # pure zerofill run: the CLI echo stays False and so does the
+    # effective-engine flag (only cycle routes to the fused engine)
+    assert report["config"]["fused"] is False
+    assert report["config"]["fused_effective"] is False
     assert "N/A" in buf.getvalue(), "printer must render the None cell"
     print("PASS test_print_summary_zero_distortion")
 
@@ -581,6 +640,7 @@ def test_dense_cache_roundtrip():
                 "--window", str(W), "--ratios", "25,50", "--horizons", "2,5",
                 "--replay-mode", "cycle", "--cycle-len", "2",
                 "--score-names", "abs_g,update",
+                "--fused-shards", "1",
                 "--dense-cache", os.path.join(td, "dense_cache")]
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -613,6 +673,20 @@ def test_dense_cache_roundtrip():
     print("PASS test_dense_cache_roundtrip")
 
 
+def test_dense_cache_ident_engine_fence():
+    """cpu and dev dense engines must never share a cache file: dense_replay
+    quantizes horizon diffs to fp32 before squaring, dense_replay_dev does
+    not — a shared ident would silently serve wrong denominators across
+    device migrations of the same trace."""
+    base = ("trace", 0, [1, 2], [1, 2], torch.float32, "fp32")
+    i_cpu = soa._dense_cache_ident(*base, "cpu")
+    i_dev = soa._dense_cache_ident(*base, "dev")
+    assert i_cpu != i_dev
+    assert (soa._dense_cache_path("cache", i_cpu)
+            != soa._dense_cache_path("cache", i_dev))
+    print("PASS test_dense_cache_ident_engine_fence")
+
+
 def test_trace_dtype_bf16():
     """--trace-dtype bf16: on fp32 traces the flag is a bitwise no-op; on
     bf16 screening copies the upcast path keeps the distortion within the
@@ -622,7 +696,7 @@ def test_trace_dtype_bf16():
     pre = [torch.randn(n) * 0.05 for _ in range(W)]
     lrs = [5e-5] * W
     with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0 = _make_trace(td, pre, lrs, 1.0, t0, n)
+        name, w0, m0, v0, _logged, _norms = _make_trace(td, pre, lrs, 1.0, t0, n)
         a = _run_module(td, name, w0, m0, v0, t0, W, "coi", 30.0, 2)
         b = _run_module(td, name, w0, m0, v0, t0, W, "coi", 30.0, 2,
                         upcast_bf16=True)
@@ -669,7 +743,7 @@ def test_trace_convert_module():
     pre = [torch.randn(n) * 0.05 for _ in range(W)]
     lrs = [5e-5] * W
     with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0 = _make_trace(td, pre, lrs, 1.0, t0, n)
+        name, w0, m0, v0, _logged, _norms = _make_trace(td, pre, lrs, 1.0, t0, n)
         dst = os.path.join(td, "dst")
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -742,7 +816,7 @@ def test_self_check_trace_dtype():
     pre = [torch.randn(n) * 0.02 for _ in range(W)]
     lrs = [5e-5] * W
     with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0 = _make_trace(td, pre, lrs, 1.0, t0, n)
+        name, w0, m0, v0, _logged, _norms = _make_trace(td, pre, lrs, 1.0, t0, n)
         # self-check compares against the real state dump at TO_STEP
         torch.save({"payload": {"w": {name: w0}, "m": {name: m0},
                                 "v": {name: v0}, "g": {name: torch.randn(n)}},
@@ -801,7 +875,7 @@ def test_norm_dtype_fp32():
     # consumed
     pre = [torch.randn(n) * 0.02 for _ in range(W)]
     with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0 = _make_trace(td, pre, lrs, 0.0, t0, n)
+        name, w0, m0, v0, _logged, _norms = _make_trace(td, pre, lrs, 0.0, t0, n)
         a = _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 25.0, 2,
                         norm_fp32=False)
         b = _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 25.0, 2,
@@ -811,7 +885,7 @@ def test_norm_dtype_fp32():
     # perturbs coef at ~1e-7 relative; the trajectory stays within the band
     pre = [torch.randn(n) * 0.5 for _ in range(W)]
     with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0 = _make_trace(td, pre, lrs, 0.3, t0, n)
+        name, w0, m0, v0, _logged, _norms = _make_trace(td, pre, lrs, 0.3, t0, n)
         a = _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 25.0, 2,
                         norm_fp32=False)
         b = _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 25.0, 2,
@@ -828,6 +902,43 @@ def test_norm_dtype_fp32():
     print("PASS test_norm_dtype_fp32")
 
 
+def test_replay_dtype_fp32():
+    """--replay-dtype fp32 anchors the fused worker's fp32 branch: state,
+    residual and q stay fp32 (no fp64 cast at the commit), so the
+    trajectory matches the from-spec fp64 reference only to the fp32 band,
+    and the flag visibly fires (the fp32 numbers differ from the fp64
+    run's)."""
+    torch.manual_seed(14)
+    t0, W, n = 1100, 6, 24
+    pre = [torch.randn(n) * 0.5 for _ in range(W)]  # norms >> clip -> active
+    lrs = [5e-5] * W
+    clip = 0.3
+    with tempfile.TemporaryDirectory() as td:
+        name, w0, m0, v0, logged, norms = _make_trace(td, pre, lrs, clip, t0, n)
+        f64 = _run_module(td, name, w0, m0, v0, t0, W, "coi", 50.0, 2)
+        f32 = _run_module(td, name, w0, m0, v0, t0, W, "coi", 50.0, 2,
+                          replay_dtype=torch.float32)
+        ref = _ref_num_at(w0, m0, v0, logged, norms, lrs, clip, t0, "coi",
+                          50.0, 2)
+        # the branch must actually fire: fp32 state/q/res move the numbers
+        assert any(f32[h] != f64[h] for h in f64), \
+            "--replay-dtype fp32 must not be a silent no-op"
+        # sub-ulp distortions collapse to exact 0.0 in fp32 (h=1 here:
+        # ref ~4e-13 -> 0.0); above that noise floor the fp32 trajectory
+        # tracks the from-spec fp64 reference to ~5e-4 relative -> band 1e-3
+        floor = 1.0e-8
+        for h in f32:
+            if ref[h] < floor:
+                assert f32[h] < floor, \
+                    f"d@{h}: {f32[h]} above the fp32 noise floor " \
+                    f"(ref {ref[h]})"
+            else:
+                rel = abs(f32[h] - ref[h]) / abs(ref[h])
+                assert rel < 1e-3, (
+                    f"fp32 d@{h} outside band: {f32[h]} vs ref {ref[h]}")
+    print("PASS test_replay_dtype_fp32")
+
+
 def main():
     test_T1_is_dense()
     test_no_fold_within_window()
@@ -841,10 +952,12 @@ def main():
     test_cli_rejects_invalid_options()
     test_print_summary_zero_distortion()
     test_dense_cache_roundtrip()
+    test_dense_cache_ident_engine_fence()
     test_trace_dtype_bf16()
     test_trace_convert_module()
     test_self_check_trace_dtype()
     test_norm_dtype_fp32()
+    test_replay_dtype_fp32()
     print("\nall replay-cycle tests passed")
 
 

@@ -1,10 +1,10 @@
 # Copyright (c) 2026, SGA framework contributors.
 """Fused single-pass streaming replay (config-grouped, param-sharded).
 
-The classic path replays the window once per arm (1 dense pass + one cycle
-pass per ratio×score), so a sweep re-reads the multi-TB window ~7× per run.
-This engine advances ALL arms of one config group over the window in
-lockstep — one window read per group — sharded across processes:
+The removed classic path replayed the window once per arm (1 dense pass +
+one cycle pass per ratio×score), so a sweep re-read the multi-TB window
+~7× per run; this engine advances ALL arms of one config group over the
+window in lockstep — one window read per group — sharded across processes:
 
 - ``--fused-shards`` shard processes (one per GPU; gloo over localhost for
   the tiny control-plane exchanges), each owning a contiguous slice of the
@@ -24,12 +24,14 @@ lockstep — one window read per group — sharded across processes:
   cache once (before the shards start), then every shard slices the
   artifacts.
 
-Arithmetic contract: per-config math is op-identical to
-``sparse_replay_cycle`` — per-param per-chunk operations in the same order,
-so a single-shard run reproduces the classic report bitwise. At world > 1
-the only deviations are cross-shard fp64 scalar-sum reorderings (the
-frozen pure-reordering band covers them), plus the optional
-``--norm-dtype fp32`` quantization (gated by its own frozen band). The
+Arithmetic contract (historical): per-config math was op-identical to the
+removed ``sparse_replay_cycle`` — per-param per-chunk operations in the
+same order — so single-shard runs reproduced the classic report bitwise
+(pinned by the pre-deletion e2e tiny-trace comparison). The standing spec
+anchor is ``tests/test_replay_cycle.reference_cycle``. At world > 1 the
+only deviations are cross-shard fp64 scalar-sum reorderings (covered by
+the frozen pure-reordering band), plus the optional ``--norm-dtype fp32``
+quantization (gated by its own frozen band). The
 score/label SUM statistics are shard-partial sums (same reordering class);
 min/max/zero-fractions stay exact. Ranking metrics are exact: the selected
 coordinates' (score, label, label-sel) values are gathered to shard 0 in
@@ -94,6 +96,15 @@ def _free_port():
     p = s.getsockname()[1]
     s.close()
     return p
+
+
+def _fresh_state(t, dev):
+    """Copy a cpu reference tensor onto dev; never alias the original (the
+    shard's w0/m0/v0 are shared across every arm in a config group)."""
+    out = t.to(dev)
+    if out is t:
+        out = out.clone()
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -396,7 +407,8 @@ def _worker(rank, world, cfg, port, frag_path):
     # (the cache roundtrip is bitwise — pinned by test_dense_cache_roundtrip)
     ident = R._dense_cache_ident(cfg["trace_dir"], t0, window_steps,
                                  eff_horizons, replay_dtype,
-                                 cfg["trace_dtype"])
+                                 cfg["trace_dtype"],
+                                 "cpu" if cfg["device"] == "cpu" else "dev")
     cached = R.load_dense_cache(cfg["dense_cache"], ident)
     if cached is None:
         raise RuntimeError("dense cache still missing after parent populate")
@@ -411,7 +423,8 @@ def _worker(rank, world, cfg, port, frag_path):
             t = cached["snap_d"][h][e["name"]].reshape(-1)
             snap_loc[h][e["name"]] = t[e["p_off"]:e["p_off"] + e["n"]] \
                 .clone()
-    dense_cache_hit = True  # the streaming pass only ever consumes the cache
+    dense_cache_hit = cfg["dense_cache_hit"]  # parent-side load outcome;
+    # the streaming pass itself only ever consumes the cache
     del cached
 
     # ---- score / label statistics (sums shard-partial; min/max exact) ------
@@ -455,9 +468,9 @@ def _worker(rank, world, cfg, port, frag_path):
                 # _fresh_state: never alias the shard's w0/m0/v0 — every
                 # arm in the group must start from the pristine state
                 stt[e["name"]] = {
-                    "ms": R._fresh_state(e["m0"], dev),
-                    "vs": R._fresh_state(e["v0"], dev),
-                    "ws": R._fresh_state(e["w0"], dev),
+                    "ms": _fresh_state(e["m0"], dev),
+                    "vs": _fresh_state(e["v0"], dev),
+                    "ws": _fresh_state(e["w0"], dev),
                     "res": torch.zeros(e["n"], dtype=replay_dtype,
                                        device=dev),
                     "sel": sel[e["a"]:e["a"] + e["n"]].to(dev),
@@ -505,7 +518,8 @@ def _worker(rank, world, cfg, port, frag_path):
                     coef = min(1.0, clip_grad / (qnorm + 1.0e-6))
                 coefs.append(coef)
 
-            # boundary re-selection (same gating as sparse_replay_cycle):
+            # boundary re-selection (same gating as
+            # tests/test_replay_cycle.reference_cycle):
             # skip si=0 (sel0 encodes it) and the final boundary (no masked
             # step remains to consume the new mask)
             if boundary and si > 0 and si + 1 < W:
@@ -698,8 +712,9 @@ def _compute_dense_and_cache(cfg, R, t0, window_steps, eff_horizons,
     label_flat = torch.cat([p["label"].float() for p in params])
     R.save_dense_cache(cfg["dense_cache"], R._dense_cache_ident(
         cfg["trace_dir"], t0, window_steps, eff_horizons, replay_dtype,
-        cfg["trace_dtype"]), label_total, den_at, recon_steps, snap_d,
-        label_flat)
+        cfg["trace_dtype"],
+        "cpu" if cfg["device"] == "cpu" else "dev"), label_total, den_at,
+        recon_steps, snap_d, label_flat)
     print(f"[fused t0={t0}] dense cache populated on miss "
           f"({cfg['dense_cache']})", flush=True)
 
@@ -715,13 +730,16 @@ def run_fused_branch(args, ctx, t0):
     import sga.replay as R
 
     if args.replay_mode != "cycle":
-        raise ValueError("--fused implements --replay-mode cycle only")
+        raise ValueError("the fused engine implements --replay-mode cycle "
+                         "only")
     if args.self_check is not None:
-        raise ValueError("--fused cannot be combined with --self-check")
+        raise ValueError("--replay-mode cycle cannot be combined with "
+                         "--self-check")
     if not args.dense_cache:
         raise ValueError(
-            "--fused requires --dense-cache (the dense arm is consumed from "
-            "the cache; a first run populates it automatically)")
+            "--replay-mode cycle requires --dense-cache (the dense arm is "
+            "consumed from the cache; a first run populates it "
+            "automatically)")
     # mirror the classic path: registry order + unknown-name rejection
     allowed = list(R.all_score_names())
     if args.score_names:
@@ -742,11 +760,14 @@ def run_fused_branch(args, ctx, t0):
         if r <= 0.0 or r > 100.0:
             raise ValueError(f"ratio {r} out of (0,100]")
     if args.device != "cpu":
-        # shard r maps to cuda:r, so a bare index on --device has no meaning
+        # shard r maps to cuda:r, so a bare index on --device has no meaning;
+        # the visible device set is constrained via CUDA_VISIBLE_DEVICES
         if args.device != "cuda":
             raise ValueError(
-                "--fused maps shard r to cuda:r; use --device cpu or cuda "
-                "(an explicit cuda:N index is not supported)")
+                "--device cuda:N is not supported: shard r always maps to "
+                "cuda:r. Use --device cuda and restrict the visible devices "
+                "with CUDA_VISIBLE_DEVICES (e.g. CUDA_VISIBLE_DEVICES=4,5 for "
+                "a 2-shard run on physical GPUs 4 and 5)")
         if world > torch.cuda.device_count():
             raise ValueError(
                 f"--fused-shards {world} exceeds the visible CUDA devices "
@@ -773,17 +794,22 @@ def run_fused_branch(args, ctx, t0):
     }
     # populate the dense cache parent-side, before any shard exists: on a
     # cold cache the dense pass can run for hours and must not happen inside
-    # the process group (the waiting shards would hit the gloo timeout)
+    # the process group (the waiting shards would hit the gloo timeout).
+    # dense_cache_hit reports the parent-side LOAD outcome (False on the
+    # populating run), matching the classic report field semantics
     replay_dtype = (torch.float64 if args.replay_dtype == "fp64"
                     else torch.float32)
     window_steps, _W, eff_horizons = _window_and_horizons(
         ctx["g_files"], t0, args.window, args.horizons)
     ident = R._dense_cache_ident(ctx["trace_dir"], t0, window_steps,
                                  eff_horizons, replay_dtype,
-                                 args.trace_dtype)
-    if R.load_dense_cache(args.dense_cache, ident) is None:
+                                 args.trace_dtype,
+                                 "cpu" if args.device == "cpu" else "dev")
+    hit = R.load_dense_cache(args.dense_cache, ident) is not None
+    if not hit:
         _compute_dense_and_cache(cfg, R, t0, window_steps, eff_horizons,
                                  replay_dtype)
+    cfg["dense_cache_hit"] = hit
     fd, frag_path = tempfile.mkstemp(suffix=".pt",
                                      prefix="fused_branch_")
     os.close(fd)
