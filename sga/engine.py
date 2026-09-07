@@ -236,6 +236,39 @@ class SGAEngine:
         # cycle the support is immutable and its counts are cached, so
         # per-step re-checks re-verify identical numbers.
         self._count_guard = cfg.sga_checks_count_guard
+        # Layer-2/3 + shadow-RNG-bracket toggles (sga_checks_*, default
+        # on). These are the RESOLVED values: a false sga_checks master
+        # forced them False in validate_sga_args before this constructor
+        # ran, so the one-time WARN below states the checks posture of
+        # the whole run unambiguously in the hostcat.
+        self._support_consistency = cfg.sga_checks_support_consistency
+        self._norm_spread = cfg.sga_checks_norm_spread
+        self._rng_bracket = cfg.sga_checks_rng_bracket
+        if not (self._count_guard and self._support_consistency
+                and self._norm_spread and self._rng_bracket):
+            # rank-once (ctor runs before self._rank is set below): the
+            # posture line is for the merged hostcat, eight copies of it
+            # say nothing new. The consequence sentences follow the
+            # actual off layers — the shadow-local RNG bracket is not a
+            # cross-rank detector, so its sentence must not claim one.
+            if (not torch.distributed.is_initialized()
+                    or torch.distributed.get_rank() == 0):
+                _msg = (f"[SGA] WARN sga_checks escape hatch active "
+                        f"(L1_count={int(self._count_guard)} "
+                        f"L2_support={int(self._support_consistency)} "
+                        f"L3_norm_spread={int(self._norm_spread)} "
+                        f"rng_bracket={int(self._rng_bracket)}): "
+                        "benchmark measurement posture, not a production "
+                        "setting")
+                if not (self._count_guard and self._support_consistency
+                        and self._norm_spread):
+                    _msg += (" — cross-rank divergence detection is OFF "
+                             "(diverged supports hang or silently fork "
+                             "instead of aborting)")
+                if not self._rng_bracket:
+                    _msg += (" — shadow RNG-invariant bracket skipped "
+                             "(shadow runs only)")
+                print(_msg, flush=True)
         # Always-sync layers (the per-parameter dense axis): None = off.
         # Resolved against attached param names at attach
         # (_always_sync_attach_check); the forced ids drive the selection
@@ -503,7 +536,8 @@ class SGAEngine:
             # order — they differ in real megatron.
             views = [p.main_param.grad.data.view(-1)
                      for (_, _, _, p) in meta]
-            self._check_norm_spread(views)
+            if self._norm_spread:
+                self._check_norm_spread(views)
             new_support = self._run_selection(views, meta)
         else:
             new_support = None
@@ -599,10 +633,13 @@ class SGAEngine:
         must be consumption-free on every RNG stream (selections are
         histogram/topk-based by design — a violation means a plugin broke
         that contract and would silently fork dense trajectories).
+        The bracket itself is the sga_checks_rng_bracket escape hatch:
+        off (benchmark posture) skips both the capture and the compare.
         """
-        rng_before = torch.get_rng_state()
+        rng_before = torch.get_rng_state() if self._rng_bracket else None
         cuda_before = (torch.cuda.get_rng_state_all()
-                       if torch.cuda.is_available() else None)
+                       if torch.cuda.is_available() and self._rng_bracket
+                       else None)
 
         rec_of = {id(rec.model_param): rec for rec in records}
         emit = self.score_name
@@ -629,27 +666,31 @@ class SGAEngine:
                     "from a different optimizer view"
                 )
             views.append(readonly_score(rec, emit, scratch).view(-1))
-        self._check_norm_spread(views)
+        if self._norm_spread:
+            self._check_norm_spread(views)
         self._activate_support(self._run_selection(views, meta))
         if self._count_guard:
             self._check_counts()
 
-        if not torch.equal(torch.get_rng_state(), rng_before):
-            raise RuntimeError(
-                "shadow: boundary scoring consumed CPU RNG — selections must "
-                "be deterministic (histogram/topk), this forks dense "
-                "trajectories and breaks the shadow invariant"
-            )
-        if cuda_before is not None:
-            cuda_after = torch.cuda.get_rng_state_all()
-            if len(cuda_after) != len(cuda_before) or any(
-                not torch.equal(a, b) for a, b in zip(cuda_before, cuda_after)
-            ):
+        if self._rng_bracket:
+            if not torch.equal(torch.get_rng_state(), rng_before):
                 raise RuntimeError(
-                    "shadow: boundary scoring consumed CUDA RNG — selections "
+                    "shadow: boundary scoring consumed CPU RNG — selections "
                     "must be deterministic (histogram/topk), this forks "
                     "dense trajectories and breaks the shadow invariant"
                 )
+            if cuda_before is not None:
+                cuda_after = torch.cuda.get_rng_state_all()
+                if len(cuda_after) != len(cuda_before) or any(
+                    not torch.equal(a, b)
+                    for a, b in zip(cuda_before, cuda_after)
+                ):
+                    raise RuntimeError(
+                        "shadow: boundary scoring consumed CUDA RNG — "
+                        "selections must be deterministic (histogram/topk), "
+                        "this forks dense trajectories and breaks the "
+                        "shadow invariant"
+                    )
 
     def _always_sync_attach_check(self):
         """Resolve the always-sync patterns against every attached param
@@ -778,7 +819,8 @@ class SGAEngine:
         else:
             masks = sel_masks
         bucket_masks = self._assemble_bucket_masks(masks, meta)
-        self._verify_support_consistency(bucket_masks)
+        if self._support_consistency:
+            self._verify_support_consistency(bucket_masks)
         # Block granularity rides along from the selection (1 = element).
         # The block-index form is NOT assembled here: it derives lazily
         # from the canonical mask + param spans (single-source doctrine),

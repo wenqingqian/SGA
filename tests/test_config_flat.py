@@ -304,7 +304,11 @@ def test_inv4_historical_surface_pinned():
         "sga_cycle_period": (1, "int", ()),
         "sga_cycle_decouple_full_sync_interval_and_period": (False, "bool", ()),
         "sga_cycle_full_sync_interval": (None, "int", ()),
+        "sga_checks": (True, "bool", ()),
         "sga_checks_count_guard": (True, "bool", ()),
+        "sga_checks_support_consistency": (True, "bool", ()),
+        "sga_checks_norm_spread": (True, "bool", ()),
+        "sga_checks_rng_bracket": (True, "bool", ()),
         "sga_always_sync_layers": (None, "str", ()),
         "sga_trace_dir": (None, "str", ()),
         "sga_trace_branch_points": (None, "str", ()),
@@ -654,10 +658,13 @@ def test_inv6_every_declared_dest_has_one_consumer():
             assert not ga & gb, f"double-claimed non-axis dests: {ga & gb}"
     covered = set().union(*groups.values()) - legal
     declared = set(sga_defaults())
-    assert not declared - covered - {"sga_cycle_start_iter_percent"}, \
-        f"unclaimed dests: {declared - covered - {'sga_cycle_start_iter_percent'}}"
+    _NON_CONSUMERS = {"sga_cycle_start_iter_percent", "sga_checks"}
+    assert not declared - covered - _NON_CONSUMERS, \
+        f"unclaimed dests: {declared - covered - _NON_CONSUMERS}"
     # the percent spelling is resolved away by validation (write-back
-    # onto sga_cycle_start_iter) — the one deliberate non-consumer
+    # onto sga_cycle_start_iter), and sga_checks is consumed by
+    # validation itself (the master write-back — sga.config is excluded
+    # from this scan by design) — the two deliberate non-consumers
     print("ok: every declared dest has exactly one consumer class")
 
 

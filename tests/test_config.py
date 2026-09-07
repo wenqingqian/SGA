@@ -150,6 +150,67 @@ def test_checks_validation():
     print("ok: checks validation (default / flag / bad type / off-ignored)")
 
 
+def test_checks_master_switch():
+    """sga_checks master (default true): false forces every consistency
+    sub-flag off via the validation write-back — an explicitly-true sub
+    under a false master is master-override semantics, not an error (bool
+    defaults make 'explicitly true' indistinguishable from unset).
+    Covers the namespace route (SimpleNamespace, the build_engine face)
+    and the yaml route (_ns_of, the launcher face). sga_enabled=false
+    returns before the forcing: sub-flags keep their own values."""
+    from types import SimpleNamespace
+
+    from sga.config.validation import sga_defaults
+
+    subs = ("sga_checks_count_guard", "sga_checks_support_consistency",
+            "sga_checks_norm_spread", "sga_checks_rng_bracket")
+
+    base = {"sga_enabled": True, "sga_score": "update",
+            "sga_selection_method": "exact",
+            "sga_selection_ratio_percent": 10.0,
+            "sga_backend": "torch_pipelined_index",
+            "sga_cycle_period": 8}
+
+    def _ns(**over):
+        ns = SimpleNamespace(**{**sga_defaults(), **base, **over})
+        ns.train_iters = 5000
+        ns.pipeline_model_parallel_size = 1
+        validate_sga_args(ns)
+        return ns
+
+    # master false → all four subs written back False (explicit true sub
+    # included — master-override, no error)
+    ns = _ns(sga_checks=False, sga_checks_support_consistency=True)
+    assert ns.sga_checks is False
+    for dest in subs:
+        assert getattr(ns, dest) is False, dest
+
+    # default master → each sub honors its own spelling
+    ns = _ns(sga_checks_norm_spread=False)
+    assert ns.sga_checks is True
+    assert ns.sga_checks_norm_spread is False
+    for dest in subs:
+        if dest != "sga_checks_norm_spread":
+            assert getattr(ns, dest) is True, dest
+
+    # yaml route (launcher face): master false lands on the parsed ns too
+    cfg, _ = make_base()
+    _enable_standard(cfg)
+    cfg.sga.sga_checks = False
+    ns2 = _ns_of(cfg)
+    for dest in subs:
+        assert getattr(ns2, dest) is False, dest
+
+    # feature off → early return BEFORE the forcing: subs untouched
+    ns3 = SimpleNamespace(**{**sga_defaults(),
+                             **{"sga_enabled": False, "sga_checks": False}})
+    validate_sga_args(ns3)
+    for dest in subs:
+        assert getattr(ns3, dest) is True, dest
+    print("ok: checks master switch (force-off both routes / sub autonomy "
+          "/ feature-off early return)")
+
+
 def test_trace_validation():
     """sga_trace_dir configures the engine-side trace collector: dir
     required, branch_points normalized from comma string or list, window

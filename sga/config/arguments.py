@@ -169,11 +169,45 @@ def _add_sga_checks_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group(
         "SGA checks", "consistency-machinery toggles (research escape hatches)")
     group.add_argument(
+        "--sga-checks", type=sga_bool, default=True,
+        help="master switch over every consistency check below: false "
+             "forces ALL of them off (validation writes the resolved "
+             "values back onto the args — individual true flags do not "
+             "override it). What is given up: layer-1 deadlock protection "
+             "(a diverged support hangs instead of aborting), layer-2 "
+             "mask-divergence detection, layer-3 scoring-input agreement, "
+             "and the shadow RNG invariant (the e2e bitwise proof is "
+             "obtained with checks on). Benchmark escape hatch only, not "
+             "a production setting. Default true.")
+    group.add_argument(
         "--sga-checks-count-guard", type=sga_bool, default=True,
         help="layer-1 consistency guard: cross-rank element-count check of "
              "the selected support at each activation (runs once per "
              "cycle on cached counts); off is a research escape hatch, "
              "not a production setting. Default true.")
+    group.add_argument(
+        "--sga-checks-support-consistency", type=sga_bool, default=True,
+        help="layer-2 consistency guard: dual checksum of the selected "
+             "positions across ranks at every reselection (chunked "
+             "arange/mod/int64-multiply/reduce over the full model — the "
+             "dominant boundary-step check cost, ~150ms GPU + hundreds of "
+             "host syncs at DP8/1.4B-class models); off removes "
+             "mask-divergence DETECTION only (diverged masks then hang or "
+             "silently fork instead of aborting). Default true.")
+    group.add_argument(
+        "--sga-checks-norm-spread", type=sga_bool, default=True,
+        help="layer-3 consistency guard: pre-selection cross-rank spread "
+             "check of the scoring inputs' norms (per-view pow(2)+sum + "
+             "MIN/MAX allreduce, ~30ms per reselection at DP8/1.4B-class "
+             "models); off removes the agreement confirmation only — an "
+             "inconsistent upstream sync then silently feeds scoring "
+             "instead of aborting. Default true.")
+    group.add_argument(
+        "--sga-checks-rng-bracket", type=sga_bool, default=True,
+        help="shadow-mode RNG invariant: CPU+CUDA RNG states are captured "
+             "and compared around the shadow reselection (selections must "
+             "be consumption-free); off skips the bracket in shadow runs "
+             "only — the live path never pays it. Default true.")
 
 
 def _add_sga_trace_args(parser: argparse.ArgumentParser):

@@ -1303,6 +1303,93 @@ def test_count_guard_once_per_cycle_and_flag_off():
     print("ok: count guard once per cycle (activations only); flag disables")
 
 
+def test_checks_escape_hatch_gating():
+    """The sga_checks_* resolved flags gate the L2/L3 call SITES (the
+    method bodies stay un-gated — the direct-call refusal legs above pin
+    detection capability). Spies prove: defaults fire both checks at the
+    reselections; every sub-flag off (the resolved state a false
+    sga_checks master produces via validate_sga_args) makes the engine
+    skip them, and the constructor prints the one-time escape-hatch WARN.
+    The negative leg pins the SEMANTICS of the hatch: with the checks off,
+    a divergence that the checks-on run refuses (SGAEngineError under
+    _MutatingAllReduce) passes through silently — off removes DETECTION,
+    nothing else."""
+    import contextlib
+    import io
+
+    def _run(over, mutate=False):
+        _seed({**_ABS_M["config"], "sga_selection_method": "histogram",
+               "sga_selection_ratio_percent": 30.0,
+               "sga_optimizer_residual_mean": False, "sga_score": "update",
+               **over})
+        selection = build_selection("topk")
+        opt = build_optimizer("adamw")
+        warn = io.StringIO()
+        with contextlib.redirect_stdout(warn):  # ctor emits the one-time WARN
+            eng = SGAEngine("update", selection, opt, build_backend_plugin(
+                "torch_pipelined_index"))
+        # a non-None group keeps the check bodies on their allreduce path
+        # (None = single-rank semantics, an early return inside each
+        # check) — the mock contexts intercept the collectives instead
+        eng._dp_cp_group = lambda: "fake-group"
+        fired = {"l2": 0, "l3": 0}
+        _orig_l2, _orig_l3 = (eng._verify_support_consistency,
+                              eng._check_norm_spread)
+        eng._verify_support_consistency = lambda m: (fired.__setitem__(
+            "l2", fired["l2"] + 1), _orig_l2(m)) and None
+        eng._check_norm_spread = lambda t: (fired.__setitem__(
+            "l3", fired["l3"] + 1), _orig_l3(t)) and None
+        chunk = _FakeChunk()
+        mp = _FakeMPOpt(chunk)
+        eng.attach(chunk)
+        raised = None
+        mock = _MutatingAllReduce() if mutate else _ReplicaWorld(world=1)
+        # the mock classes replace all_reduce only; the fake group would
+        # explode in _dp_bitwise_fix's get_world_size (clip path), so pin
+        # the world at 1 there — consistent with _ReplicaWorld(world=1)
+        saved_gws = torch.distributed.get_world_size
+        torch.distributed.get_world_size = lambda group=None: 1
+        try:
+            with mock:
+                try:
+                    for step in range(1, 10):  # reselections at 5 and 8
+                        _accumulate_into_bucket(chunk)
+                        eng.grad_sync(chunk, force_all_reduce=False)
+                        eng.optimizer_step(mp, [chunk], step)
+                except Exception as e:  # SGAEngineError on the checks-on leg
+                    raised = e
+        finally:
+            torch.distributed.get_world_size = saved_gws
+        return fired, raised, warn.getvalue()
+
+    # defaults: L2/L3 both fire at the two reselections, no WARN
+    fired, raised, warn = _run({})
+    assert raised is None, repr(raised)
+    assert fired == {"l2": 2, "l3": 2}, fired
+    assert "escape hatch" not in warn
+
+    # resolved all-off state: zero calls + the one-time ctor WARN
+    subs_off = {d: False for d in ("sga_checks_count_guard",
+                                   "sga_checks_support_consistency",
+                                   "sga_checks_norm_spread",
+                                   "sga_checks_rng_bracket")}
+    fired, raised, warn = _run(subs_off)
+    assert raised is None
+    assert fired == {"l2": 0, "l3": 0}, fired
+    assert "[SGA] WARN sga_checks escape hatch active" in warn
+    assert "L1_count=0" in warn and "L2_support=0" in warn
+
+    # negative leg: divergence under _MutatingAllReduce —
+    # checks ON refuses (SGAEngineError), checks OFF passes through
+    _, raised_on, _ = _run({}, mutate=True)
+    assert isinstance(raised_on, SGAEngineError), raised_on
+    fired_off, raised_off, warn_off = _run(subs_off, mutate=True)
+    assert raised_off is None
+    assert fired_off == {"l2": 0, "l3": 0}, fired_off
+    print("ok: checks escape hatch (defaults fire / resolved-off skips + "
+          "WARN / divergence: on refuses, off passes)")
+
+
 # ------------------------------------------------- step-counter + resume C1/C2
 
 def _accumulate_into_bucket(chunk):

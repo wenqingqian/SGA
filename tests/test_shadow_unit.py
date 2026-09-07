@@ -243,6 +243,76 @@ def test_shadow_rng_guard_raises():
     print("PASS test_shadow_rng_guard_raises")
 
 
+def test_shadow_rng_bracket_off_leg():
+    """sga_checks_rng_bracket=false: the SAME rng-eating boundary that the
+    bracket-on leg refuses passes through silently — the off state removes
+    only the invariant, selection and activation still run (the escape
+    hatch must not disable the machinery it watches). Companion leg: the
+    shadow-path L3 gate (checks_norm_spread=false) skips the spread check
+    inside _shadow_reselect."""
+    import sga.engine as engine_mod
+
+    torch.manual_seed(3)
+    chunk = _FakeChunk()
+    mp = _ShadowCapableMPOpt(chunk)
+    _seed({"sga_selection_method": "histogram",
+           "sga_selection_ratio_percent": 30.0, "sga_score": "abs_m",
+           "sga_cycle_start_iter": 0, "sga_cycle_period": 1,
+           "sga_shadow": True, "sga_checks_rng_bracket": False})
+    selection = build_selection("topk")
+    opt = build_optimizer("adamw")
+    eng = SGAEngine("abs_m", selection, opt,
+                    build_backend_plugin(_ABS_M["backend"]))
+    eng._dp_cp_group = lambda: None
+    eng.attach(chunk)
+    orig = engine_mod.readonly_score
+    norm_calls = []
+    orig_l3 = eng._check_norm_spread
+
+    def rng_eating(rec, emit_name, scratch=None):
+        torch.rand(1)  # forbidden consumption — must go UNDETECTED now
+        return orig(rec, emit_name, scratch)
+
+    def l3_spy(t):
+        norm_calls.append(1)
+        orig_l3(t)
+
+    engine_mod.readonly_score = rng_eating
+    eng._check_norm_spread = l3_spy
+    gen = torch.Generator().manual_seed(5)
+    try:
+        with _ReplicaWorld(world=1):
+            _push_grads(chunk, gen)
+            chunk.finish_grad_sync(force_all_reduce=False)
+            eng.optimizer_step(mp, [chunk], 1)  # boundary: must NOT raise
+    finally:
+        engine_mod.readonly_score = orig
+    # selection + activation ran (the boundary did its real work)
+    assert eng._active_support is not None
+    assert norm_calls == [1], norm_calls  # bracket off ≠ L3 off
+
+    # companion: shadow L3 gate — spread check skipped in _shadow_reselect
+    _seed({"sga_selection_method": "histogram",
+           "sga_selection_ratio_percent": 30.0, "sga_score": "abs_m",
+           "sga_cycle_start_iter": 0, "sga_cycle_period": 1,
+           "sga_shadow": True, "sga_checks_norm_spread": False})
+    eng2 = SGAEngine("abs_m", build_selection("topk"), build_optimizer(
+        "adamw"), build_backend_plugin(_ABS_M["backend"]))
+    eng2._dp_cp_group = lambda: None
+    chunk2 = _FakeChunk()
+    mp2 = _ShadowCapableMPOpt(chunk2)
+    eng2.attach(chunk2)
+    eng2._check_norm_spread = l3_spy
+    norm_calls.clear()
+    gen2 = torch.Generator().manual_seed(6)
+    with _ReplicaWorld(world=1):
+        _push_grads(chunk2, gen2)
+        chunk2.finish_grad_sync(force_all_reduce=False)
+        eng2.optimizer_step(mp2, [chunk2], 1)
+    assert norm_calls == [], norm_calls
+    print("PASS test_shadow_rng_bracket_off_leg")
+
+
 def test_readonly_score_matches_optimizer_torch_reference():
     """readonly_score vs grad_correct_torch's materialized output,
     elementwise, for every registry emit name (a plumbing-equivalence pin,

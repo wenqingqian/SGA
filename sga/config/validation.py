@@ -22,8 +22,9 @@ own validate_args works:
   - write-backs: derived values are resolved ONTO the args (megatron
     writes ``args.data_parallel_size = ...`` the same way) — the percent
     spelling resolves into ``sga_cycle_start_iter``, the comma-token list
-    keys parse into sorted lists. Exactly three write-backs exist; every
-    other key passes through untouched.
+    keys parse into sorted lists, and a false ``sga_checks`` forces every
+    ``sga_checks_*`` sub-flag False. Exactly four write-back sites exist;
+    every other key passes through untouched.
 
 Inputs: an args-like namespace (attribute access). ``args=None`` reads the
 sga singleton (``sga.config.get_args`` — the copy build_engine seeded from
@@ -146,6 +147,23 @@ def validate_sga_args(args=None) -> None:
     from sga.plugins import plugin_class, register_default_plugins
 
     register_default_plugins()
+
+    # --- checks master switch (derived write-back, megatron style) ---
+    # False forces every consistency sub-flag off. A sub-flag explicitly
+    # set true under a false master is master-override semantics, NOT a
+    # dead-knob error: the sub-flags default true, so "explicitly true"
+    # is indistinguishable from "unset" and cannot be refused. The
+    # write-back lands on the CALLER's namespace: the launcher's
+    # pre-validation namespace is discarded after validation (the flag
+    # emission face regenerates from the yaml independently), while the
+    # build_engine route writes the sga singleton after seeding and
+    # before the engine constructor caches the resolved flags — the
+    # megatron namespace keeps the user's original spelling, so the
+    # resume guard comparison face is unaffected. Idempotent.
+    if not args.sga_checks:
+        for _dest in (d for d in sga_defaults()
+                      if d.startswith("sga_checks_")):
+            setattr(args, _dest, False)
 
     # --- required when enabled ---
     if args.sga_score is None:
