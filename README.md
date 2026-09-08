@@ -12,11 +12,40 @@ error_feedback × backend) is pure configuration, not code.
   pretrain implementations and stock GPT build chain verbatim.
 - `sga/plugins/`, `sga/backends/` — reserved for SGA algorithm plugins and
   gradient-sync backends (day-one backend: `dense`).
+- `sga/replay.py`, `sga/replay_fused.py` — offline replay oracle: record a
+  training window once (shadow-mode trace), then sweep any
+  score × ratio × cycle-length configuration offline; the fused engine
+  streams the window once for a whole config group, sharded across GPUs
+  with an exact distributed top-k and a reusable dense-reference cache
+  (see docs/fused_replay.md).
 - `examples/llama3/train_1b_dense.yaml` — dense llama 1B config.
 - `tests/` — unit tests + the megatron arg audit tool.
 - `env.sh` — environment single source of truth (megatron source resolution +
   anti-shadowing assertion); `setup.sh` — environment/manifest check;
   `manifest.yaml` — expected sibling-repo states.
+
+## Offline replay (fused)
+
+SGA scheme research needs "what would training look like under a different
+selection scheme?" answered many times. Record a training window once
+(`sga_trace_dir` + `sga_trace_branch_points` + `sga_trace_window` on a
+shadow run), then replay any configuration offline — the fused engine
+advances a whole group of score × ratio arms over a single window pass,
+sharded across GPUs, reproducing per-config replay bitwise (single shard)
+or within the frozen pure-reordering band (multi-shard). The branch point
+is a global training step number (train iteration): `--branch-point 40`
+replays from the optimizer-state snapshot saved at the 40th train
+iteration, consuming the `--window` recorded gradient steps after it
+(steps 41..1040 for `--window 1000`):
+
+    CUDA_VISIBLE_DEVICES=0,...,7 python -m sga.replay \
+        --trace-dir <trace> --branch-point 40 --window 1000 \
+        --ratios 20,30,40 --score-names abs_m,update \
+        --replay-mode cycle --cycle-len 20 --device cuda --fused-shards 8 \
+        --dense-cache <cache-dir> --out report.json
+
+Details, precision guarantees, and a full parameter reference:
+[docs/fused_replay.md](docs/fused_replay.md) (中文).
 
 ## Quick start (in the training container)
 
