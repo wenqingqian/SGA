@@ -456,6 +456,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m sga.replay \
 | `--fused` | 关 | **已废弃 no-op** (旧行为现已无条件生效); 报告 `config.fused` 仅回显此 flag, 生效引擎看 `config.fused_effective` |
 | `--fused-shards` | 8 | 分片进程数 = 用到的 GPU 数 (分片 r → 第 r 块可见卡) |
 | `--fused-max-configs` | 12 | 单趟同时推进的 (分数×比例) 数; 组内每配置优化器状态驻留显存, 显存紧张可调小 |
+| `--fused-g-residency` | 关 | 每步梯度切片一次上传显存驻留, 全配置 × 3 pass 共享 (数值逐位不变; §6.7) |
+| `--fused-dev-reduce` | 关 | 范数/视界分子改设备端 fp64 累加, 每 pass 一次主机同步 (数值逐位不变; §6.7) |
 | `--device` | cpu | `cpu` 或 `cuda`; `cuda:N` 不支持 (分片固定映射, 报错有提示) |
 | `--replay-dtype` / `--norm-dtype` | fp64 / fp64 | 重放算术精度 / 每步范数累加精度 (`fp32` 偏差有冻结带覆盖, 一般不动) |
 | `--trace-dtype` | fp32 | trace 存储精度; bf16 副本须填 `bf16` (§6.4) |
@@ -510,6 +512,25 @@ branches["40"]
 | `--score-names [...] not a registered score` | 分数名拼错; 可用名见注册表 (`update`/`abs_g`/`abs_m`/`coi`) |
 | `shard_select requires finite scores` | 分数出现 NaN/Inf, 查 trace 完整性与分数配置 |
 | `k > N` | 比例换算的 k 超过总坐标数, 查 `--ratios` |
+
+### 6.7 加速旗标与计时
+
+两个 opt-in 加速旗标, 默认关; 开启后报告值与关闭时**逐位恒等** (上传/升精度/除法都是逐元素可交换运算, 归约加数与合并序不变), 只是执行策略变快:
+
+- `--fused-g-residency` — 每步把本片各参数的梯度切片**一次性**上传显存驻留, 组内全部配置 × 3 个流式 pass 共享同一份。旧路径每配置每 pass 重复上传同一批字节 (profile 实测冗余 24×, 每 rank 每 pass ~6.9 GB H2D); 驻留后每步每参数只剩一次上传。CUDA 下预取线程改用锁页缓冲 + `non_blocking` (host 不阻塞; H2D 本身仍在流上串行); 边界步无梯度载荷时读缓存的设备端零张量。内存口径: 驻留量 = 本片每参数切片全量, 与 `--chunk-mb` 工作集预算**无关**, 每步的 clip 系数除法瞬时再翻倍, 锁页主机内存约 (depth+1) 步切片。
+- `--fused-dev-reduce` — pass1 clip 范数分子与 pass3 视界分子改为逐配置 fp64 **设备标量**累加, 每 pass 一次主机同步。旧路径每 chunk 一次 `float()` 同步 (profile 实测每 rank 每千步 6 万-44 万次)。
+
+环境变量 `REPLAY_S0_PROFILE=1` 输出每配置组诊断计数 (主机同步数 / gloo 次数 / 每 pass H2D 字节与耗时 / 显存峰), 并在 rank0 报告 fragment 附 `s0_profile` 键。计数是诊断口径而非精确测量: 驻留模式下共享上传全部记入 pass1, `mem_peak_gb` 是进程生命周期累计。
+
+实测 (llama-1B 真实训练 trace, 1000 步窗口 × 12 配置, 8×A100-40GB, bf16 trace + fp32 重放):
+
+| 配置 | 稳态耗时 | 相对基线 |
+|---|---|---|
+| 旗标关 (三趟均值, CV 1.3%) | 6452 s | 1× |
+| 仅 `--fused-g-residency` | 5220 s | 1.24× |
+| 双旗标 + 预取切片先行 | 2906 s | 2.22× |
+
+仅驻留时 pass 计时合计只占墙钟 ~13% (profile 归因), 其余耗在预取线程的全载荷升精度; 预取改为"先切本片窗口再升精度"后该份额消除, 上表末行即终态组合 (小窗 w100 口径同向: 双旗标 1405 s vs 基线 2254 s)。`--chunk-mb` 在驻留下不再影响耗时 (旧路径 c512 的 -12.5% 收益正来自已消除的 per-config 上传冗余)。全部组合逐位恒等 (A/B 对照相干 trace 产物 rel==0)。
 
 ## 7. 边界与限制
 

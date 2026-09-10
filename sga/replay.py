@@ -1417,6 +1417,31 @@ def main(argv=None):
                     help="arms (score x ratio) advanced per fused window "
                          "pass in --replay-mode cycle (config group size; "
                          "state memory per group scales with this)")
+    ap.add_argument("--fused-g-residency", action="store_true",
+                    help="upload each step's local g slices to the device "
+                         "once and share the resident copy across every "
+                         "config and all three streaming passes instead of "
+                         "re-uploading per config per pass (bitwise "
+                         "identical arithmetic; the pinned host buffers "
+                         "plus non_blocking keep the HOST unblocked, the "
+                         "H2D itself still serializes on the compute "
+                         "stream). Memory: "
+                         "residency holds full per-entry g slices on "
+                         "device per step (independent of the --chunk-mb "
+                         "working-set budget; the per-step divide "
+                         "transiently doubles that footprint) and on CUDA "
+                         "pins ~depth+1 steps of shard g slices in "
+                         "page-locked host memory (sizeable at production "
+                         "shard sizes)")
+    ap.add_argument("--fused-dev-reduce", action="store_true",
+                    help="accumulate the pass-1 clip norms and pass-3 "
+                         "horizon numerators in per-config device scalars "
+                         "and fetch them once per pass instead of a host "
+                         "sync per chunk per config (same addends in the "
+                         "same order, so bitwise identical; at most one "
+                         "host sync per pass per step — the clip-norm "
+                         "fetch every step, plus the horizon fetch only "
+                         "on steps where a horizon lands)")
     ap.add_argument("--score-names", default=None,
                     help="comma list restricting the score set (validated "
                          "against the framework score registry). Default: all "
@@ -1578,6 +1603,8 @@ def main(argv=None):
             "fused_effective": args.fused or args.replay_mode == "cycle",
             "fused_shards": args.fused_shards,
             "fused_max_configs": args.fused_max_configs,
+            "fused_g_residency": args.fused_g_residency,
+            "fused_dev_reduce": args.fused_dev_reduce,
             "score_names": args.score_names,
             "window": args.window,
             "seed": args.seed,

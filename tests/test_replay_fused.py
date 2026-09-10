@@ -32,6 +32,12 @@ classic in-process cycle replay was removed; cycle auto-routes here):
 6. CUDA smoke (skipped without a GPU): world=1 on cuda (dense via
    dense_replay_dev) matches the from-spec reference within the
    sanitize/report band.
+7. Perf-flag mechanism (not just report values): the --fused-g-residency
+   / --fused-dev-reduce echoes, the REPLAY_S0_PROFILE counters carried in
+   the fragment (residency books every shared H2D byte to pass 1,
+   dev-reduce collapses the host syncs to the per-pass fetches), the
+   pinned prefetcher buffers on CUDA, and a --trace-dtype bf16 leg of
+   the slice-first prefetcher (reference anchor + bitwise fp32-twin A/B).
 """
 import io
 import json
@@ -46,7 +52,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from sga import replay as soa
+from sga import replay_fused
 from test_replay_cycle import reference_cycle
+
+# runners may export REPLAY_S0_PROFILE globally for their GPU arms; the
+# suite must stay immune (the s0_profile fragment key carries wall-clock
+# counters that break the bitwise A/Bs). Tests that need it set it
+# themselves. Covers both the pytest and the main() entry paths.
+if "REPLAY_S0_PROFILE" in os.environ:
+    del os.environ["REPLAY_S0_PROFILE"]
+    replay_fused._S0_PROFILE = False
 
 
 B1, B2, EPS, WD = 0.9, 0.95, 1e-8, 0.1
@@ -62,11 +77,13 @@ NAMES = [f"p{i}" for i in range(len(SIZES))]
 N_TOTAL = sum(SIZES)
 
 
-def _make_trace_multi(tmpdir, pre_grads, lrs, clip, t0, absent=None):
+def _make_trace_multi(tmpdir, pre_grads, lrs, clip, t0, absent=None,
+                      payload_dtype=torch.float32):
     """Multi-param synthetic trace; ``absent`` maps step-index -> param name
     that is missing from that step's g payload (the zero-fill path).
-    Returns (w0s, m0s, v0s, g0) so from-spec references can replay the exact
-    saved branch state."""
+    ``payload_dtype`` is the stored g dtype (bf16 for --trace-dtype bf16
+    screening-copy fixtures). Returns (w0s, m0s, v0s, g0) so from-spec
+    references can replay the exact saved branch state."""
     absent = absent or {}
     torch.save({"catalog": {n: {"shape": [s]}
                             for n, s in zip(NAMES, SIZES)}},
@@ -86,7 +103,7 @@ def _make_trace_multi(tmpdir, pre_grads, lrs, clip, t0, absent=None):
         coef = 1.0
         if clip > 0.0:
             coef = min(1.0, clip / (norm + 1.0e-6))
-        payload = {n: (pre[n] * coef).float()
+        payload = {n: (pre[n] * coef).to(payload_dtype)
                    for n in NAMES if absent.get(si) != n}
         meta = {"lr": [lrs[si]], "grad_norm": norm, "clip_grad": clip,
                 "adam_beta1": B1, "adam_beta2": B2, "adam_eps": EPS,
@@ -100,7 +117,7 @@ def _make_trace_multi(tmpdir, pre_grads, lrs, clip, t0, absent=None):
     return w0s, m0s, v0s, g0
 
 
-def _build_fixture(tmpdir):
+def _build_fixture(tmpdir, payload_dtype=torch.float32):
     """Clipped 6-step trace (the clip binds every step), 3 params, p2 absent
     at the si=2 boundary and p1 absent at the si=3 masked step. Returns
     everything a from-spec reference needs (the state's g — the
@@ -113,7 +130,8 @@ def _build_fixture(tmpdir):
            for _ in range(W)]
     absent = {2: "p2", 3: "p1"}
     w0s, m0s, v0s, g0s = _make_trace_multi(tmpdir, pre, lrs, clip, t0,
-                                           absent=absent)
+                                           absent=absent,
+                                           payload_dtype=payload_dtype)
     return t0, W, pre, lrs, clip, absent, w0s, m0s, v0s, g0s
 
 
@@ -139,14 +157,16 @@ def _close(a, b, rel):
 
 
 def _ref_distortion(pre, lrs, clip, t0, absent, w0s, m0s, v0s, g0s, score,
-                    ratio, T, W):
+                    ratio, T, W, payload_dtype=torch.float32):
     """From-spec distortion {str(h): num/den} for one score x ratio arm on
     the multi-param fixture (params concatenated in catalog order — the
     engine's flat index space). Rebuilds the exact logged gradients and
     meta norms the fixture writer produced (the trace inputs the engine
     and the reference both consume); absent params replay as zero
     gradients; g0s is the branch state's g — the branch-point selection
-    input."""
+    input. ``payload_dtype`` mirrors the stored g dtype: the reference
+    quantizes the logged gradients exactly as the fixture writer did
+    (bf16 payloads reach the engine upcast to fp32)."""
     w0 = torch.cat([w0s[n] for n in NAMES]).double()
     m0 = torch.cat([m0s[n] for n in NAMES]).double()
     v0 = torch.cat([v0s[n] for n in NAMES]).double()
@@ -159,7 +179,7 @@ def _ref_distortion(pre, lrs, clip, t0, absent, w0s, m0s, v0s, g0s, score,
         norm = norm ** 0.5
         coef = min(1.0, clip / (norm + 1.0e-6)) if clip > 0.0 else 1.0
         parts = [torch.zeros(SIZES[i]) if absent.get(si) == n
-                 else (g[n] * coef).float().double()
+                 else (g[n] * coef).to(payload_dtype).float().double()
                  for i, n in enumerate(NAMES)]
         logged_flat.append(torch.cat(parts))
         norms.append(norm)
@@ -185,7 +205,9 @@ def _assert_ref_anchor(report, t0, ref_args, horizons):
             got = report["branch_results"][str(t0)]["per_ratio"][str(r)] \
                 ["scores"][s]["distortion"]
             want = _ref_distortion(*ref_args["fixture"], s, r,
-                                   ref_args["T"], ref_args["W"])
+                                   ref_args["T"], ref_args["W"],
+                                   payload_dtype=ref_args.get(
+                                       "payload_dtype", torch.float32))
             for h in horizons:
                 g, w = got[str(h)], want[str(h)]
                 assert (g is None) == (w is None), (s, r, h, g, w)
@@ -230,6 +252,8 @@ def test_fused_world1_bitwise():
         assert noop["config"]["fused_max_configs"] == 2
         assert noop["config"]["fused"] is True  # CLI echo of --fused
         assert noop["config"]["fused_effective"] is True
+        # env-gated: no s0_profile key unless REPLAY_S0_PROFILE=1
+        assert "s0_profile" not in hit["branch_results"][str(t0)]
         a = json.dumps(hit["branch_results"], sort_keys=True)
         b = json.dumps(noop["branch_results"], sort_keys=True)
         assert a == b, "--fused (deprecated no-op) changed the report"
@@ -420,6 +444,309 @@ def test_fused_cuda_world1():
     print("PASS test_fused_cuda_world1")
 
 
+def test_fused_bf16_trace_world1():
+    """--trace-dtype bf16 (screening copies): the prefetcher's unconditional
+    slice-first leg (slice the mmap'd bf16 payload, THEN widen) exercised
+    three ways — (a) a loud rejection when the bf16 fixture is met with the
+    fp32 declaration, so this test cannot silently degrade into an fp32
+    duplicate; (b) the from-spec reference with the identical bf16->fp32
+    upcast mirrored in the logged gradients; (c) a bitwise A/B against a
+    fused run on the fp32 twin trace (the same payloads pre-upcast at
+    rest, i.e. exactly what the bf16 load hands the engine)."""
+    with tempfile.TemporaryDirectory() as td:
+        bf16_dir = os.path.join(td, "bf16")
+        os.makedirs(bf16_dir)
+        (t0, W, pre, lrs, clip, absent, w0s, m0s, v0s, g0s) = \
+            _build_fixture(bf16_dir, payload_dtype=torch.bfloat16)
+        cache = os.path.join(bf16_dir, "dense_cache")
+        try:
+            _run(_base_args(bf16_dir, cache, t0, ["--fused-shards", "1"]))
+        except ValueError as e:
+            assert "--trace-dtype" in str(e), str(e)
+        else:
+            raise AssertionError(
+                "bf16 payload accepted with --trace-dtype fp32")
+        report = _run(_base_args(bf16_dir, cache, t0,
+                                 ["--fused-shards", "1",
+                                  "--trace-dtype", "bf16"]))
+        assert report["config"]["trace_dtype"] == "bf16"
+        assert report["branch_results"][str(t0)]["replay"][
+            "trace_dtype"] == "bf16"
+        ref_args = {
+            "fixture": (pre, lrs, clip, t0, absent, w0s, m0s, v0s, g0s),
+            "ratios": (20.0, 30.0), "scores": ("abs_g", "update"),
+            "T": 2, "W": W, "payload_dtype": torch.bfloat16,
+        }
+        _assert_ref_anchor(report, t0, ref_args, ("1", "3", "6"))
+        # fp32 twin: identical payloads pre-upcast at rest — every replay
+        # path must consume exactly the same fp32 inputs either way, so
+        # the two fused runs are bit-identical (the dense caches populate
+        # separately per trace_dtype ident; both arms are populate runs,
+        # so dense_cache_hit matches)
+        twin = os.path.join(td, "twin_fp32")
+        os.makedirs(twin)
+        for f in os.listdir(bf16_dir):
+            src_path = os.path.join(bf16_dir, f)
+            if f.endswith("_g.pt"):
+                d = torch.load(src_path, weights_only=False)
+                for k, t in d["payload"].items():
+                    d["payload"][k] = t.float()
+                torch.save(d, os.path.join(twin, f))
+            elif f == "catalog.pt" or f.endswith("_state.pt"):
+                torch.save(torch.load(src_path, weights_only=False),
+                           os.path.join(twin, f))
+        twin_rep = _run(_base_args(twin, os.path.join(twin, "dense_cache"),
+                                   t0, ["--fused-shards", "1"]))
+        for rep in (report, twin_rep):
+            rep["branch_results"][str(t0)]["replay"].pop("trace_dtype")
+        assert _deep_eq_nan(report["branch_results"],
+                            twin_rep["branch_results"]), \
+            "the bf16 load path diverged from its fp32 twin"
+    print("PASS test_fused_bf16_trace_world1")
+
+
+def _deep_eq_nan(a, b):
+    """Deep equality treating NaN == NaN: the fixture's grad_norm is NaN,
+    and dict == compares two distinct NaN objects as unequal even when the
+    reports are bit-identical."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(
+            _deep_eq_nan(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(
+            _deep_eq_nan(x, y) for x, y in zip(a, b))
+    if isinstance(a, float) and isinstance(b, float):
+        return a == b or (a != a and b != b)
+    return type(a) is type(b) and a == b
+
+
+def test_g_residency_bitwise():
+    """--fused-g-residency uploads each step's g slices once and shares the
+    resident copy across configs and passes 1/2/3 (boundary steps missing a
+    g payload read a cached device zeros buffer). The arithmetic per element
+    is unchanged, so the whole report must be bit-identical to the default
+    per-chunk-upload path (world 1 and 2, warm cache)."""
+    with tempfile.TemporaryDirectory() as td:
+        t0, *_ = _build_fixture(td)
+        cache = os.path.join(td, "dense_cache")
+        # warm the cache first: the populating run reports
+        # dense_cache_hit False and must not sit in the A/B
+        _run(_base_args(td, cache, t0, ["--fused-shards", "1"]))
+        for shards in ("1", "2"):
+            base = _run(_base_args(td, cache, t0,
+                                   ["--fused-shards", shards]))
+            res = _run(_base_args(td, cache, t0,
+                                  ["--fused-shards", shards,
+                                   "--fused-g-residency"]))
+            assert base["config"]["fused_g_residency"] is False
+            assert res["config"]["fused_g_residency"] is True
+            assert res["branch_results"][str(t0)]["replay"][
+                "g_residency"] is True
+            assert base["branch_results"][str(t0)]["replay"][
+                "g_residency"] is False
+            # strip the provenance echoes; everything else must be identical
+            res["config"].pop("fused_g_residency")
+            base["config"].pop("fused_g_residency")
+            res["branch_results"][str(t0)]["replay"].pop("g_residency")
+            base["branch_results"][str(t0)]["replay"].pop("g_residency")
+            assert _deep_eq_nan(base, res), \
+                f"residency moved a bit (shards={shards})"
+    print("PASS test_g_residency_bitwise")
+
+
+def test_g_residency_cuda_pinned():
+    """On CUDA the residency path also pins the prefetcher's host buffers
+    (async H2D). Numbers stay bit-identical to the unpinned default path
+    (world 1 wherever a GPU is visible; the world-2 leg needs 2 GPUs)."""
+    if not torch.cuda.is_available():
+        print("SKIP test_g_residency_cuda_pinned (no CUDA)")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        t0, *_ = _build_fixture(td)
+        cache = os.path.join(td, "dense_cache")
+        # the dense-cache ident is world-independent: one warm run serves
+        # both shard legs (the populating run reports dense_cache_hit False
+        # and must not sit in the A/B)
+        _run(_base_args(td, cache, t0, ["--device", "cuda",
+                                        "--fused-shards", "1"]))
+        # pin is world-independent (pin=(residency and device != cpu)), so
+        # world 1 already exercises it; world 2 only where 2 GPUs are up
+        shard_legs = ["1"]
+        if torch.cuda.device_count() >= 2:
+            shard_legs.append("2")
+        else:
+            print("NOTE test_g_residency_cuda_pinned: world-2 leg skipped "
+                  "(needs 2 visible GPUs)")
+        for shards in shard_legs:
+            common = ["--device", "cuda", "--fused-shards", shards]
+            base = _run(_base_args(td, cache, t0, common))
+            res = _run(_base_args(td, cache, t0,
+                                  [*common, "--fused-g-residency"]))
+            assert res["config"]["fused_g_residency"] is True
+            for rep in (base, res):
+                rep["config"].pop("fused_g_residency")
+                rep["branch_results"][str(t0)]["replay"].pop("g_residency")
+            assert _deep_eq_nan(base, res), f"shards={shards}"
+    print("PASS test_g_residency_cuda_pinned")
+
+
+def test_gprefetcher_pinned_buffers():
+    """GPrefetcher(pin=True) — the construction the CUDA residency path
+    makes (pin=(residency and device != cpu)) — hands the consumer pinned
+    fp32 host buffers, so the H2D can go out with non_blocking. Needs a
+    CUDA context (pin_memory), skipped without one."""
+    if not torch.cuda.is_available():
+        print("SKIP test_gprefetcher_pinned_buffers (no CUDA)")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        t0, W = _build_fixture(td)[0:2]
+        catalog, names, offsets, N, state_files, g_files = \
+            soa.discover_trace(td)
+        sp = replay_fused.ShardParams(names, catalog,
+                                      {**BASE_META, "step": t0}, 0, N)
+        window_steps = soa.window_steps_for(g_files, t0, W)
+        pre = replay_fused.GPrefetcher(g_files, window_steps, sp, False,
+                                       pin=True)
+        # one generator only: each __iter__() call restarts q.get() from
+        # scratch, but the producer emits exactly len(window_steps) items —
+        # a second iterator would wait forever for items already consumed
+        it = iter(pre)
+        _gstep, _gmeta, local = next(it)
+        assert set(local) == set(names)
+        for t in local.values():
+            assert t.is_pinned()
+            assert t.dtype == torch.float32
+        for _ in it:  # drain: let the producer thread finish cleanly
+            pass
+    print("PASS test_gprefetcher_pinned_buffers")
+
+
+def test_dev_reduce_bitwise():
+    """--fused-dev-reduce accumulates the pass-1 clip norms and pass-3
+    horizon numerators in per-config fp64 device scalars fetched once per
+    pass. The addends and their order are unchanged, so the whole report
+    must be bit-identical to the per-chunk host-sync path (world 1 and 2,
+    warm cache, both norm dtypes; on CUDA also combined with residency)."""
+    with tempfile.TemporaryDirectory() as td:
+        t0, *_ = _build_fixture(td)
+        cache = os.path.join(td, "dense_cache")
+        _run(_base_args(td, cache, t0, ["--fused-shards", "1"]))
+        for shards in ("1", "2"):
+            for nd in ("fp64", "fp32"):
+                base = _run(_base_args(td, cache, t0,
+                                       ["--fused-shards", shards,
+                                        "--norm-dtype", nd]))
+                red = _run(_base_args(td, cache, t0,
+                                      ["--fused-shards", shards,
+                                       "--norm-dtype", nd,
+                                       "--fused-dev-reduce"]))
+                assert base["config"]["fused_dev_reduce"] is False
+                assert red["config"]["fused_dev_reduce"] is True
+                for rep in (base, red):
+                    rep["config"].pop("fused_dev_reduce")
+                    frag = rep["branch_results"][str(t0)]
+                    frag["replay"].pop("dev_reduce")
+                assert _deep_eq_nan(base, red), \
+                    f"dev_reduce moved a bit (shards={shards} nd={nd})"
+    print("PASS test_dev_reduce_bitwise")
+
+
+def test_dev_reduce_cuda():
+    """CUDA leg: dev-reduce alone and stacked with g residency (the
+    intended production combo) both stay bit-identical AND echo the flags
+    (world 1 wherever a GPU is visible; the world-2 leg needs 2 GPUs)."""
+    if not torch.cuda.is_available():
+        print("SKIP test_dev_reduce_cuda (no CUDA)")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        t0, *_ = _build_fixture(td)
+        cache = os.path.join(td, "dense_cache")
+        _run(_base_args(td, cache, t0, ["--device", "cuda",
+                                        "--fused-shards", "1"]))
+        shard_legs = ["1"]
+        if torch.cuda.device_count() >= 2:
+            shard_legs.append("2")
+        else:
+            print("NOTE test_dev_reduce_cuda: world-2 leg skipped (needs "
+                  "2 visible GPUs)")
+        for shards in shard_legs:
+            common = ["--device", "cuda", "--fused-shards", shards]
+            base = _run(_base_args(td, cache, t0, common))
+            red = _run(_base_args(td, cache, t0,
+                                  [*common, "--fused-dev-reduce"]))
+            combo = _run(_base_args(td, cache, t0,
+                                    [*common, "--fused-dev-reduce",
+                                     "--fused-g-residency"]))
+            # the flags must do more than parse: the single-flag run
+            # reports dev_reduce with residency off, the combo both
+            assert red["config"]["fused_dev_reduce"] is True
+            assert red["config"]["fused_g_residency"] is False
+            assert red["branch_results"][str(t0)]["replay"][
+                "dev_reduce"] is True
+            assert red["branch_results"][str(t0)]["replay"][
+                "g_residency"] is False
+            assert combo["config"]["fused_dev_reduce"] is True
+            assert combo["config"]["fused_g_residency"] is True
+            assert combo["branch_results"][str(t0)]["replay"][
+                "dev_reduce"] is True
+            assert combo["branch_results"][str(t0)]["replay"][
+                "g_residency"] is True
+            for rep in (base, red, combo):
+                rep["config"].pop("fused_dev_reduce")
+                rep["config"].pop("fused_g_residency")
+                frag = rep["branch_results"][str(t0)]
+                frag["replay"].pop("dev_reduce")
+                frag["replay"].pop("g_residency")
+            assert _deep_eq_nan(base, red), f"shards={shards}"
+            assert _deep_eq_nan(base, combo), f"shards={shards}"
+    print("PASS test_dev_reduce_cuda")
+
+
+def test_s0_profile_counters():
+    """REPLAY_S0_PROFILE=1 (env-gated diagnostic): the fragment gains one
+    counter dict per config group and the S0PROFILE line prints. With
+    residency on, every shared upload byte is booked to pass 1 (p2/p3
+    stay 0); with dev-reduce on, host syncs collapse to the per-pass
+    fetches (one per step, plus the horizon fetch when a horizon lands)
+    instead of the per-chunk storm. The gate binds at import, so the test
+    sets the env AND the module flag, restored in finally (monkeypatch
+    semantics without a pytest fixture, so main() below keeps working)."""
+    old_env = os.environ.get("REPLAY_S0_PROFILE")
+    old_gate = replay_fused._S0_PROFILE
+    os.environ["REPLAY_S0_PROFILE"] = "1"
+    replay_fused._S0_PROFILE = True
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            t0, W = _build_fixture(td)[0:2]
+            cache = os.path.join(td, "dense_cache")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                report = soa.main(_base_args(
+                    td, cache, t0,
+                    ["--fused-shards", "1", "--fused-g-residency",
+                     "--fused-dev-reduce"]))
+            assert "S0PROFILE" in buf.getvalue()
+            profs = report["branch_results"][str(t0)]["s0_profile"]
+            assert isinstance(profs, list) and profs
+            for prof in profs:
+                for key in ("sync", "ar", "h2d"):
+                    assert key in prof, key
+                # residency books every shared upload to pass 1
+                assert prof["h2d"][0] > 0
+                assert prof["h2d"][1] == 0 and prof["h2d"][2] == 0
+                # dev-reduce: one norm fetch per step plus one horizon
+                # fetch on the 3 horizon steps of this window — generous
+                # bound, but far under the per-chunk sync storm
+                assert prof["sync"] <= 2 * W, (prof["sync"], W)
+    finally:
+        if old_env is None:
+            os.environ.pop("REPLAY_S0_PROFILE", None)
+        else:
+            os.environ["REPLAY_S0_PROFILE"] = old_env
+        replay_fused._S0_PROFILE = old_gate
+    print("PASS test_s0_profile_counters")
+
+
 def main():
     test_fused_world1_bitwise()
     test_fused_world2_band()
@@ -427,6 +754,13 @@ def main():
     test_fused_cold_cache_world2()
     test_fused_cli_gates()
     test_fused_cuda_world1()
+    test_fused_bf16_trace_world1()
+    test_g_residency_bitwise()
+    test_g_residency_cuda_pinned()
+    test_gprefetcher_pinned_buffers()
+    test_dev_reduce_bitwise()
+    test_dev_reduce_cuda()
+    test_s0_profile_counters()
     print("\nall replay-fused tests passed")
 
 

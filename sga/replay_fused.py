@@ -49,6 +49,10 @@ import queue
 import torch
 import torch.distributed as dist
 
+# opt-in S0 profile (plan-level speedup baseline): counts host syncs / gloo
+# ops / H2D bytes per pass and per-pass wall time; zero effect when unset
+_S0_PROFILE = os.environ.get("REPLAY_S0_PROFILE", "") == "1"
+
 
 # ----------------------------------------------------------------------------
 # small comms wrapper: exact reductions, identity when world == 1
@@ -274,9 +278,13 @@ class GPrefetcher:
     contiguous fp32 CPU tensors (page-cache faults + upcast overlap the
     compute of the current step); the compute side only pays the H2D."""
 
-    def __init__(self, g_files, window_steps, sp, upcast_bf16, depth=2):
+    def __init__(self, g_files, window_steps, sp, upcast_bf16, depth=2,
+                 pin=False):
         self.g_files, self.window_steps, self.sp = g_files, window_steps, sp
         self.upcast_bf16 = upcast_bf16
+        # pinned host buffers make the consumer's H2D non_blocking-able;
+        # requires CUDA (callers gate this on the device)
+        self.pin = pin
         self.q = queue.Queue(maxsize=depth)
         self.exc = None
         threading.Thread(target=self._run, daemon=True).start()
@@ -294,15 +302,29 @@ class GPrefetcher:
                         f"{self.g_files[gstep]}: bf16 payload(s) {bf16_keys} "
                         "but --trace-dtype is fp32; rerun with --trace-dtype "
                         "bf16 (payloads are upcast to fp32 at load)")
-                for k in bf16_keys:
-                    pl[k] = pl[k].float()
+                # no full-payload upcast: each entry slices its window of
+                # the mmap'd payload FIRST and upcasts just that slice
+                # (slicing and the elementwise upcast commute, so the
+                # values are identical — but only the slice's pages fault
+                # and only the slice is converted)
                 local = {}
                 for e in self.sp.entries:
                     t = pl.get(e["name"])
                     if t is None:
                         continue
-                    local[e["name"]] = t.reshape(-1)[e["p_off"]:e["p_off"]
-                                                    + e["n"]].clone()
+                    src = t.reshape(-1)[e["p_off"]:e["p_off"] + e["n"]]
+                    out_dtype = (torch.float32
+                                 if src.dtype == torch.bfloat16
+                                 else src.dtype)
+                    if self.pin:
+                        buf = torch.empty(src.shape, dtype=out_dtype,
+                                          pin_memory=True)
+                        buf.copy_(src)
+                        local[e["name"]] = buf
+                    elif out_dtype is not src.dtype:
+                        local[e["name"]] = src.float()
+                    else:
+                        local[e["name"]] = src.clone()
                 self.q.put((gstep, d["meta"], local))
         except BaseException as e:
             # die loudly in the consumer instead of leaving it blocked on
@@ -458,6 +480,9 @@ def _worker(rank, world, cfg, port, frag_path):
     groups = [configs[i:i + cfg["max_configs"]]
               for i in range(0, len(configs), cfg["max_configs"])]
     num_at = {(s, r): {} for s in score_names for r in ratios}
+    # one counter dict per config group, stashed into shard 0's fragment
+    # alongside the S0PROFILE print (env-gated: None when the env is absent)
+    s0_profs = [] if _S0_PROFILE else None
     t_pass0 = time.time()
     for gi, group in enumerate(groups):
         states = {}
@@ -480,36 +505,107 @@ def _worker(rank, world, cfg, port, frag_path):
                                    torch.finfo(replay_dtype).bits // 8)
         norm_fp32 = cfg["norm_fp32"]
 
-        pre = GPrefetcher(g_files, window_steps, sp, cfg["upcast_bf16"])
+        res_on = bool(cfg.get("g_residency"))
+        red_on = bool(cfg.get("dev_reduce"))
+        pre = GPrefetcher(g_files, window_steps, sp, cfg["upcast_bf16"],
+                          pin=(res_on and dev != "cpu"))
+        # boundary steps without a g payload read zeros; the resident path
+        # caches one device zeros buffer per entry instead of materializing
+        # a host zeros tensor per (config, entry, step)
+        zeros_dev = {}
+        # S0 counters are diagnostic labels, not exact measurements:
+        # gloo_ar counts logical sum_f64 calls (nonzero even at world 1,
+        # where the op is an identity), syncs counts only the norm/numerator
+        # fetches, mem_peak_gb (printed at group end) is the process-lifetime
+        # cumulative peak, and residency books every shared upload byte to
+        # pass 1
+        prof = {"sync": 0, "ar": 0, "h2d": [0, 0, 0],
+                "pt": [0.0, 0.0, 0.0]} if _S0_PROFILE else None
         for si, (_gstep, gmeta, local) in enumerate(pre):
             coef_dense, _flag = R.coef_dense_for(gmeta)
             clip_grad = float(gmeta.get("clip_grad", 0.0))
             count = t0 + si + 1
             boundary = (si % cfg["cycle_len"] == 0)
+            if res_on:
+                # one H2D per entry per step, shared by every config and
+                # all three passes (the legacy path re-uploads per config
+                # per pass: max_configs x passes x the same bytes). The
+                # coef_dense division is per-step too, so it is folded in
+                # here once instead of per chunk per config per pass —
+                # elementwise, identical values either way.
+                g_res = {}
+                for e in sp.entries:
+                    if e["name"] in local:
+                        g_res[e["name"]] = local[e["name"]].to(
+                            dev, non_blocking=(dev != "cpu"))
+                    else:
+                        z = zeros_dev.get(e["name"])
+                        if z is None:
+                            z = torch.zeros(e["n"], dtype=torch.float32,
+                                            device=dev)
+                            zeros_dev[e["name"]] = z
+                        g_res[e["name"]] = z
+                # must stay out-of-place: boundary steps read the cached
+                # zeros_dev buffer, an in-place div_ would corrupt the zeros
+                g_res = {k: t / coef_dense for k, t in g_res.items()}
+                if prof:
+                    prof["h2d"][0] += sum(local[e["name"]].numel()
+                                          for e in sp.entries
+                                          if e["name"] in local)
 
             # pass 1: per-config clip norms (local sums -> fp64 allreduce)
+            _t0p = time.perf_counter() if prof else 0.0
             qn2 = [0.0] * len(group)
+            # dev_reduce: same addends, same chunk order — the per-chunk
+            # device partials land in per-config fp64 device scalars and
+            # reach the host once per pass instead of per chunk
+            qn2_dev = (torch.zeros(len(group), dtype=torch.float64,
+                                   device=dev) if red_on else None)
             for ci, (s, r) in enumerate(group):
                 for e in sp.entries:
                     g = local.get(e["name"])
                     if g is None and not boundary:
                         continue
-                    g_el = (torch.zeros(e["n"], dtype=torch.float32)
-                            if g is None else g)
+                    g_el = None if res_on else (
+                        torch.zeros(e["n"], dtype=torch.float32)
+                        if g is None else g)
                     stt = states[(s, r)][e["name"]]
                     for a in range(0, e["n"], chunk_dev):
                         b = min(e["n"], a + chunk_dev)
-                        gd = g_el[a:b].to(dev) / coef_dense
+                        if res_on:
+                            gd = g_res[e["name"]][a:b]
+                        else:
+                            gd = g_el[a:b].to(dev) / coef_dense
+                            if prof:
+                                prof["h2d"][0] += b - a
                         if boundary:
                             q_pre = gd + stt["res"][a:b]
                         else:
                             q_pre = gd * stt["sel"][a:b]
-                        if norm_fp32:
+                        if red_on:
+                            if norm_fp32:
+                                q32 = q_pre.to(torch.float32)
+                                qn2_dev[ci] += (q32 * q32).sum()
+                            else:
+                                qn2_dev[ci] += (q_pre.double()
+                                                ** 2.0).sum()
+                        elif norm_fp32:
                             q32 = q_pre.to(torch.float32)
                             qn2[ci] += float((q32 * q32).sum())
+                            if prof:
+                                prof["sync"] += 1
                         else:
                             qn2[ci] += float((q_pre.double() ** 2.0).sum())
+                            if prof:
+                                prof["sync"] += 1
+            if red_on:
+                qn2 = qn2_dev.cpu().tolist()
+                if prof:
+                    prof["sync"] += 1
             qn2 = comms.sum_f64(qn2)
+            if prof:
+                prof["ar"] += 1
+                prof["pt"][0] += time.perf_counter() - _t0p
             coefs = []
             for ci in range(len(group)):
                 coef = 1.0
@@ -523,22 +619,30 @@ def _worker(rank, world, cfg, port, frag_path):
             # skip si=0 (sel0 encodes it) and the final boundary (no masked
             # step remains to consume the new mask)
             if boundary and si > 0 and si + 1 < W:
+                _t0p = time.perf_counter() if prof else 0.0
                 for ci, (s, r) in enumerate(group):
                     spec = specs[s]
                     score_flat = torch.empty(sp.n, dtype=torch.float32,
                                              device=dev)
                     for e in sp.entries:
                         g = local.get(e["name"])
-                        g_el = (torch.zeros(e["n"], dtype=torch.float32)
-                                if g is None else g)
+                        g_el = None if res_on else (
+                            torch.zeros(e["n"], dtype=torch.float32)
+                            if g is None else g)
                         stt = states[(s, r)][e["name"]]
                         b1, b2, eps, wd = e["b1"], e["b2"], e["eps"], e["wd"]
                         bc1c = 1.0 - b1 ** count
                         bc2c = 1.0 - b2 ** count
                         for a in range(0, e["n"], chunk_dev):
                             b = min(e["n"], a + chunk_dev)
-                            q = (g_el[a:b].to(dev) / coef_dense
-                                 + stt["res"][a:b]) * coefs[ci]
+                            if res_on:
+                                q = (g_res[e["name"]][a:b]
+                                     + stt["res"][a:b]) * coefs[ci]
+                            else:
+                                q = (g_el[a:b].to(dev) / coef_dense
+                                     + stt["res"][a:b]) * coefs[ci]
+                                if prof:
+                                    prof["h2d"][1] += b - a
                             sc = spec.formula(
                                 stt["ws"][a:b], stt["ms"][a:b],
                                 stt["vs"][a:b], q, b1, b2, eps, wd,
@@ -550,15 +654,22 @@ def _worker(rank, world, cfg, port, frag_path):
                         stt = states[(s, r)][e["name"]]
                         stt["sel"] = newsel[e["a"]:e["a"] + e["n"]].to(dev)
                     del score_flat
+                if prof:
+                    prof["pt"][1] += time.perf_counter() - _t0p
 
             # pass 3: commit + residual + horizon numerators
             hz = (si + 1) if (si + 1) in eff_horizons else None
+            _t0p = time.perf_counter() if prof else 0.0
             num2 = [0.0] * len(group)
+            num2_dev = (torch.zeros(len(group), dtype=torch.float64,
+                                    device=dev)
+                        if (red_on and hz is not None) else None)
             for ci, (s, r) in enumerate(group):
                 for e in sp.entries:
                     g = local.get(e["name"])
-                    g_el = (torch.zeros(e["n"], dtype=torch.float32)
-                            if g is None else g)
+                    g_el = None if res_on else (
+                        torch.zeros(e["n"], dtype=torch.float32)
+                        if g is None else g)
                     stt = states[(s, r)][e["name"]]
                     lr = R._lr_for_step(gmeta, e["group"])
                     b1, b2, eps, wd = e["b1"], e["b2"], e["eps"], e["wd"]
@@ -566,7 +677,12 @@ def _worker(rank, world, cfg, port, frag_path):
                     bc2c = 1.0 - b2 ** count
                     for a in range(0, e["n"], chunk_dev):
                         b = min(e["n"], a + chunk_dev)
-                        gd = g_el[a:b].to(dev) / coef_dense
+                        if res_on:
+                            gd = g_res[e["name"]][a:b]
+                        else:
+                            gd = g_el[a:b].to(dev) / coef_dense
+                            if prof:
+                                prof["h2d"][2] += b - a
                         if boundary:
                             q = (gd + stt["res"][a:b]) * coefs[ci]
                             stt["res"][a:b] = 0.0
@@ -583,9 +699,22 @@ def _worker(rank, world, cfg, port, frag_path):
                             d = (stt["ws"][a:b]
                                  - snap_loc[hz][e["name"]][a:b].to(dev)) \
                                 .double()
-                            num2[ci] += float((d * d).sum())
+                            if red_on:
+                                num2_dev[ci] += (d * d).sum()
+                            else:
+                                num2[ci] += float((d * d).sum())
+                                if prof:
+                                    prof["sync"] += 1
+            if prof:
+                prof["pt"][2] += time.perf_counter() - _t0p
             if hz is not None:
+                if red_on:
+                    num2 = num2_dev.cpu().tolist()
+                    if prof:
+                        prof["sync"] += 1
                 num2 = comms.sum_f64(num2)
+                if prof:
+                    prof["ar"] += 1
                 for ci, (s, r) in enumerate(group):
                     num_at[(s, r)][hz] = math.sqrt(num2[ci])
 
@@ -597,6 +726,20 @@ def _worker(rank, world, cfg, port, frag_path):
                   f"({len(group)} configs) done in "
                   f"{time.time() - t_pass0:.0f}s", flush=True)
             t_pass0 = time.time()
+        if prof:
+            # g slices are fp32 host-side (prefetcher upcasts), 4 B/elem
+            mem_gb = (torch.cuda.max_memory_allocated() / 2 ** 30
+                      if dev != "cpu" else 0.0)
+            print(f"S0PROFILE rank={rank} group={gi} steps={W} "
+                  f"syncs={prof['sync']} gloo_ar={prof['ar']} "
+                  f"h2d_gb_p1={prof['h2d'][0] * 4 / 2 ** 30:.1f} "
+                  f"h2d_gb_p2={prof['h2d'][1] * 4 / 2 ** 30:.1f} "
+                  f"h2d_gb_p3={prof['h2d'][2] * 4 / 2 ** 30:.1f} "
+                  f"pass_s_p1={prof['pt'][0]:.0f} "
+                  f"pass_s_p2={prof['pt'][1]:.0f} "
+                  f"pass_s_p3={prof['pt'][2]:.0f} mem_peak_gb={mem_gb:.1f}",
+                  flush=True)
+            s0_profs.append(dict(prof))
 
     # ---- shard 0 assembles the full branch fragment ------------------------
     out = None
@@ -639,6 +782,8 @@ def _worker(rank, world, cfg, port, frag_path):
                 "dtype": cfg["replay_dtype"],
                 "trace_dtype": cfg["trace_dtype"],
                 "dense_cache_hit": dense_cache_hit,
+                "g_residency": bool(cfg.get("g_residency")),
+                "dev_reduce": bool(cfg.get("dev_reduce")),
                 "per_step": recon_steps,
                 "den_norm_at_horizon": {
                     str(h): den_at.get(h) for h in eff_horizons
@@ -650,6 +795,8 @@ def _worker(rank, world, cfg, port, frag_path):
             "scores": stats,
             "per_ratio": per_ratio,
         }
+        if _S0_PROFILE:
+            out["s0_profile"] = s0_profs
         torch.save(out, frag_path)
     if comms.distributed:
         dist.destroy_process_group()
@@ -789,6 +936,10 @@ def run_fused_branch(args, ctx, t0):
         "device": ("cpu" if args.device == "cpu" else "cuda"),
         "dense_cache": args.dense_cache,
         "max_configs": args.fused_max_configs,
+        # getattr: programmatic callers (tests) build their own argparse
+        # Namespace and must keep defaulting to the legacy upload path
+        "g_residency": getattr(args, "fused_g_residency", False),
+        "dev_reduce": getattr(args, "fused_dev_reduce", False),
         "seed": args.seed,
         "verbose": args.verbose,
     }
