@@ -445,6 +445,20 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m sga.replay \
 
 一场运行评 `|分数| × |比例|` 个配置 (上例 4×3 = 12, 上限 12), 周期由 `--cycle-len` 固定; 扫多个周期就多跑几场 (换 `--cycle-len`, dense 缓存自动复用)。`--branch-point all` 遍历 trace 内全部分支点。首次运行自动填充 dense 缓存 (报告 `dense_cache_hit: false`), 此后所有同 trace/窗口/精度的运行直接命中 (`true`)。
 
+跨多个周期同场混装用 `--cycle-lens 5,100,200` (配置空间 = 分数 × 比例 × 周期全集, 组内任意 T 混装, 混跑与分跑逐位一致); 组大小可交给 `--fused-state-budget-mb` 按常驻状态字节预算自动推导 (§6.7)。
+
+跨节点分片 (2 台 8 卡 → world16) 不换命令面, 加 `--nodes` 即走多机拉起器 (§6.8):
+
+```bash
+python -m sga.replay \
+    --trace-dir /data/traces/run1 --branch-point 40 --window 1000 \
+    --ratios 20,30,40 --score-names abs_g,abs_m,update,coi \
+    --replay-mode cycle --cycle-lens 5,20,100 \
+    --device cuda --fused-shards 16 \
+    --nodes 10.1.2.8,10.1.2.118 \
+    --dense-cache /data/cache/run1 --out report.json
+```
+
 ### 6.3 参数速查
 
 | 参数 | 默认 | 说明 |
@@ -465,6 +479,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m sga.replay \
 | `--fused-state-budget-mb` | 0 (关) | 常驻状态字节预算 (MiB): 组大小改由 `floor(预算 / 每配置状态字节)` 推导, >0 时覆盖 `--fused-max-configs`; 记账口径 = {w,m,v,res} × 重放精度字节 × 最宽分片 (⌈N/world⌉), bool 掩码 / chunk 工作集 / g 驻留缓冲在预算外; llama-1B 8 分片 fp32 每配置 ≈2359 MiB → 30720 推导 R=13 (§6.7) |
 | `--fused-g-residency` | 关 | 每步梯度切片一次上传显存驻留, 全配置 × 3 pass 共享 (数值逐位不变; §6.7) |
 | `--fused-dev-reduce` | 关 | 范数/视界分子改设备端 fp64 累加, 每 pass 一次主机同步 (数值逐位不变; §6.7) |
+| `--nodes` | — | 逗号分隔节点地址表: 走多机拉起器 (§6.8); 本进程须在**首节点**上且与各节点共享同一 NFS 路径视图; 分片 r → 节点 `r // (shards/节点数)` 的 `cuda:(r % 每节点分片数)` |
+| `--ssh-key` | env/祖先目录 | `--nodes` 拉起用的集群私钥 (默认 `$SGA_SSH_KEY`, 再退到 workspace 祖先的 `cluster_ssh_key`) |
+| `--preflight-timeout` | 600 | 多机预检 rendezvous 有界时限 (秒), 到期大声失败并给各节点诊断 |
+| `--run-deadline` | 0 (关) | 运行段可选墙钟上限 (秒): 到期杀掉全部 node-worker 并带各节点日志尾大声失败 (0 = 不设界) |
+| `--launch-log-dir` | — | `--nodes` 运行的各节点日志目录 (缺省: 运行临时文件旁的时间戳目录) |
 | `--device` | cpu | `cpu` 或 `cuda`; `cuda:N` 不支持 (分片固定映射, 报错有提示) |
 | `--replay-dtype` / `--norm-dtype` | fp64 / fp64 | 重放算术精度 / 每步范数累加精度 (`fp32` 偏差有冻结带覆盖, 一般不动) |
 | `--trace-dtype` | fp32 | trace 存储精度; bf16 副本须填 `bf16` (§6.4) |
@@ -542,10 +561,22 @@ branches["40"]
 
 仅驻留时 pass 计时合计只占墙钟 ~13% (profile 归因), 其余耗在预取线程的全载荷升精度; 预取改为"先切本片窗口再升精度"后该份额消除, 上表末行即终态组合 (小窗 w100 口径同向: 双旗标 1405 s vs 基线 2254 s)。`--chunk-mb` 在驻留下不再影响耗时 (旧路径 c512 的 -12.5% 收益正来自已消除的 per-config 上传冗余)。全部组合逐位恒等 (A/B 对照相干 trace 产物 rel==0)。
 
+### 6.8 多机分片拉起 (--nodes)
+
+按坐标分片的数据面天然可跨机: 每个分片只 mmap 读自己坐标区间的文件页, 跨分片交换只有 fp64 标量与 32769 桶整数直方图 (gloo over tcp 足够)。`--nodes` 把这套能力接进同一命令面 — `sga.replay` 的 main 检测到 `--nodes` 即转入 `sga/replay_launch.py` 多机拉起器:
+
+- **拓扑**: 分片 r → 节点 `r // (world / M)` 的 `cuda:(r % (world / M))`; 拉起进程在节点 0 上, 所有节点必须共享同一 NFS 树的同一路径视图 (容器内即 `/workspace` 视角)。
+- **启动序**: 节点 0 父进程先做 dense 缓存 (miss 时本进程填充 — dense 段绝不在进程组内跑), 缓存发布后**带外 ssh 确认** (不走 NFS 轮询, 避负 dentry 盲窗); 然后全节点**有界预检 rendezvous** (`--preflight-timeout`, 起不来的节点几分钟内带诊断大声失败, 而不是挂在 2 h gloo 超时上); 再逐节点 ssh :2222 拉起 node-worker (每 worker 自带 `SGA_MASTER_ADDR/SGA_MASTER_PORT/SGA_GLOBAL_RANK`, 本地分片号留在 `rank`); 运行段全程监管, 任一 node-worker 早退即杀群收尸。
+- **数值面**: 全局 rank 键控 (选点 tie-fill 按进程组序), 单机数值不受影响; 多机产物落在冻结纯重排带内 (与单机对照: 非 sum 域逐位, sum/mean rel ≤1e-6)。
+- **免 ssh 仿真**: `SGA_LAUNCH_EXECUTOR=local` 把节点拉起降级为本机子进程, 单机即可演练完整拓扑 (单测与 CI 用)。
+- **冒烟**: `tests/smoke_replay_multinode.sh <master-ip> <worker-ip> <NFS-workdir>` — CPU world=2 双节点全链路 (冷缓存填充 + 带外发布 + ssh 拉起), 判据 = 纯重排带。
+
+计时带 (world16 vs world8 加速比) 为预注册待补项, 等双节点空闲窗口。
+
 ## 7. 边界与限制
 
-- **单节点**: 跨分片控制面走本机回环的 gloo, 面向单机 8 卡; 多机不在当前设计内 (页缓存去重的前提是同宿主)。
+- **默认单机, 多机 opt-in**: 控制面默认走本机回环 gloo (单机 8 卡零配置); 跨节点须显式 `--nodes` (§6.8), 页缓存去重收益只在同宿主分片间存在 (跨机各读各的页, 正确性不受影响)。
 - **cycle 语义专用**: fused 引擎只实现 `--replay-mode cycle`; `zerofill` 仍走 `sga/replay.py` 进程内路径。
 - **计算主导**: 实测瓶颈在分片算力而非 IO (§5.3); 单机上提速手段是融合 kernel 或压缩每步的冗余搬运 (同一步的梯度切片目前被 host→device 拷贝最多 3 次: pass 1/pass 2/pass 3 各一次), bf16 副本主要省存储。
-- **到 ~1 h 的路径 (12.6 h → 1 h 需 ~12×)**: 都是立项级改造, 不是参数开关 —— (a) 多机坐标分片: 按坐标分片天然可跨机 (每机只读自己区间的文件页), 控制面从本机回环改 tcp; 计算主导下分片数近线性加速, 8 → 64 卡约 4×, 前提是 NFS 前端聚合带宽跟上; (b) 融合 kernel: 把范数/掩码/残差/AdamW 多趟扫描合成一遍 Triton kernel (在线优化器侧已有同族 kernel 可借鉴), 估计 2-3×; (c) 组大小上限受显存: 每配置每分片约 2.4 GB 状态 (w/m/v/res), 40 GB 卡上 12 配置已近上限, 加大组需同时加分片 (组大小可交由 `--fused-state-budget-mb` 按状态字节预算自动推导, §6.7)。
+- **到 ~1 h 的路径 (12.6 h → 1 h 需 ~12×)**: (a) 多机坐标分片**已落地** (`--nodes`, §6.8; 计算主导下分片数近线性加速, 前提是 NFS 前端聚合带宽跟上, 计时带待补); (b) 融合 kernel: 把范数/掩码/残差/AdamW 多趟扫描合成一遍 Triton kernel (在线优化器侧已有同族 kernel 可借鉴), 估计 2-3×; (c) 组大小上限受显存: 每配置每分片约 2.4 GB 状态 (w/m/v/res), 40 GB 卡上 12 配置已近上限, 加大组需同时加分片 (组大小可交由 `--fused-state-budget-mb` 按状态字节预算自动推导, §6.7)。
 - **等价性范围**: 单分片 = 逐位一致; 多分片偏差属纯浮点重排类, 由预注册带覆盖。分数公式与在线引擎同源 (同一注册表), "离线结论外推到在线"取决于 trace 的代表性 (分支点/窗口是否覆盖感兴趣的训练阶段), 不取决于重放引擎本身。

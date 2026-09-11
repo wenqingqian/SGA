@@ -32,8 +32,12 @@ selection scheme?" answered many times. Record a training window once
 optional `sga_trace_dump_dtype=bf16` to store the per-step g dumps as bf16
 at rest — see `docs/fused_replay.md` §6.4) on a
 shadow run, then replay any configuration offline — the fused engine
-advances a whole group of score × ratio arms over a single window pass,
-sharded across GPUs, reproducing per-config replay bitwise (single shard)
+advances a whole group of score × ratio × cycle-length arms over a single
+window pass (mixed cycle lengths via `--cycle-lens`, group size derived
+from a state-byte budget via `--fused-state-budget-mb`), sharded across
+GPUs — and spans nodes with `--nodes` (ssh-launched shards over the shared
+NFS view; `docs/fused_replay.md` §6.8) — reproducing per-config replay
+bitwise (single shard)
 or within the frozen pure-reordering band (multi-shard). The branch point
 is a global training step number (train iteration): `--branch-point 40`
 replays from the optimizer-state snapshot saved at the 40th train
