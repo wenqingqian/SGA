@@ -549,7 +549,9 @@ branches["40"]
 - `--fused-dev-reduce` — pass1 clip 范数分子与 pass3 视界分子改为逐配置 fp64 **设备标量**累加, 每 pass 一次主机同步。旧路径每 chunk 一次 `float()` 同步 (profile 实测每 rank 每千步 6 万-44 万次)。
 - `--fused-state-budget-mb` — 按常驻状态字节预算自动推导每趟配置数: 组切分从计数口径 (`--fused-max-configs`) 升级为字节预算口径, 预算 >0 时组上限 = `floor(预算 / 每配置状态字节)` 并覆盖计数旋钮。记账只含 {w,m,v,res} × 重放精度字节 × 最宽分片 (⌈N/world⌉ — 全 rank 无集体地一致, 分区纯函数); bool 选点掩码 (1 B/elem)、`--chunk-mb` 工作集与 g 驻留缓冲**不计入**预算。组切分只改 "哪些配置同趟", 每配置数值与所在分区无关 (逐臂状态机 + 逐 lane fp64 归约 + 逐配置独立选点), 故报告与计数旋钮**逐位恒等** (同分区与跨分区皆然); 报告回显 (`fused_state_budget_mb` / `state_budget_mb` / `group_cap`) 仅在开启时出现 — 默认路径的报告字节不变。`REPLAY_S0_PROFILE=1` 的诊断行同步增列 `state_gb` (本组常驻状态全额口径: 四状态张量 + bool 掩码)。
 
-环境变量 `REPLAY_S0_PROFILE=1` 输出每配置组诊断计数 (主机同步数 / gloo 次数 / 每 pass H2D 字节与耗时 / 显存峰), 并在 rank0 报告 fragment 附 `s0_profile` 键。计数是诊断口径而非精确测量: 驻留模式下共享上传全部记入 pass1, `mem_peak_gb` 是进程生命周期累计。
+环境变量 `REPLAY_S0_PROFILE=1` 输出每配置组诊断计数 (主机同步数 / gloo 次数 / 每 pass H2D 字节与耗时 / 显存峰), 并在 rank0 报告 fragment 附 `s0_profile` 键。计数是诊断口径而非精确测量: 驻留模式下共享上传全部记入 pass1, `mem_peak_gb` 是进程生命周期累计。同一开关下 rank0 另增 `S0FRONT` 行, 把流前固定开销分解为分支分数 / dense 缓存载入 / 选点 / 排序指标四段耗时, 并回显本臂排序落在设备还是主机 (`front_sort=dev/cpu`)。
+
+流前排序指标 (NDCG/recall 的 argsort 与 idcg 排序) 在 `--device cuda` 下自动在设备上计算: 设备只产出置换与排序值, 全部归约 (fp32 求和、log2、fp64 加权) 留在主机原表达式, 且稳定排序对有限非负键与后端无关, 报告与纯主机路径逐字节相等。显存守卫按 32 B/elem 对 `torch.cuda.mem_get_info` 记账 (先释放本进程持留的空闲缓存块再量), 放不下即回退主机排序并打印一行诊断; 若设备排序自身抛出 CUDA OOM (守卫测量与显存分配之间的竞态窗口), 同样回退。环境变量 `REPLAY_FUSED_FRONT_SORT=cpu` 是运维紧急开关, 强制逐位等价的主机路径; 其他取值报错退出。实测 (20 步窗口 × 6 配置, dense 缓存命中): 流前合计 995.6 → 193.6 s (5.14×), 其中排序段 885.2 → 85.1 s (10.4×), 全臂墙钟 ~1055 → 251 s; 72 配置 demo 形状的流前推算约 280-400 s (推算, 未经实测)。
 
 实测 (llama-1B 真实训练 trace, 1000 步窗口 × 12 配置, 8×A100-40GB, bf16 trace + fp32 重放):
 
