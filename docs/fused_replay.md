@@ -125,11 +125,11 @@ for config in all_configs:                          # 72 个配置
 
 ### 3.3 fused replay: 单趟流式重放
 
-fused 引擎把"逐配置外层循环"翻到内侧: **一组配置** (group, 同周期长度, 至多 12 个, 由 `--fused-max-configs` 控制; 例如 4 分数 × 3 比例恰好一组) 在**同一次窗口遍历**中齐头并进; 参数空间按连续坐标区间切分到分片进程 (每卡一片); 每步跨分片只交换标量:
+fused 引擎把"逐配置外层循环"翻到内侧: **一组配置** (group, 任意 (score, ratio, T) 组合混装 — 每 config 自带周期长度, 由 `--cycle-lens` 集合展开; 至多 12 个, 由 `--fused-max-configs` 控制, 或按 `--fused-state-budget-mb` 常驻状态字节预算切组; 例如 4 分数 × 3 比例 × 3 周期恰好 6 组) 在**同一次窗口遍历**中齐头并进; 参数空间按连续坐标区间切分到分片进程 (每卡一片); 每步跨分片只交换标量:
 
 ```text
 # fused: 一组配置共享一次窗口遍历; 参数坐标空间连续分片, 每卡一个分片
-group = 本场同时推进的配置集合 (同 cycle_len, 至多 12 个)
+group = 本场同时推进的配置集合 (混合周期长度, 至多 max_configs 个)
 dense_cache = load_or_populate(trace, branch_point, window)   # 父进程, 每份 trace 一次
 
 for shard in shards (并行; 分片 r 用第 r 块 GPU, 持连续坐标区间 [lo, hi)):
@@ -140,7 +140,7 @@ for shard in shards (并行; 分片 r 用第 r 块 GPU, 持连续坐标区间 [l
 
     for step in window_steps:                      # 窗口每个梯度文件每组只读一遍
         grad_shard = prefetcher.next()[lo:hi] / clip_coef_recorded
-        boundary = (step 是周期边界)
+        boundary_c = (si % T_c == 0 对每 config 判定)   # per-config 周期日历
 
         # pass 1: 每配置的 clip 范数 — 跨分片只传标量
         for config in group:
@@ -282,7 +282,10 @@ def shard_select(score, k, comms):
 ```python
 for si, (_gstep, gmeta, local) in enumerate(prefetcher):     # 预取线程后台拉下一步
     coef_dense, _ = R.coef_dense_for(gmeta)   # 录制的是裁剪后梯度, 先除回还原
-    boundary = (si % cfg["cycle_len"] == 0)   # 周期边界: 折叠残差 + 全量同步 + 重选
+    # per-config 周期日历: config (s, r, T_c) 在 si % T_c == 0 处到边界
+    # (折叠残差 + 全量同步 + 重选); 组内混合 T 时各 config 日历独立判定,
+    # 到达边界的 config 集合由日历确定性推出 → 全 rank 一致
+    boundary_c = [si % t == 0 for (_s, _r, t) in group]
 
     # pass 1 — 每配置裁剪范数: 本片平方和 → 跨分片 fp64 标量 allreduce
     #          (每配置每步只通信 1 个标量; 12 配置 = 12 个 float)
@@ -290,9 +293,10 @@ for si, (_gstep, gmeta, local) in enumerate(prefetcher):     # 预取线程后�
     qn2 = comms.sum_f64(qn2)
     coefs = [min(1.0, clip_grad / (math.sqrt(q) + 1e-6)) for q in qn2]
 
-    # pass 2 — 边界重选 (仅 boundary 且 si > 0 且 si + 1 < W):
+    # pass 2 — 边界重选 (per-config: boundary_c[ci] 且 si > 0 且 si + 1 < W):
     #   待提交更新 (grad/coef_dense + residual) * coef 代入分数公式 → shard_select
-    if boundary and si > 0 and si + 1 < W:
+    for ci, hit in enumerate(boundary_c):
+        if hit and si > 0 and si + 1 < W:
         score = spec.formula(ws, ms, vs, (gd + res) * coef, ...,
                              update_includes_wd=True).abs()
         newsel, _th = shard_select(score, ks[r], comms)
@@ -449,14 +453,16 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m sga.replay \
 | `--branch-point` | 必填 | 分支点训练全局步号 (train iteration 序号) 或 `all` |
 | `--window` | 100 | 重放窗口步数 |
 | `--replay-mode` | zerofill | `cycle` = 周期掩码语义 (本文, 走 fused 引擎); `zerofill` = 冻结掩码、未选坐标置零的对照语义 (进程内路径, 无需缓存) |
-| `--cycle-len` | 20 | 周期长度: 每隔多少步折叠残差、全量同步并重选 |
+| `--cycle-len` | 20 | 周期长度: 每隔多少步折叠残差、全量同步并重选 (单值兼容入口; 配置空间见 `--cycle-lens`) |
+| `--cycle-lens` | — | 周期长度集合 (逗号分隔, 自动排序去重), 如 `5,100,200`; 配置空间 = 分数 × 比例 × 周期全集, 组内混装任意 T (每 config 独立周期日历, 混跑与分跑逐位一致); 与 `--cycle-len` 二选一 |
 | `--ratios` | 10,20 | 通信比例 (%) 列表 |
 | `--score-names` | 全部注册分数 | 逗号分隔; 注册表: `update`/`abs_g`/`abs_m`/`coi` (与在线引擎同一注册表) |
 | `--horizons` | 1,10,100 | 输出 distortion 的视界步列表 (自动截到窗口长; 周期语义下第 1 步是全量同步步, distortion 恒为 0, 有信息量的视界从 2 起) |
 | `--dense-cache` | — | dense 缓存目录; **cycle 模式必填** (首跑自动填充) |
 | `--fused` | 关 | **已废弃 no-op** (旧行为现已无条件生效); 报告 `config.fused` 仅回显此 flag, 生效引擎看 `config.fused_effective` |
 | `--fused-shards` | 8 | 分片进程数 = 用到的 GPU 数 (分片 r → 第 r 块可见卡) |
-| `--fused-max-configs` | 12 | 单趟同时推进的 (分数×比例) 数; 组内每配置优化器状态驻留显存, 显存紧张可调小 |
+| `--fused-max-configs` | 12 | 单趟同时推进的 (分数×比例×周期) 数; 组内每配置优化器状态驻留显存, 显存紧张可调小 (或改用 `--fused-state-budget-mb` 按字节预算切组) |
+| `--fused-state-budget-mb` | 0 (关) | 常驻状态字节预算 (MiB): 组大小改由 `floor(预算 / 每配置状态字节)` 推导, >0 时覆盖 `--fused-max-configs`; 记账口径 = {w,m,v,res} × 重放精度字节 × 最宽分片 (⌈N/world⌉), bool 掩码 / chunk 工作集 / g 驻留缓冲在预算外; llama-1B 8 分片 fp32 每配置 ≈2359 MiB → 30720 推导 R=13 (§6.7) |
 | `--fused-g-residency` | 关 | 每步梯度切片一次上传显存驻留, 全配置 × 3 pass 共享 (数值逐位不变; §6.7) |
 | `--fused-dev-reduce` | 关 | 范数/视界分子改设备端 fp64 累加, 每 pass 一次主机同步 (数值逐位不变; §6.7) |
 | `--device` | cpu | `cpu` 或 `cuda`; `cuda:N` 不支持 (分片固定映射, 报错有提示) |
@@ -522,6 +528,7 @@ branches["40"]
 
 - `--fused-g-residency` — 每步把本片各参数的梯度切片**一次性**上传显存驻留, 组内全部配置 × 3 个流式 pass 共享同一份。旧路径每配置每 pass 重复上传同一批字节 (profile 实测冗余 24×, 每 rank 每 pass ~6.9 GB H2D); 驻留后每步每参数只剩一次上传。CUDA 下预取线程改用锁页缓冲 + `non_blocking` (host 不阻塞; H2D 本身仍在流上串行); 边界步无梯度载荷时读缓存的设备端零张量。内存口径: 驻留量 = 本片每参数切片全量, 与 `--chunk-mb` 工作集预算**无关**, 每步的 clip 系数除法瞬时再翻倍, 锁页主机内存约 (depth+1) 步切片。
 - `--fused-dev-reduce` — pass1 clip 范数分子与 pass3 视界分子改为逐配置 fp64 **设备标量**累加, 每 pass 一次主机同步。旧路径每 chunk 一次 `float()` 同步 (profile 实测每 rank 每千步 6 万-44 万次)。
+- `--fused-state-budget-mb` — 按常驻状态字节预算自动推导每趟配置数: 组切分从计数口径 (`--fused-max-configs`) 升级为字节预算口径, 预算 >0 时组上限 = `floor(预算 / 每配置状态字节)` 并覆盖计数旋钮。记账只含 {w,m,v,res} × 重放精度字节 × 最宽分片 (⌈N/world⌉ — 全 rank 无集体地一致, 分区纯函数); bool 选点掩码 (1 B/elem)、`--chunk-mb` 工作集与 g 驻留缓冲**不计入**预算。组切分只改 "哪些配置同趟", 每配置数值与所在分区无关 (逐臂状态机 + 逐 lane fp64 归约 + 逐配置独立选点), 故报告与计数旋钮**逐位恒等** (同分区与跨分区皆然); 报告回显 (`fused_state_budget_mb` / `state_budget_mb` / `group_cap`) 仅在开启时出现 — 默认路径的报告字节不变。`REPLAY_S0_PROFILE=1` 的诊断行同步增列 `state_gb` (本组常驻状态全额口径: 四状态张量 + bool 掩码)。
 
 环境变量 `REPLAY_S0_PROFILE=1` 输出每配置组诊断计数 (主机同步数 / gloo 次数 / 每 pass H2D 字节与耗时 / 显存峰), 并在 rank0 报告 fragment 附 `s0_profile` 键。计数是诊断口径而非精确测量: 驻留模式下共享上传全部记入 pass1, `mem_peak_gb` 是进程生命周期累计。
 
@@ -540,5 +547,5 @@ branches["40"]
 - **单节点**: 跨分片控制面走本机回环的 gloo, 面向单机 8 卡; 多机不在当前设计内 (页缓存去重的前提是同宿主)。
 - **cycle 语义专用**: fused 引擎只实现 `--replay-mode cycle`; `zerofill` 仍走 `sga/replay.py` 进程内路径。
 - **计算主导**: 实测瓶颈在分片算力而非 IO (§5.3); 单机上提速手段是融合 kernel 或压缩每步的冗余搬运 (同一步的梯度切片目前被 host→device 拷贝最多 3 次: pass 1/pass 2/pass 3 各一次), bf16 副本主要省存储。
-- **到 ~1 h 的路径 (12.6 h → 1 h 需 ~12×)**: 都是立项级改造, 不是参数开关 —— (a) 多机坐标分片: 按坐标分片天然可跨机 (每机只读自己区间的文件页), 控制面从本机回环改 tcp; 计算主导下分片数近线性加速, 8 → 64 卡约 4×, 前提是 NFS 前端聚合带宽跟上; (b) 融合 kernel: 把范数/掩码/残差/AdamW 多趟扫描合成一遍 Triton kernel (在线优化器侧已有同族 kernel 可借鉴), 估计 2-3×; (c) 组大小上限受显存: 每配置每分片约 2.4 GB 状态 (w/m/v/res), 40 GB 卡上 12 配置已近上限, 加大组需同时加分片。
+- **到 ~1 h 的路径 (12.6 h → 1 h 需 ~12×)**: 都是立项级改造, 不是参数开关 —— (a) 多机坐标分片: 按坐标分片天然可跨机 (每机只读自己区间的文件页), 控制面从本机回环改 tcp; 计算主导下分片数近线性加速, 8 → 64 卡约 4×, 前提是 NFS 前端聚合带宽跟上; (b) 融合 kernel: 把范数/掩码/残差/AdamW 多趟扫描合成一遍 Triton kernel (在线优化器侧已有同族 kernel 可借鉴), 估计 2-3×; (c) 组大小上限受显存: 每配置每分片约 2.4 GB 状态 (w/m/v/res), 40 GB 卡上 12 配置已近上限, 加大组需同时加分片 (组大小可交由 `--fused-state-budget-mb` 按状态字节预算自动推导, §6.7)。
 - **等价性范围**: 单分片 = 逐位一致; 多分片偏差属纯浮点重排类, 由预注册带覆盖。分数公式与在线引擎同源 (同一注册表), "离线结论外推到在线"取决于 trace 的代表性 (分支点/窗口是否覆盖感兴趣的训练阶段), 不取决于重放引擎本身。

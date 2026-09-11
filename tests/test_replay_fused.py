@@ -32,17 +32,27 @@ classic in-process cycle replay was removed; cycle auto-routes here):
 6. CUDA smoke (skipped without a GPU): world=1 on cuda (dense via
    dense_replay_dev) matches the from-spec reference within the
    sanitize/report band.
-7. Comms multi-node rendezvous env (SGA_MASTER_ADDR + SGA_MASTER_PORT,
+7. --cycle-lens T sets: every f"{score}@T{t}" arm of a mixed-T group is
+   bitwise identical to the same arm under the solo-T runs (world 1 and
+   2); --cycle-lens N equals --cycle-len N modulo the echo keys; the
+   mutually-exclusive/invalid knob values are rejected by name.
+8. Comms multi-node rendezvous env (SGA_MASTER_ADDR + SGA_MASTER_PORT,
    per-process SGA_GLOBAL_RANK): real gloo init over the master endpoint
    with the global process-group rank while the local shard index stays
    in ``rank``, collectives come back in global-rank order, and both env
    misconfigurations raise loudly.
-8. Perf-flag mechanism (not just report values): the --fused-g-residency
+9. Perf-flag mechanism (not just report values): the --fused-g-residency
    / --fused-dev-reduce echoes, the REPLAY_S0_PROFILE counters carried in
    the fragment (residency books every shared H2D byte to pass 1,
    dev-reduce collapses the host syncs to the per-pass fetches), the
    pinned prefetcher buffers on CUDA, and a --trace-dtype bf16 leg of
    the slice-first prefetcher (reference anchor + bitwise fp32-twin A/B).
+10. --fused-state-budget-mb: the resident-state byte budget derives the
+   config group size (overrides --fused-max-configs); reports stay
+   bit-identical to the count knob at the same partition AND across
+   partitions; the echoes are conditional so budget-off artifacts keep
+   their exact bytes; the cap derivation (floor + >=1 clamp) is pinned
+   through the group_cap echo; REPLAY_S0_PROFILE gains a state_gb field.
 """
 import io
 import json
@@ -146,11 +156,13 @@ def _run(argv):
         return soa.main(argv)
 
 
-def _base_args(td, cache, t0, extra=()):
+def _base_args(td, cache, t0, extra=(), cycle=("--cycle-len", "2")):
+    # ``cycle`` is swappable because the two T spellings are mutually
+    # exclusive on the CLI — a --cycle-lens run cannot just append the flag
     return ["--trace-dir", td, "--branch-point", str(t0), "--window", "6",
             "--horizons", "1,3,6", "--ratios", "20,30",
             "--score-names", "abs_g,update", "--replay-mode", "cycle",
-            "--cycle-len", "2", "--dense-cache", cache, "--device", "cpu",
+            *cycle, "--dense-cache", cache, "--device", "cpu",
             "--chunk-mb", "1", *extra]
 
 
@@ -159,6 +171,36 @@ def _close(a, b, rel):
         return True
     denom = max(abs(a), abs(b))
     return denom == 0.0 or abs(a - b) / denom <= rel
+
+
+def _deep_eq_nan(a, b):
+    """Deep equality treating NaN == NaN: the fixture's grad_norm is NaN,
+    and dict == compares two distinct NaN objects as unequal even when the
+    reports are bit-identical."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(
+            _deep_eq_nan(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(
+            _deep_eq_nan(x, y) for x, y in zip(a, b))
+    if isinstance(a, float) and isinstance(b, float):
+        return a == b or (a != a and b != b)
+    return type(a) is type(b) and a == b
+
+
+def _strip_cycle_echo(rep):
+    """Drop the T-set provenance echoes (config cycle_len/cycle_lens, the
+    branch fragment's cycle_lens) so reports produced through different
+    spellings or T sets compare equal on the numbers."""
+    cfg = dict(rep["config"])
+    cfg.pop("cycle_len", None)
+    cfg.pop("cycle_lens", None)
+    brs = {}
+    for t0k, br in rep["branch_results"].items():
+        br = dict(br)
+        br.pop("cycle_lens", None)
+        brs[t0k] = br
+    return {"config": cfg, "branch_results": brs}
 
 
 def _ref_distortion(pre, lrs, clip, t0, absent, w0s, m0s, v0s, g0s, score,
@@ -397,12 +439,38 @@ def test_fused_cli_gates():
             (base + ["--replay-mode", "cycle", "--dense-cache", cache,
                      "--fused-max-configs", "-1"],
              "--fused-max-configs must be >= 1"),
+            # the state byte budget knob: rejected on non-finite/negative
+            # under cycle ...
+            (base + ["--replay-mode", "cycle", "--dense-cache", cache,
+                     "--fused-state-budget-mb", "-1"],
+             "--fused-state-budget-mb must be a finite value >= 0"),
+            (base + ["--replay-mode", "cycle", "--dense-cache", cache,
+                     "--fused-state-budget-mb", "inf"],
+             "--fused-state-budget-mb must be a finite value >= 0"),
+            # ... and under zerofill (fused-only knobs are unused there but
+            # still validated with the option named)
+            (base + ["--fused-state-budget-mb", "-0.5"],
+             "--fused-state-budget-mb must be a finite value >= 0"),
             (base + ["--replay-mode", "cycle", "--dense-cache", cache,
                      "--score-names", "nope"],
              "not a registered score"),
             (base + ["--replay-mode", "cycle", "--dense-cache", cache,
                      "--ratios", "150"],
              "in (0, 100]"),
+            # the T-set knob: the two spellings are mutually exclusive (the
+            # gate fires under zerofill too — the knob is only echoed there),
+            # and the set itself is validated value by value
+            (base + ["--cycle-len", "2", "--cycle-lens", "3,5"],
+             "--cycle-len and --cycle-lens are mutually exclusive"),
+            (base + ["--replay-mode", "cycle", "--dense-cache", cache,
+                     "--cycle-lens", ""],
+             "names no cycle length"),
+            (base + ["--replay-mode", "cycle", "--dense-cache", cache,
+                     "--cycle-lens", "2,0"],
+             "must be >= 1"),
+            (base + ["--replay-mode", "cycle", "--dense-cache", cache,
+                     "--cycle-lens", "2,x"],
+             "must be integers >= 1"),
         ]
         if torch.cuda.is_available():
             # --device cpu: shards are plain processes with no CUDA bound,
@@ -425,6 +493,80 @@ def test_fused_cli_gates():
             else:
                 raise AssertionError(f"gate accepted: {argv}")
     print("PASS test_fused_cli_gates")
+
+
+def test_cycle_lens_mixed_equivalence():
+    """Mixed-T groups (--cycle-lens 2,3): every f"{score}@T{t}" arm must be
+    bitwise identical to the same (score, ratio) arm in the solo-T run
+    (--cycle-len t), at world 1 and world 2 — each arm's state machine
+    consumes only its own calendar/states and the qn2/num2 collectives carry
+    one independent scalar lane per arm, so no band is needed here."""
+    with tempfile.TemporaryDirectory() as td:
+        t0, _W = _build_fixture(td)[0:2]
+        cache = os.path.join(td, "dense_cache")
+        # warm the shared dense cache once: the populating run must not sit
+        # in any A/B arm
+        _run(_base_args(td, cache, t0, ["--fused-shards", "1"]))
+        for shards in ("1", "2"):
+            mixed = _run(_base_args(td, cache, t0,
+                                    ["--fused-shards", shards],
+                                    cycle=("--cycle-lens", "2,3")))
+            solos = {t: _run(_base_args(td, cache, t0,
+                                        ["--fused-shards", shards],
+                                        cycle=("--cycle-len", t)))
+                     for t in ("2", "3")}
+            assert mixed["branch_results"][str(t0)]["cycle_lens"] == [2, 3]
+            mixed_br = mixed["branch_results"][str(t0)]
+            for t in ("2", "3"):
+                s = _strip_cycle_echo(solos[t])
+                # rebuild the mixed per_ratio with only this T's arms,
+                # renamed to the solo keys (no mutation of the shared
+                # nested dicts — the other T's arms stay intact)
+                new_per_ratio = {}
+                for r, pr in mixed_br["per_ratio"].items():
+                    solo_keys = set(
+                        s["branch_results"][str(t0)]["per_ratio"][r]
+                        ["scores"])
+                    picked = {}
+                    for k in sorted(pr["scores"]):
+                        base_k, _, tag = k.partition("@T")
+                        if tag == t:
+                            picked[base_k] = pr["scores"][k]
+                        else:
+                            assert tag in ("2", "3"), k
+                    assert set(picked) == solo_keys, (shards, t, r)
+                    new_per_ratio[r] = {"k": pr["k"], "scores": picked}
+                m = _strip_cycle_echo(mixed)
+                m["branch_results"][str(t0)]["per_ratio"] = new_per_ratio
+                assert _deep_eq_nan(m, s), \
+                    f"mixed-T arm diverged from solo T={t} (shards={shards})"
+    print("PASS test_cycle_lens_mixed_equivalence")
+
+
+def test_cycle_lens_single_compat():
+    """--cycle-lens 2 and --cycle-len 2 produce the same report once the
+    echo keys are stripped (the set spelling echoes config cycle_len None
+    and per_ratio keeps the bare score keys) — single-T products are
+    unaffected by the schema extension (world 1 and 2)."""
+    with tempfile.TemporaryDirectory() as td:
+        t0, _W = _build_fixture(td)[0:2]
+        cache = os.path.join(td, "dense_cache")
+        _run(_base_args(td, cache, t0, ["--fused-shards", "1"]))
+        for shards in ("1", "2"):
+            via_set = _run(_base_args(td, cache, t0,
+                                      ["--fused-shards", shards],
+                                      cycle=("--cycle-lens", "2")))
+            via_scalar = _run(_base_args(td, cache, t0,
+                                         ["--fused-shards", shards]))
+            assert via_set["config"]["cycle_lens"] == [2]
+            assert via_set["config"]["cycle_len"] is None
+            assert via_scalar["config"]["cycle_len"] == 2
+            br = via_set["branch_results"][str(t0)]
+            assert br["cycle_lens"] == [2]
+            assert "abs_g" in br["per_ratio"]["20.0"]["scores"]
+            assert _deep_eq_nan(_strip_cycle_echo(via_set),
+                                _strip_cycle_echo(via_scalar)), shards
+    print("PASS test_cycle_lens_single_compat")
 
 
 def _env_comms_worker(rank, world, port, per_node, expected_sum):
@@ -603,21 +745,6 @@ def test_fused_bf16_trace_world1():
                             twin_rep["branch_results"]), \
             "the bf16 load path diverged from its fp32 twin"
     print("PASS test_fused_bf16_trace_world1")
-
-
-def _deep_eq_nan(a, b):
-    """Deep equality treating NaN == NaN: the fixture's grad_norm is NaN,
-    and dict == compares two distinct NaN objects as unequal even when the
-    reports are bit-identical."""
-    if isinstance(a, dict) and isinstance(b, dict):
-        return a.keys() == b.keys() and all(
-            _deep_eq_nan(a[k], b[k]) for k in a)
-    if isinstance(a, list) and isinstance(b, list):
-        return len(a) == len(b) and all(
-            _deep_eq_nan(x, y) for x, y in zip(a, b))
-    if isinstance(a, float) and isinstance(b, float):
-        return a == b or (a != a and b != b)
-    return type(a) is type(b) and a == b
 
 
 def test_g_residency_bitwise():
@@ -802,6 +929,189 @@ def test_dev_reduce_cuda():
     print("PASS test_dev_reduce_cuda")
 
 
+def _budget_mb(shards, cap, replay_dtype="fp64"):
+    """The --fused-state-budget-mb value that derives group size == cap,
+    recomputed from the fixture spec constants (sum(SIZES)) via the
+    engine's public accounting: {w,m,v,res} x itemsize over the widest
+    shard (ceil(N/world)). Dividing by 2**20 is exact in binary floats
+    (power-of-two divisor), so the engine's floor lands exactly on cap."""
+    basis = (sum(SIZES) + shards - 1) // shards
+    itemsize = 8 if replay_dtype == "fp64" else 4
+    return basis * 4 * itemsize * cap / 2 ** 20
+
+
+def test_state_budget_bitwise():
+    """--fused-state-budget-mb derives the fused group size from the
+    resident-state byte budget instead of --fused-max-configs (which it
+    overrides). The report must be bit-identical to the count-knob run at
+    the same partition AND across partitions (each arm's value path is
+    group-membership invariant: per-arm state machines, per-lane fp64
+    collectives, per-config shard_select calls). The echo keys
+    (fused_state_budget_mb / state_budget_mb / group_cap) are conditional —
+    the budget-off report gains no keys at all, so default-path artifacts
+    stay byte-identical (absorb-style byte cmps)."""
+    with tempfile.TemporaryDirectory() as td:
+        t0, *_ = _build_fixture(td)
+        cache = os.path.join(td, "dense_cache")
+        # warm the shared dense cache once (the populating run must not sit
+        # in any A/B arm)
+        _run(_base_args(td, cache, t0, ["--fused-shards", "1"]))
+        for shards in ("1", "2"):
+            w = int(shards)
+
+            def _arm(extra):
+                return _run(_base_args(
+                    td, cache, t0, ["--fused-shards", shards, *extra],
+                    cycle=("--cycle-lens", "2,3")))
+
+            cnt2 = _arm(["--fused-max-configs", "2"])          # 4 groups
+            bud2 = _arm(["--fused-state-budget-mb",
+                         repr(_budget_mb(w, 2))])              # same 4 groups
+            cnt8 = _arm(["--fused-max-configs", "8"])          # 1 group
+            bud8 = _arm(["--fused-state-budget-mb",
+                         repr(_budget_mb(w, 8))])              # same 1 group
+            # echoes: absent when off (byte-stability), present and correct
+            # when on, with the derived cap reported
+            assert "fused_state_budget_mb" not in cnt2["config"]
+            br2 = cnt2["branch_results"][str(t0)]["replay"]
+            assert "state_budget_mb" not in br2 and "group_cap" not in br2
+            # the report sanitizes floats to 8 decimals — compare echoed
+            # values on the same grid
+            assert bud2["config"]["fused_state_budget_mb"] \
+                == round(_budget_mb(w, 2), 8)
+            brr = bud2["branch_results"][str(t0)]["replay"]
+            assert brr["state_budget_mb"] == round(_budget_mb(w, 2), 8)
+            assert brr["group_cap"] == 2
+            assert bud8["branch_results"][str(t0)]["replay"][
+                "group_cap"] == 8
+            # strip the knob echoes; all four arms must coincide bitwise —
+            # same partition (count vs budget) and across partitions (4
+            # groups vs 1 group). fused_max_configs is a knob echo too: the
+            # count arms set it to the partition size while the budget arms
+            # leave the default (the budget overrides it), and the
+            # cross-partition compare (cnt2 vs cnt8) differs on it by
+            # construction — the partition-invariance claim is about
+            # VALUES, not which knob chose the partition
+            for rep in (cnt2, bud2, cnt8, bud8):
+                rep["config"].pop("fused_max_configs", None)
+                rep["config"].pop("fused_state_budget_mb", None)
+                frag = rep["branch_results"][str(t0)]["replay"]
+                frag.pop("state_budget_mb", None)
+                frag.pop("group_cap", None)
+            assert _deep_eq_nan(cnt2, bud2), \
+                f"same-partition budget run moved a bit (shards={shards})"
+            assert _deep_eq_nan(cnt8, bud8), \
+                f"same-partition budget run moved a bit (shards={shards})"
+            assert _deep_eq_nan(cnt2, cnt8), \
+                f"partition changed the values (shards={shards})"
+        # uneven-shard leg: world 7 does not divide N (870000 / 7 ->
+        # 124285.71), so the budget cap basis ceil(N/world) = 124286
+        # differs from six of the seven rank-local sp.n values — a
+        # regression to a per-shard basis would disagree across ranks at
+        # the floor and tear the qn2/num2 collectives. A non-hanging run
+        # implicitly pins cross-rank partition agreement; the echo and
+        # the bitwise A/B vs the count knob pin the derived cap itself
+        shards = "7"
+
+        def _arm7(extra):
+            return _run(_base_args(
+                td, cache, t0, ["--fused-shards", shards, *extra],
+                cycle=("--cycle-lens", "2,3")))
+
+        cnt7 = _arm7(["--fused-max-configs", "2"])
+        bud7 = _arm7(["--fused-state-budget-mb", repr(_budget_mb(7, 2))])
+        assert bud7["branch_results"][str(t0)]["replay"]["group_cap"] == 2
+        for rep in (cnt7, bud7):
+            rep["config"].pop("fused_max_configs", None)
+            rep["config"].pop("fused_state_budget_mb", None)
+            frag = rep["branch_results"][str(t0)]["replay"]
+            frag.pop("state_budget_mb", None)
+            frag.pop("group_cap", None)
+        assert _deep_eq_nan(cnt7, bud7), \
+            "uneven-shard budget run moved a bit (shards=7)"
+    print("PASS test_state_budget_bitwise")
+
+
+def test_state_budget_cap_semantics():
+    """Floor semantics and the >=1 clamp, pinned through the group_cap echo
+    with budgets recomputed from the spec constants: half a config's bytes
+    clamps to cap 1, 2.5 configs floors to cap 2, one config per exact
+    budget unit steps cap 1 -> 8."""
+    with tempfile.TemporaryDirectory() as td:
+        t0, *_ = _build_fixture(td)
+        cache = os.path.join(td, "dense_cache")
+        _run(_base_args(td, cache, t0, ["--fused-shards", "1"]))
+        one = _budget_mb(1, 1)
+        for budget, want in ((one / 2, 1), (one, 1),
+                             (_budget_mb(1, 2) + one / 2, 2),
+                             (_budget_mb(1, 8), 8)):
+            rep = _run(_base_args(
+                td, cache, t0,
+                ["--fused-shards", "1",
+                 "--fused-state-budget-mb", repr(budget)],
+                cycle=("--cycle-lens", "2,3")))
+            assert rep["branch_results"][str(t0)]["replay"]["group_cap"] \
+                == want, (budget, want)
+    print("PASS test_state_budget_cap_semantics")
+
+
+def test_state_budget_cuda():
+    """CUDA leg: the budget-derived partition stays bit-identical to the
+    count knob, and a narrower budget stacked with the production perf
+    flags (g residency + dev reduce) stays bit-identical too — the
+    intended combination. World 1 wherever a GPU is visible; the world-2
+    leg needs 2 GPUs."""
+    if not torch.cuda.is_available():
+        print("SKIP test_state_budget_cuda (no CUDA)")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        t0, *_ = _build_fixture(td)
+        cache = os.path.join(td, "dense_cache")
+        _run(_base_args(td, cache, t0, ["--device", "cuda",
+                                        "--fused-shards", "1"]))
+        shard_legs = ["1"]
+        if torch.cuda.device_count() >= 2:
+            shard_legs.append("2")
+        else:
+            print("NOTE test_state_budget_cuda: world-2 leg skipped "
+                  "(needs 2 visible GPUs)")
+        for shards in shard_legs:
+            w = int(shards)
+
+            def _arm(extra):
+                return _run(_base_args(
+                    td, cache, t0,
+                    ["--device", "cuda", "--fused-shards", shards, *extra],
+                    cycle=("--cycle-lens", "2,3")))
+
+            base = _arm(["--fused-max-configs", "8"])
+            wide = _arm(["--fused-state-budget-mb", repr(_budget_mb(w, 8))])
+            combo = _arm(["--fused-state-budget-mb", repr(_budget_mb(w, 2)),
+                          "--fused-g-residency", "--fused-dev-reduce"])
+            # strip the provenance echoes: the budget knob echoes only on
+            # the budget arms, the count-knob echo differs by construction
+            # (base sets 8, the budget arms keep the default 12), and the
+            # combo arm's perf-flag echoes (fused_g_residency/fused_dev_reduce
+            # in config, g_residency/dev_reduce in the fragment) are
+            # unconditional — the partition/flag-invariance claim is about
+            # VALUES, not which knob chose the partition or which flags ran
+            for rep in (base, wide, combo):
+                rep["config"].pop("fused_max_configs", None)
+                rep["config"].pop("fused_state_budget_mb", None)
+                frag = rep["branch_results"][str(t0)]["replay"]
+                frag.pop("state_budget_mb", None)
+                frag.pop("group_cap", None)
+            for rep in (base, wide, combo):
+                rep["config"].pop("fused_g_residency", None)
+                rep["config"].pop("fused_dev_reduce", None)
+                frag = rep["branch_results"][str(t0)]["replay"]
+                frag.pop("g_residency", None)
+                frag.pop("dev_reduce", None)
+            assert _deep_eq_nan(base, wide), f"shards={shards}"
+            assert _deep_eq_nan(base, combo), f"shards={shards}"
+    print("PASS test_state_budget_cuda")
+
+
 def test_s0_profile_counters():
     """REPLAY_S0_PROFILE=1 (env-gated diagnostic): the fragment gains one
     counter dict per config group and the S0PROFILE line prints. With
@@ -825,11 +1135,18 @@ def test_s0_profile_counters():
                     td, cache, t0,
                     ["--fused-shards", "1", "--fused-g-residency",
                      "--fused-dev-reduce"]))
+                # the budget knob: state_gb books the resident state (the
+                # derived cap shows up in the fragment echo)
+                report_b = soa.main(_base_args(
+                    td, cache, t0,
+                    ["--fused-shards", "1", "--fused-g-residency",
+                     "--fused-dev-reduce",
+                     "--fused-state-budget-mb", repr(_budget_mb(1, 4))]))
             assert "S0PROFILE" in buf.getvalue()
             profs = report["branch_results"][str(t0)]["s0_profile"]
             assert isinstance(profs, list) and profs
             for prof in profs:
-                for key in ("sync", "ar", "h2d"):
+                for key in ("sync", "ar", "h2d", "state_gb"):
                     assert key in prof, key
                 # residency books every shared upload to pass 1
                 assert prof["h2d"][0] > 0
@@ -838,6 +1155,21 @@ def test_s0_profile_counters():
                 # fetch on the 3 horizon steps of this window — generous
                 # bound, but far under the per-chunk sync storm
                 assert prof["sync"] <= 2 * W, (prof["sync"], W)
+            profs_b = report_b["branch_results"][str(t0)]["s0_profile"]
+            assert isinstance(profs_b, list) and profs_b
+            # value pin: len(group) * sp.n * (4 * itemsize + 1 B sel) /
+            # 2**30 — cap 4 over the 4 (score, ratio, T) arms is one full
+            # group, world 1 so sp.n == N == sum(SIZES), itemsize from the
+            # replay_dtype echo; the report sanitizes floats to 8 decimals
+            itemsize = 8 if report_b["config"]["replay_dtype"] == "fp64" \
+                else 4
+            expected_gb = 4 * sum(SIZES) * (4 * itemsize + 1) / 2 ** 30
+            for prof in profs_b:
+                assert prof["state_gb"] > 0
+                assert prof["state_gb"] == round(expected_gb, 8), \
+                    (prof["state_gb"], expected_gb)
+            assert report_b["branch_results"][str(t0)]["replay"][
+                "group_cap"] == 4
     finally:
         if old_env is None:
             os.environ.pop("REPLAY_S0_PROFILE", None)
@@ -853,6 +1185,8 @@ def main():
     test_fused_world2_norm_fp32()
     test_fused_cold_cache_world2()
     test_fused_cli_gates()
+    test_cycle_lens_mixed_equivalence()
+    test_cycle_lens_single_compat()
     test_comms_env_multinode_world2()
     test_comms_env_global_local_split()
     test_comms_env_errors()
@@ -863,6 +1197,9 @@ def main():
     test_gprefetcher_pinned_buffers()
     test_dev_reduce_bitwise()
     test_dev_reduce_cuda()
+    test_state_budget_bitwise()
+    test_state_budget_cap_semantics()
+    test_state_budget_cuda()
     test_s0_profile_counters()
     print("\nall replay-fused tests passed")
 

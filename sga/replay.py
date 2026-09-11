@@ -1331,12 +1331,14 @@ def print_summary(report):
         for rk in sorted(b["per_ratio"], key=float):
             pr = b["per_ratio"][rk]
             print(f"  ratio {rk}%  k={pr['k']}")
-            first = pr["scores"][score_names[0]]
+            # per-ratio entries iterate by their own keys: with a T set the
+            # score names carry an @T{t} suffix and supersede score_names
+            first = next(iter(pr["scores"].values()))
             hs = sorted(first["distortion"], key=lambda h: int(h))
             hdr = "    score        " + " ".join(f"d@H={h:>10s}" for h in hs) + \
                   "     ndcg@k     recall@k  miss_label miss_score"
             print(hdr)
-            for s in score_names:
+            for s in pr["scores"]:
                 met = pr["scores"][s]
                 dists = " ".join(_fmt_dist(met['distortion'][h]) for h in hs)
                 print(f"    {s:>12s}  {dists}   {met['ndcg_at_k']:>9.5f} "
@@ -1400,10 +1402,17 @@ def main(argv=None):
                          "cyclic semantics), always served by the fused "
                          "single-pass engine — requires --dense-cache (a "
                          "first run populates it automatically)")
-    ap.add_argument("--cycle-len", type=int, default=20,
+    ap.add_argument("--cycle-len", type=int, default=None,
                     help="T: full-sync / mask re-selection interval for "
                          "--replay-mode cycle (window boundary si=0 is always "
-                         "a full-sync step)")
+                         "a full-sync step); single-T spelling of "
+                         "--cycle-lens, mutually exclusive with it")
+    ap.add_argument("--cycle-lens", default=None,
+                    help="comma set of T intervals for --replay-mode cycle "
+                         "(e.g. 5,20,100): every (score, ratio, T) triple "
+                         "becomes a replay config and mixed-T groups share "
+                         "one window pass; mutually exclusive with "
+                         "--cycle-len (default: 20, as a one-element set)")
     ap.add_argument("--fused", action="store_true",
                     help="(deprecated no-op: --replay-mode cycle now always "
                          "runs the fused engine; kept so existing command "
@@ -1417,6 +1426,19 @@ def main(argv=None):
                     help="arms (score x ratio) advanced per fused window "
                          "pass in --replay-mode cycle (config group size; "
                          "state memory per group scales with this)")
+    ap.add_argument("--fused-state-budget-mb", type=float, default=0.0,
+                    help="resident-state byte budget per shard (MiB) for "
+                         "--replay-mode cycle: the config group size is "
+                         "derived as floor(budget / per-config state bytes) "
+                         "instead of --fused-max-configs, which this "
+                         "overrides when > 0. Accounting (the plan-level "
+                         "budget table): {w,m,v,res} x replay-dtype "
+                         "itemsize over the widest shard (ceil(N/world)); "
+                         "the bool selection mask, the --chunk-mb working "
+                         "set and g-residency buffers sit OUTSIDE the "
+                         "budget. llama-1B at 8 shards costs ~2359 MiB per "
+                         "config in fp32, so 30720 derives R=13. 0 = off "
+                         "(the count knob rules)")
     ap.add_argument("--nodes", default=None,
                     help="comma list of node addresses for a multi-node "
                          "fused run (sga.replay_launch; this process must "
@@ -1486,12 +1508,43 @@ def main(argv=None):
 
     # Option-value gate before any work: every invalid value is rejected with
     # its option named, instead of surfacing as an incidental deep exception
-    # (si % cycle_len) or a silently empty report (',' branch specs).
-    if args.cycle_len < 1:
-        # cycle mode needs a positive full-sync interval; under zerofill the
-        # knob is unused but still echoed into the report config, so the
-        # gate covers both modes
-        raise ValueError(f"--cycle-len must be >= 1, got {args.cycle_len}")
+    # (si % T_c) or a silently empty report (',' branch specs).
+    # The cycle knob resolves to the per-config T list here: --cycle-len N is
+    # the one-element list, the two spellings are mutually exclusive, and the
+    # set is sorted/deduped so the config enumeration is deterministic.
+    # Validation covers zerofill too (the knob is unused there but still
+    # echoed into the report config).
+    if args.cycle_len is not None and args.cycle_lens is not None:
+        raise ValueError(
+            "--cycle-len and --cycle-lens are mutually exclusive: pass the "
+            "T set once (--cycle-len N or --cycle-lens T1,T2,...)")
+    if args.cycle_lens is not None:
+        toks = [t for t in args.cycle_lens.replace(" ", "").split(",") if t]
+        if not toks:
+            raise ValueError(
+                f"--cycle-lens {args.cycle_lens!r} names no cycle length")
+        lens = []
+        for tok in toks:
+            try:
+                t = int(tok)
+            except ValueError:
+                raise ValueError(
+                    f"--cycle-lens values must be integers >= 1, "
+                    f"got {tok!r}") from None
+            if t < 1:
+                raise ValueError(
+                    f"--cycle-lens values must be >= 1, got {tok!r}")
+            lens.append(t)
+        args.cycle_lens = sorted(set(lens))
+    else:
+        if args.cycle_len is None:
+            args.cycle_len = 20  # historical default
+        if args.cycle_len < 1:
+            # cycle mode needs a positive full-sync interval; under zerofill
+            # the knob is unused but still echoed into the report config, so
+            # the gate covers both modes
+            raise ValueError(f"--cycle-len must be >= 1, got {args.cycle_len}")
+        args.cycle_lens = [args.cycle_len]
     if args.replay_mode == "cycle" and args.self_check is not None:
         # cycle dispatches to run_fused_branch, which the self-check path
         # never reaches — reject the combination by name instead of
@@ -1544,6 +1597,11 @@ def main(argv=None):
     if args.fused_max_configs < 1:
         raise ValueError(
             f"--fused-max-configs must be >= 1, got {args.fused_max_configs}")
+    if not math.isfinite(args.fused_state_budget_mb) \
+            or args.fused_state_budget_mb < 0:
+        raise ValueError(
+            "--fused-state-budget-mb must be a finite value >= 0, got "
+            f"{args.fused_state_budget_mb}")
     for tok in args.ratios.split(","):
         if tok.strip():
             r = float(tok)
@@ -1654,6 +1712,7 @@ def main(argv=None):
             "dense_cache": args.dense_cache,
             "replay_mode": args.replay_mode,
             "cycle_len": args.cycle_len,
+            "cycle_lens": args.cycle_lens,
             "fused": args.fused,
             "fused_effective": args.fused or args.replay_mode == "cycle",
             "fused_shards": args.fused_shards,
@@ -1667,6 +1726,13 @@ def main(argv=None):
         },
         "branch_results": branch_results,
     }
+    # conditional echo: the budget-off report must stay byte-identical to
+    # budget-off artifacts of this version (cycle_lens above is echoed
+    # unconditionally, so pre-knob artifacts already differ at byte level),
+    # so this key only exists when the knob is on
+    if args.fused_state_budget_mb > 0:
+        report["config"]["fused_state_budget_mb"] = \
+            args.fused_state_budget_mb
     report = sanitize(report, nd=8)
 
     if args.out:

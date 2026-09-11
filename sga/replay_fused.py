@@ -498,6 +498,7 @@ def _worker(rank, world, cfg, port, frag_path):
 
     # ---- branch selections + label selections + ranking metrics -----------
     ratios = cfg["ratios"]
+    cycle_lens = cfg["cycle_lens"]
     ks = {r: max(1, int(round(r / 100.0 * N))) for r in ratios}
     idcg, sel0, thresh0, rankmet = {}, {}, {}, {}
     for r in ratios:
@@ -506,29 +507,60 @@ def _worker(rank, world, cfg, port, frag_path):
         if comms.global_rank == 0:
             idcg[r] = _idcg_of_parts(parts)
         for s in score_names:
+            # the branch-point selection is a function of (score, ratio)
+            # only, and shard_select is deterministic on its inputs — every
+            # T arm of one (s, r) shares a single select instead of paying
+            # len(cycle_lens) redundant global selects; sel0 is only read to
+            # build the per-config device masks (never mutated)
             sel, th = shard_select(score_loc[s], ks[r], comms)
-            sel0[(s, r)], thresh0[(s, r)] = sel, th
             sc_parts = comms.all_gather_pad(score_loc[s][sel].clone())
             lb_parts = comms.all_gather_pad(label_loc[sel].clone())
             ls_parts = comms.all_gather_pad(lsel[sel].clone())
+            met_sr = None
             if comms.global_rank == 0:
-                rankmet[(s, r)] = _fused_ranking(
+                met_sr = _fused_ranking(
                     torch.cat(sc_parts), torch.cat(lb_parts), ls_parts,
                     ks[r], stats[s]["sum"], label_total, idcg[r])
+            for t in cycle_lens:
+                sel0[(s, r, t)] = sel
+                thresh0[(s, r, t)] = th
+                if comms.global_rank == 0:
+                    rankmet[(s, r, t)] = met_sr
 
     # ---- streaming passes over config groups ------------------------------
-    configs = [(s, r) for r in ratios for s in score_names]
-    groups = [configs[i:i + cfg["max_configs"]]
-              for i in range(0, len(configs), cfg["max_configs"])]
-    num_at = {(s, r): {} for s in score_names for r in ratios}
+    # (score, ratio, T) arms; a single T enumerates exactly the historical
+    # (score, ratio) order, so the max_configs partition is unchanged
+    configs = [(s, r, t) for r in ratios for s in score_names
+               for t in cycle_lens]
+    # group-size cap: with a state byte budget set (>0) the cap is derived
+    # from the resident {w,m,v,res} bytes of ONE config over the WIDEST
+    # shard — ceil(N/world) elements on every rank, so the partition stays a
+    # deterministic pure function (a per-shard sp.n basis could split the
+    # ranks at the floor and tear the qn2/num2 collectives). The budget
+    # overrides --fused-max-configs; the bool sel mask, the --chunk-mb
+    # working set and g-residency buffers sit outside the accounting (the
+    # plan-level budget table counts the four state tensors only).
+    itemsize = torch.finfo(replay_dtype).bits // 8
+    budget_bytes = cfg["state_budget_mb"] * 2 ** 20
+    if budget_bytes > 0:
+        per_cfg = ((N + world - 1) // world) * 4 * itemsize
+        # per_cfg > 0 whenever N >= 1 (empty traces fail loudly in discover_trace)
+        assert per_cfg > 0
+        eff_cap = max(1, int(budget_bytes // per_cfg))
+    else:
+        eff_cap = cfg["max_configs"]
+    groups = [configs[i:i + eff_cap]
+              for i in range(0, len(configs), eff_cap)]
+    num_at = {(s, r, t): {} for s in score_names for r in ratios
+              for t in cycle_lens}
     # one counter dict per config group, stashed into shard 0's fragment
     # alongside the S0PROFILE print (env-gated: None when the env is absent)
     s0_profs = [] if _S0_PROFILE else None
     t_pass0 = time.time()
     for gi, group in enumerate(groups):
         states = {}
-        for (s, r) in group:
-            sel = sel0[(s, r)]
+        for (s, r, t) in group:
+            sel = sel0[(s, r, t)]
             stt = {}
             for e in sp.entries:
                 # _fresh_state: never alias the shard's w0/m0/v0 — every
@@ -541,9 +573,8 @@ def _worker(rank, world, cfg, port, frag_path):
                                        device=dev),
                     "sel": sel[e["a"]:e["a"] + e["n"]].to(dev),
                 }
-            states[(s, r)] = stt
-        chunk_dev = R._chunk_elems(cfg["chunk_mb"],
-                                   torch.finfo(replay_dtype).bits // 8)
+            states[(s, r, t)] = stt
+        chunk_dev = R._chunk_elems(cfg["chunk_mb"], itemsize)
         norm_fp32 = cfg["norm_fp32"]
 
         res_on = bool(cfg.get("g_residency"))
@@ -562,11 +593,24 @@ def _worker(rank, world, cfg, port, frag_path):
         # pass 1
         prof = {"sync": 0, "ar": 0, "h2d": [0, 0, 0],
                 "pt": [0.0, 0.0, 0.0]} if _S0_PROFILE else None
+        if prof:
+            # diagnostic memory accounting: the group's resident state at
+            # its full per-rank truth ({w,m,v,res} at replay itemsize plus
+            # the 1 B/elem bool sel) — the budget knob itself counts the
+            # four state tensors only, this field books everything
+            prof["state_gb"] = (len(group) * sp.n * (4 * itemsize + 1)
+                                / 2 ** 30)
         for si, (_gstep, gmeta, local) in enumerate(pre):
             coef_dense, _flag = R.coef_dense_for(gmeta)
             clip_grad = float(gmeta.get("clip_grad", 0.0))
             count = t0 + si + 1
-            boundary = (si % cfg["cycle_len"] == 0)
+            # per-config calendars: arm (s, r, t) full-syncs iff si % t == 0.
+            # Mixed-T runs reproduce solo-T arms bitwise because each arm's
+            # state machine consumes only its own calendar/states, the
+            # qn2/num2 exchanges are per-arm-indexed lists (elementwise
+            # reductions — the list length never enters a lane's value) and
+            # chunking / entry order are group-invariant
+            boundary_c = [si % t == 0 for (_s, _r, t) in group]
             if res_on:
                 # one H2D per entry per step, shared by every config and
                 # all three passes (the legacy path re-uploads per config
@@ -602,15 +646,16 @@ def _worker(rank, world, cfg, port, frag_path):
             # reach the host once per pass instead of per chunk
             qn2_dev = (torch.zeros(len(group), dtype=torch.float64,
                                    device=dev) if red_on else None)
-            for ci, (s, r) in enumerate(group):
+            for ci, (s, r, t) in enumerate(group):
+                bnd = boundary_c[ci]
                 for e in sp.entries:
                     g = local.get(e["name"])
-                    if g is None and not boundary:
+                    if g is None and not bnd:
                         continue
                     g_el = None if res_on else (
                         torch.zeros(e["n"], dtype=torch.float32)
                         if g is None else g)
-                    stt = states[(s, r)][e["name"]]
+                    stt = states[(s, r, t)][e["name"]]
                     for a in range(0, e["n"], chunk_dev):
                         b = min(e["n"], a + chunk_dev)
                         if res_on:
@@ -619,7 +664,7 @@ def _worker(rank, world, cfg, port, frag_path):
                             gd = g_el[a:b].to(dev) / coef_dense
                             if prof:
                                 prof["h2d"][0] += b - a
-                        if boundary:
+                        if bnd:
                             q_pre = gd + stt["res"][a:b]
                         else:
                             q_pre = gd * stt["sel"][a:b]
@@ -658,45 +703,48 @@ def _worker(rank, world, cfg, port, frag_path):
             # boundary re-selection (same gating as
             # tests/test_replay_cycle.reference_cycle):
             # skip si=0 (sel0 encodes it) and the final boundary (no masked
-            # step remains to consume the new mask)
-            if boundary and si > 0 and si + 1 < W:
-                _t0p = time.perf_counter() if prof else 0.0
-                for ci, (s, r) in enumerate(group):
-                    spec = specs[s]
-                    score_flat = torch.empty(sp.n, dtype=torch.float32,
-                                             device=dev)
-                    for e in sp.entries:
-                        g = local.get(e["name"])
-                        g_el = None if res_on else (
-                            torch.zeros(e["n"], dtype=torch.float32)
-                            if g is None else g)
-                        stt = states[(s, r)][e["name"]]
-                        b1, b2, eps, wd = e["b1"], e["b2"], e["eps"], e["wd"]
-                        bc1c = 1.0 - b1 ** count
-                        bc2c = 1.0 - b2 ** count
-                        for a in range(0, e["n"], chunk_dev):
-                            b = min(e["n"], a + chunk_dev)
-                            if res_on:
-                                q = (g_res[e["name"]][a:b]
-                                     + stt["res"][a:b]) * coefs[ci]
-                            else:
-                                q = (g_el[a:b].to(dev) / coef_dense
-                                     + stt["res"][a:b]) * coefs[ci]
-                                if prof:
-                                    prof["h2d"][1] += b - a
-                            sc = spec.formula(
-                                stt["ws"][a:b], stt["ms"][a:b],
-                                stt["vs"][a:b], q, b1, b2, eps, wd,
-                                bc1c, bc2c, update_includes_wd=True)
-                            score_flat[e["a"] + a:e["a"] + b] = sc.abs() \
-                                .float()
-                    newsel, _th = shard_select(score_flat, ks[r], comms)
-                    for e in sp.entries:
-                        stt = states[(s, r)][e["name"]]
-                        stt["sel"] = newsel[e["a"]:e["a"] + e["n"]].to(dev)
-                    del score_flat
-                if prof:
-                    prof["pt"][1] += time.perf_counter() - _t0p
+            # step remains to consume the new mask); only arms whose own
+            # calendar reaches this step re-select, the others leave mask
+            # and states untouched
+            _t0p = time.perf_counter() if prof else 0.0
+            for ci, (s, r, t) in enumerate(group):
+                if not (boundary_c[ci] and si > 0 and si + 1 < W):
+                    continue
+                spec = specs[s]
+                score_flat = torch.empty(sp.n, dtype=torch.float32,
+                                         device=dev)
+                for e in sp.entries:
+                    g = local.get(e["name"])
+                    g_el = None if res_on else (
+                        torch.zeros(e["n"], dtype=torch.float32)
+                        if g is None else g)
+                    stt = states[(s, r, t)][e["name"]]
+                    b1, b2, eps, wd = e["b1"], e["b2"], e["eps"], e["wd"]
+                    bc1c = 1.0 - b1 ** count
+                    bc2c = 1.0 - b2 ** count
+                    for a in range(0, e["n"], chunk_dev):
+                        b = min(e["n"], a + chunk_dev)
+                        if res_on:
+                            q = (g_res[e["name"]][a:b]
+                                 + stt["res"][a:b]) * coefs[ci]
+                        else:
+                            q = (g_el[a:b].to(dev) / coef_dense
+                                 + stt["res"][a:b]) * coefs[ci]
+                            if prof:
+                                prof["h2d"][1] += b - a
+                        sc = spec.formula(
+                            stt["ws"][a:b], stt["ms"][a:b],
+                            stt["vs"][a:b], q, b1, b2, eps, wd,
+                            bc1c, bc2c, update_includes_wd=True)
+                        score_flat[e["a"] + a:e["a"] + b] = sc.abs() \
+                            .float()
+                newsel, _th = shard_select(score_flat, ks[r], comms)
+                for e in sp.entries:
+                    stt = states[(s, r, t)][e["name"]]
+                    stt["sel"] = newsel[e["a"]:e["a"] + e["n"]].to(dev)
+                del score_flat
+            if prof:
+                prof["pt"][1] += time.perf_counter() - _t0p
 
             # pass 3: commit + residual + horizon numerators
             hz = (si + 1) if (si + 1) in eff_horizons else None
@@ -705,13 +753,14 @@ def _worker(rank, world, cfg, port, frag_path):
             num2_dev = (torch.zeros(len(group), dtype=torch.float64,
                                     device=dev)
                         if (red_on and hz is not None) else None)
-            for ci, (s, r) in enumerate(group):
+            for ci, (s, r, t) in enumerate(group):
+                bnd = boundary_c[ci]
                 for e in sp.entries:
                     g = local.get(e["name"])
                     g_el = None if res_on else (
                         torch.zeros(e["n"], dtype=torch.float32)
                         if g is None else g)
-                    stt = states[(s, r)][e["name"]]
+                    stt = states[(s, r, t)][e["name"]]
                     lr = R._lr_for_step(gmeta, e["group"])
                     b1, b2, eps, wd = e["b1"], e["b2"], e["eps"], e["wd"]
                     bc1c = 1.0 - b1 ** count
@@ -724,7 +773,7 @@ def _worker(rank, world, cfg, port, frag_path):
                             gd = g_el[a:b].to(dev) / coef_dense
                             if prof:
                                 prof["h2d"][2] += b - a
-                        if boundary:
+                        if bnd:
                             q = (gd + stt["res"][a:b]) * coefs[ci]
                             stt["res"][a:b] = 0.0
                         else:
@@ -756,8 +805,8 @@ def _worker(rank, world, cfg, port, frag_path):
                 num2 = comms.sum_f64(num2)
                 if prof:
                     prof["ar"] += 1
-                for ci, (s, r) in enumerate(group):
-                    num_at[(s, r)][hz] = math.sqrt(num2[ci])
+                for ci, (s, r, t) in enumerate(group):
+                    num_at[(s, r, t)][hz] = math.sqrt(num2[ci])
 
         del states
         if dev != "cpu":
@@ -773,6 +822,7 @@ def _worker(rank, world, cfg, port, frag_path):
                       if dev != "cpu" else 0.0)
             print(f"S0PROFILE rank={rank} group={gi} steps={W} "
                   f"syncs={prof['sync']} gloo_ar={prof['ar']} "
+                  f"state_gb={prof['state_gb']:.2f} "
                   f"h2d_gb_p1={prof['h2d'][0] * 4 / 2 ** 30:.1f} "
                   f"h2d_gb_p2={prof['h2d'][1] * 4 / 2 ** 30:.1f} "
                   f"h2d_gb_p3={prof['h2d'][2] * 4 / 2 ** 30:.1f} "
@@ -793,25 +843,30 @@ def _worker(rank, world, cfg, port, frag_path):
         for r in ratios:
             scores = {}
             for s in score_names:
-                distortion = {}
-                for h in cfg["horizons"]:
-                    hh = max(1, min(h, W))
-                    den = den_at.get(hh)
-                    num = num_at[(s, r)].get(hh)
-                    distortion[str(h)] = (
-                        num / den if (den is not None and num is not None
-                                      and den > 0) else None)
-                scores[s] = {
-                    "threshold": thresh0[(s, r)],
-                    "distortion": distortion,
-                    **rankmet[(s, r)],
-                }
+                # a single T keeps the historical bare score key; with a T
+                # set the same score name recurs per T and would collide
+                for t in cycle_lens:
+                    key = s if len(cycle_lens) == 1 else f"{s}@T{t}"
+                    distortion = {}
+                    for h in cfg["horizons"]:
+                        hh = max(1, min(h, W))
+                        den = den_at.get(hh)
+                        num = num_at[(s, r, t)].get(hh)
+                        distortion[str(h)] = (
+                            num / den if (den is not None and num is not None
+                                          and den > 0) else None)
+                    scores[key] = {
+                        "threshold": thresh0[(s, r, t)],
+                        "distortion": distortion,
+                        **rankmet[(s, r, t)],
+                    }
             per_ratio[str(r)] = {"k": ks[r], "scores": scores}
         out = {
             "t0": t0,
             "state_absent": bool(meta.get("state_absent", False)),
             "window_len": W,
             "window_steps": window_steps,
+            "cycle_lens": cycle_lens,
             "horizon_steps": {str(h): max(1, min(h, W))
                               for h in cfg["horizons"]},
             "meta": {
@@ -840,6 +895,13 @@ def _worker(rank, world, cfg, port, frag_path):
             "scores": stats,
             "per_ratio": per_ratio,
         }
+        # conditional echoes: the default (budget off) report must stay
+        # byte-identical to budget-off artifacts of this version (cycle_lens
+        # above is echoed unconditionally, so pre-knob artifacts already
+        # differ at byte level), so these keys only exist when the knob is on
+        if cfg["state_budget_mb"] > 0:
+            out["replay"]["state_budget_mb"] = float(cfg["state_budget_mb"])
+            out["replay"]["group_cap"] = int(eff_cap)
         if _S0_PROFILE:
             out["s0_profile"] = s0_profs
         torch.save(out, frag_path)
@@ -956,12 +1018,59 @@ def _common_gates(args):
         score_names = [s for s in allowed if s in args.score_names]
     else:
         score_names = allowed
+    world = args.fused_shards
+    if world < 1:
+        raise ValueError("--fused-shards must be >= 1")
+    if args.fused_max_configs < 1:
+        raise ValueError("--fused-max-configs must be >= 1")
+    # getattr: programmatic callers (tests) build their own argparse
+    # Namespace and must keep defaulting to the count-knob behavior
+    state_budget_mb = float(getattr(args, "fused_state_budget_mb", 0.0)
+                            or 0.0)
+    if not math.isfinite(state_budget_mb) or state_budget_mb < 0:
+        raise ValueError(
+            "--fused-state-budget-mb must be a finite value >= 0, got "
+            f"{state_budget_mb}")
+    # the T set rides the cfg as a list; direct programmatic callers (tests)
+    # predate the set spelling and pass the scalar cycle_len — resolve and
+    # normalize here, mirroring the CLI gate
+    cycle_lens = getattr(args, "cycle_lens", None)
+    if cycle_lens is None:
+        cycle_lens = [args.cycle_len]
+    if (not cycle_lens
+            or [t for t in cycle_lens
+                if not isinstance(t, int) or t < 1]):
+        raise ValueError(
+            "cycle_lens must be a non-empty list of ints >= 1, "
+            f"got {cycle_lens!r}")
+    cycle_lens = sorted(set(cycle_lens))
+    for r in args.ratios:
+        if r <= 0.0 or r > 100.0:
+            raise ValueError(f"ratio {r} out of (0,100]")
+    if args.device != "cpu":
+        # shard r maps to cuda:r, so a bare index on --device has no meaning;
+        # the visible device set is constrained via CUDA_VISIBLE_DEVICES
+        if args.device != "cuda":
+            raise ValueError(
+                "--device cuda:N is not supported: shard r always maps to "
+                "cuda:r. Use --device cuda and restrict the visible devices "
+                "with CUDA_VISIBLE_DEVICES (e.g. CUDA_VISIBLE_DEVICES=4,5 for "
+                "a 2-shard run on physical GPUs 4 and 5)")
+        if world > torch.cuda.device_count():
+            raise ValueError(
+                f"--fused-shards {world} exceeds the visible CUDA devices "
+                f"({torch.cuda.device_count()})")
     return score_names
 
 
 def _fused_cfg(args, ctx, t0, score_names):
     """The plain-dict worker config (json-serializable: the multi-node
     launcher ships it to every node verbatim)."""
+    # the same T-set resolution as the gate (validated there): scalar
+    # cycle_len from legacy programmatic callers fans out to a 1-element set
+    cycle_lens = getattr(args, "cycle_lens", None)
+    if cycle_lens is None:
+        cycle_lens = [args.cycle_len]
     return {
         "trace_dir": ctx["trace_dir"],
         "t0": t0,
@@ -969,7 +1078,7 @@ def _fused_cfg(args, ctx, t0, score_names):
         "horizons": args.horizons,
         "ratios": args.ratios,
         "score_names": score_names,
-        "cycle_len": args.cycle_len,
+        "cycle_lens": sorted(set(cycle_lens)),
         "cycle_mode": True,
         "replay_dtype": args.replay_dtype,
         "trace_dtype": args.trace_dtype,
@@ -979,6 +1088,8 @@ def _fused_cfg(args, ctx, t0, score_names):
         "device": ("cpu" if args.device == "cpu" else "cuda"),
         "dense_cache": args.dense_cache,
         "max_configs": args.fused_max_configs,
+        "state_budget_mb": float(getattr(args, "fused_state_budget_mb", 0.0)
+                                 or 0.0),
         # getattr: programmatic callers (tests) build their own argparse
         # Namespace and must keep defaulting to the legacy upload path
         "g_residency": getattr(args, "fused_g_residency", False),
