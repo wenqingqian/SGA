@@ -393,7 +393,7 @@ trace 默认 fp32 录制 (4.7 TB/千步)。`sga.trace_convert` 可将其转成 *
 
 ### 6.1 采集 trace
 
-trace 用 **shadow 模式**采集: 训练行为与 dense 完全一致 (不影响训练), 引擎在旁路录制。训练配置加三个键 (Hydra 透传到 `sga/config/arguments.py` 的 `--sga-trace-*`):
+trace 用 **shadow 模式**采集: 训练行为与 dense 完全一致 (不影响训练), 引擎在旁路录制。训练配置加三个键 (外加一个可选的存储精度键; Hydra 透传到 `sga/config/arguments.py` 的 `--sga-trace-*`):
 
 ```bash
 python run.py --config-path examples/llama3 --config-name train_1b_shadow \
@@ -408,6 +408,7 @@ python run.py --config-path examples/llama3 --config-name train_1b_shadow \
 | `sga_trace_dir` | trace 输出目录; **设置即开启采集** |
 | `sga_trace_branch_points` | 分支点列表 (训练全局步号), 逗号分隔, 如 `'40'` 或 `'40,1040'` |
 | `sga_trace_window` | 每个分支点之后录多少步梯度 |
+| `sga_trace_dump_dtype` | g 梯度文件的存储精度: `fp32` (默认) 或 `bf16` — `bf16` 在录制时直接落 bf16 dump (体积减半, 见 §6.4), state 文件两种取值下都保持 fp32 |
 
 **分支点的确切含义**: 分支点是训练全局步号, 即第几个 train iteration。`'40'` 表示训练推进到第 40 个 train iteration 时落一份完整状态快照 (参数/动量/方差, 附当步梯度), 此后每步的裁剪后梯度各落一个文件; 重放 = "从第 40 步快照出发, 依次消费第 41..1040 步录制梯度" (配 `--window 1000`)。重放不需要模型、数据集与前向代码。磁盘注意: 1.2B 模型每步约 4.7 GB。
 
@@ -477,6 +478,8 @@ python -m sga.replay --trace-dir /data/traces/run1_bf16 --trace-dtype bf16 \
 ```
 
 dense 缓存身份键含 trace 精度, fp32/bf16 缓存互不串用。
+
+`trace_convert` 之外的第二条路: 新录制的 trace 可在训练配置里直接加 `++sga.sga_trace_dump_dtype=bf16`, 录制时就落 bf16 dump (免 4.7 TB fp32 中间副本; catalog 自带 `g_dtype=bf16` 标记, 重放同样加 `--trace-dtype bf16`)。`trace_convert` 仍适用于已录制好的 fp32 trace。
 
 ### 6.5 输出报告
 

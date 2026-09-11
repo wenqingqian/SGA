@@ -214,7 +214,8 @@ def test_checks_master_switch():
 def test_trace_validation():
     """sga_trace_dir configures the engine-side trace collector: dir
     required, branch_points normalized from comma string or list, window
-    default 100; unknown trace keys named."""
+    default 100, an illegal dump dtype refused on the yaml route (the flag
+    is named), unknown trace keys named."""
     cfg, _ = make_base()
     _enable_standard(cfg)
     ns = _ns_of(cfg)
@@ -234,11 +235,20 @@ def test_trace_validation():
     cfg.sga.sga_trace_window = 0
     expect_error(lambda: _prevalidate_sga(cfg), "window")
 
+    # yaml dump dtype: the illegal value rides the emitted flags through
+    # the real parser, so argparse choices rejects it (_LoudParser names
+    # the flag); validation.py's membership check stays as defense-in-depth
+    # for namespaces built without the parser
+    cfg2, _ = make_base()
+    _enable_standard(cfg2)
+    cfg2.sga.sga_trace_dump_dtype = "fp16"
+    expect_error(lambda: _prevalidate_sga(cfg2), "sga-trace-dump-dtype")
+
     cfg3, _ = make_base()
     _enable_standard(cfg3)
     OmegaConf.update(cfg3, "sga.sga_trace_bogus", 1)
     expect_error(lambda: _prevalidate_sga(cfg3), "sga_trace_bogus")
-    print("ok: trace validation (dir/branch/window/unknown)")
+    print("ok: trace validation (dir/branch/window/dump-dtype/unknown)")
 
 
 def test_start_iter_percent_resolves():

@@ -736,8 +736,10 @@ def test_trace_dtype_bf16():
 def test_trace_convert_module():
     """sga.trace_convert: one-way fp32->bf16 copy — g payloads become bf16
     with meta preserved and values exactly the bf16 rounding of the source,
-    catalog/states are copied verbatim (fp32), the step range selects which
-    g/state files land in dst, and dst==src / non-empty dst are rejected."""
+    states are copied verbatim (fp32) and the catalog verbatim except its
+    self-describing g_dtype flip, the step range selects which
+    g/state files land in dst, an already-bf16 source converts no-op but
+    warns loudly, and dst==src / non-empty dst are rejected."""
     torch.manual_seed(12)
     t0, W, n = 700, 4, 8
     pre = [torch.randn(n) * 0.05 for _ in range(W)]
@@ -765,9 +767,23 @@ def test_trace_convert_module():
                              map_location="cpu", weights_only=False)
         dst_cat = torch.load(os.path.join(dst, "catalog.pt"),
                              map_location="cpu", weights_only=False)
-        assert dst_cat == src_cat
+        # catalog verbatim except g_dtype, which flips to bf16 so the
+        # converted dir is self-describing (same shape a runtime bf16
+        # dump's collector writes)
+        assert dst_cat == {**src_cat, "g_dtype": "bf16"}
         assert sorted(f for f in os.listdir(dst) if f.endswith("_g.pt")) == \
             sorted(f"step_{t0 + si:06d}_g.pt" for si in range(W))
+
+        # re-converting an already-bf16 source is a correct no-op (the
+        # per-tensor guard skips non-fp32 payloads) but must say so loudly
+        dst3 = os.path.join(td, "dst3")
+        buf3 = io.StringIO()
+        with redirect_stdout(buf3):
+            tc.main(["--src", dst, "--dst", dst3])
+        assert "already bf16" in buf3.getvalue()
+        g3 = torch.load(os.path.join(dst3, f"step_{t0:06d}_g.pt"),
+                        map_location="cpu", weights_only=False)
+        assert torch.equal(g3["payload"][name], dst_g["payload"][name])
 
         # step range: only g files in [from, to) land in dst2 (the t0 state
         # is outside the range and must not be copied)

@@ -313,6 +313,7 @@ def test_inv4_historical_surface_pinned():
         "sga_trace_dir": (None, "str", ()),
         "sga_trace_branch_points": (None, "str", ()),
         "sga_trace_window": (100, "int", ()),
+        "sga_trace_dump_dtype": ("fp32", "str", ("fp32", "bf16")),
         "sga_score": (None, "str", ("abs_g", "abs_m", "coi", "update")),
         "sga_selection": ("topk", "str", ()),
         "sga_selection_method": (None, "str", ("adaptive", "exact", "histogram")),

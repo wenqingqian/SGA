@@ -28,8 +28,10 @@ error_feedback × backend) is pure configuration, not code.
 
 SGA scheme research needs "what would training look like under a different
 selection scheme?" answered many times. Record a training window once
-(`sga_trace_dir` + `sga_trace_branch_points` + `sga_trace_window` on a
-shadow run), then replay any configuration offline — the fused engine
+(`sga_trace_dir` + `sga_trace_branch_points` + `sga_trace_window`, plus
+optional `sga_trace_dump_dtype=bf16` to store the per-step g dumps as bf16
+at rest — see `docs/fused_replay.md` §6.4) on a
+shadow run, then replay any configuration offline — the fused engine
 advances a whole group of score × ratio arms over a single window pass,
 sharded across GPUs, reproducing per-config replay bitwise (single shard)
 or within the frozen pure-reordering band (multi-shard). The branch point

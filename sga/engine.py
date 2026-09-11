@@ -281,7 +281,8 @@ class SGAEngine:
         self._trace = (TraceCollector(
             dir=cfg.sga_trace_dir,
             branch_points=cfg.sga_trace_branch_points,
-            window=cfg.sga_trace_window)
+            window=cfg.sga_trace_window,
+            dump_dtype=cfg.sga_trace_dump_dtype)
             if cfg.sga_trace_dir is not None else None)
         # Shadow mode (sga_shadow): replicate the stock step() literally and
         # only READ state at cycle boundaries. shadow_score=false strips even

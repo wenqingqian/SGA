@@ -3,8 +3,12 @@
 
 Everything a config may say lives in ``sga/config/arguments.py`` (plain
 ``add_argument`` declarations); THIS module derives the flag vocabulary from
-that file by parser introspection (no key set, default or choice is restated
-anywhere) and adds the context argparse cannot express as PLAIN CONDITIONAL
+that file by parser introspection (no key set or default is restated
+anywhere; the one deliberate choice restatement is the
+sga_trace_dump_dtype membership check below — defense-in-depth for
+namespaces built without the parser, since both production routes go
+through the parser's ``choices``) and adds the context argparse cannot
+express as PLAIN CONDITIONAL
 RULES over the args (``if args.xxx: raise ...``), exactly the way megatron's
 own validate_args works:
 
@@ -228,13 +232,23 @@ def validate_sga_args(args=None) -> None:
         args.sga_trace_dir is not None
         or args.sga_trace_branch_points is not None
         or args.sga_trace_window
-        != sga_defaults()["sga_trace_window"])
+        != sga_defaults()["sga_trace_window"]
+        or args.sga_trace_dump_dtype
+        != sga_defaults()["sga_trace_dump_dtype"])
     if trace_present:
         tdir = args.sga_trace_dir
         if not isinstance(tdir, str) or not tdir:
             raise ValueError(
                 "sga_trace_dir is required and must be a non-empty string "
                 "(the trace output directory)")
+        # Defense-in-depth restatement of the argparse choices: the CLI and
+        # the launcher's yaml re-parse are both gated by the parser, but a
+        # hand-built namespace reaches here unguarded — same backstop role
+        # as TraceCollector's constructor check.
+        dd = args.sga_trace_dump_dtype
+        if dd not in ("fp32", "bf16"):
+            raise ValueError(
+                f"sga_trace_dump_dtype must be 'fp32' or 'bf16' (got {dd!r})")
         # Lazy import: sga.trace -> sga.config (package __init__) -> this
         # module -> sga.trace is a cycle; deferring keeps both importable
         # first.

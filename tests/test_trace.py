@@ -647,6 +647,136 @@ def test_sparse_dump_compact_restore_on_dump_exception():
     print("PASS test_sparse_dump_compact_restore_on_dump_exception")
 
 
+def test_dump_dtype_bf16_ab_convert():
+    """--sga-trace-dump-dtype bf16: the g payloads are the per-tensor
+    round-to-nearest bf16 of the same fp32 dump — bit-identical to what
+    sga.trace_convert produces from the fp32 trace (so a runtime-bf16 trace
+    and a converted trace are interchangeable replay inputs); state files
+    stay fp32; catalog self-describes via g_dtype; the resume dtype matrix
+    is fully pinned (refusals name g_dtype; the explicit-present-and-equal
+    bf16/bf16 cell — the feature's crash-resume scenario — is accepted)."""
+    from sga.trace_convert import convert
+    with tempfile.TemporaryDirectory() as td:
+        dirs = {
+            "fp32": os.path.join(td, "a_fp32"),
+            "bf16": os.path.join(td, "b_bf16"),
+        }
+        for tag, extra in (("fp32", {}),
+                           ("bf16", {"sga_trace_dump_dtype": "bf16"})):
+            torch.manual_seed(7)
+            chunk = _prefixed_chunk()
+            mp = _FakeMPOpt(chunk)
+            eng = _build_traced_engine(dirs[tag], [0], 2, chunk,
+                                       config_extra=extra)
+            _drive_steps(eng, chunk, mp, [0, 1])
+
+        ga = torch.load(os.path.join(dirs["fp32"], "step_000000_g.pt"),
+                        weights_only=False)
+        gb = torch.load(os.path.join(dirs["bf16"], "step_000000_g.pt"),
+                        weights_only=False)
+        for name, v in ga["payload"].items():
+            w = gb["payload"][name]
+            assert v.dtype == torch.float32
+            assert w.dtype == torch.bfloat16
+            assert torch.equal(w, v.to(torch.bfloat16))
+        assert ga["meta"] == gb["meta"]  # dtype is storage-only
+
+        st = torch.load(os.path.join(dirs["bf16"], "step_000000_state.pt"),
+                        weights_only=False)
+        for sect in ("w", "m", "v", "g"):
+            for name in st["payload"][sect]:
+                assert st["payload"][sect][name].dtype == torch.float32
+
+        cat = torch.load(os.path.join(dirs["bf16"], "catalog.pt"),
+                         weights_only=False)
+        assert cat["g_dtype"] == "bf16"
+        cat_fp32 = torch.load(os.path.join(dirs["fp32"], "catalog.pt"),
+                              weights_only=False)
+        assert cat_fp32["g_dtype"] == "fp32"
+
+        conv_dir = os.path.join(td, "c_conv")
+        convert(dirs["fp32"], conv_dir)
+        gc = torch.load(os.path.join(conv_dir, "step_000000_g.pt"),
+                        weights_only=False)
+        for name in gb["payload"]:
+            assert torch.equal(gc["payload"][name], gb["payload"][name])
+
+        torch.manual_seed(7)
+        chunk2 = _prefixed_chunk()
+        mp2 = _FakeMPOpt(chunk2)
+        eng2 = _build_traced_engine(dirs["bf16"], [0], 2, chunk2)
+        try:
+            _drive_steps(eng2, chunk2, mp2, [0])
+        except ValueError as e:
+            assert "g_dtype" in str(e)
+        else:
+            raise SystemExit("resume with a different dump dtype must fail")
+
+        # remaining refusal cells of the resume matrix (same catalog, only
+        # the dtype disagrees — the error must name g_dtype, not a catalog
+        # field):
+        # fp32 dir (g_dtype present = fp32) resumed by a bf16 run
+        torch.manual_seed(7)
+        chunk3 = _prefixed_chunk()
+        mp3 = _FakeMPOpt(chunk3)
+        eng3 = _build_traced_engine(
+            dirs["fp32"], [0], 2, chunk3,
+            config_extra={"sga_trace_dump_dtype": "bf16"})
+        try:
+            _drive_steps(eng3, chunk3, mp3, [0])
+        except ValueError as e:
+            assert "g_dtype" in str(e)
+        else:
+            raise SystemExit("fp32 dir resumed as bf16 must fail")
+        # legacy dir (pre-g_dtype collector: no g_dtype key) resumed by a
+        # bf16 run — the "fp32" default direction must refuse bf16 too
+        legacy_dir = os.path.join(td, "legacy")
+        os.makedirs(legacy_dir)
+        torch.save({"meta": {}, "catalog": {
+            f"p{i}": {"shape": [4, 16], "dtype": "torch.float32",
+                      "param_group": 0} for i in range(2)}},
+                   os.path.join(legacy_dir, "catalog.pt"))
+        torch.manual_seed(7)
+        chunk4 = _prefixed_chunk()
+        mp4 = _FakeMPOpt(chunk4)
+        eng4 = _build_traced_engine(
+            legacy_dir, [0], 2, chunk4,
+            config_extra={"sga_trace_dump_dtype": "bf16"})
+        try:
+            _drive_steps(eng4, chunk4, mp4, [0])
+        except ValueError as e:
+            assert "g_dtype" in str(e)
+        else:
+            raise SystemExit("legacy fp32 dir resumed as bf16 must fail")
+
+        # the accept cell: an explicitly-tagged bf16 dir resumed by a bf16
+        # run — the core crash-resume scenario; a regression that raises
+        # whenever g_dtype is present would fail exactly here
+        torch.manual_seed(7)
+        chunk5 = _prefixed_chunk()
+        mp5 = _FakeMPOpt(chunk5)
+        eng5 = _build_traced_engine(
+            dirs["bf16"], [0], 2, chunk5,
+            config_extra={"sga_trace_dump_dtype": "bf16"})
+        _drive_steps(eng5, chunk5, mp5, [0])  # must not raise
+    print("PASS test_dump_dtype_bf16_ab_convert")
+
+
+def test_dump_dtype_constructor_guard():
+    """Direct-construction backstop: dump_dtype outside {fp32, bf16} is
+    refused at the collector (engine tests seed config via _seed, which
+    skips validation — on that route this branch is the only guard)."""
+    try:
+        TraceCollector(dir="/tmp/sga-trace-never", branch_points=[],
+                       window=1, dump_dtype="fp16")
+        raise AssertionError("invalid dump_dtype accepted")
+    except ValueError as e:
+        assert "dump_dtype" in str(e) and "fp16" in str(e)
+    assert TraceCollector(dir="/tmp/sga-trace-never", branch_points=[],
+                          window=1).dump_dtype == "fp32"  # default fp32
+    print("PASS test_dump_dtype_constructor_guard")
+
+
 def main():
     test_parse_branch_points()
     test_canonical_name_strips_module_prefixes()
@@ -660,6 +790,8 @@ def main():
     test_sparse_dump_dualpath_content()
     test_sparse_dump_compact_rebuild_content()
     test_sparse_dump_compact_restore_on_dump_exception()
+    test_dump_dtype_bf16_ab_convert()
+    test_dump_dtype_constructor_guard()
     print("\nall trace tests passed")
 
 

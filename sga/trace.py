@@ -12,11 +12,14 @@ runs at most once per step inside a configured window and a silent overlap
 hazard costs more than the copy).
 
 Format is schema-compatible with the legacy in-fork collector (catalog.pt /
-step_NNNNNN_state.pt / step_NNNNNN_g.pt): mutually readable, with two
+step_NNNNNN_state.pt / step_NNNNNN_g.pt): mutually readable, with three
 ADDITIVE extensions the legacy replay simply ignores — catalog entries
 carry ``param_group`` and the meta carries ``param_groups`` (per-group
 lr/betas/eps/wd), letting the new replay resolve exact per-group
-hyperparameters. Catalog keys are canonical
+hyperparameters, and the catalog carries a top-level ``g_dtype``
+storage-dtype tag for the per-step g payloads (fp32|bf16; the runtime bf16
+dump's self-describing marker, enforced by the resume guard below and read
+by ``sga.trace_convert``). Catalog keys are canonical
 parameter names with every leading ``module.`` wrapper segment stripped —
 the legacy dumps keyed by ``module.module.*``, which tied traces to the
 wrapping stack for no benefit. The legacy ``_sga_trace_name`` param tagging
@@ -135,10 +138,16 @@ class TraceCollector:
     (already typed and validated; ``parse_branch_points`` below is the
     idempotent guard for direct construction)."""
 
-    def __init__(self, dir: str, branch_points, window: int):
+    def __init__(self, dir: str, branch_points, window: int,
+                 dump_dtype: str = "fp32"):
         self.dir = dir
         self.branch_points = parse_branch_points(branch_points)
         self.window = int(window)
+        if dump_dtype not in ("fp32", "bf16"):
+            raise ValueError(
+                f"dump_dtype must be 'fp32' or 'bf16' (got {dump_dtype!r})")
+        self.dump_dtype = dump_dtype
+        self._g_dtype = torch.bfloat16 if dump_dtype == "bf16" else None
         self._entries: Optional[list] = None   # [(name, rec, group_index)]
         self._catalog_written = False          # per process (resume-safe)
 
@@ -261,6 +270,11 @@ class TraceCollector:
                 on_disk = torch.load(cat_path, weights_only=False)
                 old = on_disk.get("catalog") if isinstance(on_disk, dict) else None
                 mismatch = _catalog_mismatch(old, catalog)
+                if (mismatch is None and on_disk.get("g_dtype", "fp32")
+                        != self.dump_dtype):
+                    mismatch = ("g_dtype",
+                                f"{on_disk.get('g_dtype', 'fp32')} on disk "
+                                f"vs {self.dump_dtype} this run")
                 if mismatch is not None:
                     raise ValueError(
                         "trace: existing catalog.pt in "
@@ -268,7 +282,8 @@ class TraceCollector:
                         f"({mismatch[1]} for {mismatch[0]})"
                     )
             else:
-                torch.save({"meta": meta, "catalog": catalog}, cat_path)
+                torch.save({"meta": meta, "catalog": catalog,
+                            "g_dtype": self.dump_dtype}, cat_path)
             self._catalog_written = True
 
         if want_state:
@@ -299,9 +314,16 @@ class TraceCollector:
                    os.path.join(self.dir, f"step_{step:06d}_state.pt"))
 
     def _dump_grad(self, step: int, meta: dict) -> None:
+        # g_dtype=bfloat16 stores the per-tensor round-to-nearest bf16 value
+        # — bit-identical to converting an fp32 dump with sga.trace_convert
+        # (same .to(bfloat16) on the same fp32 source), so a runtime-bf16
+        # trace and a converted trace are interchangeable replay inputs.
         payload = {}
         for name, rec, _gi in self._entries:
             if rec.main_param.grad is not None:
-                payload[name] = rec.main_param.grad.detach().cpu()
+                g = rec.main_param.grad.detach().cpu()
+                if self._g_dtype is not None:
+                    g = g.to(self._g_dtype)
+                payload[name] = g
         torch.save({"meta": dict(meta), "payload": payload},
                    os.path.join(self.dir, f"step_{step:06d}_g.pt"))

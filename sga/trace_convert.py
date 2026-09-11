@@ -7,7 +7,8 @@ the logged gradients to bf16; replays on the copy run with ``python -m
 sga.replay --trace-dtype bf16`` (payloads upcast to fp32 at load, replay
 arithmetic unchanged). The source trace is never modified.
 
-catalog.pt and the step_NNNNNN_state.pt dumps are copied verbatim: they hold
+catalog.pt and the step_NNNNNN_state.pt dumps are copied verbatim except the
+catalog's self-describing ``g_dtype`` tag, which flips to bf16: they hold
 the replay branch states (w/m/v), which stay fp32 — only the per-step
 gradients belong to the IO-halving being screened.
 
@@ -24,6 +25,7 @@ import argparse
 import os
 import re
 import shutil
+import sys
 
 import torch
 
@@ -34,7 +36,8 @@ _S_RE = re.compile(r"step_(\d+)_state\.pt$")
 def convert(src, dst, from_step=None, to_step=None, overwrite=False,
             log=None):
     """Copy ``src`` into a new ``dst`` dir with the g payloads of steps in
-    [from_step, to_step) rounded to bf16; catalog + state files verbatim.
+    [from_step, to_step) rounded to bf16; state files verbatim (fp32), the
+    catalog verbatim except the self-describing ``g_dtype`` flip to bf16.
     Returns (n_g, n_state, src_bytes, dst_bytes) over the converted g files."""
     if not os.path.isfile(os.path.join(src, "catalog.pt")):
         raise ValueError(f"no catalog.pt in --src {src}")
@@ -53,8 +56,24 @@ def convert(src, dst, from_step=None, to_step=None, overwrite=False,
                 os.unlink(os.path.join(dst, f))
 
     os.makedirs(dst, exist_ok=True)
-    shutil.copy2(os.path.join(src, "catalog.pt"),
-                 os.path.join(dst, "catalog.pt"))
+    # catalog: verbatim except g_dtype, which flips to bf16 to keep the
+    # converted dir self-describing (runtime-bf16 dumps land on the same
+    # catalog shape via the collector's own field)
+    cat = torch.load(os.path.join(src, "catalog.pt"),
+                     map_location="cpu", weights_only=False)
+    if str(cat.get("g_dtype", "fp32")) == "bf16":
+        # loud but not fatal: the output is still correct (idempotent — the
+        # per-tensor guard below skips non-fp32 payloads), so this pass just
+        # re-copies bytes at full volume with zero rounding
+        msg = ("source catalog g_dtype is already bf16: this conversion "
+               "rounds nothing (an idempotent re-copy of an already-bf16 "
+               "trace)")
+        if log is not None:
+            log(f"WARNING: {msg}", flush=True)
+        else:
+            print(f"WARNING: {msg}", file=sys.stderr, flush=True)
+    cat["g_dtype"] = "bf16"
+    torch.save(cat, os.path.join(dst, "catalog.pt"))
 
     def _in_range(step):
         if from_step is not None and step < from_step:
@@ -97,7 +116,8 @@ def convert(src, dst, from_step=None, to_step=None, overwrite=False,
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="build a bf16 screening copy of a trace (g payloads "
-                    "fp32->bf16; catalog/states verbatim; source untouched)")
+                    "fp32->bf16; states verbatim; catalog verbatim except "
+                    "the g_dtype=bf16 tag; source untouched)")
     ap.add_argument("--src", required=True, help="source trace directory")
     ap.add_argument("--dst", required=True, help="destination directory")
     ap.add_argument("--from-step", type=int, default=None,

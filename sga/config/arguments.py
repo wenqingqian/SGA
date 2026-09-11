@@ -229,6 +229,15 @@ def _add_sga_trace_args(parser: argparse.ArgumentParser):
         "--sga-trace-window", type=int, default=100,
         help="gradient-capture window length after each branch point "
              "(>= 1). Default 100.")
+    group.add_argument(
+        "--sga-trace-dump-dtype", type=str, default="fp32",
+        choices=("fp32", "bf16"),
+        help="storage dtype of the g payloads in step_*_g.pt files. "
+             "bf16 dumps the per-tensor round-to-nearest bf16 value "
+             "(bit-identical to converting an fp32 trace with "
+             "sga.trace_convert), halving dump volume and skipping the "
+             "post-hoc conversion pass; state files stay fp32 either "
+             "way. Default fp32 (zero-drift).")
 
 
 def _add_sga_score_args(parser: argparse.ArgumentParser):
