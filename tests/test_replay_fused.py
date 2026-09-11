@@ -73,10 +73,15 @@ from test_replay_cycle import reference_cycle
 # runners may export REPLAY_S0_PROFILE globally for their GPU arms; the
 # suite must stay immune (the s0_profile fragment key carries wall-clock
 # counters that break the bitwise A/Bs). Tests that need it set it
-# themselves. Covers both the pytest and the main() entry paths.
+# themselves. Same for REPLAY_FUSED_FRONT_SORT: a suite-wide export would
+# force test_fused_sort_device_bitwise's dev arm onto the CPU path and fail
+# with a misleading "patch did not engage". Covers both the pytest and the
+# main() entry paths.
 if "REPLAY_S0_PROFILE" in os.environ:
     del os.environ["REPLAY_S0_PROFILE"]
     replay_fused._S0_PROFILE = False
+if "REPLAY_FUSED_FRONT_SORT" in os.environ:
+    del os.environ["REPLAY_FUSED_FRONT_SORT"]
 
 
 B1, B2, EPS, WD = 0.9, 0.95, 1e-8, 0.1
@@ -929,6 +934,259 @@ def test_dev_reduce_cuda():
     print("PASS test_dev_reduce_cuda")
 
 
+def _adv_sort_vectors():
+    """Non-negative finite sort keys engineered against stable-sort tie
+    rules: all-equal, +0.0 runs interleaved with duplicated positives, and
+    a duplicate-heavy random draw (the fused engine's score/label vectors
+    are exactly this shape — non-negative, finite, tie-rich)."""
+    v_tie = torch.zeros(4096)
+    v_tie[::7] = 1.5
+    v_tie[3::7] = 1.5
+    v_tie[1::11] = 0.25
+    g = torch.Generator().manual_seed(1234)
+    return {
+        "all_equal": torch.zeros(4096),
+        "tie_blocks": v_tie,
+        "dup_random": torch.randint(0, 64, (16384,), generator=g).float()
+                      / 8.0,
+    }
+
+
+def test_stable_order_desc_adversarial():
+    """The device-permutation fast path must return the SAME permutation as
+    the CPU path on adversarial keys (the whole engine's byte-identity
+    rests on stable sort being backend-independent for finite non-negative
+    keys) — including when the VRAM guard is forced to fall back."""
+    if not torch.cuda.is_available():
+        print("SKIP test_stable_order_desc_adversarial (no CUDA)")
+        return
+    for name, v in _adv_sort_vectors().items():
+        cpu_order = replay_fused._stable_order_desc(v, None)
+        gpu_order = replay_fused._stable_order_desc(v, "cuda:0")
+        assert torch.equal(cpu_order, gpu_order), \
+            f"permutation diverged on {name}"
+        # guard forced to refuse → loud CPU fallback, still the same order
+        real_get = torch.cuda.mem_get_info
+        torch.cuda.mem_get_info = lambda *a, **k: (0, 1)
+        try:
+            fb_order = replay_fused._stable_order_desc(v, "cuda:0")
+        finally:
+            torch.cuda.mem_get_info = real_get
+        assert torch.equal(fb_order, cpu_order), \
+            f"forced fallback diverged on {name}"
+    print("PASS test_stable_order_desc_adversarial")
+
+
+def test_ranking_idcg_device_bitwise():
+    """_fused_ranking/_idcg_of_parts with adversarial keys: the device only
+    produces the permutation/sorted values, every reduction stays on the
+    callers' CPU expression — so the returned metric scalars must be
+    bitwise-equal to the pure-CPU call."""
+    if not torch.cuda.is_available():
+        print("SKIP test_ranking_idcg_device_bitwise (no CUDA)")
+        return
+    for i, (name, lb) in enumerate(_adv_sort_vectors().items()):
+        n = lb.numel()
+        # the engine's call sites pass k == sc_all.numel() (the gathered
+        # selection IS the top-k), so wts and the gathered labels align
+        k = n
+        g = torch.Generator().manual_seed(100 + i)
+        sc = torch.randint(0, 32, (n,), generator=g).float() / 4.0
+        lsel = torch.rand(n, generator=g) < 0.3
+        parts = [lb[: n // 2], lb[n // 2:]]
+        idcg_cpu = replay_fused._idcg_of_parts(parts)
+        idcg_dev = replay_fused._idcg_of_parts(parts, dev="cuda:0")
+        assert idcg_cpu == idcg_dev, f"idcg moved a bit on {name}"
+        m_cpu = replay_fused._fused_ranking(
+            sc, lb, [lsel], k, float(sc.sum()), float(lb.sum()), idcg_cpu)
+        m_dev = replay_fused._fused_ranking(
+            sc, lb, [lsel], k, float(sc.sum()), float(lb.sum()), idcg_cpu,
+            dev="cuda:0")
+        assert m_cpu == m_dev, f"ranking moved a bit on {name}"
+    # boundary documentation: LABELS may carry -0.0 (finite, asserted) —
+    # radix sort groups -0.0/+0.0 into different key classes where CPU
+    # stability interleaves them, but labels only feed VALUES (idcg mul-sum
+    # is immune to the sign of zero; the ranking permutation is keyed on sc,
+    # which comes from .abs() and can never be -0.0), so the scalars stay
+    # bitwise. This is the ONLY -0.0 tolerance — never feed -0.0 as sc.
+    n = 8192
+    g = torch.Generator().manual_seed(99)
+    lb = torch.randint(0, 16, (n,), generator=g).float() / 4.0
+    lb[::5] = -0.0
+    sc = torch.randint(0, 32, (n,), generator=g).float() / 4.0
+    lsel = torch.rand(n, generator=g) < 0.3
+    k = n  # engine call sites: k == gathered-selection length
+    parts = [lb[: n // 2], lb[n // 2:]]
+    idcg_cpu = replay_fused._idcg_of_parts(parts)
+    idcg_dev = replay_fused._idcg_of_parts(parts, dev="cuda:0")
+    assert idcg_cpu == idcg_dev, "idcg moved a bit on label_neg_zero"
+    m_cpu = replay_fused._fused_ranking(
+        sc, lb, [lsel], k, float(sc.sum()), float(lb.sum()), idcg_cpu)
+    m_dev = replay_fused._fused_ranking(
+        sc, lb, [lsel], k, float(sc.sum()), float(lb.sum()), idcg_cpu,
+        dev="cuda:0")
+    assert m_cpu == m_dev, "ranking moved a bit on label_neg_zero"
+    print("PASS test_ranking_idcg_device_bitwise")
+
+
+def test_fused_sort_device_bitwise():
+    """End-to-end on cuda: forcing the ranking/idcg sorts onto the CPU
+    fallback (the guard patched to refuse) must leave the whole fused
+    report bit-identical to the device-permutation run — the device
+    computes permutations only. The counting wrapper asserts the patch
+    actually engaged (a spawned worker would bypass it and pass
+    vacuously)."""
+    if not torch.cuda.is_available():
+        print("SKIP test_fused_sort_device_bitwise (no CUDA)")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        t0, *_ = _build_fixture(td)
+        cache = os.path.join(td, "dense_cache")
+        common = ["--device", "cuda", "--fused-shards", "1"]
+        base = _run(_base_args(td, cache, t0, common))
+        calls = {"n": 0}
+
+        def refusing_guard(numel, dev):
+            calls["n"] += 1
+            return False
+
+        real_guard = replay_fused._device_ok_for_sort
+        replay_fused._device_ok_for_sort = refusing_guard
+        try:
+            fb = _run(_base_args(td, cache, t0, common))
+        finally:
+            replay_fused._device_ok_for_sort = real_guard
+        assert calls["n"] > 0, "guard never consulted — patch did not engage"
+        for rep in (base, fb):
+            rep["branch_results"][str(t0)]["replay"].pop("dense_cache_hit")
+        assert _deep_eq_nan(base, fb), \
+            "the device-permutation fast path moved a report bit"
+    print("PASS test_fused_sort_device_bitwise")
+
+
+def test_sort_oom_fallback_loud_cpu():
+    """The TOCTOU completion of the loud-fallback contract: a CUDA OOM
+    raised at the device sort itself (the guard already passed — another
+    process grabbed the VRAM in between) must fall back to the bit-identical
+    CPU path with a loud one-line print, not abort the run. torch.argsort /
+    torch.sort are patched to raise only for CUDA inputs, so the CPU
+    fallback exercise is real; restored in finally."""
+    if not torch.cuda.is_available():
+        print("SKIP test_sort_oom_fallback_loud_cpu (no CUDA)")
+        return
+    real_argsort, real_sort = torch.argsort, torch.sort
+    calls = []
+
+    def oom_argsort(t, *a, **k):
+        if t.is_cuda:
+            calls.append("dev_argsort")
+            raise torch.cuda.OutOfMemoryError("simulated OOM")
+        calls.append("cpu_argsort")
+        return real_argsort(t, *a, **k)
+
+    def oom_sort(t, *a, **k):
+        if t.is_cuda:
+            calls.append("dev_sort")
+            raise torch.cuda.OutOfMemoryError("simulated OOM")
+        calls.append("cpu_sort")
+        return real_sort(t, *a, **k)
+
+    v = _adv_sort_vectors()["tie_blocks"]
+    expected_order = replay_fused._stable_order_desc(v, None)
+    expected_idcg = replay_fused._idcg_of_parts([v], dev=None)
+    try:
+        torch.argsort = oom_argsort
+        torch.sort = oom_sort
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            fb_order = replay_fused._stable_order_desc(v, "cuda:0")
+            fb_idcg = replay_fused._idcg_of_parts([v], dev="cuda:0")
+    finally:
+        torch.argsort, torch.sort = real_argsort, real_sort
+    assert calls.count("dev_argsort") == 1 and \
+        calls.count("cpu_argsort") == 1, calls
+    assert calls.count("dev_sort") == 1 and calls.count("cpu_sort") == 1, \
+        calls
+    out = buf.getvalue()
+    assert out.count("hit CUDA OOM") == 2, out[-500:]
+    assert "CPU fallback (bit-identical)" in out, out[-500:]
+    assert torch.equal(fb_order, expected_order), \
+        "OOM fallback changed the ranking permutation"
+    assert fb_idcg == expected_idcg, "OOM fallback moved the idcg bit"
+    print("PASS test_sort_oom_fallback_loud_cpu")
+
+
+def test_sort_guard_empty_cache_before_measure():
+    """Pins the guard's call order: empty_cache before mem_get_info (the
+    rationale is _device_ok_for_sort's: device-wide free-mem accounting
+    counts this process's cached-but-free blocks as used). Recorded by
+    monkeypatching both (restored in finally)."""
+    if not torch.cuda.is_available():
+        print("SKIP test_sort_guard_empty_cache_before_measure (no CUDA)")
+        return
+    calls = []
+    real_empty = torch.cuda.empty_cache
+    real_get = torch.cuda.mem_get_info
+
+    def rec_empty_cache():
+        calls.append("empty_cache")
+
+    def rec_mem_get_info(dev=None):
+        calls.append("mem_get_info")
+        return real_get(dev)
+
+    try:
+        torch.cuda.empty_cache = rec_empty_cache
+        torch.cuda.mem_get_info = rec_mem_get_info
+        replay_fused._device_ok_for_sort(1, "cuda:0")
+    finally:
+        torch.cuda.empty_cache = real_empty
+        torch.cuda.mem_get_info = real_get
+    assert calls == ["empty_cache", "mem_get_info"], calls
+    print("PASS test_sort_guard_empty_cache_before_measure")
+
+
+def test_front_sort_env_killswitch():
+    """REPLAY_FUSED_FRONT_SORT=cpu forces the bit-identical CPU sort path on
+    a cuda run: the S0FRONT echo must read front_sort=cpu (dev arm:
+    front_sort=dev) and the two arms' reports must be byte-identical — the
+    small-field A/B harness drives its arms through this public knob."""
+    if not torch.cuda.is_available():
+        print("SKIP test_front_sort_env_killswitch (no CUDA)")
+        return
+    old_env = os.environ.get("REPLAY_FUSED_FRONT_SORT")
+    old_gate = replay_fused._S0_PROFILE
+    replay_fused._S0_PROFILE = True
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            t0, *_ = _build_fixture(td)
+            cache = os.path.join(td, "dense_cache")
+            common = ["--device", "cuda", "--fused-shards", "1"]
+            bufs = []
+            reps = []
+            for arm in ("auto", "cpu"):
+                os.environ["REPLAY_FUSED_FRONT_SORT"] = arm
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    reps.append(soa.main(_base_args(td, cache, t0, common)))
+                bufs.append(buf.getvalue())
+            assert "front_sort=dev" in bufs[0], bufs[0][-500:]
+            assert "front_sort=cpu" in bufs[1], bufs[1][-500:]
+            for rep in reps:
+                rep["branch_results"][str(t0)]["replay"].pop(
+                    "dense_cache_hit")
+                rep["branch_results"][str(t0)].pop("s0_profile", None)
+            assert _deep_eq_nan(reps[0], reps[1]), \
+                "the front-sort kill-switch moved a report bit"
+    finally:
+        if old_env is None:
+            os.environ.pop("REPLAY_FUSED_FRONT_SORT", None)
+        else:
+            os.environ["REPLAY_FUSED_FRONT_SORT"] = old_env
+        replay_fused._S0_PROFILE = old_gate
+    print("PASS test_front_sort_env_killswitch")
+
+
 def _budget_mb(shards, cap, replay_dtype="fp64"):
     """The --fused-state-budget-mb value that derives group size == cap,
     recomputed from the fixture spec constants (sum(SIZES)) via the
@@ -1143,6 +1401,10 @@ def test_s0_profile_counters():
                      "--fused-dev-reduce",
                      "--fused-state-budget-mb", repr(_budget_mb(1, 4))]))
             assert "S0PROFILE" in buf.getvalue()
+            # the front-phase decomposition line rides the same gate (the
+            # cpu device arm echoes front_sort=cpu)
+            assert "S0FRONT" in buf.getvalue()
+            assert "front_sort=cpu" in buf.getvalue()
             profs = report["branch_results"][str(t0)]["s0_profile"]
             assert isinstance(profs, list) and profs
             for prof in profs:
@@ -1197,6 +1459,12 @@ def main():
     test_gprefetcher_pinned_buffers()
     test_dev_reduce_bitwise()
     test_dev_reduce_cuda()
+    test_stable_order_desc_adversarial()
+    test_ranking_idcg_device_bitwise()
+    test_fused_sort_device_bitwise()
+    test_sort_oom_fallback_loud_cpu()
+    test_sort_guard_empty_cache_before_measure()
+    test_front_sort_env_killswitch()
     test_state_budget_bitwise()
     test_state_budget_cap_semantics()
     test_state_budget_cuda()

@@ -263,14 +263,65 @@ def shard_select(score, k, comms):
 # ranking metrics over gathered selections (exact; mirrors ranking_metrics)
 # ----------------------------------------------------------------------------
 
+def _device_ok_for_sort(numel, dev):
+    """Conservative VRAM guard for computing one permutation on ``dev``
+    (cub radix SortPairs double-buffers keys+indices ≈ 20-24 B/elem; this
+    books 32). Runtime free-mem based — static accounting lies on shared
+    nodes. Falls back (loudly) to the CPU path, which is bit-identical."""
+    if dev is None:
+        return False
+    # mem_get_info is device-wide and therefore counts THIS process's own
+    # cached-but-free allocator blocks (e.g. a previous sort's cub temp) as
+    # used — release them before measuring or big sorts get refused despite
+    # physically fitting. No sort tensor is live between calls (the .cpu()
+    # fetch syncs), so only genuinely freeable blocks go back.
+    torch.cuda.empty_cache()
+    free, _total = torch.cuda.mem_get_info(dev)
+    need = numel * 32
+    ok = need < free * 0.85
+    if not ok:
+        print(f"[fused] ranking permutation on {dev} skipped: "
+              f"need ~{need / 2 ** 30:.1f} GiB, free {free / 2 ** 30:.1f} "
+              f"GiB — CPU fallback (bit-identical)", flush=True)
+    return ok
+
+
+def _stable_order_desc(keys, dev):
+    """Descending stable argsort as a CPU int64 tensor. With ``dev`` set
+    (and enough VRAM) the permutation is computed on the device and
+    fetched back; ``stable=True`` guarantees the same permutation on both
+    backends. FINITENESS of the callers' keys is enforced upstream (the
+    shard_select isfinite gate for scores, the one-time label assertion in
+    _worker); non-negativity is only structural — scores are written via
+    .abs(), labels are sums of squares — and NOT separately checked. A
+    finite NEGATIVE key would still sort identically across backends (the
+    only cross-backend key-class split is ±0.0, which can affect
+    permutations only if it appears in the ranking KEYS; a -0.0 label
+    touches sorted VALUES only, which is report-safe). Reductions never
+    run here — they stay on the callers' original CPU expression path, so
+    results are bit-identical with or without a device."""
+    if _device_ok_for_sort(keys.numel(), dev):
+        try:
+            return torch.argsort(keys.to(dev), descending=True,
+                                 stable=True).cpu()
+        except torch.cuda.OutOfMemoryError:
+            # TOCTOU: free VRAM can shrink between the guard's mem_get_info
+            # and the cub allocation on a shared node — complete the
+            # loud-CPU-fallback contract instead of aborting the run
+            print(f"[fused] ranking permutation on {dev} hit CUDA OOM — "
+                  "CPU fallback (bit-identical)", flush=True)
+    return torch.argsort(keys, descending=True, stable=True)
+
+
 def _fused_ranking(sc_all, lb_all, lsel_parts, k, total_score, total_label,
-                   idcg):
+                   idcg, dev=None):
     """The classic ranking_metrics arithmetic on the gathered selected
     vectors (global index order), with recall from the gathered label-sel
-    overlap counts."""
+    overlap counts. ``dev`` only accelerates the permutation (see
+    _stable_order_desc); every sum/conversion below is untouched."""
     pos = torch.arange(1, k + 1, dtype=torch.float64)
     wts = 1.0 / torch.log2(pos + 1.0)
-    order = torch.argsort(sc_all, descending=True, stable=True)
+    order = _stable_order_desc(sc_all, dev)
     dcg = float((lb_all[order].to(torch.float64) * wts).sum())
     if idcg > 0.0:
         ndcg = dcg / idcg
@@ -295,15 +346,27 @@ def _fused_ranking(sc_all, lb_all, lsel_parts, k, total_score, total_label,
     }
 
 
-def _idcg_of_parts(parts):
+def _idcg_of_parts(parts, dev=None):
     """idcg over gathered label-sel values (already in global index order;
-    idcg's sort is order-stable, so the value matches the classic path)."""
+    idcg's sort is order-stable, so the value matches the classic path).
+    ``dev`` only accelerates the sort — the sorted values come back to
+    CPU before the fp64 conversion/weighting (bit-identical either way)."""
     whole = torch.cat(parts)
-    rel2 = torch.sort(whole, descending=True, stable=True).values \
-        .to(torch.float64)
+    rel2 = None
+    if _device_ok_for_sort(whole.numel(), dev):
+        try:
+            rel2 = torch.sort(whole.to(dev), descending=True,
+                              stable=True).values.cpu()
+        except torch.cuda.OutOfMemoryError:
+            # same guard-allocation TOCTOU window as _stable_order_desc —
+            # loud CPU fallback, bit-identical by construction
+            print(f"[fused] idcg sort on {dev} hit CUDA OOM — "
+                  "CPU fallback (bit-identical)", flush=True)
+    if rel2 is None:
+        rel2 = torch.sort(whole, descending=True, stable=True).values
     pos = torch.arange(1, whole.numel() + 1, dtype=torch.float64)
     wts = 1.0 / torch.log2(pos + 1.0)
-    return float((rel2 * wts).sum())
+    return float((rel2.to(torch.float64) * wts).sum())
 
 
 # ----------------------------------------------------------------------------
@@ -399,6 +462,21 @@ def _worker(rank, world, cfg, port, frag_path):
 
     torch.manual_seed(cfg["seed"])
     dev = "cpu" if cfg["device"] == "cpu" else f"cuda:{rank}"
+    # sort_dev feeds the ranking/idcg sorts (device computes the
+    # permutation; the guard inside falls back to CPU — see
+    # _stable_order_desc)
+    sort_dev = None if dev == "cpu" else dev
+    # ops kill-switch (A/B arms and emergencies): force the bit-identical
+    # CPU sort path — the S0FRONT print echoes the arm as front_sort=cpu.
+    # Unknown values must fail loudly: a typo ("CPU", "1") would otherwise
+    # silently leave the emergency knob a no-op.
+    front_sort = os.environ.get("REPLAY_FUSED_FRONT_SORT", "auto")
+    if front_sort not in ("auto", "cpu"):
+        raise ValueError(
+            f"REPLAY_FUSED_FRONT_SORT={front_sort!r} is not one of the "
+            "allowed values ('auto', 'cpu')")
+    if front_sort == "cpu":
+        sort_dev = None
     if dev.startswith("cuda"):
         torch.cuda.set_device(int(dev.split(":")[1]))
     comms = Comms(rank, world, port)
@@ -444,6 +522,7 @@ def _worker(rank, world, cfg, port, frag_path):
     del st
 
     # ---- branch scores (per score_name, elementwise fp64 math -> fp32) ----
+    _tf0 = time.perf_counter() if _S0_PROFILE else 0.0
     score_names = cfg["score_names"]
     specs = {s: R.get_score_spec(s) for s in score_names}
     t0step = int(meta["step"])
@@ -468,6 +547,11 @@ def _worker(rank, world, cfg, port, frag_path):
 
     # ---- dense artifacts: the parent populated the cache before spawn -----
     # (the cache roundtrip is bitwise — pinned by test_dense_cache_roundtrip)
+    if _S0_PROFILE:
+        _tf_scores = time.perf_counter() - _tf0
+        _tf0 = time.perf_counter()
+    else:
+        _tf_scores = 0.0
     ident = R._dense_cache_ident(cfg["trace_dir"], t0, window_steps,
                                  eff_horizons, replay_dtype,
                                  cfg["trace_dtype"],
@@ -476,6 +560,13 @@ def _worker(rank, world, cfg, port, frag_path):
     if cached is None:
         raise RuntimeError("dense cache still missing after parent populate")
     label_loc = cached["label_flat"][lo:hi].clone()
+    # the device-permutation fast path relies on finite non-negative sort
+    # keys (score_loc passes the shard_select isfinite gate; label gets one
+    # upfront check here — non-finite labels would sort inconsistently
+    # across backends)
+    if not bool(torch.isfinite(label_loc).all().item()):
+        raise ValueError("dense-cache label vector contains non-finite "
+                         "entries; check the trace/cache integrity")
     den_at = cached["den_at"]
     recon_steps = cached["recon_steps"]
     label_total = cached["label_total"]
@@ -489,6 +580,10 @@ def _worker(rank, world, cfg, port, frag_path):
     dense_cache_hit = cfg["dense_cache_hit"]  # parent-side load outcome;
     # the streaming pass itself only ever consumes the cache
     del cached
+    if _S0_PROFILE:
+        _tf_cache = time.perf_counter() - _tf0
+    else:
+        _tf_cache = 0.0
 
     # ---- score / label statistics (sums shard-partial; min/max exact) ------
     stats = {}
@@ -501,31 +596,55 @@ def _worker(rank, world, cfg, port, frag_path):
     cycle_lens = cfg["cycle_lens"]
     ks = {r: max(1, int(round(r / 100.0 * N))) for r in ratios}
     idcg, sel0, thresh0, rankmet = {}, {}, {}, {}
+    _tf_sel = 0.0
+    _tf_rank = 0.0
     for r in ratios:
+        _tq = time.perf_counter() if _S0_PROFILE else 0.0
         lsel, _lt = shard_select(label_loc, ks[r], comms)
         parts = comms.all_gather_pad(label_loc[lsel].clone())
+        if _S0_PROFILE:
+            _tf_sel += time.perf_counter() - _tq
+            _tq = time.perf_counter()
         if comms.global_rank == 0:
-            idcg[r] = _idcg_of_parts(parts)
+            idcg[r] = _idcg_of_parts(parts, dev=sort_dev)
+        if _S0_PROFILE:
+            _tf_rank += time.perf_counter() - _tq
         for s in score_names:
             # the branch-point selection is a function of (score, ratio)
             # only, and shard_select is deterministic on its inputs — every
             # T arm of one (s, r) shares a single select instead of paying
             # len(cycle_lens) redundant global selects; sel0 is only read to
             # build the per-config device masks (never mutated)
+            _tq = time.perf_counter() if _S0_PROFILE else 0.0
             sel, th = shard_select(score_loc[s], ks[r], comms)
             sc_parts = comms.all_gather_pad(score_loc[s][sel].clone())
             lb_parts = comms.all_gather_pad(label_loc[sel].clone())
             ls_parts = comms.all_gather_pad(lsel[sel].clone())
+            if _S0_PROFILE:
+                _tf_sel += time.perf_counter() - _tq
+                _tq = time.perf_counter()
             met_sr = None
             if comms.global_rank == 0:
                 met_sr = _fused_ranking(
                     torch.cat(sc_parts), torch.cat(lb_parts), ls_parts,
-                    ks[r], stats[s]["sum"], label_total, idcg[r])
+                    ks[r], stats[s]["sum"], label_total, idcg[r],
+                    dev=sort_dev)
+            if _S0_PROFILE:
+                _tf_rank += time.perf_counter() - _tq
             for t in cycle_lens:
                 sel0[(s, r, t)] = sel
                 thresh0[(s, r, t)] = th
                 if comms.global_rank == 0:
                     rankmet[(s, r, t)] = met_sr
+    if _S0_PROFILE and comms.global_rank == 0:
+        # front-phase decomposition (diagnostic labels, not exact
+        # accounting): branch-score math / dense-cache load / shard_select
+        # + gathers / ranking+idcg sorts
+        print(f"S0FRONT rank={rank} scores_s={_tf_scores:.1f} "
+              f"cache_s={_tf_cache:.1f} select_s={_tf_sel:.1f} "
+              f"rank_s={_tf_rank:.1f} "
+              f"front_sort={'cpu' if sort_dev is None else 'dev'}",
+              flush=True)
 
     # ---- streaming passes over config groups ------------------------------
     # (score, ratio, T) arms; a single T enumerates exactly the historical
@@ -559,19 +678,30 @@ def _worker(rank, world, cfg, port, frag_path):
     t_pass0 = time.time()
     for gi, group in enumerate(groups):
         states = {}
+        # sel0[(s,r,t)] is the SAME tensor for every t of one (s,r) — key
+        # the upload cache by (s, r, entry) so "same selection across T
+        # arms" is expressed directly and the slice + upload happens once
+        # per distinct selection instead of once per arm (the masks are
+        # read-only downstream; reselection replaces the tensor, never
+        # mutates in place, so aliasing is safe)
+        sel_dev_cache = {}
         for (s, r, t) in group:
             sel = sel0[(s, r, t)]
             stt = {}
             for e in sp.entries:
                 # _fresh_state: never alias the shard's w0/m0/v0 — every
                 # arm in the group must start from the pristine state
+                sel_key = (s, r, e["name"])
+                if sel_key not in sel_dev_cache:
+                    sel_dev_cache[sel_key] = \
+                        sel[e["a"]:e["a"] + e["n"]].to(dev)
                 stt[e["name"]] = {
                     "ms": _fresh_state(e["m0"], dev),
                     "vs": _fresh_state(e["v0"], dev),
                     "ws": _fresh_state(e["w0"], dev),
                     "res": torch.zeros(e["n"], dtype=replay_dtype,
                                        device=dev),
-                    "sel": sel[e["a"]:e["a"] + e["n"]].to(dev),
+                    "sel": sel_dev_cache[sel_key],
                 }
             states[(s, r, t)] = stt
         chunk_dev = R._chunk_elems(cfg["chunk_mb"], itemsize)
@@ -1119,6 +1249,13 @@ def _populate_dense_cache(args, ctx, cfg, t0):
     if not hit:
         _compute_dense_and_cache(cfg, R, t0, window_steps, eff_horizons,
                                  replay_dtype)
+        if args.device != "cpu":
+            # the populate pass ran on cuda:0 in THIS (parent) process and
+            # its peak stays cached in the allocator, invisible to per-process
+            # accounting but visible to the workers' sort guard, which reads
+            # device-wide free memory — hand the blocks back before any
+            # shard spawns (no device tensor is live at this point)
+            torch.cuda.empty_cache()
     cfg["dense_cache_hit"] = hit
     return window_steps, eff_horizons, ident
 
