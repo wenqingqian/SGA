@@ -32,7 +32,12 @@ classic in-process cycle replay was removed; cycle auto-routes here):
 6. CUDA smoke (skipped without a GPU): world=1 on cuda (dense via
    dense_replay_dev) matches the from-spec reference within the
    sanitize/report band.
-7. Perf-flag mechanism (not just report values): the --fused-g-residency
+7. Comms multi-node rendezvous env (SGA_MASTER_ADDR + SGA_MASTER_PORT,
+   per-process SGA_GLOBAL_RANK): real gloo init over the master endpoint
+   with the global process-group rank while the local shard index stays
+   in ``rank``, collectives come back in global-rank order, and both env
+   misconfigurations raise loudly.
+8. Perf-flag mechanism (not just report values): the --fused-g-residency
    / --fused-dev-reduce echoes, the REPLAY_S0_PROFILE counters carried in
    the fragment (residency books every shared H2D byte to pass 1,
    dev-reduce collapses the host syncs to the per-pass fetches), the
@@ -422,6 +427,101 @@ def test_fused_cli_gates():
     print("PASS test_fused_cli_gates")
 
 
+def _env_comms_worker(rank, world, port, per_node, expected_sum):
+    """One simulated multi-node shard (rank = the global process-group
+    rank, local shard index = rank % per_node). The launcher contract is
+    env-per-process, so each worker sets its own SGA_GLOBAL_RANK; the
+    master addr/port must arrive by mp.spawn os.environ inheritance from
+    the parent. port is deliberately 0 — unusable — so the rendezvous can
+    only succeed through the inherited env path."""
+    glob, local = rank, rank % per_node
+    os.environ["SGA_GLOBAL_RANK"] = str(glob)
+    c = replay_fused.Comms(local, world, port)
+    assert (c.rank, c.global_rank, c.world) == (local, glob, world), \
+        (c.rank, c.global_rank, c.world, local, glob, world)
+    assert c.sum_f64([float(glob) + 0.5]) == [expected_sum]
+    parts = c.all_gather_pad(torch.tensor([float(glob)]))
+    assert [int(p[0].item()) for p in parts] == list(range(world))
+    if c.distributed:
+        torch.distributed.destroy_process_group()
+
+
+def _with_rendezvous_env(fn):
+    """Run fn() with SGA_MASTER_ADDR/SGA_MASTER_PORT set to a free local
+    endpoint, restoring any SGA_* rendezvous vars afterwards."""
+    keys = ("SGA_MASTER_ADDR", "SGA_MASTER_PORT", "SGA_GLOBAL_RANK")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ["SGA_MASTER_ADDR"] = "127.0.0.1"
+        os.environ["SGA_MASTER_PORT"] = str(replay_fused._free_port())
+        fn()
+    finally:
+        for k in keys:
+            if saved[k] is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = saved[k]
+
+
+def test_comms_env_multinode_world2():
+    """SGA_MASTER_ADDR + SGA_MASTER_PORT set in the parent and inherited by
+    the mp.spawn children, per-worker SGA_GLOBAL_RANK: a real 2-rank gloo
+    init over the master endpoint (the port argument is 0, so only the env
+    path can rendezvous) plus one sum_f64 and one all_gather_pad
+    roundtrip."""
+    import torch.multiprocessing as mp
+    _with_rendezvous_env(lambda: mp.spawn(
+        _env_comms_worker, args=(2, 0, 2, 2.0), nprocs=2, join=True))
+    print("PASS test_comms_env_multinode_world2")
+
+
+def test_comms_env_global_local_split():
+    """Two simulated nodes x 2 local shards (world=4): global rank != local
+    rank on the second node, init_process_group uses the global rank (all
+    4 meet), collectives return in global process-group rank order (the
+    order shard_select's tie-fill indexes), and self.rank stays the local
+    shard index."""
+    import torch.multiprocessing as mp
+    _with_rendezvous_env(lambda: mp.spawn(
+        _env_comms_worker, args=(4, 0, 2, 8.0), nprocs=4, join=True))
+    print("PASS test_comms_env_global_local_split")
+
+
+def test_comms_env_errors():
+    """The two env misconfigurations raise loudly, naming the orphaned or
+    missing variable, before any process group is touched (world=1, so no
+    init would happen anyway)."""
+    keys = ("SGA_MASTER_ADDR", "SGA_MASTER_PORT", "SGA_GLOBAL_RANK")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        os.environ["SGA_GLOBAL_RANK"] = "1"
+        try:
+            replay_fused.Comms(0, 1, 0)
+        except ValueError as e:
+            assert "SGA_MASTER_ADDR" in str(e), str(e)
+        else:
+            raise AssertionError(
+                "SGA_GLOBAL_RANK accepted without SGA_MASTER_ADDR")
+        del os.environ["SGA_GLOBAL_RANK"]
+        os.environ["SGA_MASTER_ADDR"] = "127.0.0.1"
+        try:
+            replay_fused.Comms(0, 1, 0)
+        except ValueError as e:
+            assert "SGA_MASTER_PORT" in str(e), str(e)
+        else:
+            raise AssertionError(
+                "SGA_MASTER_ADDR accepted without SGA_MASTER_PORT")
+    finally:
+        for k in keys:
+            if saved[k] is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = saved[k]
+    print("PASS test_comms_env_errors")
+
+
 def test_fused_cuda_world1():
     """CUDA smoke: world=1 on cuda (dense via dense_replay_dev) matches the
     from-spec reference within the sanitize/report band (fp64 dev engine,
@@ -753,6 +853,9 @@ def main():
     test_fused_world2_norm_fp32()
     test_fused_cold_cache_world2()
     test_fused_cli_gates()
+    test_comms_env_multinode_world2()
+    test_comms_env_global_local_split()
+    test_comms_env_errors()
     test_fused_cuda_world1()
     test_fused_bf16_trace_world1()
     test_g_residency_bitwise()

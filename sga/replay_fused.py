@@ -23,6 +23,11 @@ window in lockstep — one window read per group — sharded across processes:
   process computes the dense pass with the classic machinery and saves the
   cache once (before the shards start), then every shard slices the
   artifacts.
+- Multi-node (``sga/replay_launch.py``): shard r lives on node
+  r // (world / M) at cuda:(r % (world / M)); the rendezvous is env-driven
+  (SGA_MASTER_ADDR / SGA_MASTER_PORT / SGA_GLOBAL_RANK) and every rank-0
+  role below is keyed by the GLOBAL rank, so "rank 0" always means the
+  launcher node's first shard.
 
 Arithmetic contract (historical): per-config math was op-identical to the
 removed ``sparse_replay_cycle`` — per-param per-chunk operations in the
@@ -59,15 +64,45 @@ _S0_PROFILE = os.environ.get("REPLAY_S0_PROFILE", "") == "1"
 # ----------------------------------------------------------------------------
 
 class Comms:
+    """gloo wrapper for the tiny control-plane exchanges.
+
+    Rendezvous: single-machine by default (tcp://127.0.0.1:{port}, rank ==
+    process-group rank). A multi-node launcher instead sets, per process:
+    SGA_MASTER_ADDR + SGA_MASTER_PORT (tcp rendezvous on the master node)
+    and SGA_GLOBAL_RANK (the global process-group rank; world is passed
+    pre-computed). In that mode init_process_group uses the global rank,
+    ``self.rank`` stays the local (intra-node) shard index and
+    ``self.global_rank`` is the process-group rank — consumers that index
+    gathered collective results must use ``global_rank``.
+    """
+
     def __init__(self, rank, world, port):
+        master = os.environ.get("SGA_MASTER_ADDR")
+        global_rank = os.environ.get("SGA_GLOBAL_RANK")
+        if master is None:
+            if global_rank is not None:
+                raise ValueError(
+                    "SGA_GLOBAL_RANK is set but SGA_MASTER_ADDR is not; "
+                    "the global rank only means something with the "
+                    "multi-node master rendezvous")
+            self.global_rank = rank
+            init_method = f"tcp://127.0.0.1:{port}"
+        else:
+            if "SGA_MASTER_PORT" not in os.environ:
+                raise ValueError(
+                    "SGA_MASTER_ADDR is set but SGA_MASTER_PORT is not; "
+                    "set both to the master node's tcp rendezvous endpoint")
+            self.global_rank = (int(global_rank) if global_rank is not None
+                                else rank)
+            init_method = f"tcp://{master}:{os.environ['SGA_MASTER_PORT']}"
         self.rank, self.world = rank, world
         self.distributed = world > 1
         if self.distributed:
             # explicit generous timeout: the 30-min gloo default would kill
             # a healthy run whose ranks legitimately take long to reconvene
-            dist.init_process_group(backend="gloo", rank=rank,
+            dist.init_process_group(backend="gloo", rank=self.global_rank,
                                     world_size=world,
-                                    init_method=f"tcp://127.0.0.1:{port}",
+                                    init_method=init_method,
                                     timeout=datetime.timedelta(hours=2))
 
     def sum_f64(self, vals):
@@ -213,7 +248,9 @@ def shard_select(score, k, comms):
         allc[0] = counts
     need = k - sum(int(c[0].item()) for c in allc)
     take = need
-    for rr in range(comms.rank):
+    # allc is in process-group rank order, so the shards before this one
+    # are counted by global_rank (== rank on the single-machine default)
+    for rr in range(comms.global_rank):
         take -= int(allc[rr][1].item())
     take = max(0, min(take, int(counts[1].item())))
     if take > 0:
@@ -374,7 +411,11 @@ def _worker(rank, world, cfg, port, frag_path):
     window_steps, W, eff_horizons = _window_and_horizons(
         g_files, t0, cfg["window"], cfg["horizons"])
 
-    lo, hi = shard_bounds(N, world)[rank]
+    # the shard's slice of the flat index space is keyed by the GLOBAL rank
+    # (multi-node: the launcher hands node m the local ranks m*g..m*g+g-1, so
+    # a local-rank key would give every node the same slices); identical to
+    # the local rank on the single-machine default path
+    lo, hi = shard_bounds(N, world)[comms.global_rank]
     st = R._load(state_files[t0])
     meta = st["meta"]
     sp = ShardParams(names, catalog, meta, lo, hi)
@@ -462,7 +503,7 @@ def _worker(rank, world, cfg, port, frag_path):
     for r in ratios:
         lsel, _lt = shard_select(label_loc, ks[r], comms)
         parts = comms.all_gather_pad(label_loc[lsel].clone())
-        if rank == 0:
+        if comms.global_rank == 0:
             idcg[r] = _idcg_of_parts(parts)
         for s in score_names:
             sel, th = shard_select(score_loc[s], ks[r], comms)
@@ -470,7 +511,7 @@ def _worker(rank, world, cfg, port, frag_path):
             sc_parts = comms.all_gather_pad(score_loc[s][sel].clone())
             lb_parts = comms.all_gather_pad(label_loc[sel].clone())
             ls_parts = comms.all_gather_pad(lsel[sel].clone())
-            if rank == 0:
+            if comms.global_rank == 0:
                 rankmet[(s, r)] = _fused_ranking(
                     torch.cat(sc_parts), torch.cat(lb_parts), ls_parts,
                     ks[r], stats[s]["sum"], label_total, idcg[r])
@@ -721,7 +762,7 @@ def _worker(rank, world, cfg, port, frag_path):
         del states
         if dev != "cpu":
             torch.cuda.empty_cache()
-        if rank == 0 and cfg["verbose"]:
+        if comms.global_rank == 0 and cfg["verbose"]:
             print(f"[fused t0={t0}] group {gi + 1}/{len(groups)} "
                   f"({len(group)} configs) done in "
                   f"{time.time() - t_pass0:.0f}s", flush=True)
@@ -741,9 +782,13 @@ def _worker(rank, world, cfg, port, frag_path):
                   flush=True)
             s0_profs.append(dict(prof))
 
-    # ---- shard 0 assembles the full branch fragment ------------------------
+    # ---- global rank 0 assembles the full branch fragment ------------------
+    # (node 0's local shard 0 in the multi-node topology — the launcher's
+    # frag_path is only meaningful on the launcher's own machine; node 0
+    # itself is launched by ssh-to-self like every other node, so its /tmp
+    # IS the launcher's filesystem view)
     out = None
-    if rank == 0:
+    if comms.global_rank == 0:
         per_ratio = {}
         for r in ratios:
             scores = {}
@@ -867,15 +912,13 @@ def _compute_dense_and_cache(cfg, R, t0, window_steps, eff_horizons,
 
 
 # ----------------------------------------------------------------------------
-# entry point (called from sga.replay main with a plain config dict)
+# entry points (called from sga.replay main with a plain config dict)
 # ----------------------------------------------------------------------------
 
-def run_fused_branch(args, ctx, t0):
-    """One branch point through the fused engine; returns the complete
-    branch dict (same JSON shape as process_branch)."""
-    import tempfile
+def _common_gates(args):
+    """Validation shared by the single-node and multi-node fused entries;
+    returns the resolved score_names (registry order, unknowns rejected)."""
     import sga.replay as R
-
     if args.replay_mode != "cycle":
         raise ValueError("the fused engine implements --replay-mode cycle "
                          "only")
@@ -887,6 +930,21 @@ def run_fused_branch(args, ctx, t0):
             "--replay-mode cycle requires --dense-cache (the dense arm is "
             "consumed from the cache; a first run populates it "
             "automatically)")
+    if args.fused_max_configs < 1:
+        raise ValueError("--fused-max-configs must be >= 1")
+    for r in args.ratios:
+        if r <= 0.0 or r > 100.0:
+            raise ValueError(f"ratio {r} out of (0,100]")
+    if args.device not in ("cpu", "cuda"):
+        # a shard always maps to its node-local cuda index, so a bare index
+        # on --device has no meaning; the visible device set is constrained
+        # via CUDA_VISIBLE_DEVICES
+        raise ValueError(
+            "--device cuda:N is not supported: each shard always maps to "
+            "its node-local cuda index. Use --device cuda and restrict the "
+            "visible devices with CUDA_VISIBLE_DEVICES (e.g. "
+            "CUDA_VISIBLE_DEVICES=4,5 for a 2-shard run on physical GPUs "
+            "4 and 5)")
     # mirror the classic path: registry order + unknown-name rejection
     allowed = list(R.all_score_names())
     if args.score_names:
@@ -898,28 +956,13 @@ def run_fused_branch(args, ctx, t0):
         score_names = [s for s in allowed if s in args.score_names]
     else:
         score_names = allowed
-    world = args.fused_shards
-    if world < 1:
-        raise ValueError("--fused-shards must be >= 1")
-    if args.fused_max_configs < 1:
-        raise ValueError("--fused-max-configs must be >= 1")
-    for r in args.ratios:
-        if r <= 0.0 or r > 100.0:
-            raise ValueError(f"ratio {r} out of (0,100]")
-    if args.device != "cpu":
-        # shard r maps to cuda:r, so a bare index on --device has no meaning;
-        # the visible device set is constrained via CUDA_VISIBLE_DEVICES
-        if args.device != "cuda":
-            raise ValueError(
-                "--device cuda:N is not supported: shard r always maps to "
-                "cuda:r. Use --device cuda and restrict the visible devices "
-                "with CUDA_VISIBLE_DEVICES (e.g. CUDA_VISIBLE_DEVICES=4,5 for "
-                "a 2-shard run on physical GPUs 4 and 5)")
-        if world > torch.cuda.device_count():
-            raise ValueError(
-                f"--fused-shards {world} exceeds the visible CUDA devices "
-                f"({torch.cuda.device_count()})")
-    cfg = {
+    return score_names
+
+
+def _fused_cfg(args, ctx, t0, score_names):
+    """The plain-dict worker config (json-serializable: the multi-node
+    launcher ships it to every node verbatim)."""
+    return {
         "trace_dir": ctx["trace_dir"],
         "t0": t0,
         "window": args.window,
@@ -943,11 +986,16 @@ def run_fused_branch(args, ctx, t0):
         "seed": args.seed,
         "verbose": args.verbose,
     }
-    # populate the dense cache parent-side, before any shard exists: on a
-    # cold cache the dense pass can run for hours and must not happen inside
-    # the process group (the waiting shards would hit the gloo timeout).
-    # dense_cache_hit reports the parent-side LOAD outcome (False on the
-    # populating run), matching the classic report field semantics
+
+
+def _populate_dense_cache(args, ctx, cfg, t0):
+    """Populate the dense cache parent-side, before any shard exists: on a
+    cold cache the dense pass can run for hours and must not happen inside
+    the process group (the waiting shards would hit the gloo timeout).
+    dense_cache_hit reports the parent-side LOAD outcome (False on the
+    populating run), matching the classic report field semantics. Returns
+    (window_steps, eff_horizons, ident)."""
+    import sga.replay as R
     replay_dtype = (torch.float64 if args.replay_dtype == "fp64"
                     else torch.float32)
     window_steps, _W, eff_horizons = _window_and_horizons(
@@ -961,6 +1009,24 @@ def run_fused_branch(args, ctx, t0):
         _compute_dense_and_cache(cfg, R, t0, window_steps, eff_horizons,
                                  replay_dtype)
     cfg["dense_cache_hit"] = hit
+    return window_steps, eff_horizons, ident
+
+
+def run_fused_branch(args, ctx, t0):
+    """One branch point through the fused engine (single node); returns the
+    complete branch dict (same JSON shape as process_branch). Multi-node
+    runs go through sga.replay_launch.run_fused_branch_multinode."""
+    import tempfile
+    score_names = _common_gates(args)
+    world = args.fused_shards
+    if world < 1:
+        raise ValueError("--fused-shards must be >= 1")
+    if args.device == "cuda" and world > torch.cuda.device_count():
+        raise ValueError(
+            f"--fused-shards {world} exceeds the visible CUDA devices "
+            f"({torch.cuda.device_count()})")
+    cfg = _fused_cfg(args, ctx, t0, score_names)
+    _populate_dense_cache(args, ctx, cfg, t0)
     fd, frag_path = tempfile.mkstemp(suffix=".pt",
                                      prefix="fused_branch_")
     os.close(fd)

@@ -1417,6 +1417,37 @@ def main(argv=None):
                     help="arms (score x ratio) advanced per fused window "
                          "pass in --replay-mode cycle (config group size; "
                          "state memory per group scales with this)")
+    ap.add_argument("--nodes", default=None,
+                    help="comma list of node addresses for a multi-node "
+                         "fused run (sga.replay_launch; this process must "
+                         "run on the FIRST node and share the other nodes' "
+                         "NFS path view; shard r -> node r // (shards/nodes), "
+                         "device cuda:(r %% (shards/nodes)); requires "
+                         "--replay-mode cycle; nodes are reached as "
+                         "root@node over ssh port 2222, and "
+                         "SGA_LAUNCH_EXECUTOR=local overrides that with an "
+                         "all-local single-machine simulation — the "
+                         "executor actually used is printed in the launch "
+                         "banner)")
+    ap.add_argument("--ssh-key", default=None,
+                    help="cluster ssh key for --nodes launches (default: "
+                         "$SGA_SSH_KEY, then the nearest workspace ancestor's "
+                         "cluster_ssh_key)")
+    ap.add_argument("--preflight-timeout", type=float, default=600.0,
+                    help="bounded rendezvous preflight deadline in seconds "
+                         "for --nodes runs (loud failure on expiry)")
+    ap.add_argument("--run-deadline", type=float, default=0.0,
+                    help="optional wall-clock deadline in seconds for the "
+                         "--nodes run phase itself: on expiry every "
+                         "node-worker is killed and the launch fails loudly "
+                         "with the per-node log tails (0 disables the "
+                         "bound — the default, since legitimate replays "
+                         "run for hours; a shard hung outside a collective "
+                         "is otherwise unbounded)")
+    ap.add_argument("--launch-log-dir", default=None,
+                    help="directory for per-node launch logs of a --nodes "
+                         "run (default: a timestamped dir next to the run's "
+                         "temp files)")
     ap.add_argument("--fused-g-residency", action="store_true",
                     help="upload each step's local g slices to the device "
                          "once and share the resident copy across every "
@@ -1480,6 +1511,25 @@ def main(argv=None):
         raise ValueError(
             "--fused is deprecated (cycle mode now always runs the fused "
             "engine) and --replay-mode zerofill has no fused form")
+    if args.nodes and args.replay_mode != "cycle":
+        raise ValueError(
+            "--nodes is only supported with --replay-mode cycle (the "
+            "multi-node launcher serves the fused engine only)")
+    if args.nodes is not None:
+        args.nodes = [x.strip() for x in args.nodes.split(",") if x.strip()]
+        if not args.nodes:
+            # ',' survives the truthy gate above; an explicitly requested
+            # multi-node launch that names no node must fail loudly instead
+            # of silently degrading to a single-node run
+            raise ValueError("--nodes names no node")
+        if args.preflight_timeout <= 0:
+            raise ValueError(
+                f"--preflight-timeout must be > 0, "
+                f"got {args.preflight_timeout}")
+        if args.run_deadline < 0:
+            raise ValueError(
+                f"--run-deadline must be >= 0 (0 disables the bound), "
+                f"got {args.run_deadline}")
     if args.chunk_mb < 1:
         raise ValueError(f"--chunk-mb must be >= 1, got {args.chunk_mb}")
     if args.window < 1:
@@ -1580,8 +1630,13 @@ def main(argv=None):
     branch_results = {}
     for t0 in branch_pts:
         if args.replay_mode == "cycle":
-            from sga.replay_fused import run_fused_branch
-            branch_results[str(t0)] = run_fused_branch(args, ctx, t0)
+            if args.nodes:
+                from sga.replay_launch import run_fused_branch_multinode
+                branch_results[str(t0)] = run_fused_branch_multinode(
+                    args, ctx, t0, args.nodes, ssh_key=args.ssh_key)
+            else:
+                from sga.replay_fused import run_fused_branch
+                branch_results[str(t0)] = run_fused_branch(args, ctx, t0)
         else:
             branch_results[str(t0)] = process_branch(t0, ctx, args)
 
@@ -1603,6 +1658,7 @@ def main(argv=None):
             "fused_effective": args.fused or args.replay_mode == "cycle",
             "fused_shards": args.fused_shards,
             "fused_max_configs": args.fused_max_configs,
+            "nodes": args.nodes,
             "fused_g_residency": args.fused_g_residency,
             "fused_dev_reduce": args.fused_dev_reduce,
             "score_names": args.score_names,
