@@ -340,8 +340,15 @@ def _device_ok_for_sort(numel, dev):
     # mem_get_info is device-wide and therefore counts THIS process's own
     # cached-but-free allocator blocks (e.g. a previous sort's cub temp) as
     # used — release them before measuring or big sorts get refused despite
-    # physically fitting. No sort tensor is live between calls (the .cpu()
-    # fetch syncs), so only genuinely freeable blocks go back.
+    # physically fitting. On the main thread no sort tensor is live between
+    # calls (the .cpu() fetch syncs); from the rank worker's vantage sorts
+    # run concurrently with the main thread's front-select transients, so
+    # the free-VRAM sample can differ between the rank_bg arms — one arm
+    # may take this loud CPU fallback where the other sorted on device.
+    # Both outcomes stay bit-identical (the stable-sort guarantee), the
+    # worker's rank_s may then include CPU-fallback sorts, and the
+    # worker's empty_cache() can hand back blocks the main thread would
+    # have reused (allocation churn, perf-only).
     torch.cuda.empty_cache()
     free, _total = torch.cuda.mem_get_info(dev)
     need = numel * 32
@@ -466,6 +473,138 @@ def _idcg_of_parts(parts, dev=None):
     return float((rel2.to(torch.float64) * wts).sum())
 
 
+class _FrontRankWorker:
+    """rank0's front-phase ranking chain on one bounded background thread.
+
+    The main pipeline enqueues each (s, r)'s gathered parts and proceeds to
+    the next shard_select collective immediately; the thread applies
+    _idcg_of_parts / _fused_ranking to the same inputs in FIFO (= loop)
+    order as the single writer of idcg/rankmet, so results are
+    bit-identical to the synchronous path. Quarantine contract (pinned at
+    the enqueue site too): the queue carries plain CPU tensors/floats
+    only — the worker never receives a comms object and never issues a
+    dist call, so every collective stays single-threaded on the main
+    thread. With a device sort arm the worker sets its own
+    torch.cuda.set_device (the device is thread-local); the helpers'
+    reductions keep their original CPU expression path either way. The
+    worker deliberately does NOT call torch.set_num_threads — the fp32 sum
+    partitioning depends on the process-wide intra-op configuration, and
+    bit-identity additionally assumes the OpenMP runtime grants the worker
+    thread's root-level parallel region a full team (the libgomp default
+    for a foreign host thread, with OMP_DYNAMIC unset/false).
+
+    Failure discipline: a worker exception is captured, not swallowed —
+    a health-checked put refuses to block forever behind a dead worker
+    (bounded queue + dead consumer would otherwise deadlock the main
+    thread on backpressure), and finish() re-raises it before the
+    streaming phase."""
+
+    _SENTINEL = object()
+
+    def __init__(self, sort_dev, cycle_lens, ks, stats, label_total,
+                 maxsize=4):
+        self.sort_dev = sort_dev
+        # read-only inputs shared with the main thread (never mutated after
+        # the pre-loop computation — the FIFO hand-off needs no copies)
+        self.cycle_lens, self.ks = cycle_lens, ks
+        self.stats, self.label_total = stats, label_total
+        self.idcg, self.rankmet = {}, {}
+        self.rank_s, self.qwait_s = 0.0, 0.0
+        self.error = None
+        # identity (op/score/ratio) of the item in flight, for the failure
+        # message; read by the main thread only once error is visible
+        self._cur = "startup"
+        self._q = queue.Queue(maxsize=maxsize)
+        self._finished = False
+        self._th = threading.Thread(target=self._run, daemon=True,
+                                    name="front-rank-worker")
+
+    def start(self):
+        self._th.start()
+
+    def _run(self):
+        try:
+            # context setup inside the try: a failure here must surface as
+            # self.error (finish() re-raises it), never as a dead worker
+            # with a silently empty rankmet
+            if self.sort_dev is not None:
+                torch.cuda.set_device(int(self.sort_dev.split(":")[1]))
+            while True:
+                item = self._q.get()
+                if item is self._SENTINEL:
+                    return
+                _t = time.perf_counter()
+                if item[0] == "idcg":
+                    _, r, parts = item
+                    self._cur = f"idcg r={r}"
+                    self.idcg[r] = _idcg_of_parts(parts, dev=self.sort_dev)
+                else:
+                    _, s, r, sc_parts, lb_parts, ls_parts = item
+                    self._cur = f"rank s={s} r={r}"
+                    met = _fused_ranking(
+                        torch.cat(sc_parts), torch.cat(lb_parts), ls_parts,
+                        self.ks[r], self.stats[s]["sum"], self.label_total,
+                        self.idcg[r], dev=self.sort_dev)
+                    for t in self.cycle_lens:
+                        self.rankmet[(s, r, t)] = met
+                self.rank_s += time.perf_counter() - _t
+        except BaseException as e:  # captured for the main thread
+            self.error = e
+
+    def _raise_worker_failed(self):
+        raise RuntimeError(
+            f"front rank worker failed ({self._cur})") from self.error
+
+    def submit(self, item):
+        # the health checks detect a DEAD worker only, never a hung one —
+        # a live-but-hung worker backpressures this put exactly as the
+        # synchronous path would stall the pipeline
+        if self.error is not None:
+            self._raise_worker_failed()
+        while True:
+            try:
+                _t = time.perf_counter()
+                self._q.put(item, timeout=1.0)
+                self.qwait_s += time.perf_counter() - _t
+                return
+            except queue.Full:
+                self.qwait_s += time.perf_counter() - _t
+                if self.error is not None:
+                    self._raise_worker_failed()
+                if not self._th.is_alive():
+                    raise RuntimeError(
+                        "front rank worker died without an exception "
+                        "record")
+
+    def finish(self):
+        """Drain + join + adopt the results; re-raises a worker failure.
+        Runs after the front loop, before streaming setup / report
+        assembly (and before destroy_process_group)."""
+        # before the submit: a failed sentinel put still marks the worker
+        # closed (its join would return instantly either way)
+        self._finished = True
+        self.submit(self._SENTINEL)
+        self._th.join()
+        if self.error is not None:
+            self._raise_worker_failed()
+        return self.rankmet
+
+    def close_best_effort(self):
+        """Exception-path shutdown: drop a sentinel if the queue has room
+        and wait out at most join(timeout=5.0) of the drain — bounded, but
+        it CAN block, so only the failure path calls it (the success
+        path's single sentinel+join is finish(), after the front-only
+        release block). A full queue skips the sentinel; the daemon flag
+        is the final backstop."""
+        if self._finished:
+            return
+        try:
+            self._q.put_nowait(self._SENTINEL)
+        except queue.Full:
+            pass
+        self._th.join(timeout=5.0)
+
+
 # ----------------------------------------------------------------------------
 # g-slice prefetch (fault the NFS pages of upcoming steps off the hot path)
 # ----------------------------------------------------------------------------
@@ -585,6 +724,15 @@ def _worker(rank, world, cfg, port, frag_path):
         raise ValueError(
             f"REPLAY_FUSED_SELECT={front_sel!r} is not one of the "
             "allowed values ('auto', 'cpu')")
+    # rank-background kill-switch (A/B arms and emergencies): force the
+    # synchronous front ranking path — the S0FRONT print echoes the arm as
+    # rank_bg=off. Same unknown-values-must-raise contract as
+    # REPLAY_FUSED_FRONT_SORT.
+    rank_bg = os.environ.get("REPLAY_FUSED_FRONT_RANK_BG", "auto")
+    if rank_bg not in ("auto", "off"):
+        raise ValueError(
+            f"REPLAY_FUSED_FRONT_RANK_BG={rank_bg!r} is not one of the "
+            "allowed values ('auto', 'off')")
     if dev.startswith("cuda"):
         torch.cuda.set_device(int(dev.split(":")[1]))
     comms = Comms(rank, world, port)
@@ -730,44 +878,69 @@ def _worker(rank, world, cfg, port, frag_path):
 
     _tf_sel = 0.0
     _tf_rank = 0.0
-    for r in ratios:
-        _tq = time.perf_counter() if _S0_PROFILE else 0.0
-        lsel, _lt = shard_select(label_sel, ks[r], comms)
-        parts = _gather(label_sel[lsel].clone())
-        if _S0_PROFILE:
-            _tf_sel += time.perf_counter() - _tq
-            _tq = time.perf_counter()
-        if comms.global_rank == 0:
-            idcg[r] = _idcg_of_parts(parts, dev=sort_dev)
-        if _S0_PROFILE:
-            _tf_rank += time.perf_counter() - _tq
-        for s in score_names:
-            # the branch-point selection is a function of (score, ratio)
-            # only, and shard_select is deterministic on its inputs — every
-            # T arm of one (s, r) shares a single select instead of paying
-            # len(cycle_lens) redundant global selects; sel0 is only read to
-            # build the per-config device masks (never mutated)
+    # rank0's ranking chain runs on a bounded background thread (the
+    # _FrontRankWorker quarantine contract: plain CPU tensors/floats cross
+    # the queue, never comms, never a dist call) so the main pipeline
+    # reaches the next shard_select collective without waiting out the
+    # ranking; world==1 takes the same path (shard_select is heavy local
+    # compute there too). rank_bg=off keeps the synchronous path.
+    rank_worker = None
+    if rank_bg == "auto" and comms.global_rank == 0:
+        rank_worker = _FrontRankWorker(sort_dev, cycle_lens, ks, stats,
+                                       label_total)
+        rank_worker.start()
+    _front_failed = False
+    try:
+        for r in ratios:
             _tq = time.perf_counter() if _S0_PROFILE else 0.0
-            sel, th = shard_select(score_sel[s], ks[r], comms)
-            sc_parts = _gather(score_sel[s][sel].clone())
-            lb_parts = _gather(label_sel[sel].clone())
-            ls_parts = _gather(lsel[sel].clone())
+            lsel, _lt = shard_select(label_sel, ks[r], comms)
+            parts = _gather(label_sel[lsel].clone())
             if _S0_PROFILE:
                 _tf_sel += time.perf_counter() - _tq
                 _tq = time.perf_counter()
-            met_sr = None
-            if comms.global_rank == 0:
-                met_sr = _fused_ranking(
-                    torch.cat(sc_parts), torch.cat(lb_parts), ls_parts,
-                    ks[r], stats[s]["sum"], label_total, idcg[r],
-                    dev=sort_dev)
-            if _S0_PROFILE:
+            if rank_worker is not None:
+                rank_worker.submit(("idcg", r, parts))
+            elif comms.global_rank == 0:
+                idcg[r] = _idcg_of_parts(parts, dev=sort_dev)
+            if _S0_PROFILE and rank_worker is None:
                 _tf_rank += time.perf_counter() - _tq
-            for t in cycle_lens:
-                sel0[(s, r, t)] = sel
-                thresh0[(s, r, t)] = th
-                if comms.global_rank == 0:
-                    rankmet[(s, r, t)] = met_sr
+            for s in score_names:
+                # the branch-point selection is a function of (score, ratio)
+                # only, and shard_select is deterministic on its inputs — every
+                # T arm of one (s, r) shares a single select instead of paying
+                # len(cycle_lens) redundant global selects; sel0 is only read to
+                # build the per-config device masks (never mutated)
+                _tq = time.perf_counter() if _S0_PROFILE else 0.0
+                sel, th = shard_select(score_sel[s], ks[r], comms)
+                sc_parts = _gather(score_sel[s][sel].clone())
+                lb_parts = _gather(label_sel[sel].clone())
+                ls_parts = _gather(lsel[sel].clone())
+                if _S0_PROFILE:
+                    _tf_sel += time.perf_counter() - _tq
+                    _tq = time.perf_counter()
+                met_sr = None
+                if rank_worker is not None:
+                    rank_worker.submit(("rank", s, r, sc_parts, lb_parts,
+                                        ls_parts))
+                elif comms.global_rank == 0:
+                    met_sr = _fused_ranking(
+                        torch.cat(sc_parts), torch.cat(lb_parts), ls_parts,
+                        ks[r], stats[s]["sum"], label_total, idcg[r],
+                        dev=sort_dev)
+                if _S0_PROFILE and rank_worker is None:
+                    _tf_rank += time.perf_counter() - _tq
+                for t in cycle_lens:
+                    sel0[(s, r, t)] = sel
+                    thresh0[(s, r, t)] = th
+                    if rank_worker is None and comms.global_rank == 0:
+                        rankmet[(s, r, t)] = met_sr
+    except BaseException:
+        _front_failed = True
+        raise
+    finally:
+        # failure-path shutdown; the success path joins via finish() below
+        if rank_worker is not None and _front_failed:
+            rank_worker.close_best_effort()
     # release the front-only device residents before the streaming phase's
     # own peak (g-residency + per-group states run the card near full):
     # the uploaded vectors and the loop-local select masks (label sel + the
@@ -782,16 +955,34 @@ def _worker(rank, world, cfg, port, frag_path):
         for _k, _v in sel0.items():
             sel0[_k] = _v.cpu()
         torch.cuda.empty_cache()
+    # the release block above overlaps the worker's queue drain; the join
+    # lands here so a worker failure re-raises ahead of any use
+    rank_joinwait = 0.0
+    if rank_worker is not None:
+        _tj = time.perf_counter()
+        rankmet = rank_worker.finish()
+        rank_joinwait = time.perf_counter() - _tj
     if _S0_PROFILE and comms.global_rank == 0:
         # front-phase decomposition (diagnostic labels, not exact
         # accounting): branch-score math / dense-cache load / shard_select
-        # + gathers / ranking+idcg sorts
+        # + gathers / ranking+idcg sorts. With rank_bg=on the rank figure
+        # is the worker's own accumulation and the main thread's share of
+        # the bracket shows up as backpressure (qwait) plus the front-end
+        # drain (joinwait); with rank_bg=off rank_s is the main-thread
+        # bracket as before
+        if rank_worker is not None:
+            _rank_f = (f"rank_s={rank_worker.rank_s:.1f} "
+                       f"qwait_s={rank_worker.qwait_s:.1f} "
+                       f"joinwait_s={rank_joinwait:.1f}")
+        else:
+            _rank_f = f"rank_s={_tf_rank:.1f}"
         print(f"S0FRONT rank={rank} scores_s={_tf_scores:.1f} "
               f"cache_s={_tf_cache:.1f} select_s={_tf_sel:.1f} "
-              f"rank_s={_tf_rank:.1f} "
+              f"{_rank_f} "
               f"front_sort={'cpu' if sort_dev is None else 'dev'} "
               f"front_sel={'cpu' if sel_dev_used is None else 'dev'} "
-              f"gather={gather_backend}",
+              f"gather={gather_backend} "
+              f"rank_bg={'on' if rank_worker is not None else 'off'}",
               flush=True)
 
     # ---- streaming passes over config groups ------------------------------

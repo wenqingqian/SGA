@@ -59,12 +59,23 @@ classic in-process cycle replay was removed; cycle auto-routes here):
    payload gather is pinned bitwise against the gloo all_gather_pad
    ground truth on uneven and zero-length per-rank payloads (bool and
    fp32).
+12. rank0 front ranking on a bounded worker thread
+   (REPLAY_FUSED_FRONT_RANK_BG): the on arm's reports are bit-identical
+   to the forced-synchronous arm (world 1, CPU and cuda device arms; and
+   at world 2 with 2 visible GPUs, where the worker's sorts overlap real
+   collectives); the worker applies the chain FIFO as single writer
+   (cross-ratio ordering included), re-raises a task failure at finish(),
+   and a submit behind a dead worker raises fast — through the entry
+   check, and through the queue.Full health check when the queue is full
+   and the only consumer dies mid-backlog — instead of deadlocking the
+   bounded queue; unknown knob values raise.
 """
 import io
 import json
 import os
 import sys
 import tempfile
+import time
 from contextlib import redirect_stdout
 
 import torch
@@ -91,6 +102,9 @@ if "REPLAY_FUSED_FRONT_SORT" in os.environ:
 # same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
 if "REPLAY_FUSED_SELECT" in os.environ:
     del os.environ["REPLAY_FUSED_SELECT"]
+# same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
+if "REPLAY_FUSED_FRONT_RANK_BG" in os.environ:
+    del os.environ["REPLAY_FUSED_FRONT_RANK_BG"]
 
 
 B1, B2, EPS, WD = 0.9, 0.95, 1e-8, 0.1
@@ -1195,6 +1209,211 @@ def test_front_sort_env_killswitch():
     print("PASS test_front_sort_env_killswitch")
 
 
+def test_front_rank_bg_env_killswitch():
+    """REPLAY_FUSED_FRONT_RANK_BG=off forces the synchronous front ranking
+    path: the on arm's reports must be bit-identical to the off arm's
+    (same arithmetic, same application order, only the executing thread
+    differs) and the S0FRONT echo must read rank_bg=on|off. Runs the
+    world-1 CPU device pair always and the cuda pair when a GPU is
+    present (the worker's set_device/sort path engages there); a bogus
+    knob value must raise with the knob named."""
+    old_env = os.environ.get("REPLAY_FUSED_FRONT_RANK_BG")
+    old_gate = replay_fused._S0_PROFILE
+    replay_fused._S0_PROFILE = True
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            t0, *_ = _build_fixture(td)
+            cache = os.path.join(td, "dense_cache")
+            device_pairs = [("cpu", ["--device", "cpu"])]
+            if torch.cuda.is_available():
+                device_pairs.append(("cuda", ["--device", "cuda"]))
+            for dev_name, dev_args in device_pairs:
+                bufs, reps = [], []
+                for arm in ("auto", "off"):
+                    os.environ["REPLAY_FUSED_FRONT_RANK_BG"] = arm
+                    buf = io.StringIO()
+                    with redirect_stdout(buf):
+                        reps.append(soa.main(_base_args(
+                            td, cache, t0,
+                            [*dev_args, "--fused-shards", "1"])))
+                    bufs.append(buf.getvalue())
+                assert "rank_bg=on" in bufs[0], (dev_name, bufs[0][-500:])
+                assert "rank_bg=off" in bufs[1], (dev_name, bufs[1][-500:])
+                for rep in reps:
+                    rep["branch_results"][str(t0)]["replay"].pop(
+                        "dense_cache_hit")
+                    rep["branch_results"][str(t0)].pop("s0_profile", None)
+                assert _deep_eq_nan(reps[0], reps[1]), \
+                    f"the rank-background arm moved a report bit ({dev_name})"
+            os.environ["REPLAY_FUSED_FRONT_RANK_BG"] = "1"
+            try:
+                soa.main(_base_args(td, cache, t0,
+                                    ["--device", "cpu",
+                                     "--fused-shards", "1"]))
+            except ValueError as e:
+                assert "REPLAY_FUSED_FRONT_RANK_BG" in str(e), str(e)
+            else:
+                raise AssertionError("bogus rank_bg value accepted")
+    finally:
+        if old_env is None:
+            os.environ.pop("REPLAY_FUSED_FRONT_RANK_BG", None)
+        else:
+            os.environ["REPLAY_FUSED_FRONT_RANK_BG"] = old_env
+        replay_fused._S0_PROFILE = old_gate
+    print("PASS test_front_rank_bg_env_killswitch")
+
+
+def test_front_rank_bg_world2():
+    """World-2 e2e A/B across the rank-background arm: the genuinely new
+    hazard — worker sort/reduction activity overlapping the main thread's
+    collectives and allocator traffic — exists only at world >= 2, so the
+    on/off report equality is pinned there too. The shard echoes (captured
+    at fd level) pin rank_bg=on|off engagement in both arms."""
+    if torch.cuda.device_count() < 2:
+        print("SKIP test_front_rank_bg_world2 (needs 2 visible GPUs)")
+        return
+    old_env = os.environ.get("REPLAY_FUSED_FRONT_RANK_BG")
+    old_s0_env = os.environ.get("REPLAY_S0_PROFILE")
+    old_gate = replay_fused._S0_PROFILE
+    # the env var (not just the module flag): the spawned shards bind
+    # _S0_PROFILE at their own import, and rank 0's S0FRONT print is the
+    # engagement evidence
+    os.environ["REPLAY_S0_PROFILE"] = "1"
+    replay_fused._S0_PROFILE = True
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            t0, *_ = _build_fixture(td)
+            cache = os.path.join(td, "dense_cache")
+            common = ["--device", "cuda", "--fused-shards", "2"]
+            outs = []
+            for arm in ("auto", "off"):
+                os.environ["REPLAY_FUSED_FRONT_RANK_BG"] = arm
+                outs.append(_run_fd_captured(
+                    _base_args(td, cache, t0, common)))
+            assert "rank_bg=on" in outs[0][1], outs[0][1][-500:]
+            assert "rank_bg=off" in outs[1][1], outs[1][1][-500:]
+            reps = [rep for rep, _txt in outs]
+            for rep in reps:
+                rep["branch_results"][str(t0)]["replay"].pop(
+                    "dense_cache_hit")
+                rep["branch_results"][str(t0)].pop("s0_profile", None)
+            assert _deep_eq_nan(reps[0], reps[1]), \
+                "the rank-background arm moved a report bit (world 2)"
+    finally:
+        if old_env is None:
+            os.environ.pop("REPLAY_FUSED_FRONT_RANK_BG", None)
+        else:
+            os.environ["REPLAY_FUSED_FRONT_RANK_BG"] = old_env
+        if old_s0_env is None:
+            os.environ.pop("REPLAY_S0_PROFILE", None)
+        else:
+            os.environ["REPLAY_S0_PROFILE"] = old_s0_env
+        replay_fused._S0_PROFILE = old_gate
+    print("PASS test_front_rank_bg_world2")
+
+
+def test_front_rank_bg_worker_unit():
+    """_FrontRankWorker applies the ranking chain in FIFO order as the
+    single writer of idcg/rankmet: tiny-tensor results match the
+    synchronous calls exactly across two ratios (the cross-ratio FIFO
+    through the shared idcg map is pinned in the unit, not just one
+    ratio's); a task exception re-raises at finish() (never a silent
+    drain); a submit behind a dead worker raises fast through the entry
+    check, and a submit backpressured on a full queue raises fast through
+    the queue.Full health check once the only consumer dies mid-backlog —
+    neither leg may deadlock the bounded queue."""
+    gen = torch.Generator().manual_seed(7)
+    ks_map = {20: 5, 30: 3}
+    idcg_parts = {20: [torch.rand(3, generator=gen),
+                       torch.rand(2, generator=gen)],
+                  30: [torch.rand(4, generator=gen)]}
+    sc_parts = {20: [torch.rand(3, generator=gen),
+                     torch.rand(2, generator=gen)],
+                30: [torch.rand(2, generator=gen),
+                     torch.rand(1, generator=gen)]}
+    lb_parts = {20: [torch.rand(3, generator=gen),
+                     torch.rand(2, generator=gen)],
+                30: [torch.rand(2, generator=gen),
+                     torch.rand(1, generator=gen)]}
+    ls_parts = {20: [torch.zeros(3, dtype=torch.bool),
+                     torch.ones(2, dtype=torch.bool)],
+                30: [torch.ones(2, dtype=torch.bool),
+                     torch.zeros(1, dtype=torch.bool)]}
+    stats = {"abs_g": {"sum": 100.0}}
+    worker = replay_fused._FrontRankWorker(None, [2], ks_map, stats, 50.0)
+    worker.start()
+    for r in (20, 30):
+        worker.submit(("idcg", r, idcg_parts[r]))
+        worker.submit(("rank", "abs_g", r, sc_parts[r], lb_parts[r],
+                       ls_parts[r]))
+    rankmet = worker.finish()
+    exp_met = {}
+    for r in (20, 30):
+        exp_idcg = replay_fused._idcg_of_parts(idcg_parts[r])
+        exp_met[("abs_g", r, 2)] = replay_fused._fused_ranking(
+            torch.cat(sc_parts[r]), torch.cat(lb_parts[r]), ls_parts[r],
+            ks_map[r], 100.0, 50.0, exp_idcg)
+    assert set(rankmet) == set(exp_met), rankmet.keys()
+    for key, want in exp_met.items():
+        got = rankmet[key]
+        assert all(got[f] == want[f] for f in want), (key, got, want)
+
+    bad = replay_fused._FrontRankWorker(None, [2], {20: ks_map[20]}, stats,
+                                        50.0)
+    bad.start()
+    bad.submit(("rank", "abs_g", 20, [torch.rand(2), "junk"],
+                [torch.rand(2)], [torch.ones(2, dtype=torch.bool)]))
+    try:
+        bad.finish()
+    except RuntimeError as e:
+        assert "front rank worker failed" in str(e), str(e)
+    else:
+        raise AssertionError("worker failure did not re-raise at finish")
+    _tq = time.perf_counter()
+    try:
+        bad.submit(("idcg", 20, idcg_parts[20]))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("submit behind a dead worker did not raise")
+    assert time.perf_counter() - _tq < 1.0, "submit blocked behind a dead worker"
+
+    # queue-full leg: the first task sleeps inside a patched
+    # _fused_ranking before raising, so the submits behind it fill the
+    # bounded queue while the only consumer is still alive; the submit
+    # that lands on backpressure must discover the death through its
+    # health check and raise bounded, not block forever on a queue
+    # nothing drains anymore
+    real_ranking = replay_fused._fused_ranking
+
+    def slow_poison(*_a, **_kw):
+        time.sleep(0.5)
+        raise ValueError("poison")
+
+    replay_fused._fused_ranking = slow_poison
+    try:
+        full = replay_fused._FrontRankWorker(None, [2], ks_map, stats, 50.0)
+        full.start()
+        for _i in range(5):
+            full.submit(("rank", "abs_g", 20, sc_parts[20], lb_parts[20],
+                         ls_parts[20]))
+        _tq = time.perf_counter()
+        try:
+            full.submit(("rank", "abs_g", 20, sc_parts[20], lb_parts[20],
+                         ls_parts[20]))
+        except RuntimeError as e:
+            assert "front rank worker failed" in str(e), str(e)
+        else:
+            raise AssertionError(
+                "a submit backpressured behind a dying worker did not "
+                "raise")
+        assert time.perf_counter() - _tq < 5.0, \
+            "the queue-full health check did not bound the submit"
+    finally:
+        replay_fused._fused_ranking = real_ranking
+    print("PASS test_front_rank_bg_worker_unit")
+
+
 def _adversarial_scores(n, gen):
     """Non-negative finite fp32 vectors engineered with heavy tie structure
     in the threshold bin."""
@@ -1730,6 +1949,9 @@ def main():
     test_sort_oom_fallback_loud_cpu()
     test_sort_guard_empty_cache_before_measure()
     test_front_sort_env_killswitch()
+    test_front_rank_bg_env_killswitch()
+    test_front_rank_bg_world2()
+    test_front_rank_bg_worker_unit()
     test_shard_select_device_bitwise()
     test_all_gather_pad_dev_world1()
     test_all_gather_pad_dev_world2()
