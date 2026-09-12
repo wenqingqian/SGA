@@ -53,6 +53,12 @@ classic in-process cycle replay was removed; cycle auto-routes here):
    partitions; the echoes are conditional so budget-off artifacts keep
    their exact bytes; the cap derivation (floor + >=1 clamp) is pinned
    through the group_cap echo; REPLAY_S0_PROFILE gains a state_gb field.
+11. Front select on device + NCCL transport + REPLAY_FUSED_SELECT
+   kill-switch: the dev arm's reports are bit-identical to the forced-CPU
+   arm (world 1 and, with 2 GPUs, world 2), and at world 2 the nccl
+   payload gather is pinned bitwise against the gloo all_gather_pad
+   ground truth on uneven and zero-length per-rank payloads (bool and
+   fp32).
 """
 import io
 import json
@@ -82,6 +88,9 @@ if "REPLAY_S0_PROFILE" in os.environ:
     replay_fused._S0_PROFILE = False
 if "REPLAY_FUSED_FRONT_SORT" in os.environ:
     del os.environ["REPLAY_FUSED_FRONT_SORT"]
+# same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
+if "REPLAY_FUSED_SELECT" in os.environ:
+    del os.environ["REPLAY_FUSED_SELECT"]
 
 
 B1, B2, EPS, WD = 0.9, 0.95, 1e-8, 0.1
@@ -1187,6 +1196,263 @@ def test_front_sort_env_killswitch():
     print("PASS test_front_sort_env_killswitch")
 
 
+def _adversarial_scores(n, gen):
+    """Non-negative finite fp32 vectors engineered with heavy tie structure
+    in the threshold bin (canonized from the pre-plan exactness probe)."""
+    plateau = torch.ones(n)
+    plateau[: int(0.4 * n)] = 2.0
+    zh = torch.zeros(n)
+    zh[: max(8, n // 1000)] = torch.rand(max(8, n // 1000), generator=gen) \
+        + 0.5
+    return {
+        "all-equal": torch.full((n,), 1.0),
+        "boundary-plateau": plateau,
+        "quantized": (torch.rand(n, generator=gen)
+                      .mul(1000).round().div(1000)),
+        "zero-heavy": zh,
+        "uniform": torch.rand(n, generator=gen) + 1e-6,
+    }
+
+
+def test_shard_select_device_bitwise():
+    """shard_select on a cuda resident score is bit-identical to the cpu
+    execution (mask bitwise + threshold exact) across adversarial tie
+    structures and k values, including tie layers filled in flat-index
+    order (the torch.nonzero ordering contract)."""
+    if not torch.cuda.is_available():
+        print("SKIP test_shard_select_device_bitwise (no CUDA)")
+        return
+    gen = torch.Generator().manual_seed(20260912)
+    comms = replay_fused.Comms(rank=0, world=1, port=29613)
+    n = 200_000
+    for cname, score in _adversarial_scores(n, gen).items():
+        n_pos = max(8, n // 1000)
+        ks = sorted({1, n // 100, 3 * n // 10, n - 1, n})
+        if cname == "zero-heavy":
+            ks = sorted(set(ks) | {max(1, n_pos // 2), min(n, n_pos * 4)})
+        for k in ks:
+            m_cpu, t_cpu = replay_fused.shard_select(score, k, comms)
+            m_dev, t_dev = replay_fused.shard_select(
+                score.to("cuda:0"), k, comms)
+            assert torch.equal(m_cpu, m_dev.cpu()), (cname, k, "mask")
+            assert t_cpu == t_dev, (cname, k, t_cpu, t_dev)
+    print("PASS test_shard_select_device_bitwise")
+
+
+def test_all_gather_pad_dev_world1():
+    """world=1 contract of the device-payload gather: this pins ONLY the
+    ``not self.distributed`` identity shortcut (both arms below take the
+    early return — no transport runs; the nccl movement itself is covered
+    by the world-2 test). Values exactly preserved, bool and fp32."""
+    if not torch.cuda.is_available():
+        print("SKIP test_all_gather_pad_dev_world1 (no CUDA)")
+        return
+    comms = replay_fused.Comms(rank=0, world=1, port=29614)
+    t = torch.rand(100_000, device="cuda:0")
+    (got,) = comms.all_gather_pad_dev(t, "nccl")
+    assert torch.equal(got, t.cpu())
+    b = (torch.rand(100_000, device="cuda:0") < 0.5)
+    (gotb,) = comms.all_gather_pad_dev(b, "gloo")
+    assert gotb.dtype == torch.bool and torch.equal(gotb, b.cpu())
+    print("PASS test_all_gather_pad_dev_world1")
+
+
+def _agp_dev_world2_worker(rank, world, port):
+    """One rank of the world-2 all_gather_pad_dev check: uneven per-rank
+    payload lengths (rank 1 also contributes a ZERO-length payload), bool
+    and fp32 payloads, every nccl result asserted bitwise against the gloo
+    all_gather_pad ground truth on the same values."""
+    torch.cuda.set_device(rank)  # production mapping: shard r -> cuda:r
+    comms = replay_fused.Comms(rank, world, port)
+    try:
+        assert comms.distributed and comms.world == 2
+        # the same unanimous vote the engine's front block runs must pick
+        # nccl on a single node; the first nccl gather then builds the lazy
+        # group — a gloo fallback would leave it None and fail below
+        assert comms.vote_gather_backend() == "nccl"
+        gen = torch.Generator().manual_seed(31 + rank)
+        dev = f"cuda:{rank}"
+        for dtype in (torch.float32, torch.bool):
+            # uneven per-rank sizes; the last slot is zero-length on rank 1
+            # (padding must never leak into any rank's result)
+            for ln in (4096 + rank * 137, 1, 0 if rank == 1 else 511):
+                t = (torch.rand(ln, generator=gen) < 0.5).to(dev) \
+                    if dtype is torch.bool \
+                    else torch.rand(ln, generator=gen).to(dev)
+                got = comms.all_gather_pad_dev(t, "nccl")
+                assert comms._nccl_group is not None
+                want = comms.all_gather_pad(t.cpu())
+                assert [p.numel() for p in got] \
+                    == [p.numel() for p in want], (dtype, ln)
+                for r in range(world):
+                    assert got[r].dtype == dtype \
+                        and got[r].device.type == "cpu", (dtype, ln, r)
+                    assert torch.equal(got[r], want[r]), (dtype, ln, r)
+    finally:
+        if comms.distributed:
+            torch.distributed.destroy_process_group()
+
+
+def test_all_gather_pad_dev_world2():
+    """world=2 NCCL transport of the device-payload gather: uneven per-rank
+    payload sizes including a zero-length payload on one rank, bool and
+    fp32, asserted bitwise against the all_gather_pad ground truth on the
+    same values (transport is exact movement); the lazy nccl group assert
+    pins that the nccl branch — not the world==1 shortcut or the gloo
+    fallback — moved the bytes."""
+    if torch.cuda.device_count() < 2:
+        print("SKIP test_all_gather_pad_dev_world2 (needs 2 visible GPUs)")
+        return
+    import torch.multiprocessing as mp
+    mp.spawn(_agp_dev_world2_worker,
+             args=(2, replay_fused._free_port()), nprocs=2, join=True)
+    print("PASS test_all_gather_pad_dev_world2")
+
+
+def test_fused_select_device_bitwise():
+    """End-to-end on cuda: forcing the front select block onto the CPU
+    fallback (the guard patched to refuse) must leave the whole fused
+    report bit-identical to the device-select run — the device computes
+    selections/gathers only, every downstream reduction keeps its original
+    CPU expression. The counting wrapper asserts the patch engaged."""
+    if not torch.cuda.is_available():
+        print("SKIP test_fused_select_device_bitwise (no CUDA)")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        t0, *_ = _build_fixture(td)
+        cache = os.path.join(td, "dense_cache")
+        common = ["--device", "cuda", "--fused-shards", "1"]
+        base = _run(_base_args(td, cache, t0, common))
+        calls = {"n": 0}
+
+        def refusing_guard(numel, k_max, world, n_scores, dev):
+            calls["n"] += 1
+            return False
+
+        real_guard = replay_fused._device_ok_for_select
+        replay_fused._device_ok_for_select = refusing_guard
+        try:
+            fb = _run(_base_args(td, cache, t0, common))
+        finally:
+            replay_fused._device_ok_for_select = real_guard
+        assert calls["n"] > 0, "guard never consulted — patch did not engage"
+        for rep in (base, fb):
+            rep["branch_results"][str(t0)]["replay"].pop("dense_cache_hit")
+        assert _deep_eq_nan(base, fb), \
+            "the device front-select fast path moved a report bit"
+    print("PASS test_fused_select_device_bitwise")
+
+
+def test_select_env_killswitch():
+    """REPLAY_FUSED_SELECT=cpu forces the bit-identical CPU front-select
+    path on a cuda run: the S0FRONT echo must read front_sel=cpu (dev arm:
+    front_sel=dev) and the two arms' reports must be byte-identical."""
+    if not torch.cuda.is_available():
+        print("SKIP test_select_env_killswitch (no CUDA)")
+        return
+    old_env = os.environ.get("REPLAY_FUSED_SELECT")
+    old_gate = replay_fused._S0_PROFILE
+    replay_fused._S0_PROFILE = True
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            t0, *_ = _build_fixture(td)
+            cache = os.path.join(td, "dense_cache")
+            common = ["--device", "cuda", "--fused-shards", "1"]
+            bufs = []
+            reps = []
+            for arm in ("auto", "cpu"):
+                os.environ["REPLAY_FUSED_SELECT"] = arm
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    reps.append(soa.main(_base_args(td, cache, t0, common)))
+                bufs.append(buf.getvalue())
+            assert "front_sel=dev" in bufs[0], bufs[0][-500:]
+            assert "front_sel=cpu" in bufs[1], bufs[1][-500:]
+            for rep in reps:
+                rep["branch_results"][str(t0)]["replay"].pop(
+                    "dense_cache_hit")
+                rep["branch_results"][str(t0)].pop("s0_profile", None)
+            assert _deep_eq_nan(reps[0], reps[1]), \
+                "the select kill-switch moved a report bit"
+    finally:
+        if old_env is None:
+            os.environ.pop("REPLAY_FUSED_SELECT", None)
+        else:
+            os.environ["REPLAY_FUSED_SELECT"] = old_env
+        replay_fused._S0_PROFILE = old_gate
+    print("PASS test_select_env_killswitch")
+
+
+def _run_fd_captured(argv):
+    """soa.main with the real stdout fd captured to a string, returned as
+    (report, text): mp.spawn shards inherit fd 1, so the parent-level
+    redirect_stdout in _run never sees their S0FRONT/S0PROFILE prints —
+    capture at the fd the children actually write to."""
+    sys.stdout.flush()
+    saved = os.dup(1)
+    tmp = tempfile.TemporaryFile(mode="w+")
+    try:
+        os.dup2(tmp.fileno(), 1)
+        rep = soa.main(argv)
+        sys.stdout.flush()
+        tmp.seek(0)
+        return rep, tmp.read()
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
+        tmp.close()
+
+
+def test_select_nccl_world2():
+    """World-2 e2e A/B across the front-select transport: the default arm
+    (auto -> device select + nccl gather on a single node) and the
+    REPLAY_FUSED_SELECT=cpu arm must produce bit-identical reports. The
+    shard echoes (captured at fd level) pin both arms' engagement:
+    front_sel=dev with gather=nccl vs front_sel=cpu."""
+    if torch.cuda.device_count() < 2:
+        print("SKIP test_select_nccl_world2 (needs 2 visible GPUs)")
+        return
+    old_env = os.environ.get("REPLAY_FUSED_SELECT")
+    old_s0_env = os.environ.get("REPLAY_S0_PROFILE")
+    old_gate = replay_fused._S0_PROFILE
+    # the env var (not just the module flag): the spawned shards bind
+    # _S0_PROFILE at their own import, and rank 0's S0FRONT print is the
+    # engagement evidence
+    os.environ["REPLAY_S0_PROFILE"] = "1"
+    replay_fused._S0_PROFILE = True
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            t0, *_ = _build_fixture(td)
+            cache = os.path.join(td, "dense_cache")
+            common = ["--device", "cuda", "--fused-shards", "2"]
+            outs = []
+            for arm in ("auto", "cpu"):
+                os.environ["REPLAY_FUSED_SELECT"] = arm
+                outs.append(_run_fd_captured(
+                    _base_args(td, cache, t0, common)))
+            assert "front_sel=dev" in outs[0][1], outs[0][1][-500:]
+            assert "gather=nccl" in outs[0][1], outs[0][1][-500:]
+            assert "front_sel=cpu" in outs[1][1], outs[1][1][-500:]
+            reps = [rep for rep, _txt in outs]
+            for rep in reps:
+                rep["branch_results"][str(t0)]["replay"].pop(
+                    "dense_cache_hit")
+                rep["branch_results"][str(t0)].pop("s0_profile", None)
+            assert _deep_eq_nan(reps[0], reps[1]), \
+                "the nccl gather fast path moved a report bit"
+    finally:
+        if old_env is None:
+            os.environ.pop("REPLAY_FUSED_SELECT", None)
+        else:
+            os.environ["REPLAY_FUSED_SELECT"] = old_env
+        if old_s0_env is None:
+            os.environ.pop("REPLAY_S0_PROFILE", None)
+        else:
+            os.environ["REPLAY_S0_PROFILE"] = old_s0_env
+        replay_fused._S0_PROFILE = old_gate
+    print("PASS test_select_nccl_world2")
+
+
 def _budget_mb(shards, cap, replay_dtype="fp64"):
     """The --fused-state-budget-mb value that derives group size == cap,
     recomputed from the fixture spec constants (sum(SIZES)) via the
@@ -1465,6 +1731,12 @@ def main():
     test_sort_oom_fallback_loud_cpu()
     test_sort_guard_empty_cache_before_measure()
     test_front_sort_env_killswitch()
+    test_shard_select_device_bitwise()
+    test_all_gather_pad_dev_world1()
+    test_all_gather_pad_dev_world2()
+    test_fused_select_device_bitwise()
+    test_select_env_killswitch()
+    test_select_nccl_world2()
     test_state_budget_bitwise()
     test_state_budget_cap_semantics()
     test_state_budget_cuda()

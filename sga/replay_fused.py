@@ -7,11 +7,12 @@ one cycle pass per ratio×score), so a sweep re-read the multi-TB window
 window in lockstep — one window read per group — sharded across processes:
 
 - ``--fused-shards`` shard processes (one per GPU; gloo over localhost for
-  the tiny control-plane exchanges), each owning a contiguous slice of the
-  global flat index space (catalog order). Every shard mmaps the same g
-  files and reads only its slice; the host page cache dedups the NFS pulls
-  (each file crosses the machine once per pass). A prefetch thread faults
-  in the next step's slices while the current step computes.
+  the tiny control-plane exchanges, plus an optional single-node NCCL data
+  plane for the front-phase payload gathers), each owning a contiguous
+  slice of the global flat index space (catalog order). Every shard mmaps
+  the same g files and reads only its slice; the host page cache dedups
+  the NFS pulls (each file crosses the machine once per pass). A prefetch
+  thread faults in the next step's slices while the current step computes.
 - Per step the shards exchange only per-config clip-norm sums (fp64
   scalars); at cycle boundaries they additionally exchange the 32769-bin
   integer score histograms and per-shard (above, tie) counts — the global
@@ -64,7 +65,10 @@ _S0_PROFILE = os.environ.get("REPLAY_S0_PROFILE", "") == "1"
 # ----------------------------------------------------------------------------
 
 class Comms:
-    """gloo wrapper for the tiny control-plane exchanges.
+    """gloo wrapper for the tiny control-plane exchanges (exact reductions,
+    length/pad gathers, unanimous votes); the same object optionally owns a
+    single-node NCCL data plane for the front-phase device payload gathers
+    (``all_gather_pad_dev``) — gloo remains THE control plane either way.
 
     Rendezvous: single-machine by default (tcp://127.0.0.1:{port}, rank ==
     process-group rank). A multi-node launcher instead sets, per process:
@@ -77,6 +81,7 @@ class Comms:
     """
 
     def __init__(self, rank, world, port):
+        self._nccl_group = None
         master = os.environ.get("SGA_MASTER_ADDR")
         global_rank = os.environ.get("SGA_GLOBAL_RANK")
         if master is None:
@@ -127,6 +132,69 @@ class Comms:
         out = [torch.zeros(m, dtype=t.dtype) for _ in range(self.world)]
         dist.all_gather(out, buf)
         return [out[r][:int(ns[r].item())] for r in range(self.world)]
+
+    def vote_unanimous(self, local_ok):
+        """One all-rank AND vote (identity when world == 1). Device-path
+        decisions must be unanimous: a partial fallback would split the
+        ranks across two different collectives (one gloo, one NCCL) and
+        deadlock the boundary."""
+        if not self.distributed:
+            return bool(local_ok)
+        vote = torch.tensor([1 if local_ok else 0], dtype=torch.int64)
+        dist.all_reduce(vote, op=dist.ReduceOp.MIN)
+        return bool(vote.item())
+
+    def vote_gather_backend(self):
+        """Unanimous transport vote for device-resident gathers. The NCCL
+        fast path is single-node only by design (the multi-node rendezvous
+        keeps the byte-identical gloo path); world == 1 needs no transport
+        at all."""
+        if not self.distributed:
+            return "gloo"
+        local = (os.environ.get("SGA_MASTER_ADDR") is None
+                 and dist.is_nccl_available())
+        return "nccl" if self.vote_unanimous(local) else "gloo"
+
+    def _dev_gather_group(self):
+        """Lazily create the NCCL group after a unanimous availability
+        vote. A failure here is post-vote (the environment is broken):
+        abort loudly rather than deadlock on a split collective."""
+        if self._nccl_group is None:
+            try:
+                self._nccl_group = dist.new_group(backend="nccl")
+            except Exception as exc:
+                raise RuntimeError(
+                    "NCCL group init failed after a unanimous availability "
+                    "vote — aborting loudly instead of deadlocking") from exc
+        return self._nccl_group
+
+    def all_gather_pad_dev(self, t, backend):
+        """Device-payload variant of all_gather_pad: same contract (per-rank
+        CPU tensors in rank order, padding never enters the results) but the
+        payload is produced on a device and moved over the NCCL fast path
+        when ``backend`` says so. Transport is pure data movement — values
+        (and every downstream CPU expression) are bit-identical across
+        backends. bool payloads move as uint8 (NCCL has no bool)."""
+        assert t.is_contiguous(), \
+            "all_gather_pad_dev needs a contiguous 1-D payload"
+        if not self.distributed:
+            return [t.cpu()]
+        if backend != "nccl":
+            return self.all_gather_pad(t.cpu())
+        n = torch.tensor([t.numel()], dtype=torch.int64)
+        ns = [torch.zeros(1, dtype=torch.int64) for _ in range(self.world)]
+        dist.all_gather(ns, n)
+        m = max(int(x.item()) for x in ns)
+        cast = t.dtype == torch.bool
+        tt = t.view(torch.uint8) if cast else t
+        buf = torch.zeros(m, dtype=tt.dtype, device=tt.device)
+        buf[:tt.numel()] = tt
+        out = [torch.zeros_like(buf) for _ in range(self.world)]
+        dist.all_gather(out, buf, group=self._dev_gather_group())
+        parts = [out[r][:int(ns[r].item())] for r in range(self.world)]
+        if cast:
+            parts = [p.view(torch.bool) for p in parts]
+        return [p.cpu() for p in parts]
 
 
 def _free_port():
@@ -283,6 +351,36 @@ def _device_ok_for_sort(numel, dev):
         print(f"[fused] ranking permutation on {dev} skipped: "
               f"need ~{need / 2 ** 30:.1f} GiB, free {free / 2 ** 30:.1f} "
               f"GiB — CPU fallback (bit-identical)", flush=True)
+    return ok
+
+
+def _device_ok_for_select(numel, k_max, world, n_scores, dev):
+    """Conservative VRAM guard for the device front-select block (not the
+    sort guard's 32 B/elem): the resident fp32 vectors (4 * (n_scores + 1)
+    B/elem: one vector per selected score + the label), the per-call select
+    peak (14 B/elem: top16 int32 4 + gt/eq bool 2 + worst-case all-tie
+    nonzero int64 8), and the padded gather fan-out (~k/world per-rank
+    payload times world+1 buffers) — the expected case with margin, not an
+    exhaustive booking (unbooked transients exist: candidate/isfinite/
+    payload copies and a selection skewed onto one rank). Runtime free-mem
+    based with the same empty_cache-first caveat as _device_ok_for_sort
+    (mem_get_info counts this process's own cached-but-free blocks). At
+    refusal the run takes the loud, bit-identical CPU path — guaranteed at
+    refusal only: a post-vote VRAM grab (TOCTOU) aborts the run by design
+    (collectives cannot be unwound mid-block)."""
+    if dev is None:
+        return False
+    torch.cuda.empty_cache()
+    free, _total = torch.cuda.mem_get_info(dev)
+    need = numel * (4 * (n_scores + 1) + 14) \
+        + (k_max // world + 1) * 4 * (world + 1)
+    ok = need < free * 0.85
+    if not ok:
+        print(f"[fused] front select on {dev} skipped: "
+              f"need ~{need / 2 ** 30:.1f} GiB, free {free / 2 ** 30:.1f} "
+              f"GiB — CPU fallback (bit-identical); a post-vote VRAM grab "
+              f"(TOCTOU) aborts instead — collectives cannot be unwound "
+              f"mid-block", flush=True)
     return ok
 
 
@@ -477,6 +575,17 @@ def _worker(rank, world, cfg, port, frag_path):
             "allowed values ('auto', 'cpu')")
     if front_sort == "cpu":
         sort_dev = None
+    # select kill-switch (A/B arms and emergencies): force the bit-identical
+    # CPU front-select path — the S0FRONT print echoes the arm as
+    # front_sel=cpu. Same unknown-values-must-raise contract as
+    # REPLAY_FUSED_FRONT_SORT. The streaming boundary re-selections are
+    # unaffected (their scores are device-constructed under --device cuda
+    # already); this flag governs the FRONT selection block only.
+    front_sel = os.environ.get("REPLAY_FUSED_SELECT", "auto")
+    if front_sel not in ("auto", "cpu"):
+        raise ValueError(
+            f"REPLAY_FUSED_SELECT={front_sel!r} is not one of the "
+            "allowed values ('auto', 'cpu')")
     if dev.startswith("cuda"):
         torch.cuda.set_device(int(dev.split(":")[1]))
     comms = Comms(rank, world, port)
@@ -596,12 +705,36 @@ def _worker(rank, world, cfg, port, frag_path):
     cycle_lens = cfg["cycle_lens"]
     ks = {r: max(1, int(round(r / 100.0 * N))) for r in ratios}
     idcg, sel0, thresh0, rankmet = {}, {}, {}, {}
+    # device front-select decision: unanimous across ranks (a partial
+    # fallback would split the gather collectives and deadlock). With the
+    # arm engaged, the CPU originals stay untouched for _shard_stats (its
+    # fp32 sum is device-divergent) while device copies feed shard_select,
+    # the mask indexing, and the gather payloads; gather parts come back
+    # to CPU (exact movement) so every downstream reduction keeps its
+    # original CPU expression path.
+    _sel_ok = (front_sel == "auto" and dev.startswith("cuda")
+               and _device_ok_for_select(sp.n, ks[max(ratios)], world,
+                                         len(score_names), dev))
+    sel_dev_used = dev if comms.vote_unanimous(_sel_ok) else None
+    gather_backend = (comms.vote_gather_backend()
+                      if sel_dev_used is not None else "gloo")
+    if sel_dev_used is not None:
+        score_sel = {s: score_loc[s].to(sel_dev_used) for s in score_names}
+        label_sel = label_loc.to(sel_dev_used)
+    else:
+        score_sel, label_sel = score_loc, label_loc
+
+    def _gather(payload):
+        if sel_dev_used is not None:
+            return comms.all_gather_pad_dev(payload, gather_backend)
+        return comms.all_gather_pad(payload)
+
     _tf_sel = 0.0
     _tf_rank = 0.0
     for r in ratios:
         _tq = time.perf_counter() if _S0_PROFILE else 0.0
-        lsel, _lt = shard_select(label_loc, ks[r], comms)
-        parts = comms.all_gather_pad(label_loc[lsel].clone())
+        lsel, _lt = shard_select(label_sel, ks[r], comms)
+        parts = _gather(label_sel[lsel].clone())
         if _S0_PROFILE:
             _tf_sel += time.perf_counter() - _tq
             _tq = time.perf_counter()
@@ -616,10 +749,10 @@ def _worker(rank, world, cfg, port, frag_path):
             # len(cycle_lens) redundant global selects; sel0 is only read to
             # build the per-config device masks (never mutated)
             _tq = time.perf_counter() if _S0_PROFILE else 0.0
-            sel, th = shard_select(score_loc[s], ks[r], comms)
-            sc_parts = comms.all_gather_pad(score_loc[s][sel].clone())
-            lb_parts = comms.all_gather_pad(label_loc[sel].clone())
-            ls_parts = comms.all_gather_pad(lsel[sel].clone())
+            sel, th = shard_select(score_sel[s], ks[r], comms)
+            sc_parts = _gather(score_sel[s][sel].clone())
+            lb_parts = _gather(label_sel[sel].clone())
+            ls_parts = _gather(lsel[sel].clone())
             if _S0_PROFILE:
                 _tf_sel += time.perf_counter() - _tq
                 _tq = time.perf_counter()
@@ -636,6 +769,20 @@ def _worker(rank, world, cfg, port, frag_path):
                 thresh0[(s, r, t)] = th
                 if comms.global_rank == 0:
                     rankmet[(s, r, t)] = met_sr
+    # release the front-only device residents before the streaming phase's
+    # own peak (g-residency + per-group states run the card near full):
+    # the uploaded vectors and the loop-local select masks (label sel + the
+    # last score sel) are dead (the vectors' CPU originals persist), and
+    # the sel0 masks go back to CPU so the streaming setup's slice-upload
+    # path behaves exactly as in the CPU arm — a device-resident mask would
+    # otherwise alias-hold every full-size mask through streaming via the
+    # per-entry slice views, and the whole set plus the NCCL buffers does
+    # not fit under the streaming peak
+    del score_sel, label_sel, lsel, sel
+    if sel_dev_used is not None:
+        for _k, _v in sel0.items():
+            sel0[_k] = _v.cpu()
+        torch.cuda.empty_cache()
     if _S0_PROFILE and comms.global_rank == 0:
         # front-phase decomposition (diagnostic labels, not exact
         # accounting): branch-score math / dense-cache load / shard_select
@@ -643,7 +790,9 @@ def _worker(rank, world, cfg, port, frag_path):
         print(f"S0FRONT rank={rank} scores_s={_tf_scores:.1f} "
               f"cache_s={_tf_cache:.1f} select_s={_tf_sel:.1f} "
               f"rank_s={_tf_rank:.1f} "
-              f"front_sort={'cpu' if sort_dev is None else 'dev'}",
+              f"front_sort={'cpu' if sort_dev is None else 'dev'} "
+              f"front_sel={'cpu' if sel_dev_used is None else 'dev'} "
+              f"gather={gather_backend}",
               flush=True)
 
     # ---- streaming passes over config groups ------------------------------
@@ -678,8 +827,10 @@ def _worker(rank, world, cfg, port, frag_path):
     t_pass0 = time.time()
     for gi, group in enumerate(groups):
         states = {}
-        # sel0[(s,r,t)] is the SAME tensor for every t of one (s,r) — key
-        # the upload cache by (s, r, entry) so "same selection across T
+        # sel0[(s,r,t)] is the SAME CPU selection mask for every t of one
+        # (s,r) — CPU-resident in every arm here (the front block released
+        # its device copies or fetched the masks back before this loop) —
+        # key the upload cache by (s, r, entry) so "same selection across T
         # arms" is expressed directly and the slice + upload happens once
         # per distinct selection instead of once per arm (the masks are
         # read-only downstream; reselection replaces the tensor, never
