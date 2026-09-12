@@ -1333,7 +1333,19 @@ def _common_gates(args):
                 "cuda:r. Use --device cuda and restrict the visible devices "
                 "with CUDA_VISIBLE_DEVICES (e.g. CUDA_VISIBLE_DEVICES=4,5 for "
                 "a 2-shard run on physical GPUs 4 and 5)")
-        if world > torch.cuda.device_count():
+        nodes = getattr(args, "nodes", None)
+        if nodes:
+            # multinode early fail: the launcher runs no shards, so check
+            # the per-node share (ceil — divisibility is the launcher's
+            # own gate); replay_launch._cuda_shard_gate re-checks the real
+            # local count on every node in both phases
+            share = -(-world // len(nodes))
+            if share > torch.cuda.device_count():
+                raise ValueError(
+                    f"--fused-shards {world} over {len(nodes)} nodes puts "
+                    f"{share} shards on each, exceeding the visible CUDA "
+                    f"devices on this node ({torch.cuda.device_count()})")
+        elif world > torch.cuda.device_count():
             raise ValueError(
                 f"--fused-shards {world} exceeds the visible CUDA devices "
                 f"({torch.cuda.device_count()})")

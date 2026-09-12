@@ -25,9 +25,10 @@ Contract under test:
    degenerate case.
 4. Launch gates: shard/world divisibility by the node count, empty and
    duplicated and ill-formed node lists, shard count >= 1, timeout bounds,
-   and the --device cuda:N rejection all name their option; the
-   node-worker entry names its required options and rejects inconsistent
-   geometry.
+   the --device cuda:N rejection, and the launcher-side CUDA capacity
+   check (per-node share under --nodes, whole world single-node) all name
+   their option; the node-worker entry names its required options and
+   rejects inconsistent geometry.
 5. Failure paths fail WITHOUT orphans: a mid-spawn failure, a run-phase
    early death and a KeyboardInterrupt all reap every started node-worker;
    the opt-in --run-deadline kills a worker hung outside a collective.
@@ -320,6 +321,41 @@ def test_multinode_gates():
                 raise AssertionError(f"gate accepted: shards={ns.fused_shards}"
                                      f" device={ns.device} nodes={nodes}")
     print("PASS test_multinode_gates")
+
+
+def test_multinode_cuda_share_gate():
+    """Under --nodes the launcher-side CUDA capacity check is per-node:
+    the launcher runs no shards, so world=16 over 2 nodes passes a node
+    showing 8 devices (the authoritative per-node check is
+    _cuda_shard_gate, exercised in test_node_worker_preflight_cuda_gate),
+    while 32 over 2 (16/node) and the single-node world=16 spelling both
+    fail — the latter with the unchanged single-node message (the CLI
+    gate test in test_replay_fused matches it)."""
+    from sga.replay_fused import _common_gates
+    with tempfile.TemporaryDirectory() as td:
+        ns = _multinode_args(td, os.path.join(td, "dc"), 1000, 16,
+                             device="cuda")
+        orig = torch.cuda.device_count
+        torch.cuda.device_count = lambda: 8
+        try:
+            try:
+                _common_gates(ns)
+            except ValueError as e:
+                assert "exceeds the visible CUDA devices" in str(e), str(e)
+            else:
+                raise AssertionError("single-node world16 gate did not fire")
+            ns.nodes = ["127.0.0.1", "127.0.0.1"]
+            assert set(_common_gates(ns)) == {"abs_g", "update"}
+            ns.fused_shards = 32
+            try:
+                _common_gates(ns)
+            except ValueError as e:
+                assert "16 shards on each" in str(e), str(e)
+            else:
+                raise AssertionError("world32 over 2 nodes gate did not fire")
+        finally:
+            torch.cuda.device_count = orig
+    print("PASS test_multinode_cuda_share_gate")
 
 
 def test_multinode_preflight_failure_loud():
