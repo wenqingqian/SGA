@@ -374,7 +374,7 @@ trace 默认 fp32 录制 (4.7 TB/千步)。`sga.trace_convert` 可将其转成 *
 
 ### 5.3 实测设定与结果
 
-设定 (2026-09 全量验证):
+设定 (全量验证):
 
 - 模型/数据: llama-1B (约 1.2×10⁹ 参数), OpenWebText, 真实训练;
 - trace: 分支点 40 后 1000 步窗口; fp32 约 4.7 TB, bf16 副本 2.5 TB (转换 8207 s);
@@ -455,7 +455,7 @@ python -m sga.replay \
     --ratios 20,30,40 --score-names abs_g,abs_m,update,coi \
     --replay-mode cycle --cycle-lens 5,20,100 \
     --device cuda --fused-shards 16 \
-    --nodes 10.1.2.8,10.1.2.118 \
+    --nodes <node0-ip>,<node1-ip> \
     --dense-cache /data/cache/run1 --out report.json
 ```
 
@@ -575,7 +575,7 @@ branches["40"]
 - **免 ssh 仿真**: `SGA_LAUNCH_EXECUTOR=local` 把节点拉起降级为本机子进程, 单机即可演练完整拓扑 (单测与 CI 用)。
 - **冒烟**: `tests/smoke_replay_multinode.sh <master-ip> <worker-ip> <NFS-workdir>` — CPU world=2 双节点全链路 (冷缓存填充 + 带外发布 + ssh 拉起), 判据 = 纯重排带。
 
-计时带 (world16 vs world8 加速比) 为预注册待补项, 等双节点空闲窗口。
+计时带 (world16 vs world8 加速比) 为预注册待补项。
 
 ## 7. 边界与限制
 

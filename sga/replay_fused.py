@@ -32,9 +32,8 @@ window in lockstep — one window read per group — sharded across processes:
 
 Arithmetic contract (historical): per-config math was op-identical to the
 removed ``sparse_replay_cycle`` — per-param per-chunk operations in the
-same order — so single-shard runs reproduced the classic report bitwise
-(pinned by the pre-deletion e2e tiny-trace comparison). The standing spec
-anchor is ``tests/test_replay_cycle.reference_cycle``. At world > 1 the
+same order — so single-shard runs reproduced the classic report bitwise.
+The standing spec anchor is ``tests/test_replay_cycle.reference_cycle``. At world > 1 the
 only deviations are cross-shard fp64 scalar-sum reorderings (covered by
 the frozen pure-reordering band), plus the optional ``--norm-dtype fp32``
 quantization (gated by its own frozen band). The
@@ -55,7 +54,7 @@ import queue
 import torch
 import torch.distributed as dist
 
-# opt-in S0 profile (plan-level speedup baseline): counts host syncs / gloo
+# opt-in S0 profile: counts host syncs / gloo
 # ops / H2D bytes per pass and per-pass wall time; zero effect when unset
 _S0_PROFILE = os.environ.get("REPLAY_S0_PROFILE", "") == "1"
 
@@ -806,8 +805,7 @@ def _worker(rank, world, cfg, port, frag_path):
     # deterministic pure function (a per-shard sp.n basis could split the
     # ranks at the floor and tear the qn2/num2 collectives). The budget
     # overrides --fused-max-configs; the bool sel mask, the --chunk-mb
-    # working set and g-residency buffers sit outside the accounting (the
-    # plan-level budget table counts the four state tensors only).
+    # working set and g-residency buffers sit outside the accounting.
     itemsize = torch.finfo(replay_dtype).bits // 8
     budget_bytes = cfg["state_budget_mb"] * 2 ** 20
     if budget_bytes > 0:
@@ -1329,8 +1327,6 @@ def _common_gates(args):
         if r <= 0.0 or r > 100.0:
             raise ValueError(f"ratio {r} out of (0,100]")
     if args.device != "cpu":
-        # shard r maps to cuda:r, so a bare index on --device has no meaning;
-        # the visible device set is constrained via CUDA_VISIBLE_DEVICES
         if args.device != "cuda":
             raise ValueError(
                 "--device cuda:N is not supported: shard r always maps to "

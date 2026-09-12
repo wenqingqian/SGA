@@ -24,8 +24,8 @@ classic in-process cycle replay was removed; cycle auto-routes here):
 4. Cold cache with no prior run: the parent populates the cache before
    the shards start (dense_cache_hit False on the populating run), and
    the populated cache then serves a world=1 run.
-5. CLI gates: cycle without --dense-cache (the post-consolidation
-   behavior change), --fused outside cycle mode, --self-check with cycle
+5. CLI gates: cycle without --dense-cache, --fused outside cycle mode,
+   --self-check with cycle
    or with --fused, shard count < 1, max-configs < 1, unknown scores,
    out-of-range ratios and an explicit cuda:N --device, each with the
    option named.
@@ -390,7 +390,7 @@ def test_fused_world2_band():
 def test_fused_world2_norm_fp32():
     """--norm-dtype fp32 on both arms: same quantization, so the world=2
     vs world=1 deviation stays pure-reorder (the fp32-norm effect itself is
-    gated by the frozen a2 band, not by this test)."""
+    gated by the frozen norm-dtype band, not by this test)."""
     with tempfile.TemporaryDirectory() as td:
         t0, _W = _build_fixture(td)[0:2]
         cache = os.path.join(td, "dense_cache")
@@ -436,7 +436,6 @@ def test_fused_cli_gates():
             # zerofill (the default) has no fused form; --fused is a
             # deprecated no-op only where it ever made sense
             (base + ["--fused"], "--fused is deprecated"),
-            # the post-consolidation behavior change, named loudly
             (base + ["--replay-mode", "cycle"],
              "--replay-mode cycle requires --dense-cache"),
             (["--trace-dir", "/nonexistent-sga-trace-dir", "--replay-mode",
@@ -1198,7 +1197,7 @@ def test_front_sort_env_killswitch():
 
 def _adversarial_scores(n, gen):
     """Non-negative finite fp32 vectors engineered with heavy tie structure
-    in the threshold bin (canonized from the pre-plan exactness probe)."""
+    in the threshold bin."""
     plateau = torch.ones(n)
     plateau[: int(0.4 * n)] = 2.0
     zh = torch.zeros(n)
@@ -1473,7 +1472,7 @@ def test_state_budget_bitwise():
     collectives, per-config shard_select calls). The echo keys
     (fused_state_budget_mb / state_budget_mb / group_cap) are conditional —
     the budget-off report gains no keys at all, so default-path artifacts
-    stay byte-identical (absorb-style byte cmps)."""
+    stay byte-identical."""
     with tempfile.TemporaryDirectory() as td:
         t0, *_ = _build_fixture(td)
         cache = os.path.join(td, "dense_cache")
