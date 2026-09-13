@@ -385,6 +385,26 @@ def _add_sga_backend_args(parser: argparse.ArgumentParser):
              "'compact' is refused on the writeback-inherent backends. "
              "Default auto.")
     group.add_argument(
+        "--sga-backend-layout", type=str, default="auto",
+        choices=("auto", "er", "eb", "bb"),
+        help="which index form the idx backends transport (the "
+             "er|eb|bb taxonomy): er = element selection + element index; eb = block "
+             "selection + element index (the mask is block-structured, the "
+             "transport stays the element idx path — same wire form as er, "
+             "only the idx distribution differs); bb = block selection + "
+             "block index (torch: block heads through the block gather/"
+             "scatter path; nccl: heads packed as v16 descriptors, head | "
+             "tail_len in the low log2(block_size) bits, and every span "
+             "start must be block_size-aligned — checked at attach). "
+             "'auto' (default) derives from sga_selection_block_size: 1 -> "
+             "er, > 1 -> bb, so the historical configs are unchanged. "
+             "er requires block_size 1; eb/bb require block_size > 1; bb "
+             "with nccl additionally bounds block_size to a power of two "
+             "in [4, 64] (4 = the descriptor kernel ABI floor, 64 = the "
+             "span 64-alignment that keeps descriptor packing "
+             "unconditional). A dead knob on the mask backend "
+             "(torch_pipelined_mask) — refused when set explicitly.")
+    group.add_argument(
         "--sga-backend-high-priority-group", type=sga_bool, default=False,
         help="torch_pipelined_index only: run sparse collectives on a twin "
              "high-priority NCCL group (true selects the legacy "

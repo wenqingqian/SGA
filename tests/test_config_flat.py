@@ -330,6 +330,7 @@ def test_inv4_historical_surface_pinned():
         "sga_optimizer_compact_search": ("table", "str", ("table", "bisection")),
         "sga_backend": ("dense", "str", ()),
         "sga_backend_emission": ("auto", "str", ("auto", "compact", "writeback")),
+        "sga_backend_layout": ("auto", "str", ("auto", "er", "eb", "bb")),
         "sga_backend_high_priority_group": (False, "bool", ()),
         "sga_backend_index_slices": (2, "int", ()),
         "sga_backend_mask_slices": (2, "int", ()),
@@ -430,27 +431,53 @@ def test_inv5_block_size_rules():
 
 
 def test_inv5_block_backend_cross_field_rules():
-    """Block-granularity comm-path cross-field rules. The mask stays the
-    canonical support form, so these gates only refuse combinations
-    whose evident intent — block communication — would silently degrade
-    to element-level transport: nccl's fork kernel has no block-size
-    argument, and tpi's compact consumers are element-granular.
-    tpi+writeback and the mask backend carry blocks."""
+    """Block-granularity comm-path cross-field rules under the layout
+    taxonomy: the mask stays the canonical support form, and
+    the layout routes which index form the transport consumes. bb rides
+    the torch block path (writeback-only) or the nccl descriptor API
+    (block_size bounded to a pow2 in [4, 64]); er/eb ride the element
+    idx paths — so nccl+block 16 is now a LEGITIMATE bb config, and the
+    refusals are the dead/misaligned combinations instead."""
     base = {"sga_selection_block_size": 16}
-    expect_error(lambda: validate_sga_args(
-        _seed({**base, "sga_backend": "nccl_pipelined_index"})),
-        "element-granular")
-    # tpi with the auto default: auto resolves to compact here, and the
-    # refusal must say so (the hint text is the user's only signpost)
+    # tpi with the auto default: layout auto-derives bb and emission
+    # resolves to compact here — the refusal must say so (the hint text
+    # is the user's only signpost)
     expect_error(lambda: validate_sga_args(
         _seed({**base})), "resolves to 'compact'")
     expect_error(lambda: validate_sga_args(
         _seed({**base, "sga_backend_emission": "compact"})), "'writeback'")
-    # allowed: tpi+writeback and the mask backend
+    # nccl bb outside the descriptor x domain [4, 64]
+    expect_error(lambda: validate_sga_args(
+        _seed({**base, "sga_selection_block_size": 128,
+               "sga_backend": "nccl_pipelined_index"})),
+        "power of two in [4, 64]")
+    # er names element selection — block_size > 1 contradicts it
+    expect_error(lambda: validate_sga_args(
+        _seed({**base, "sga_backend_layout": "er"})),
+        "'er' (element selection + element index) refuses")
+    # eb/bb name block selection — block_size 1 contradicts them
+    for layout in ("eb", "bb"):
+        expect_error(lambda l=layout: validate_sga_args(
+            _seed({"sga_backend_layout": l})),
+            "refuses sga_selection_block_size == 1")
+    # an explicit layout on the mask backend is dead config
+    expect_error(lambda: validate_sga_args(
+        _seed({**base, "sga_backend_layout": "bb",
+               "sga_backend": "torch_pipelined_mask"})),
+        "refused with backend torch_pipelined_mask")
+    # allowed: tpi+writeback (bb), tpi+eb+compact (element transport),
+    # nccl+bb in domain, nccl+eb (element transport), the mask backend
     validate_sga_args(_seed(
         {**base, "sga_backend_emission": "writeback"}))
+    validate_sga_args(_seed(
+        {**base, "sga_backend_layout": "eb"}))
+    validate_sga_args(_seed(
+        {**base, "sga_backend": "nccl_pipelined_index"}))
+    validate_sga_args(_seed(
+        {**base, "sga_backend_layout": "eb",
+         "sga_backend": "nccl_pipelined_index"}))
     validate_sga_args(_seed({**base, "sga_backend": "torch_pipelined_mask"}))
-    print("ok: block comm-path cross-field refusals (nccl, tpi non-writeback)")
+    print("ok: layout cross-field refusals (dead layouts, bb domains)")
 
 
 def test_inv5_block_fast_mode_refusal():

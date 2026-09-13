@@ -88,12 +88,13 @@ _sga_main() {
     # Sparse NCCL library for the nccl_pipelined_index backend: the nccl-sar
     # fork's modified ncclAllReduce signature makes it mutually exclusive
     # with torch's bundled NCCL, so it is only ever loaded explicitly via
-    # ctypes. The v5 build is the sparse_index branch, and its "-mask"
-    # artifact name is what serves the index backend (it exports
-    # ncclSparseAllReduce). Unset when the sibling checkout has no built
-    # library — that backend then fails its own loud prepare() check
-    # instead of here.
-    _SPARSE_LIB="${_SGA_ROOT}/../nccl-sar/libs/v5/libnccl-mask.so"
+    # ctypes. The v7 build is the API-split alias window — it
+    # exports the new ncclSparseAllReduceIndex/BlockIndex spellings while
+    # keeping the pre-split names as deprecated forwarders, so er/eb (and
+    # bb, which v5 could not serve) all resolve from one library. Unset
+    # when the sibling checkout has no built library — that backend then
+    # fails its own loud prepare() check instead of here.
+    _SPARSE_LIB="${_SGA_ROOT}/../nccl-sar/libs/v7/libnccl-mask.so"
     if [ -z "${SGA_NCCL_SAR_LIB:-}" ] && [ -f "$_SPARSE_LIB" ]; then
         export SGA_NCCL_SAR_LIB="$_SPARSE_LIB"
     fi

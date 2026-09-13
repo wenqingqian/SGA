@@ -22,6 +22,13 @@ Self-declared class facts (read by config validation and the engine):
     layer's). Compact means the communicated values stay in the backend's
     compact buffer and are handed back as (idx, values) — only
     compact-capable optimizers may pair with them (config-checked).
+  - ``block_form`` (idx backends): 'block_idx' or 'block_desc' — which
+    bb-layout support form the backend transports, torch block heads
+    (Triton gather/scatter) or nccl-packed descriptors (head | tail_len).
+    Drives the engine's activation-time materialization and the
+    span-alignment attach gate (descriptor packing needs x-aligned span
+    starts); the default 'block_idx' keeps third-party idx backends
+    working unchanged.
 
 No hardcoded combination table lives here: value-level cross rules
 (emission vs optimizer compact-consumption, score emittability) are
@@ -36,6 +43,7 @@ __all__ = [
     "get_score_spec",
     "score_names",
     "resolve_emission",
+    "resolve_layout",
     "register_selection",
     "register_optimizer",
     "register_backend_plugin",
@@ -60,6 +68,26 @@ def resolve_emission(value, inherent):
     legality is the config layer's, plus the constructors' own membership
     backstops — a bogus spelling must fail BEFORE this resolves it)."""
     return inherent if value in (None, "auto") else value
+
+
+def resolve_layout(layout, block_size):
+    """The single 'auto' derivation of ``sga_backend_layout``:
+    element-granular selection names er, block-granular names bb. An
+    EXPLICIT value always passes through untouched (its legality is the
+    config layer's — eb under block_size 1 is refused there, not folded
+    here). Config validation writes the resolved value back onto the
+    args singleton, so production readers see er|eb|bb; this helper also
+    serves direct construction paths (unit tests) whose args never ran
+    validation — an 'auto' left on the namespace resolves identically
+    here.
+
+    The taxonomy's wire forms: er/eb transport the element idx (eb's is
+    the block selection expanded to elements — same wire form, only the
+    distribution differs); bb transports the backend's declared block
+    form — torch block heads or nccl packed descriptors."""
+    if layout not in (None, "auto"):
+        return layout
+    return "er" if block_size == 1 else "bb"
 
 
 def register_selection(name, cls):

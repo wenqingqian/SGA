@@ -26,9 +26,10 @@ own validate_args works:
   - write-backs: derived values are resolved ONTO the args (megatron
     writes ``args.data_parallel_size = ...`` the same way) — the percent
     spelling resolves into ``sga_cycle_start_iter``, the comma-token list
-    keys parse into sorted lists, and a false ``sga_checks`` forces every
-    ``sga_checks_*`` sub-flag False. Exactly four write-back sites exist;
-    every other key passes through untouched.
+    keys parse into sorted lists, a false ``sga_checks`` forces every
+    ``sga_checks_*`` sub-flag False, and the layout 'auto' spelling
+    resolves into er|eb|bb. Exactly five write-back sites exist; every
+    other key passes through untouched.
 
 Inputs: an args-like namespace (attribute access). ``args=None`` reads the
 sga singleton (``sga.config.get_args`` — the copy build_engine seeded from
@@ -356,20 +357,24 @@ def validate_sga_args(args=None) -> None:
         # first error is the dead block_size knob, not a backend-switch
         # pointer
         _dead_config_exceptions(args)
+        # --- backend layout: 'auto' resolves via sga.plugins.resolve_layout
+        # (single source; an explicit value passes through untouched, its
+        # legality is the rules below).
+        layout_explicit = args.sga_backend_layout != "auto"
+        if not layout_explicit:
+            from sga.plugins import resolve_layout
+            args.sga_backend_layout = resolve_layout(
+                args.sga_backend_layout, block_size)
+        layout = args.sga_backend_layout
         # Block-granularity comm-path constraints. The mask stays the
         # canonical support form, so a block-structured mask is CORRECT on
-        # every backend — but the block-INDEX transport (one entry per
-        # contiguous run) exists only on torch_pipelined_index with
-        # writeback emission. Refuse the combinations whose evident intent
-        # (block communication) would silently degrade to element-level
-        # transport or hit element-granular consumers.
+        # every backend; the layout only routes WHICH index form the
+        # transport consumes (taxonomy: sga.plugins.resolve_layout).
+        # Dead-layout and cross-axis refusals:
         if block_size > 1:
             # fast places the threshold at the crossing bin's LOWER edge
             # (systematic over-selection) and a block payload amplifies
-            # it: x elements ride every over-selected block off a
-            # narrower block-score distribution — measured realized
-            # ratio 0.253 vs the 0.20 target, a silent breach of the
-            # ratio contract.
+            # it. Selection-layer gate: holds for eb AND bb.
             # TODO(fast-block): sound once the threshold moves to the
             # crossing bin's midpoint/upper edge — that is its own plan;
             # lift this gate there.
@@ -382,20 +387,49 @@ def validate_sga_args(args=None) -> None:
                     "over-selection (measured realized ratio 0.253 vs "
                     "0.20 target) — use 'balanced' or 'exact', or keep "
                     "block_size 1")
-            if args.sga_backend == "nccl_pipelined_index":
+            if layout == "er":
                 raise ValueError(
-                    "sga_selection_block_size > 1 with backend "
-                    "nccl_pipelined_index: the fork kernel's idx is "
-                    "element-granular (no block-size argument). Use "
-                    "torch_pipelined_index with sga_backend_emission "
-                    "'writeback', or torch_pipelined_mask")
-            if (args.sga_backend == "torch_pipelined_index"
-                    and emission != "writeback"):
-                raise ValueError(
-                    f"sga_selection_block_size > 1 with backend "
-                    f"torch_pipelined_index needs sga_backend_emission "
-                    f"'writeback' (got '{emission}'"
-                    + (", which resolves to 'compact' here"
-                       if emission == "auto" else "")
-                    + "): the compact consumers (merge-join, compact norm) "
-                    "are element-granular")
+                    "sga_backend_layout 'er' (element selection + element "
+                    f"index) refuses sga_selection_block_size > 1 (got "
+                    f"{block_size}): er names element-granular selection. "
+                    "Use layout 'eb' (block selection transported as the "
+                    "expanded element idx) or 'bb' (block index), or set "
+                    "block_size 1")
+        elif layout_explicit and layout in ("eb", "bb"):
+            raise ValueError(
+                f"sga_backend_layout '{layout}' (block selection) refuses "
+                "sga_selection_block_size == 1: it names block-granular "
+                "selection. Use layout 'er' or set block_size > 1")
+        # The mask backend never transports an index form — an explicit
+        # layout there is dead config with a routing connotation (same
+        # refusal category the curated dead-config list carves out).
+        if layout_explicit and args.sga_backend == "torch_pipelined_mask":
+            raise ValueError(
+                f"sga_backend_layout '{layout}' is refused with backend "
+                "torch_pipelined_mask: the mask transport consumes the "
+                "canonical mask directly and no index form is ever "
+                "built — drop the layout flag")
+        # bb on the idx backends: torch routes the block gather/scatter
+        # path (writeback-only); nccl routes the packed descriptor API
+        # (block_size bounded to a power of two in [4, 64]).
+        if layout == "bb" and args.sga_backend == "torch_pipelined_index" \
+                and emission != "writeback":
+            raise ValueError(
+                f"sga_backend_layout 'bb' with backend "
+                f"torch_pipelined_index needs sga_backend_emission "
+                f"'writeback' (got '{emission}'"
+                + (", which resolves to 'compact' here"
+                   if emission == "auto" else "")
+                + "): the block path's payload is mask-guarded lanes, "
+                "not an (idx, values) compact handoff; layout 'eb' keeps "
+                "the element idx and allows compact")
+        if (layout == "bb" and args.sga_backend == "nccl_pipelined_index"
+                and not (4 <= block_size <= 64)):
+            raise ValueError(
+                "sga_backend_layout 'bb' with backend nccl_pipelined_index "
+                f"bounds sga_selection_block_size to a power of two in "
+                f"[4, 64] (got {block_size}): 4 is the descriptor kernel's "
+                "ABI floor (blockShift >= 2 decode), 64 keeps the packed "
+                "heads unconditionally representable under the spans' "
+                "64-element padding — use layout 'eb' (element transport) "
+                "for other block sizes")

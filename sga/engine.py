@@ -205,6 +205,21 @@ class SGAEngine:
             decouple=cfg.sga_cycle_decouple_full_sync_interval_and_period,
             full_sync_interval=cfg.sga_cycle_full_sync_interval,
         )
+        # Backend layout: which index form the idx backends transport
+        # (er/eb/bb — see sga.plugins.resolve_layout). Read off the BACKEND
+        # object (the emission precedent — the config key stays the backend
+        # group's single consumer); validation resolved 'auto' onto the
+        # singleton before construction in production, and an unresolved
+        # 'auto' (direct construction in unit tests) belts through the
+        # selection's own block granularity. Drives the activation-time
+        # support materialization and the attach-time span-alignment gate
+        # (bb on descriptor-form backends).
+        layout = getattr(self.backend, "layout", "auto")
+        if layout == "auto":
+            layout = ("er" if getattr(self.selection, "block_size", 1) == 1
+                      else "bb")
+        self._backend_layout = layout
+        self._selection_block_size = getattr(self.selection, "block_size", 1)
         self._chunks = {}                 # id(chunk) -> chunk
         self._bucket_states = []          # global ordered list (Support alignment)
         self._bucket_state_of = {}        # id(bucket) -> BucketState
@@ -346,6 +361,21 @@ class SGAEngine:
         self._selection_meta = None  # rebuilt after a new chunk attaches
         self._always_sync_attach_check()
         self.opt.ensure_state(self._bucket_states)
+        # bb-on-descriptor startup gate: the packed descriptor
+        # form is only representable when every param span STARTS
+        # x-aligned (a head's low log2(x) bits carry the tail length, so
+        # an offset span start is unencodable). The bucket layout is
+        # final here, and the gate deliberately runs BEFORE the backend
+        # prepare loop below — a refusal must not leave half-built raw
+        # comms (and their warmup allocations) behind — naming the
+        # offending bucket/span/param at start of run instead of an
+        # assert deep inside the first reselection's packing. The
+        # torch bb path is exempt: its block tiling is span-relative and
+        # needs no absolute alignment.
+        if (self._backend_layout == "bb"
+                and getattr(self.backend, "block_form", "block_idx")
+                == "block_desc"):
+            self._bb_alignment_check()
         # The comm groups just became known (DDP bucket construction is a
         # world-collective, so attach runs symmetrically on every rank):
         # give the backend its optional eager-setup point BEFORE the training
@@ -361,6 +391,22 @@ class SGAEngine:
                     continue
                 seen_ids.add(id(dp_group))
                 prepare(dp_group, device=bs.grad_data.device)
+
+    def _bb_alignment_check(self) -> None:
+        """Refuse non-x-aligned param span starts for descriptor bb."""
+        x = self._selection_block_size
+        for bs in self._bucket_states:
+            for (param, start, end), name in zip(bs.param_spans,
+                                                 bs.param_names):
+                if start % x:
+                    raise SGAEngineError(
+                        f"sga_backend_layout bb (nccl descriptor packing) "
+                        f"needs every param span start {x}-aligned; bucket "
+                        f"{bs.bucket_id} param '{name}' spans "
+                        f"[{start}, {end}) — the descriptor head's low "
+                        f"log2({x}) bits carry the tail length and cannot "
+                        "encode the offset. Pad the bucket layout to "
+                        "alignment or use layout eb (element transport)")
 
     # -------------------------------------------------------------- grad sync
 
@@ -1377,18 +1423,27 @@ class SGAEngine:
         support.total_selected
         # Dual representation, resident per the backend's declared input
         # form (the config names the backend, which IS the manual
-        # override): an
-        # idx-consuming backend gets its sorted indices compacted and cached
-        # here, outside the collective path, instead of paying the chunked
-        # compaction inside the first sparse sync. Shadow gates this off:
-        # grad sync never goes sparse there, so no consumer exists and the
-        # compacted pool would be pure resident waste (~idx-sized per bucket).
+        # override): an idx-consuming backend gets its transport form
+        # compacted and cached here, outside the collective path, instead
+        # of paying the chunked derivation inside the first sparse sync.
+        # The form is layout-driven (er/eb vs bb — taxonomy:
+        # sga.plugins.resolve_layout). Shadow gates this off: grad sync
+        # never goes sparse there, so no consumer exists and the compacted
+        # pool would be pure resident waste (~idx-sized per bucket).
         if self.backend.consumes == "idx" and not self._shadow:
+            block_form = getattr(self.backend, "block_form", "block_idx")
             for bucket_support in support.buckets:
-                if bucket_support.block_size > 1:
+                if self._backend_layout != "bb":
+                    bucket_support.idx
+                elif block_form == "block_desc":
+                    # BOTH block forms: the descriptor carries the wire
+                    # form, but the pre-scale path (factor != 1) gathers
+                    # by the plain heads — so both are materialized here,
+                    # outside the first sparse sync.
+                    bucket_support.block_desc
                     bucket_support.block_idx
                 else:
-                    bucket_support.idx
+                    bucket_support.block_idx
         for bs, bucket_support in zip(self._bucket_states, support.buckets):
             bs.active_mask_u8 = bucket_support.mask_u8
         # The freshly written pool slot becomes the active one; the next

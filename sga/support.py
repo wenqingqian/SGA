@@ -142,6 +142,70 @@ def block_idx_from_mask(mask_u8: torch.Tensor, spans, x: int) -> torch.Tensor:
     return torch.cat(outs).to(torch.int32)
 
 
+def block_desc_from_mask(mask_u8: torch.Tensor, spans, x: int) -> torch.Tensor:
+    """Packed u32 descriptors derived FROM THE MASK (single-source
+    doctrine): one int32 entry per selected block, ``head | tail_len``
+    with the valid tail length in the low log2(x) bits (0 = complete
+    block) — the v16 descriptor contract the nccl-sar fork's
+    ``ncclSparseAllReduceBlockIndex`` decodes.
+
+    Representable geometry (belt-asserted here, gated at attach):
+    span starts x-aligned (so every head's low bits are free for the
+    tail encoding) and every selected block's valid run fully set — a
+    whole-run transfer must not put unselected elements on the wire.
+    The selection produces exactly this geometry (histogram blocks tile
+    each span from its start; a selected block is uniformly selected;
+    the span-tail prefix rides its own short block), so the asserts are
+    the belt against post-attach layout drift, not the primary gate.
+    """
+    # Pow2 >= 4 is the descriptor ABI floor: the tail encoding needs the
+    # low log2(x) bits and the kernel decode needs blockShift >= 2 — any
+    # other x would turn the alignment belt below into a misleading
+    # refusal (or garbage descriptors), so refuse it up front.
+    assert x & (x - 1) == 0 and x >= 4, (
+        f"block_desc: block_size must be a power of two >= 4 "
+        f"(the descriptor ABI floor), got {x}")
+    heads = block_idx_from_mask(mask_u8, spans, x)
+    if heads.numel() == 0:
+        return heads
+    heads64 = heads.to(torch.int64)
+    # Span membership of every head: spans are ascending, and heads lie
+    # within them by construction, so searchsorted lands the owning span.
+    span_starts = torch.tensor([s for s, _ in spans], dtype=torch.int64,
+                               device=mask_u8.device)
+    span_ends = torch.tensor([e for _, e in spans], dtype=torch.int64,
+                             device=mask_u8.device)
+    owner = torch.searchsorted(span_starts, heads64, right=True) - 1
+    valid = torch.clamp(span_ends[owner] - heads64, max=x)
+    # Belt 1: x-aligned heads (span starts are x-aligned and full blocks
+    # tile from them; a misaligned head would collide with the tail bits).
+    assert not bool((heads64 & (x - 1)).any()), (
+        f"block_desc: head not {x}-aligned (span starts must be "
+        f"x-aligned at attach; layout drifted post-attach?)")
+    # Belt 2: every selected block's valid run fully set — the descriptor
+    # transfers whole runs, so a partial block would communicate
+    # unselected elements.
+    for start, end in spans:
+        n = end - start
+        nb = n // x
+        if nb:
+            full = mask_u8[start:start + nb * x].view(nb, x)
+            partial = (full.any(dim=1) & ~full.all(dim=1)).any()
+            assert not bool(partial), (
+                f"block_desc: partially-selected {x}-block inside span "
+                f"[{start}, {end}) — the descriptor contract transfers "
+                "whole runs only (layout drifted post-attach?)")
+        rem = n - nb * x
+        if rem and bool(mask_u8[start + nb * x:end].any()):
+            tail_set = bool(mask_u8[start + nb * x:end].all())
+            assert tail_set, (
+                f"block_desc: partially-selected tail block at span "
+                f"[{start}, {end}) — the descriptor contract transfers "
+                "whole runs only (layout drifted post-attach?)")
+    tail = torch.where(valid < x, valid, torch.zeros_like(valid))
+    return (heads64 | tail).to(torch.int32)
+
+
 @dataclass
 class BucketSupport:
     """Support for one gradient bucket, built from a selection decision."""
@@ -167,6 +231,9 @@ class BucketSupport:
     # Block-start indices (derived lazily from the mask via
     # ``block_idx_from_mask``); only materialized for idx-consuming backends.
     _block_idx: torch.Tensor = field(default=None, repr=False)
+    # Packed u32 descriptors (derived lazily from the mask via
+    # ``block_desc_from_mask``); only materialized for the nccl bb path.
+    _block_desc: torch.Tensor = field(default=None, repr=False)
     # Midpoint split for two-slice pipelining (derived lazily, cached).
     _split: int = field(default=None, repr=False)
     # Block-idx midpoint split (the block path's ``split`` analog).
@@ -226,6 +293,31 @@ class BucketSupport:
             self._block_idx = block_idx_from_mask(
                 self.mask_u8, self.block_spans, self.block_size)
         return self._block_idx
+
+    @property
+    def block_desc(self) -> torch.Tensor:
+        """Sorted int32 packed descriptors ``head | tail_len`` (low
+        log2(block_size) bits), the nccl-sar BlockIndex wire form.
+
+        bb-layout nccl only (config validation refuses the degenerate
+        combinations; the raises below are the direct-construction
+        belt). Derived once per reselection at activation — never inside
+        the hot step — and belt-checked against the v16 contract (x-
+        aligned heads, whole-run selection).
+        """
+        if self.block_size == 1:
+            raise ValueError(
+                "block_desc needs block_size > 1 (layout bb); the "
+                "descriptor form has no element-granular degeneration")
+        if self._block_desc is None:
+            if self.block_spans is None:
+                raise ValueError(
+                    "block_desc needs block_spans (param element spans) — "
+                    "the engine supplies them at assembly; direct "
+                    "construction with block_size > 1 must pass them")
+            self._block_desc = block_desc_from_mask(
+                self.mask_u8, self.block_spans, self.block_size)
+        return self._block_desc
 
     @property
     def block_split(self) -> int:

@@ -167,9 +167,8 @@ def main():
             g_be, bempty, group, factor, op, key=3) is None
     assert torch.equal(g_be, local)
 
-    # block + tpi compact or nccl: refused loudly (direct-construction
-    # belt; config validation is the front gate, pinned in
-    # test_config_flat)
+    # block + tpi compact: refused loudly (direct-construction belt;
+    # config validation is the front gate, pinned in test_config_flat)
     try:
         _seed(sga_backend_emission="compact")
         TorchPipelinedIndexBackend().allreduce_sparse(
@@ -177,14 +176,20 @@ def main():
         raise AssertionError("compact emission accepted a block support")
     except ValueError as e:
         assert "writeback" in str(e), e
+    # nccl bb outside the descriptor x domain [4, 64]: refused loudly
+    # (the kernel ABI floor is blockShift >= 2). Inside the domain a
+    # block support is a LEGITIMATE bb config — the descriptor arm
+    # below exercises it end to end.
     from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
+    nsup = BucketSupport(torch.ones(n, dtype=torch.uint8, device=device),
+                         block_size=2, block_spans=[(0, n)])
     try:
         _seed()
         NcclPipelinedIndexBackend().allreduce_sparse(
-            local.clone(), bsupport, group, factor, op, key=4)
-        raise AssertionError("nccl accepted a block-granular support")
+            local.clone(), nsup, group, factor, op, key=4)
+        raise AssertionError("nccl accepted an out-of-domain block size")
     except ValueError as e:
-        assert "element-granular" in str(e), e
+        assert "[4, 64]" in str(e), e
 
     # --- raw-kernel backend (needs the sparse library; skip loudly) -------
     lib = os.environ.get("SGA_NCCL_SAR_LIB")
@@ -218,6 +223,124 @@ def main():
         expected_fast = _vec(100) + _vec(101)  # (a + b) * 1.0: no scaling
         assert torch.equal(g_fast[active], expected_fast[active]), \
             f"nccl fast-path selected coords wrong (rank {rank})"
+
+        # --- bb descriptor frozen grid (C2): the same whole-run
+        # selected set through FOUR transports — mask backend, torch
+        # element writeback (eb form), torch block heads (bb), nccl
+        # packed descriptors (bb) — must land identical end states,
+        # bitwise, on every cell of the frozen grid: x in
+        # {4,8,16,32,64} (x=4 is the kernel's ABI floor — the in-domain
+        # smallest, the live control for the out-of-domain refusals)
+        # x span-tail on/off x factor in {1.0, 0.125} (a non-1 power of
+        # two keeps the pre-scale exact in fp32).
+        #
+        # Why bitwise agreement holds despite different compact domains
+        # (bb packs k_b*x lanes with tail runs riding short blocks; the
+        # element paths pack k_e indices; the mask backend communicates
+        # nothing compact at all): at 2 ranks every selected coordinate
+        # sees exactly one a-term and one b-term — fp32 addition is
+        # commutative and the pow2 factor makes each scaled term exact —
+        # and every transport writes ONLY selected coordinates
+        # (descriptor runs are whole-run by the contract belt; the torch
+        # block lanes are mask-guarded; the element paths move exactly
+        # the set bits). Beyond 2 ranks this is an empirical property,
+        # not an identity (reduction trees enter) — the suite's scope
+        # statement.
+        _seed(sga_backend_layout="bb")
+        be_bb = NcclPipelinedIndexBackend()
+        assert be_bb.layout == "bb"
+        be_bb.prepare(group, device=device)  # block-form warmup (C6)
+
+        def _grid_case(x, with_tail, fac):
+            a = (n // 3 // x) * x
+            if with_tail:
+                a += x - 1                 # span-0 tail-short end
+            b = a if a % x == 0 else (a + x - 1) // x * x
+            spans = [(0, a), (b, n)]       # aligned starts; gap = dead space
+            gsel = torch.Generator(device="cpu").manual_seed(
+                4242 + x + 8 * int(with_tail) + int(fac != 1.0))
+            m = torch.zeros(n, dtype=torch.uint8)
+            nb, rem = divmod(a, x)
+            keep = torch.rand(nb, generator=gsel) < 0.25
+            for i in keep.nonzero(as_tuple=True)[0].tolist():
+                m[i * x:(i + 1) * x] = 1
+            if with_tail and rem:
+                m[nb * x:a] = 1            # whole tail (prefix contract)
+            m[b + x:n - x] = 1             # span 1: all but edge blocks
+            dact = m.to(device) > 0
+            dsup = BucketSupport(m.to(device), block_size=x,
+                                 block_spans=spans)
+            esup = BucketSupport(m.to(device))  # element form, same mask
+            exp = (_vec(100) + _vec(101)) * fac
+            _seed()
+            g_mask = local.clone()
+            TorchPipelinedMaskBackend().allreduce_sparse(
+                g_mask, esup, group, fac, op, key=20)
+            _seed(sga_backend_emission="writeback")
+            g_elem = local.clone()
+            TorchPipelinedIndexBackend().allreduce_sparse(
+                g_elem, esup, group, fac, op, key=21)
+            g_tblk = local.clone()
+            TorchPipelinedIndexBackend().allreduce_sparse(
+                g_tblk, dsup, group, fac, op, key=22)
+            g_desc = local.clone()
+            be_bb.allreduce_sparse(g_desc, dsup, group, fac, op, key=23)
+            torch.cuda.synchronize()
+            for tag, g in (("mask", g_mask), ("element", g_elem),
+                           ("torch-block", g_tblk), ("nccl-desc", g_desc)):
+                assert torch.equal(g[~dact], local[~dact]), \
+                    f"{tag} residual changed x={x} t={with_tail} f={fac}"
+                assert torch.equal(g[dact], exp[dact]), \
+                    f"{tag} wrong x={x} t={with_tail} f={fac} r={rank}"
+                assert torch.equal(g, g_mask), \
+                    f"{tag} diverged from mask x={x} t={with_tail} f={fac}"
+            # one auto-layout spot check through the plain backend: the
+            # dispatch belt derives bb from the support's granularity
+            if x == 16 and with_tail:
+                g_auto = local.clone()
+                be.allreduce_sparse(g_auto, dsup, group, fac, op, key=24)
+                torch.cuda.synchronize()
+                assert torch.equal(g_auto, g_mask), \
+                    "auto-belt dispatch diverged"
+
+        for x in (4, 8, 16, 32, 64):
+            for with_tail in (True, False):
+                for fac in (1.0, 0.125):
+                    _grid_case(x, with_tail, fac)
+        if rank == 0:
+            print("ok: bb frozen grid (5x2x2) four-transport bitwise, C2")
+
+        # --- old-library belt (C7): a block-incapable library under a
+        # bb config must refuse at LOAD time — before any raw comm is
+        # created (no half-built communicator may survive a config the
+        # library cannot serve). v5 exports the element API only and is
+        # staged as a SIBLING of the pinned generation (lib is
+        # <libsroot>/<gen>/libnccl-mask.so — two dirname levels reach
+        # <libsroot>).
+        v5 = os.path.join(os.path.dirname(os.path.dirname(lib)),
+                          "v5", "libnccl-mask.so")
+        if os.path.exists(v5):
+            saved = os.environ.get("SGA_NCCL_SAR_LIB")
+            os.environ["SGA_NCCL_SAR_LIB"] = v5
+            try:
+                be_old = NcclPipelinedIndexBackend()
+                be_old.layout = "bb"  # production ctor reads it concrete
+                try:
+                    be_old.prepare(group, device=device)
+                    raise AssertionError("bb config accepted a library "
+                                         "without any block API")
+                except RuntimeError as e:
+                    assert "refusing before comm creation" in str(e), e
+                assert not be_old._comms, "a comm survived the refusal"
+            finally:
+                if saved is None:
+                    del os.environ["SGA_NCCL_SAR_LIB"]
+                else:
+                    os.environ["SGA_NCCL_SAR_LIB"] = saved
+        else:
+            if rank == 0:
+                print(f"skip: C7 old-library belt (v5 lib not staged "
+                      f"at {v5})")
     else:
         if rank == 0:
             print("skip: nccl_pipelined_index arm (SGA_NCCL_SAR_LIB unset)")

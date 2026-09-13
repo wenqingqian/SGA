@@ -32,6 +32,21 @@ how the sparse allreduce hands its result to the optimizer.
   The engine's deterministic compact grad-norm reverts to the masked
   atomic path with it.
 
+LAYOUT (``sga_backend_layout``, the er|eb|bb taxonomy; 'auto' derives
+er for element-granular selection and bb for block-granular — the
+historical routing): which index form this backend transports.
+
+- ``er``/``eb``: the element idx path. eb's selection is block-
+  structured but its mask compacted to element indices IS the same wire
+  form as er's (only the idx distribution differs), so both ride the
+  paths below unchanged — including compact emission for eb (the
+  consumers are element-granular either way).
+- ``bb``: the block path (``_allreduce_sparse_block``) — one payload
+  lane per block-head element, gathered/scattered by the mask-guarded
+  block Triton kernels; writeback emission only. Dispatch is driven by
+  the LAYOUT (never by block_size directly): a block-structured
+  selection may legitimately transport as elements (eb).
+
 Twin-mode runtime gates (probed via the optional ``validate_runtime`` /
 ``prepare`` hooks, only active when ``high_priority_group`` is true):
 
@@ -42,12 +57,7 @@ Twin-mode runtime gates (probed via the optional ``validate_runtime`` /
 - Resume runs are refused on memory grounds (override:
   ``SGA_ALLOW_RESUME_PIPELINED=1`` on hardware with headroom; the
   plain-group mode needs no override — turn this backend's
-  ``high_priority_group`` off instead). The twin communicator costs
-  ~330MB/GPU of permanent residency; a resume run's checkpoint-load
-  steady state on 40GB cards leaves less than that, and every warmup
-  ordering was probed: the failures just move (first sparse sync
-  ``ncclUnhandledCudaError: Failed to CUDA calloc async`` → checkpoint
-  load OOM). Not a scheduling bug — arithmetic.
+  ``high_priority_group`` off instead).
 
 The twin group is created EAGERLY by ``prepare()`` at attach time —
 symmetrically on every rank, BEFORE the training loop's allocator
@@ -94,6 +104,10 @@ class TorchPipelinedIndexBackend:
 
     consumes = "idx"
     inherent_emission = "compact"
+    # bb-layout transport form: torch routes block heads through the
+    # mask-guarded block Triton kernels (read by the engine's
+    # activation-time materialization and the attach alignment gate).
+    block_form = "block_idx"
 
     def __init__(self):
         args = get_args()
@@ -112,6 +126,14 @@ class TorchPipelinedIndexBackend:
                 "sga_backend_emission must be auto|compact|writeback "
                 f"(got {emission!r})")
         self.emission = resolve_emission(emission, self.inherent_emission)
+        # Layout: dispatch key for the transport form. Raw
+        # value — config validation resolved 'auto' onto the args
+        # singleton before construction on the build_engine route, so
+        # production always sees er|eb|bb here; the dispatch-time
+        # support-based belt below covers unvalidated direct-construction
+        # namespaces. The engine routes on this public attribute (the
+        # emission precedent) instead of re-reading the config key.
+        self.layout = args.sga_backend_layout
         self._hiprio = bool(args.sga_backend_high_priority_group)
         s = args.sga_backend_index_slices
         if not isinstance(s, int) or isinstance(s, bool) or s < 1:
@@ -304,7 +326,7 @@ class TorchPipelinedIndexBackend:
 
     def _allreduce_sparse_block(self, grad_data, support, comm_group,
                                 gradient_scaling_factor, reduce_op, key):
-        """Block-granular writeback sync (sga_selection_block_size > 1).
+        """Block-granular writeback sync (sga_backend_layout bb).
 
         Each block-idx entry heads a contiguous x-element run; the payload
         packs k_blocks*x slots whose lanes are mask-guarded (tail-short
@@ -323,11 +345,19 @@ class TorchPipelinedIndexBackend:
         """
         if self.emission != "writeback":
             raise ValueError(
-                "torch_pipelined_index: block supports "
-                "(sga_selection_block_size > 1) run writeback emission "
-                "only — the compact consumers are element-granular; set "
-                "sga_backend_emission=writeback")
+                "torch_pipelined_index: layout bb (block transport) runs "
+                "writeback emission only — the compact consumers are "
+                "element-granular; set sga_backend_emission=writeback or "
+                "layout eb (element transport)")
         x = int(support.block_size)
+        if x == 1:
+            # bb + block_size 1 is a config-refused degenerate; the belt
+            # keeps a directly-constructed support from silently riding
+            # the element idx through the block payload path.
+            raise ValueError(
+                "torch_pipelined_index: the block path needs "
+                "block_size > 1 (layout bb); layout er/eb route the "
+                "element idx path")
         blk = support.block_idx
         kb = blk.numel()
         if kb == 0:
@@ -400,7 +430,15 @@ class TorchPipelinedIndexBackend:
                 f"int32 support indices assume < 2^31 bucket elements, "
                 f"got {grad_data.numel()} (bucket key {key})"
             )
-        if getattr(support, "block_size", 1) > 1:
+        # Layout-driven dispatch: bb rides the block path,
+        # er/eb the element path — never keyed off block_size directly
+        # (eb is block selection transported as elements). 'auto' belts
+        # resolve from the support's own block granularity (the same
+        # ground truth the selection wrote).
+        layout = self.layout
+        if layout == "auto":
+            layout = "er" if support.block_size == 1 else "bb"
+        if layout == "bb":
             return self._allreduce_sparse_block(
                 grad_data, support, comm_group, gradient_scaling_factor,
                 reduce_op, key)
