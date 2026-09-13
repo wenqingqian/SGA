@@ -47,6 +47,23 @@ classic in-process cycle replay was removed; cycle auto-routes here):
    dev-reduce collapses the host syncs to the per-pass fetches), the
    pinned prefetcher buffers on CUDA, and a --trace-dtype bf16 leg of
    the slice-first prefetcher (reference anchor + bitwise fp32-twin A/B).
+   The prefetcher's pread arm (REPLAY_FUSED_P1_READ, default on) is pinned
+   bitwise against the mmap arm across payload dtypes, range splits and
+   the pinned construction, its torch.save zip index parser against
+   torch.load ground truth (with the non-contiguous / foreign-class
+   guards), and the knob's echo + bogus-raise + report-bitwise contract.
+   The same gate carries the p2 attribution split (p2f/p2s counter keys
+   and the p2_formula_s/p2_select_s line fields): device-sync-bracketed
+   sub-timers nesting inside the pass-2 bracket, pinned by the nesting
+   bound on their sum. The select bracket splits further into the
+   p2s_hist/p2s_ar/p2s_cand/p2s_fill sub-buckets (top16+bincount /
+   histogram all_reduce / candidate+kthvalue / gt-eq-tie fill), pinned
+   by the same nesting bound inside p2s. The same gate also carries the
+   gap buckets (qw/h2dl/p1d2h/p1ar/hzar/stp/cln/gw): a three-way split of
+   the streaming residual outside the pass brackets into own read-wait
+   (prefetch q.get), lockstep wait (clip-norm / horizon all_reduce), and
+   real work, coverage-checked against the group wall with the p1
+   sub-buckets pinned by the nesting bound inside pt[0].
 10. --fused-state-budget-mb: the resident-state byte budget derives the
    config group size (overrides --fused-max-configs); reports stay
    bit-identical to the count knob at the same partition AND across
@@ -69,13 +86,24 @@ classic in-process cycle replay was removed; cycle auto-routes here):
    check, and through the queue.Full health check when the queue is full
    and the only consumer dies mid-backlog — instead of deadlocking the
    bounded queue; unknown knob values raise.
+13. REPLAY_FUSED_KERNEL replay-kernel kill-switch: the auto arm on
+   CUDA+fp32 engages the triton kernels (echo line) with reports
+   bit-identical to the forced-off arm across two chunk-mb settings
+   (formula/select/adam sweeps all bit-covered); the CPU device arm
+   stays torch under auto; a bogus value raises with the knob named.
+   The per-kernel adversarial conformance matrix (per-score, adam,
+   select passes, stack canaries, dispatch gates) lives in
+   tests/test_replay_kernels.py.
 """
 import io
 import json
 import os
+import pickle
 import sys
 import tempfile
+import threading
 import time
+import zipfile
 from contextlib import redirect_stdout
 
 import torch
@@ -105,6 +133,12 @@ if "REPLAY_FUSED_SELECT" in os.environ:
 # same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
 if "REPLAY_FUSED_FRONT_RANK_BG" in os.environ:
     del os.environ["REPLAY_FUSED_FRONT_RANK_BG"]
+# same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
+if "REPLAY_FUSED_KERNEL" in os.environ:
+    del os.environ["REPLAY_FUSED_KERNEL"]
+# same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
+if "REPLAY_FUSED_P1_READ" in os.environ:
+    del os.environ["REPLAY_FUSED_P1_READ"]
 
 
 B1, B2, EPS, WD = 0.9, 0.95, 1e-8, 0.1
@@ -875,6 +909,451 @@ def test_gprefetcher_pinned_buffers():
     print("PASS test_gprefetcher_pinned_buffers")
 
 
+class _ForeignPayload:
+    pass
+
+
+def test_pread_trace_index():
+    """_pt_index reads a torch.save zip's index without touching payload
+    records: stubs carry key/dtype/offset/shape/stride, record data offsets
+    come from the local headers (alignment padding via the extra field),
+    and slicing bytes at (offset + p_off) * elsize reproduces torch.load's
+    slice bitwise across dtypes (bf16/fp32/int64, 1-D and 2-D) — including
+    a sliced/view payload with a nonzero storage offset, so the
+    (st.offset + p_off) arithmetic the reader performs is pinned against
+    torch.load ground truth. A non-contiguous payload is caught by the
+    contiguous() guard, and a foreign class in the pickle fails loudly
+    (fixed-vocabulary contract)."""
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "toy.pt")
+        payload = {
+            "a_bf16_2d": torch.randn(64, 96).to(torch.bfloat16),
+            "b_fp32_1d": torch.randn(1000),
+            "c_int64_2d": torch.arange(24).reshape(4, 6),
+            "d_fp32_view": torch.randn(80)[17:],
+        }
+        meta = {"step": 7, "lr": [1e-5], "clip_grad": 0.5}
+        torch.save({"payload": payload, "meta": meta}, path)
+        got_meta, stubs, offs = replay_fused._pt_index(path)
+        assert got_meta == meta
+        truth = torch.load(path, map_location="cpu", weights_only=False)
+        assert set(stubs) == set(payload)
+        assert stubs["d_fp32_view"].offset == 17, \
+            "fixture lost its nonzero-storage-offset payload"
+        for name, st in stubs.items():
+            t = truth["payload"][name]
+            assert st.dtype == t.dtype, name
+            assert st.size == tuple(t.shape), name
+            assert st.offset == t.storage_offset() and st.contiguous(), name
+            elsize = t.element_size()
+            data_off, rec_bytes = offs[st.key]
+            assert rec_bytes >= (st.offset + st.numel()) * elsize, name
+            flat = t.reshape(-1)
+            for p_off, n in ((0, flat.numel()), (3, 17),
+                             (flat.numel() - 5, 5)):
+                with open(path, "rb") as f:
+                    f.seek(data_off + (st.offset + p_off) * elsize)
+                    buf = f.read(n * elsize)
+                back = torch.frombuffer(bytearray(buf), dtype=st.dtype)
+                assert torch.equal(back, flat[p_off:p_off + n]), \
+                    (name, p_off, n)
+        nc_path = os.path.join(td, "nc.pt")
+        torch.save({"payload": {"nc": torch.randn(8, 9).t()},
+                    "meta": {}}, nc_path)
+        _m, nc_stubs, _o = replay_fused._pt_index(nc_path)
+        assert not nc_stubs["nc"].contiguous()
+        fk_path = os.path.join(td, "fk.pt")
+        torch.save({"payload": {"x": torch.randn(4)}, "meta": {},
+                    "foreign": _ForeignPayload()}, fk_path)
+        try:
+            replay_fused._pt_index(fk_path)
+        except pickle.UnpicklingError as e:
+            assert "unexpected" in str(e), str(e)
+        else:
+            raise AssertionError("foreign class accepted by index unpickler")
+    print("PASS test_pread_trace_index")
+
+
+def test_pread_prefetch_bitwise():
+    """GPrefetcher pread arm == mmap arm bitwise: both payload dtypes
+    (fp32 clone path, bf16 upcast path), full range and a mid split
+    (offsets + partial slices), every step's meta and every entry's fp32
+    values torch.equal; on CUDA also the pinned construction. The
+    REPLAY_FUSED_P1_READ knob echoes its arm and a bogus value raises with
+    the knob named."""
+    for payload_dtype, upcast in ((torch.float32, False),
+                                  (torch.bfloat16, True)):
+        with tempfile.TemporaryDirectory() as td:
+            t0, W = _build_fixture(td, payload_dtype=payload_dtype)[0:2]
+            catalog, names, offsets, N, state_files, g_files = \
+                soa.discover_trace(td)
+            window_steps = soa.window_steps_for(g_files, t0, W)
+            for lo, hi in ((0, N), (N // 3, 2 * N // 3)):
+                sp = replay_fused.ShardParams(
+                    names, catalog, {**BASE_META, "step": t0}, lo, hi)
+                arms = {}
+                for mode in ("mmap", "pread"):
+                    pre = replay_fused.GPrefetcher(
+                        g_files, window_steps, sp, upcast, read_mode=mode)
+                    arms[mode] = [(gs, gm, {k: v.clone()
+                                            for k, v in local.items()})
+                                  for gs, gm, local in pre]
+                assert len(arms["mmap"]) == len(arms["pread"]) == W
+                for (gs_a, gm_a, la), (gs_b, gm_b, lb) in zip(
+                        arms["mmap"], arms["pread"]):
+                    assert (gs_a, gm_a) == (gs_b, gm_b)
+                    assert set(la) == set(lb)
+                    for k in la:
+                        assert la[k].dtype == lb[k].dtype
+                        assert torch.equal(la[k], lb[k]), \
+                            (payload_dtype, lo, k)
+            if torch.cuda.is_available():
+                sp = replay_fused.ShardParams(
+                    names, catalog, {**BASE_META, "step": t0}, 0, N)
+                pinned = {}
+                for mode in ("mmap", "pread"):
+                    pre = replay_fused.GPrefetcher(
+                        g_files, window_steps, sp, upcast, pin=True,
+                        read_mode=mode)
+                    pinned[mode] = [{k: v for k, v in local.items()}
+                                    for _gs, _gm, local in pre]
+                for la, lb in zip(pinned["mmap"], pinned["pread"]):
+                    for k in la:
+                        assert lb[k].is_pinned()
+                        assert torch.equal(la[k], lb[k]), ("pin", k)
+    old_env = os.environ.get("REPLAY_FUSED_P1_READ")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            t0, *_ = _build_fixture(td)
+            cache = os.path.join(td, "dense_cache")
+            reps = []
+            for arm, echo in ((None, "g read: pread"),
+                              ("mmap", "g read: mmap")):
+                if arm is None:
+                    os.environ.pop("REPLAY_FUSED_P1_READ", None)
+                else:
+                    os.environ["REPLAY_FUSED_P1_READ"] = arm
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rep = soa.main(_base_args(td, cache, t0,
+                                              ["--fused-shards", "1"]))
+                assert echo in buf.getvalue(), (echo, buf.getvalue()[-500:])
+                reps.append(rep)
+            # the read arm must not move a report bit (hard gate 1 at
+            # fixture scale; the w1000 gate is the same comparison)
+            for rep in reps:
+                rep["branch_results"][str(t0)]["replay"].pop(
+                    "dense_cache_hit")
+            assert _deep_eq_nan(reps[0], reps[1]), \
+                "the pread read arm moved a report bit"
+            os.environ["REPLAY_FUSED_P1_READ"] = "bogus"
+            try:
+                soa.main(_base_args(td, cache, t0, ["--fused-shards", "1"]))
+            except ValueError as e:
+                assert "REPLAY_FUSED_P1_READ" in str(e), str(e)
+            else:
+                raise AssertionError("bogus REPLAY_FUSED_P1_READ accepted")
+    finally:
+        if old_env is None:
+            os.environ.pop("REPLAY_FUSED_P1_READ", None)
+        else:
+            os.environ["REPLAY_FUSED_P1_READ"] = old_env
+    print("PASS test_pread_prefetch_bitwise")
+
+
+def test_gprefetcher_index_cache_shared_across_groups():
+    """The zip-index cache is worker-lifetime, not per prefetcher: two
+    sequential pread-arm GPrefetcher instances sharing one index_cache dict
+    (the _worker pattern — one dict handed to every config group's
+    prefetcher) parse each g file's index exactly once and yield
+    bitwise-equal items; an instance without a shared cache re-parses per
+    instance (the documented fallback). The counting wrapper around
+    _pt_index makes a silent never-hitting cache visible."""
+    with tempfile.TemporaryDirectory() as td:
+        t0, W = _build_fixture(td)[0:2]
+        catalog, names, offsets, N, state_files, g_files = \
+            soa.discover_trace(td)
+        sp = replay_fused.ShardParams(names, catalog,
+                                      {**BASE_META, "step": t0}, 0, N)
+        window_steps = soa.window_steps_for(g_files, t0, W)
+        calls = []
+        real_index = replay_fused._pt_index
+
+        def counting_index(path):
+            calls.append(path)
+            return real_index(path)
+
+        replay_fused._pt_index = counting_index
+        try:
+            index_cache = {}
+            runs = []
+            for _ in range(2):
+                pre = replay_fused.GPrefetcher(
+                    g_files, window_steps, sp, False,
+                    index_cache=index_cache, read_mode="pread")
+                runs.append([(gs, dict(gm),
+                              {k: v.clone() for k, v in local.items()})
+                             for gs, gm, local in pre])
+            assert calls == [g_files[s] for s in window_steps], calls
+            calls.clear()
+            pre = replay_fused.GPrefetcher(g_files, window_steps, sp, False,
+                                           read_mode="pread")
+            fallback = [(gs, dict(gm),
+                         {k: v.clone() for k, v in local.items()})
+                        for gs, gm, local in pre]
+            assert len(calls) == W, calls
+        finally:
+            replay_fused._pt_index = real_index
+        for a, b in zip(runs[0], runs[1]):
+            assert a[0] == b[0] and a[1] == b[1]
+            assert set(a[2]) == set(b[2])
+            for k in a[2]:
+                assert torch.equal(a[2][k], b[2][k]), k
+        for run in runs + [fallback]:
+            assert [gs for gs, _gm, _l in run] == window_steps
+        for a, b in zip(runs[0], fallback):
+            for k in a[2]:
+                assert torch.equal(a[2][k], b[2][k]), k
+    print("PASS test_gprefetcher_index_cache_shared_across_groups")
+
+
+def test_pread_pipeline_lifecycle():
+    """Two-stage pread pipeline lifecycle: at depth=1 the reader -> _raw_q
+    -> upcast -> q handoff backpressures yet delivers every step in order
+    without deadlock, and after a clean drain BOTH producer threads are
+    gone — the success path must post the sentinel that releases the
+    upcast thread (pre-fix, one parked daemon thread leaked per config
+    group; the consumer could never see the difference, so this is pinned
+    by thread identity, not by values)."""
+    with tempfile.TemporaryDirectory() as td:
+        t0, W = _build_fixture(td)[0:2]
+        catalog, names, offsets, N, state_files, g_files = \
+            soa.discover_trace(td)
+        sp = replay_fused.ShardParams(names, catalog,
+                                      {**BASE_META, "step": t0}, 0, N)
+        window_steps = soa.window_steps_for(g_files, t0, W)
+        made = []
+        real_thread = threading.Thread
+
+        def rec_thread(*a, **k):
+            th = real_thread(*a, **k)
+            made.append(th)
+            return th
+
+        threading.Thread = rec_thread
+        try:
+            pre = replay_fused.GPrefetcher(g_files, window_steps, sp, False,
+                                           depth=1, read_mode="pread")
+        finally:
+            threading.Thread = real_thread
+        assert len(made) == 2, "pread arm must run exactly two threads"
+        items = [(gs, gm, {k: v.clone() for k, v in local.items()})
+                 for gs, gm, local in pre]
+        assert [gs for gs, _gm, _l in items] == window_steps, \
+            "depth=1 reordered the two-stage pipeline"
+        for th in made:
+            th.join(timeout=5.0)
+            assert not th.is_alive(), \
+                "pread producer thread parked past a clean drain " \
+                "(success-path sentinel missing)"
+    print("PASS test_pread_pipeline_lifecycle")
+
+
+def test_pread_failure_injection():
+    """Pinned by injection: any producer-thread exception surfaces at the
+    consumer as RuntimeError('g prefetch failed') with the original
+    exception chained, never a silent hang. Three injections: a short
+    pread where the payload record outruns the file (OSError from the
+    r==0 guard), a corrupt zip local-header signature (ValueError from
+    the index parser), and an upcast-thread failure — all take the same
+    path."""
+    with tempfile.TemporaryDirectory() as td:
+        t0, W = _build_fixture(td)[0:2]
+        catalog, names, offsets, N, state_files, g_files = \
+            soa.discover_trace(td)
+        sp = replay_fused.ShardParams(names, catalog,
+                                      {**BASE_META, "step": t0}, 0, N)
+        window_steps = soa.window_steps_for(g_files, t0, W)
+
+        def _expect_consumer_failure(cause_type, cause_msg, build):
+            pre = build()
+            try:
+                next(iter(pre))
+            except RuntimeError as e:
+                assert "g prefetch failed" in str(e), str(e)
+                assert isinstance(e.__cause__, cause_type), e.__cause__
+                assert cause_msg in str(e.__cause__), \
+                    (cause_msg, str(e.__cause__))
+            else:
+                raise AssertionError(
+                    f"producer failure '{cause_msg}' did not surface at "
+                    "the consumer")
+
+        # (a) short pread: preadv hits EOF inside the record (the shape a
+        # truncated trace file takes once the central directory survives)
+        real_preadv = os.preadv
+
+        def eof_preadv(fd, bufs, offset):
+            return 0
+
+        os.preadv = eof_preadv
+        try:
+            _expect_consumer_failure(
+                OSError, "short pread",
+                lambda: replay_fused.GPrefetcher(
+                    g_files, window_steps, sp, False, read_mode="pread"))
+        finally:
+            os.preadv = real_preadv
+
+        # (b) corrupt zip local header: clobber one storage record's
+        # signature on disk (data.pkl stays intact so the failure lands in
+        # the _pt_index header arithmetic, not zipfile); restore right
+        # after, otherwise (c) would see the reader fail on the same file
+        # before the upcast injection fires
+        path = g_files[window_steps[0]]
+        with zipfile.ZipFile(path) as zf:
+            hdr_off = next(inf.header_offset for inf in zf.infolist()
+                           if len(inf.filename.split("/")) == 3
+                           and inf.filename.split("/")[-2] == "data")
+        with open(path, "r+b") as f:
+            f.seek(hdr_off)
+            orig_sig = f.read(4)
+            f.seek(hdr_off)
+            f.write(b"\x00\x00\x00\x00")
+        try:
+            _expect_consumer_failure(
+                ValueError, "bad local header sig",
+                lambda: replay_fused.GPrefetcher(
+                    g_files, window_steps, sp, False, read_mode="pread"))
+        finally:
+            with open(path, "r+b") as f:
+                f.seek(hdr_off)
+                f.write(orig_sig)
+
+        # (c) upcast-thread failure: same contract, same chaining; depth
+        # >= W+1 keeps the reader off a full _raw_q so both threads finish
+        real_frombuffer = torch.frombuffer
+
+        def boom(*a, **k):
+            raise ValueError("simulated upcast failure")
+
+        torch.frombuffer = boom
+        try:
+            _expect_consumer_failure(
+                ValueError, "simulated upcast failure",
+                lambda: replay_fused.GPrefetcher(
+                    g_files, window_steps, sp, False, depth=W + 1,
+                    read_mode="pread"))
+        finally:
+            torch.frombuffer = real_frombuffer
+    print("PASS test_pread_failure_injection")
+
+
+def test_pread_guards_through_prefetcher():
+    """The pread arm's payload guards raise THROUGH GPrefetcher (the
+    consumer sees RuntimeError('g prefetch failed') from the guard's
+    ValueError, not just the bare predicate): a non-contiguous payload, a
+    catalog record shorter than its storage needs, and a stale catalog
+    whose slice extent outruns the payload record (silent wrong-bytes must
+    stay loud). Both arms — the default pread and the mmap emergency
+    fallback — reject bf16 payloads with the upcast off under the same
+    ValueError contract."""
+    with tempfile.TemporaryDirectory() as td:
+        t0, W = _build_fixture(td)[0:2]
+        catalog, names, offsets, N, state_files, g_files = \
+            soa.discover_trace(td)
+        sp = replay_fused.ShardParams(names, catalog,
+                                      {**BASE_META, "step": t0}, 0, N)
+        window_steps = soa.window_steps_for(g_files, t0, W)
+
+        def _expect_guard(msg, build):
+            pre = build()
+            try:
+                next(iter(pre))
+            except RuntimeError as e:
+                assert "g prefetch failed" in str(e), str(e)
+                assert isinstance(e.__cause__, ValueError), e.__cause__
+                assert msg in str(e.__cause__), (msg, str(e.__cause__))
+            else:
+                raise AssertionError(f"guard '{msg}' did not fire")
+
+        # (a) non-contiguous payload (transposed storage layout) — the
+        # contiguous() predicate pinned by test_pread_trace_index, now
+        # through the prefetcher itself
+        with tempfile.TemporaryDirectory() as td2:
+            torch.save({"catalog": {"nc": {"shape": [72]}}},
+                       os.path.join(td2, "catalog.pt"))
+            torch.save({"payload": {"nc": torch.randn(8, 9).t()},
+                        "meta": {"step": t0}},
+                       os.path.join(td2, f"step_{t0:06d}_g.pt"))
+            torch.save({"payload": {}, "meta": {"step": t0}},
+                       os.path.join(td2, f"step_{t0:06d}_state.pt"))
+            cat2, names2, _off2, n2, _sf2, gf2 = soa.discover_trace(td2)
+            sp_nc = replay_fused.ShardParams(
+                names2, cat2, {**BASE_META, "step": t0}, 0, n2)
+            _expect_guard(
+                "non-contiguous",
+                lambda: replay_fused.GPrefetcher(
+                    gf2, soa.window_steps_for(gf2, t0, 1), sp_nc, False,
+                    read_mode="pread"))
+
+        # (b) record-too-short guard: the catalog claims one element less
+        # per storage record than the payload stores (a corrupt/stale
+        # catalog — honest torch.save output can never produce this)
+        real_index = replay_fused._pt_index
+
+        def short_record(path):
+            meta, stubs, offs = real_index(path)
+            for key in offs:
+                data_off, rec_bytes = offs[key]
+                offs[key] = (data_off, rec_bytes - 4)
+            return meta, stubs, offs
+
+        replay_fused._pt_index = short_record
+        try:
+            _expect_guard(
+                "too short",
+                lambda: replay_fused.GPrefetcher(
+                    g_files, window_steps, sp, False, read_mode="pread"))
+        finally:
+            replay_fused._pt_index = real_index
+
+        # (c) slice-extent guard: an entry whose [p_off, p_off + n) window
+        # outruns the payload record — in-repo ShardParams construction
+        # cannot produce this, so the stale catalog is built by hand and
+        # the guard is the loud backstop (pread would otherwise read the
+        # adjacent record's bytes where the mmap arm silently clamps)
+        sp_wide = replay_fused.ShardParams(names, catalog,
+                                           {**BASE_META, "step": t0}, 0, N)
+        sp_wide.entries[0]["n"] += 1
+        _expect_guard(
+            "outruns storage record",
+            lambda: replay_fused.GPrefetcher(
+                g_files, window_steps, sp_wide, False, read_mode="pread"))
+
+        with tempfile.TemporaryDirectory() as td3:
+            _build_fixture(td3, payload_dtype=torch.bfloat16)
+            cat3, names3, _off3, n3, _sf3, gf3 = soa.discover_trace(td3)
+            sp_bf = replay_fused.ShardParams(
+                names3, cat3, {**BASE_META, "step": t0}, 0, n3)
+            ws3 = soa.window_steps_for(gf3, t0, W)
+            for mode in ("mmap", "pread"):
+                pre = replay_fused.GPrefetcher(gf3, ws3, sp_bf, False,
+                                               read_mode=mode)
+                try:
+                    next(iter(pre))
+                except RuntimeError as e:
+                    assert "g prefetch failed" in str(e), (mode, str(e))
+                    assert isinstance(e.__cause__, ValueError), \
+                        (mode, e.__cause__)
+                    assert "--trace-dtype" in str(e.__cause__), \
+                        (mode, str(e.__cause__))
+                else:
+                    raise AssertionError(
+                        f"{mode} arm accepted bf16 with upcast off")
+    print("PASS test_pread_guards_through_prefetcher")
+
+
 def test_dev_reduce_bitwise():
     """--fused-dev-reduce accumulates the pass-1 clip norms and pass-3
     horizon numerators in per-config fp64 device scalars fetched once per
@@ -1261,6 +1740,67 @@ def test_front_rank_bg_env_killswitch():
             os.environ["REPLAY_FUSED_FRONT_RANK_BG"] = old_env
         replay_fused._S0_PROFILE = old_gate
     print("PASS test_front_rank_bg_env_killswitch")
+
+
+def test_replay_kernels_killswitch():
+    """REPLAY_FUSED_KERNEL kill-switch: on CUDA+fp32 the auto arm engages
+    the triton kernels (echo line) and its report is bit-identical to the
+    forced-off arm's — the formula/select/adam sweeps are all covered by
+    the conformance matrix in tests/test_replay_kernels.py, this leg pins
+    the end-to-end wiring including the chunk-boundary invariance (two
+    chunk-mb settings). The CPU device arm stays torch under auto; a
+    bogus value raises with the knob named."""
+    old_env = os.environ.get("REPLAY_FUSED_KERNEL")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            t0, *_ = _build_fixture(td)
+            cache = os.path.join(td, "dense_cache")
+            if torch.cuda.is_available():
+                for chunk in ("1", "3"):
+                    bufs, reps = [], []
+                    for arm in ("auto", "off"):
+                        os.environ["REPLAY_FUSED_KERNEL"] = arm
+                        buf = io.StringIO()
+                        with redirect_stdout(buf):
+                            reps.append(soa.main(_base_args(
+                                td, cache, t0,
+                                ["--device", "cuda", "--fused-shards", "1",
+                                 "--replay-dtype", "fp32",
+                                 "--chunk-mb", chunk])))
+                        bufs.append(buf.getvalue())
+                    assert "replay kernels: triton" in bufs[0], \
+                        ("auto arm", chunk, bufs[0][-500:])
+                    assert "replay kernels: torch" in bufs[1], \
+                        ("off arm", chunk, bufs[1][-500:])
+                    for rep in reps:
+                        rep["branch_results"][str(t0)]["replay"].pop(
+                            "dense_cache_hit")
+                    assert _deep_eq_nan(reps[0], reps[1]), \
+                        f"the kernel arm moved a report bit (chunk {chunk})"
+            # the CPU device arm stays torch even under auto
+            os.environ["REPLAY_FUSED_KERNEL"] = "auto"
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                soa.main(_base_args(td, cache, t0,
+                                    ["--device", "cpu",
+                                     "--fused-shards", "1"]))
+            assert "replay kernels: torch" in buf.getvalue(), \
+                buf.getvalue()[-500:]
+            os.environ["REPLAY_FUSED_KERNEL"] = "bogus"
+            try:
+                soa.main(_base_args(td, cache, t0,
+                                    ["--device", "cpu",
+                                     "--fused-shards", "1"]))
+            except ValueError as e:
+                assert "REPLAY_FUSED_KERNEL" in str(e), str(e)
+            else:
+                raise AssertionError("bogus REPLAY_FUSED_KERNEL accepted")
+    finally:
+        if old_env is None:
+            os.environ.pop("REPLAY_FUSED_KERNEL", None)
+        else:
+            os.environ["REPLAY_FUSED_KERNEL"] = old_env
+    print("PASS test_replay_kernels_killswitch")
 
 
 def test_front_rank_bg_world2():
@@ -1885,6 +2425,19 @@ def test_s0_profile_counters():
                      "--fused-dev-reduce",
                      "--fused-state-budget-mb", repr(_budget_mb(1, 4))]))
             assert "S0PROFILE" in buf.getvalue()
+            # the p2 attribution split rides the same line, with the
+            # select sub-buckets nested inside it
+            assert "p2_formula_s=" in buf.getvalue()
+            assert "p2_select_s=" in buf.getvalue()
+            for field in ("p2s_hist=", "p2s_ar=", "p2s_cand=", "p2s_fill="):
+                assert field in buf.getvalue(), field
+            # the gap buckets (three-way split of the streaming residual:
+            # own read-wait / lockstep wait / real work, coverage-checked
+            # against the group wall) ride the same line
+            for field in ("gw_s=", "qwait_s=", "h2d_launch_s=", "p1_d2h_s=",
+                          "p1_ar_s=", "hz_ar_s=", "setup_s=", "clean_s=",
+                          "cov="):
+                assert field in buf.getvalue(), field
             # the front-phase decomposition line rides the same gate (the
             # cpu device arm echoes front_sort=cpu)
             assert "S0FRONT" in buf.getvalue()
@@ -1892,8 +2445,37 @@ def test_s0_profile_counters():
             profs = report["branch_results"][str(t0)]["s0_profile"]
             assert isinstance(profs, list) and profs
             for prof in profs:
-                for key in ("sync", "ar", "h2d", "state_gb"):
+                for key in ("sync", "ar", "h2d", "state_gb", "p2f", "p2s",
+                            "p2s_hist", "p2s_ar", "p2s_cand", "p2s_fill",
+                            "qw", "h2dl", "p1d2h", "p1ar", "hzar", "stp",
+                            "cln", "gw"):
                     assert key in prof, key
+                # the split brackets nest inside the pass-2 bracket
+                assert prof["p2f"] >= 0.0 and prof["p2s"] >= 0.0
+                assert prof["p2f"] + prof["p2s"] <= prof["pt"][1] + 0.01, \
+                    (prof["p2f"], prof["p2s"], prof["pt"][1])
+                # the select sub-buckets nest inside the select bracket
+                sub = (prof["p2s_hist"] + prof["p2s_ar"] + prof["p2s_cand"]
+                       + prof["p2s_fill"])
+                assert 0.0 <= sub <= prof["p2s"] + 0.01, \
+                    (sub, prof["p2s"])
+                # the p1 sub-buckets nest inside the pass-1 bracket; all
+                # gap buckets are nonnegative and bounded by the group wall
+                assert 0.0 <= prof["p1d2h"] + prof["p1ar"] \
+                    <= prof["pt"][0] + 0.01, \
+                    (prof["p1d2h"], prof["p1ar"], prof["pt"][0])
+                assert prof["gw"] > 0.0
+                for key in ("qw", "h2dl", "hzar", "stp", "cln"):
+                    assert 0.0 <= prof[key] <= prof["gw"] + 0.01, \
+                        (key, prof[key], prof["gw"])
+                # coverage: the buckets account for the group wall — loose
+                # bounds on this tiny CPU fixture (the glue outside the
+                # brackets is proportionally larger here); the production
+                # gate (>=80%) is checked on the w1000 run, not here
+                cov = (prof["stp"] + prof["qw"] + prof["h2dl"]
+                       + sum(prof["pt"]) + prof["hzar"] + prof["cln"]
+                       ) / prof["gw"]
+                assert 0.3 <= cov <= 1.05, (cov, prof)
                 # residency books every shared upload to pass 1
                 assert prof["h2d"][0] > 0
                 assert prof["h2d"][1] == 0 and prof["h2d"][2] == 0
@@ -1941,6 +2523,12 @@ def main():
     test_g_residency_bitwise()
     test_g_residency_cuda_pinned()
     test_gprefetcher_pinned_buffers()
+    test_pread_trace_index()
+    test_pread_prefetch_bitwise()
+    test_gprefetcher_index_cache_shared_across_groups()
+    test_pread_pipeline_lifecycle()
+    test_pread_failure_injection()
+    test_pread_guards_through_prefetcher()
     test_dev_reduce_bitwise()
     test_dev_reduce_cuda()
     test_stable_order_desc_adversarial()

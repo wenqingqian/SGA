@@ -44,12 +44,16 @@ global index order and the same arithmetic as ``ranking_metrics`` runs on
 the reconstructed vectors.
 """
 import datetime
+import io
 import math
 import os
+import pickle
 import socket
+import struct
 import threading
 import time
 import queue
+import zipfile
 
 import torch
 import torch.distributed as dist
@@ -256,22 +260,59 @@ def shard_bounds(N, world):
 # exact global top-k over sharded non-negative fp32 score slices
 # ----------------------------------------------------------------------------
 
-def shard_select(score, k, comms):
+def shard_select(score, k, comms, prof=None):
     """Exact global top-k of a non-negative fp32 score vector sharded across
     ranks (each rank holds its contiguous slice; ``score`` may live on cpu or
     the shard's cuda device). Returns (local bool mask on the same device,
     global threshold) with the tie layer filled in GLOBAL flat-index order —
-    bit-identical to select_topk_flat on the concatenated vector."""
-    if not bool(torch.isfinite(score).all().item()):
-        # NaN/Inf sit in the histogram's top bit-pattern bins: they would be
-        # selected FIRST, silently displacing real coordinates from the topk.
-        raise ValueError(
-            "shard_select requires finite scores (NaN/Inf would land in "
-            "the top bins and silently pollute the topk)")
-    top16 = ((score.view(torch.int32) & 0x7FFFFFFF) >> 16)
-    hist = torch.bincount(top16, minlength=32769).cpu()
+    bit-identical to select_topk_flat on the concatenated vector.
+
+    ``prof`` (env-gated diagnostic, None on the default path): when given,
+    device-sync-bracketed sub-bucket timers accumulate into the keys
+    p2s_hist (finite guard + top16 + bincount + D2H), p2s_ar (histogram
+    all_reduce), p2s_cand (cumsum/searchsorted + candidate extraction +
+    gather + kthvalue) and p2s_fill (gt/eq + counts + tie-fill).
+
+    When the replay-kernel arm engages (``arm_select``: CUDA fp32
+    contiguous + killswitch auto + pinned triton), the histogram sweep
+    (with the finite guard folded in), the candidate extraction and the
+    compare+count sweep run as Triton kernels — integer/compare-identical
+    to the torch chain, the candidate vector in the same global index
+    order; the collectives and kthvalue always stay torch."""
+    _t = time.perf_counter() if prof is not None else 0.0
+
+    def _prof_mark(key):
+        nonlocal _t
+        if score.is_cuda:
+            torch.cuda.synchronize()
+        _now = time.perf_counter()
+        prof[key] += _now - _t
+        _t = _now
+
+    from sga import replay_kernels as K
+    k_sel = K.arm_select(score)
+    if k_sel:
+        hist, _nf = K.hist_top16(score)
+        if _nf:
+            raise ValueError(
+                "shard_select requires finite scores (NaN/Inf would land "
+                "in the top bins and silently pollute the topk)")
+    else:
+        if not bool(torch.isfinite(score).all().item()):
+            # NaN/Inf sit in the histogram's top bit-pattern bins: they
+            # would be selected FIRST, silently displacing real
+            # coordinates from the topk.
+            raise ValueError(
+                "shard_select requires finite scores (NaN/Inf would land "
+                "in the top bins and silently pollute the topk)")
+        top16 = ((score.view(torch.int32) & 0x7FFFFFFF) >> 16)
+        hist = torch.bincount(top16, minlength=32769).cpu()
+    if prof is not None:
+        _prof_mark("p2s_hist")
     if comms.distributed:
         dist.all_reduce(hist, op=dist.ReduceOp.SUM)
+    if prof is not None:
+        _prof_mark("p2s_ar")
     cum = torch.cumsum(hist, 0)
     total = int(cum[-1].item())
     if k > total:
@@ -282,7 +323,8 @@ def shard_select(score, k, comms):
 
     # exact k-th value: kthvalue over the union of the shards' candidates in
     # bin b (the same multiset the classic hist_threshold refines over)
-    cand = score[top16 == b].cpu().clone()
+    cand = (K.cand_extract(score, b) if k_sel
+            else score[top16 == b].cpu().clone())
     parts = comms.all_gather_pad(cand)
     whole = torch.cat(parts)
     kk = whole.numel() - (k - n_above) + 1
@@ -291,23 +333,28 @@ def shard_select(score, k, comms):
             f"fused hist select math out of range: cand={whole.numel()} "
             f"kk={kk} r={r}")
     thresh = float(torch.kthvalue(whole, kk).values.item())
+    if prof is not None:
+        _prof_mark("p2s_cand")
 
     # tie-fill: first `need` tied coords in global index order = shard
     # order, then in-shard order. counting runs chunked and the fill marks
     # the tie layer's nonzero indices: bool .sum()/.count_nonzero()/.cumsum()
     # all materialize a full-size int64 copy (9+ GB per call at 1.2B elements
     # on one shard), which OOMs the world=1 oracle mode
-    gt = score > thresh
-    eq = score == thresh
+    if k_sel:
+        gt, eq, counts = K.gt_eq_counts(score, thresh)
+    else:
+        gt = score > thresh
+        eq = score == thresh
 
-    def _count_bool(t):
-        total = 0
-        for a in range(0, t.numel(), 64 * 1024 * 1024):
-            total += int(t[a:a + 64 * 1024 * 1024].sum().item())
-        return total
+        def _count_bool(t):
+            total = 0
+            for a in range(0, t.numel(), 64 * 1024 * 1024):
+                total += int(t[a:a + 64 * 1024 * 1024].sum().item())
+            return total
 
-    counts = torch.tensor([_count_bool(gt), _count_bool(eq)],
-                          dtype=torch.int64)
+        counts = torch.tensor([_count_bool(gt), _count_bool(eq)],
+                              dtype=torch.int64)
     allc = [torch.zeros(2, dtype=torch.int64) for _ in range(comms.world)]
     if comms.distributed:
         dist.all_gather(allc, counts)
@@ -323,6 +370,8 @@ def shard_select(score, k, comms):
     if take > 0:
         tie_idx = torch.nonzero(eq, as_tuple=False).squeeze(1)
         gt[tie_idx[:take]] = True
+    if prof is not None:
+        _prof_mark("p2s_fill")
     return gt, thresh
 
 
@@ -609,21 +658,277 @@ class _FrontRankWorker:
 # g-slice prefetch (fault the NFS pages of upcoming steps off the hot path)
 # ----------------------------------------------------------------------------
 
+# pread-arm trace index: read a torch.save zip's data.pkl + record offsets
+# WITHOUT faulting any storage page, so the shard's slices can be pulled
+# with plain pread (measured ×1.246 aggregate over the mmap fault path on
+# this NFS — the fault/readahead machinery, not the wire, is the old cap)
+_TRACE_DTYPES = {
+    "DoubleStorage": torch.float64, "FloatStorage": torch.float32,
+    "HalfStorage": torch.float16, "BFloat16Storage": torch.bfloat16,
+    "LongStorage": torch.int64, "IntStorage": torch.int32,
+    "ShortStorage": torch.int16, "CharStorage": torch.int8,
+    "ByteStorage": torch.uint8, "BoolStorage": torch.bool,
+}
+
+# static element sizes for the trace dtype vocabulary — a KeyError here is
+# the same fail-loudly contract as _TRACE_DTYPES (no per-entry 0-d tensor
+# allocation just to read a constant)
+_ELSIZE = {
+    torch.float64: 8, torch.float32: 4, torch.float16: 2,
+    torch.bfloat16: 2, torch.int64: 8, torch.int32: 4,
+    torch.int16: 2, torch.int8: 1, torch.uint8: 1, torch.bool: 1,
+}
+
+
+class _StubTensor:
+    """A payload tensor's index card: which storage record, which dtype,
+    which element offset/shape/stride — no payload bytes."""
+    __slots__ = ("key", "dtype", "offset", "size", "stride")
+
+    def __init__(self, key, dtype, offset, size, stride):
+        self.key, self.dtype, self.offset = key, dtype, offset
+        self.size, self.stride = size, stride
+
+    def contiguous(self):
+        exp, acc = [], 1
+        for d in reversed(self.size):
+            exp.append(acc)
+            acc *= d
+        return self.stride == tuple(reversed(exp))
+
+    def numel(self):
+        n = 1
+        for d in self.size:
+            n *= d
+        return n
+
+
+def _stub_rebuild_tensor_v2(storage, offset, size, stride, *rest):
+    key, dtype, _numel = storage
+    return _StubTensor(key, dtype, offset, tuple(size), tuple(stride))
+
+
+class _TraceIndexUnpickler(pickle.Unpickler):
+    """data.pkl → meta + payload stubs. The trace writer's vocabulary is
+    fixed (containers + _rebuild_tensor_v2 + typed-storage dtype tokens);
+    anything else must fail loudly, never guess."""
+
+    def find_class(self, module, name):
+        if module == "torch._utils" and name == "_rebuild_tensor_v2":
+            return _stub_rebuild_tensor_v2
+        if module == "torch" and name in _TRACE_DTYPES:
+            return _TRACE_DTYPES[name]
+        if module == "collections" and name == "OrderedDict":
+            return dict
+        raise pickle.UnpicklingError(
+            f"unexpected {module}.{name} in trace index")
+
+    def persistent_load(self, pid):
+        # arity validated before the unpack: a malformed id must raise the
+        # UnpicklingError contract, not a bare ValueError from the tuple
+        if not (isinstance(pid, tuple) and len(pid) == 5):
+            raise pickle.UnpicklingError(
+                f"unexpected persistent id {pid!r}")
+        kind, dtype, key, loc, numel = pid
+        if kind != "storage" or loc != "cpu":
+            raise pickle.UnpicklingError(
+                f"unexpected persistent id {pid!r}")
+        return (key, dtype, numel)
+
+
+def _pt_index(path):
+    """(meta, stubs, data_offsets) for a torch.save trace file: stubs map
+    payload name → _StubTensor; data_offsets map storage key → absolute
+    file offset of the storage bytes. The data offset must come from the
+    LOCAL header (torch pads each storage record's start to
+    .storage_alignment via the local extra field, so central-directory
+    arithmetic alone lands short)."""
+    with zipfile.ZipFile(path) as zf:
+        recs = {}
+        pkl_bytes = None
+        for inf in zf.infolist():
+            parts = inf.filename.split("/")
+            if parts[-1] == "data.pkl":
+                pkl_bytes = zf.read(inf)
+            elif len(parts) == 3 and parts[-2] == "data":
+                if inf.compress_type != zipfile.ZIP_STORED:
+                    raise ValueError(
+                        f"{path}: compressed storage record {inf.filename}")
+                recs[parts[-1]] = inf
+    if pkl_bytes is None:
+        raise ValueError(f"{path}: no data.pkl record")
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        offs = {}
+        for key, inf in recs.items():
+            hdr = os.pread(fd, 30, inf.header_offset)
+            if len(hdr) != 30:
+                # named parse error, not an opaque struct.error (same
+                # short-read discipline as the payload preadv loop)
+                raise ValueError(
+                    f"{path}: short local header read "
+                    f"@{inf.header_offset} ({len(hdr)}/30)")
+            (sig, _ver, _flag, _meth, _mt, _dt, _crc, _csz, _usz,
+             nlen, elen) = struct.unpack("<IHHHHHIIIHH", hdr)
+            if sig != 0x04034B50:
+                raise ValueError(
+                    f"{path}: bad local header sig @{inf.header_offset}")
+            offs[key] = (inf.header_offset + 30 + nlen + elen,
+                         inf.file_size)
+    finally:
+        os.close(fd)
+    d = _TraceIndexUnpickler(io.BytesIO(pkl_bytes)).load()
+    return d["meta"], dict(d["payload"]), offs
+
+
 class GPrefetcher:
     """Background thread materializing the shard's per-step g slices as
     contiguous fp32 CPU tensors (page-cache faults + upcast overlap the
-    compute of the current step); the compute side only pays the H2D."""
+    compute of the current step); the compute side only pays the H2D.
+
+    The pread arm's in-flight host-memory bound is ``depth`` raw slice
+    bytearrays in _raw_q PLUS ``depth`` converted (fp32 / pinned) tensors
+    in q — roughly 2x the mmap arm's peak (for bf16 traces the raw side is
+    half-width, so the increment is modest). Matters when sizing host
+    memory for large shards with ``pin=True``."""
 
     def __init__(self, g_files, window_steps, sp, upcast_bf16, depth=2,
-                 pin=False):
+                 pin=False, timed=False, read_mode="mmap", index_cache=None):
         self.g_files, self.window_steps, self.sp = g_files, window_steps, sp
         self.upcast_bf16 = upcast_bf16
         # pinned host buffers make the consumer's H2D non_blocking-able;
         # requires CUDA (callers gate this on the device)
         self.pin = pin
+        # timed brackets the consumer's q.get() (S0PROFILE diagnostics only —
+        # the value path is untouched)
+        self.timed = timed
+        self.qwait_s = 0.0
+        # pread arm: one reader thread pulls the shard's raw slice bytes
+        # (single-threaded by design — the NFS aggregate is wire-capped and
+        # read threads do not scale it) while a second thread does the
+        # upcast/pin CPU work, so conversion never serializes into the read
+        # syscalls; the consumer-facing queue/semantics are unchanged
+        self.read_mode = read_mode
+        # zip-index cache: the worker hands one dict to every group's
+        # prefetcher so each file's index is parsed once per worker, not
+        # once per group; per-instance dict when the caller passes none
+        self.index_cache = {} if index_cache is None else index_cache
         self.q = queue.Queue(maxsize=depth)
         self.exc = None
-        threading.Thread(target=self._run, daemon=True).start()
+        if read_mode == "pread":
+            self._raw_q = queue.Queue(maxsize=depth)
+            threading.Thread(target=self._run_read, daemon=True).start()
+            threading.Thread(target=self._run_upcast, daemon=True).start()
+        else:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def _run_read(self):
+        try:
+            for gstep in self.window_steps:
+                path = self.g_files[gstep]
+                # the index is pure metadata; one reader thread per
+                # prefetcher walks the groups sequentially, so the shared
+                # dict has no concurrent writers and needs no lock
+                if path not in self.index_cache:
+                    self.index_cache[path] = _pt_index(path)
+                meta, stubs, offs = self.index_cache[path]
+                bf16_keys = [k for k, v in stubs.items()
+                             if isinstance(v, _StubTensor)
+                             and v.dtype == torch.bfloat16]
+                if bf16_keys and not self.upcast_bf16:
+                    raise ValueError(
+                        f"{path}: bf16 payload(s) {bf16_keys} "
+                        "but --trace-dtype is fp32; rerun with --trace-dtype "
+                        "bf16 (payloads are upcast to fp32 at load)")
+                raw = {}
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    for e in self.sp.entries:
+                        st = stubs.get(e["name"])
+                        if st is None:
+                            continue
+                        if not st.contiguous():
+                            raise ValueError(
+                                f"{path}: non-contiguous "
+                                f"payload {e['name']} stride={st.stride}")
+                        elsize = _ELSIZE[st.dtype]
+                        data_off, rec_bytes = offs[st.key]
+                        if rec_bytes < (st.offset + st.numel()) * elsize:
+                            raise ValueError(
+                                f"{path}: storage record "
+                                f"{st.key} too short for {e['name']}")
+                        if (st.offset + e["p_off"] + e["n"]) * elsize \
+                                > rec_bytes:
+                            # a stale catalog must fail loudly here: past
+                            # this check preadv would read the adjacent
+                            # record's bytes where the mmap arm silently
+                            # clamps — the arms would diverge on corrupt
+                            # input instead of both raising
+                            raise ValueError(
+                                f"{path}: slice [{e['p_off']}, "
+                                f"{e['p_off'] + e['n']}) of {e['name']} "
+                                f"outruns storage record {st.key}")
+                        lo = data_off + (st.offset + e["p_off"]) * elsize
+                        n = e["n"] * elsize
+                        # preadv: the kernel copies straight into the buffer
+                        # with the GIL released — a python-side assign would
+                        # hold the GIL for the whole memcpy and convoy the
+                        # consumer's CUDA launches
+                        buf = bytearray(n)
+                        mv = memoryview(buf)
+                        got = 0
+                        while got < n:
+                            r = os.preadv(fd, [mv[got:]], lo + got)
+                            if r == 0:
+                                raise OSError(
+                                    f"short pread {path} "
+                                    f"@{lo + got} ({got}/{n})")
+                            got += r
+                        raw[e["name"]] = (st.dtype, buf)
+                finally:
+                    os.close(fd)
+                self._raw_q.put((gstep, meta, raw))
+            # the upcast thread exits only on this sentinel — without the
+            # success-path put it parks on _raw_q.get() forever (one
+            # leaked daemon thread per config group)
+            self._raw_q.put(None)
+        except BaseException as e:
+            self.exc = e
+            self._raw_q.put(None)
+
+    def _run_upcast(self):
+        try:
+            while True:
+                item = self._raw_q.get()
+                if item is None:
+                    self.q.put(None)
+                    return
+                gstep, meta, raw = item
+                # same slice→upcast commute as the mmap arm: the buffer
+                # holds exactly the shard's slice bytes, so the fp32 values
+                # are bit-identical to slicing the mmap'd payload first
+                local = {}
+                for e in self.sp.entries:
+                    got = raw.get(e["name"])
+                    if got is None:
+                        continue
+                    dtype, buf = got
+                    src = torch.frombuffer(buf, dtype=dtype)
+                    out_dtype = (torch.float32
+                                 if dtype == torch.bfloat16 else dtype)
+                    if self.pin:
+                        pb = torch.empty(src.shape, dtype=out_dtype,
+                                         pin_memory=True)
+                        pb.copy_(src)
+                        local[e["name"]] = pb
+                    elif out_dtype is not dtype:
+                        local[e["name"]] = src.float()
+                    else:
+                        local[e["name"]] = src.clone()
+                self.q.put((gstep, meta, local))
+        except BaseException as e:
+            self.exc = e
+            self.q.put(None)
 
     def _run(self):
         from sga.replay import _load
@@ -670,7 +975,12 @@ class GPrefetcher:
 
     def __iter__(self):
         for _ in self.window_steps:
-            item = self.q.get()
+            if self.timed:
+                _t = time.perf_counter()
+                item = self.q.get()
+                self.qwait_s += time.perf_counter() - _t
+            else:
+                item = self.q.get()
             if item is None:
                 raise RuntimeError("g prefetch failed") from self.exc
             yield item
@@ -740,6 +1050,32 @@ def _worker(rank, world, cfg, port, frag_path):
     t0 = cfg["t0"]
     replay_dtype = (torch.float64 if cfg["replay_dtype"] == "fp64"
                     else torch.float32)
+    # replay-kernel kill-switch (A/B arms and emergencies): force the
+    # torch eager path — same unknown-values-must-raise contract as the
+    # other replay flags
+    kmode = os.environ.get("REPLAY_FUSED_KERNEL", "auto")
+    if kmode not in ("auto", "off"):
+        raise ValueError(
+            f"REPLAY_FUSED_KERNEL={kmode!r} is not one of the "
+            "allowed values ('auto', 'off')")
+    from sga import replay_kernels as K
+    K.MODE = kmode
+    k_on = K.arm(dev.startswith("cuda"), replay_dtype)
+    if comms.global_rank == 0:
+        print(f"[fused] replay kernels: {'triton' if k_on else 'torch'}"
+              f" (REPLAY_FUSED_KERNEL={kmode})", flush=True)
+    # g-read kill-switch (A/B arms and emergencies): pread pulls the shard's
+    # slice bytes straight (measured ×1.246 aggregate over the mmap fault
+    # path on this NFS); mmap keeps the legacy page-fault reader. Same
+    # unknown-values-must-raise contract as the other replay flags
+    p1_read = os.environ.get("REPLAY_FUSED_P1_READ", "pread")
+    if p1_read not in ("pread", "mmap"):
+        raise ValueError(
+            f"REPLAY_FUSED_P1_READ={p1_read!r} is not one of the "
+            "allowed values ('pread', 'mmap')")
+    if comms.global_rank == 0:
+        print(f"[fused] g read: {p1_read} (REPLAY_FUSED_P1_READ={p1_read})",
+              flush=True)
     catalog, names, offsets, N, state_files, g_files = R.discover_trace(
         cfg["trace_dir"])
     window_steps, W, eff_horizons = _window_and_horizons(
@@ -1014,6 +1350,13 @@ def _worker(rank, world, cfg, port, frag_path):
     # alongside the S0PROFILE print (env-gated: None when the env is absent)
     s0_profs = [] if _S0_PROFILE else None
     t_pass0 = time.time()
+    # one zip-index cache per worker, handed to every group's prefetcher:
+    # the streaming loop re-reads the same window files once per group
+    index_cache = {}
+    # group-wall clock matching the "done in Ns" print's span, so the gap
+    # buckets can be coverage-checked against it:
+    # (stp + qw + h2dl + pt[] + hzar + cln) / gw
+    _tgw0 = time.perf_counter() if _S0_PROFILE else 0.0
     for gi, group in enumerate(groups):
         states = {}
         # sel0[(s,r,t)] is the SAME CPU selection mask for every t of one
@@ -1025,6 +1368,7 @@ def _worker(rank, world, cfg, port, frag_path):
         # read-only downstream; reselection replaces the tensor, never
         # mutates in place, so aliasing is safe)
         sel_dev_cache = {}
+        _t0s = time.perf_counter() if _S0_PROFILE else 0.0
         for (s, r, t) in group:
             sel = sel0[(s, r, t)]
             stt = {}
@@ -1044,13 +1388,15 @@ def _worker(rank, world, cfg, port, frag_path):
                     "sel": sel_dev_cache[sel_key],
                 }
             states[(s, r, t)] = stt
+        _stp_s = (time.perf_counter() - _t0s) if _S0_PROFILE else 0.0
         chunk_dev = R._chunk_elems(cfg["chunk_mb"], itemsize)
         norm_fp32 = cfg["norm_fp32"]
 
         res_on = bool(cfg.get("g_residency"))
         red_on = bool(cfg.get("dev_reduce"))
         pre = GPrefetcher(g_files, window_steps, sp, cfg["upcast_bf16"],
-                          pin=(res_on and dev != "cpu"))
+                          pin=(res_on and dev != "cpu"), timed=_S0_PROFILE,
+                          read_mode=p1_read, index_cache=index_cache)
         # boundary steps without a g payload read zeros; the resident path
         # caches one device zeros buffer per entry instead of materializing
         # a host zeros tensor per (config, entry, step)
@@ -1060,9 +1406,19 @@ def _worker(rank, world, cfg, port, frag_path):
         # where the op is an identity), syncs counts only the norm/numerator
         # fetches, mem_peak_gb (printed at group end) is the process-lifetime
         # cumulative peak, and residency books every shared upload byte to
-        # pass 1
+        # pass 1. The gap buckets (qw/h2dl/p1d2h/p1ar/hzar/stp/cln/gw) split
+        # the group wall three ways — own read-wait (qw), lockstep wait
+        # (p1ar/hzar), real work (pt[] + h2d_launch + stp/cln) — so the
+        # streaming residual outside pt[] is attributed, not inferred;
+        # p1d2h stays 0 when dev_reduce is off (the per-chunk float()
+        # syncs are then fused into pt[0] and not separable cheaply)
         prof = {"sync": 0, "ar": 0, "h2d": [0, 0, 0],
-                "pt": [0.0, 0.0, 0.0]} if _S0_PROFILE else None
+                "pt": [0.0, 0.0, 0.0], "p2f": 0.0,
+                "p2s": 0.0, "p2s_hist": 0.0, "p2s_ar": 0.0,
+                "p2s_cand": 0.0, "p2s_fill": 0.0,
+                "qw": 0.0, "h2dl": 0.0, "p1d2h": 0.0, "p1ar": 0.0,
+                "hzar": 0.0, "stp": 0.0, "cln": 0.0, "gw": 0.0} \
+            if _S0_PROFILE else None
         if prof:
             # diagnostic memory accounting: the group's resident state at
             # its full per-rank truth ({w,m,v,res} at replay itemsize plus
@@ -1070,6 +1426,7 @@ def _worker(rank, world, cfg, port, frag_path):
             # four state tensors only, this field books everything
             prof["state_gb"] = (len(group) * sp.n * (4 * itemsize + 1)
                                 / 2 ** 30)
+            prof["stp"] = _stp_s
         for si, (_gstep, gmeta, local) in enumerate(pre):
             coef_dense, _flag = R.coef_dense_for(gmeta)
             clip_grad = float(gmeta.get("clip_grad", 0.0))
@@ -1088,6 +1445,7 @@ def _worker(rank, world, cfg, port, frag_path):
                 # coef_dense division is per-step too, so it is folded in
                 # here once instead of per chunk per config per pass —
                 # elementwise, identical values either way.
+                _t0h = time.perf_counter() if prof else 0.0
                 g_res = {}
                 for e in sp.entries:
                     if e["name"] in local:
@@ -1104,6 +1462,9 @@ def _worker(rank, world, cfg, port, frag_path):
                 # zeros_dev buffer, an in-place div_ would corrupt the zeros
                 g_res = {k: t / coef_dense for k, t in g_res.items()}
                 if prof:
+                    # launch-side time only (pinned H2D and the div kernels
+                    # are async); the completion wait lands in p1d2h below
+                    prof["h2dl"] += time.perf_counter() - _t0h
                     prof["h2d"][0] += sum(local[e["name"]].numel()
                                           for e in sp.entries
                                           if e["name"] in local)
@@ -1155,11 +1516,19 @@ def _worker(rank, world, cfg, port, frag_path):
                             if prof:
                                 prof["sync"] += 1
             if red_on:
+                _t0d = time.perf_counter() if prof else 0.0
                 qn2 = qn2_dev.cpu().tolist()
                 if prof:
+                    # first device sync of the step: absorbs completion of
+                    # the resident H2D burst + the norm partials
+                    prof["p1d2h"] += time.perf_counter() - _t0d
                     prof["sync"] += 1
+            _t0a = time.perf_counter() if prof else 0.0
             qn2 = comms.sum_f64(qn2)
             if prof:
+                # clip-norm all_reduce: the per-step lockpoint — measures
+                # rank-skew wait directly (sub-bucket of pt[0])
+                prof["p1ar"] += time.perf_counter() - _t0a
                 prof["ar"] += 1
                 prof["pt"][0] += time.perf_counter() - _t0p
             coefs = []
@@ -1181,8 +1550,17 @@ def _worker(rank, world, cfg, port, frag_path):
                 if not (boundary_c[ci] and si > 0 and si + 1 < W):
                     continue
                 spec = specs[s]
+                _kf = K.formula(s) if k_on else None
                 score_flat = torch.empty(sp.n, dtype=torch.float32,
                                          device=dev)
+                if prof:
+                    # p2 attribution split (formula+q-build vs the select
+                    # collective): device-sync brackets, otherwise async
+                    # kernels bleed across the boundary and the split
+                    # measures launch order instead of execution
+                    if dev.startswith("cuda"):
+                        torch.cuda.synchronize()
+                    _t0f = time.perf_counter()
                 for e in sp.entries:
                     g = local.get(e["name"])
                     g_el = None if res_on else (
@@ -1202,13 +1580,27 @@ def _worker(rank, world, cfg, port, frag_path):
                                  + stt["res"][a:b]) * coefs[ci]
                             if prof:
                                 prof["h2d"][1] += b - a
-                        sc = spec.formula(
-                            stt["ws"][a:b], stt["ms"][a:b],
-                            stt["vs"][a:b], q, b1, b2, eps, wd,
-                            bc1c, bc2c, update_includes_wd=True)
+                        sc = (_kf(stt["ws"][a:b], stt["ms"][a:b],
+                                  stt["vs"][a:b], q, b1, b2, eps, wd,
+                                  bc1c, bc2c)
+                              if _kf is not None else
+                              spec.formula(stt["ws"][a:b], stt["ms"][a:b],
+                                           stt["vs"][a:b], q, b1, b2, eps,
+                                           wd, bc1c, bc2c,
+                                           update_includes_wd=True))
                         score_flat[e["a"] + a:e["a"] + b] = sc.abs() \
                             .float()
-                newsel, _th = shard_select(score_flat, ks[r], comms)
+                if prof:
+                    if dev.startswith("cuda"):
+                        torch.cuda.synchronize()
+                    prof["p2f"] += time.perf_counter() - _t0f
+                    _t0f = time.perf_counter()
+                newsel, _th = shard_select(score_flat, ks[r], comms,
+                                           prof=prof)
+                if prof:
+                    if dev.startswith("cuda"):
+                        torch.cuda.synchronize()
+                    prof["p2s"] += time.perf_counter() - _t0f
                 for e in sp.entries:
                     stt = states[(s, r, t)][e["name"]]
                     stt["sel"] = newsel[e["a"]:e["a"] + e["n"]].to(dev)
@@ -1252,9 +1644,16 @@ def _worker(rank, world, cfg, port, frag_path):
                             stt["res"][a:b] += gd * (~sel_c)
                         if replay_dtype != torch.float32:
                             q = q.to(replay_dtype)
-                        R._adam_step_inplace(
-                            q, stt["ms"][a:b], stt["vs"][a:b], stt["ws"][a:b],
-                            None, lr, wd, b1, b2, bc1c, bc2c, eps)
+                        if k_on:
+                            K.adam_step_inplace(
+                                q, stt["ms"][a:b], stt["vs"][a:b],
+                                stt["ws"][a:b], None, lr, wd, b1, b2,
+                                bc1c, bc2c, eps)
+                        else:
+                            R._adam_step_inplace(
+                                q, stt["ms"][a:b], stt["vs"][a:b],
+                                stt["ws"][a:b], None, lr, wd, b1, b2,
+                                bc1c, bc2c, eps)
                         if hz is not None:
                             d = (stt["ws"][a:b]
                                  - snap_loc[hz][e["name"]][a:b].to(dev)) \
@@ -1272,15 +1671,20 @@ def _worker(rank, world, cfg, port, frag_path):
                     num2 = num2_dev.cpu().tolist()
                     if prof:
                         prof["sync"] += 1
+                _t0z = time.perf_counter() if prof else 0.0
                 num2 = comms.sum_f64(num2)
                 if prof:
+                    prof["hzar"] += time.perf_counter() - _t0z
                     prof["ar"] += 1
                 for ci, (s, r, t) in enumerate(group):
                     num_at[(s, r, t)][hz] = math.sqrt(num2[ci])
 
+        _t0c = time.perf_counter() if prof else 0.0
         del states
         if dev != "cpu":
             torch.cuda.empty_cache()
+        if prof:
+            prof["cln"] += time.perf_counter() - _t0c
         if comms.global_rank == 0 and cfg["verbose"]:
             print(f"[fused t0={t0}] group {gi + 1}/{len(groups)} "
                   f"({len(group)} configs) done in "
@@ -1290,6 +1694,12 @@ def _worker(rank, world, cfg, port, frag_path):
             # g slices are fp32 host-side (prefetcher upcasts), 4 B/elem
             mem_gb = (torch.cuda.max_memory_allocated() / 2 ** 30
                       if dev != "cpu" else 0.0)
+            prof["qw"] = pre.qwait_s
+            prof["gw"] = time.perf_counter() - _tgw0
+            _tgw0 = time.perf_counter()
+            _cov = (prof["stp"] + prof["qw"] + prof["h2dl"]
+                    + sum(prof["pt"]) + prof["hzar"] + prof["cln"]
+                    ) / prof["gw"] if prof["gw"] > 0 else 0.0
             print(f"S0PROFILE rank={rank} group={gi} steps={W} "
                   f"syncs={prof['sync']} gloo_ar={prof['ar']} "
                   f"state_gb={prof['state_gb']:.2f} "
@@ -1298,7 +1708,23 @@ def _worker(rank, world, cfg, port, frag_path):
                   f"h2d_gb_p3={prof['h2d'][2] * 4 / 2 ** 30:.1f} "
                   f"pass_s_p1={prof['pt'][0]:.0f} "
                   f"pass_s_p2={prof['pt'][1]:.0f} "
-                  f"pass_s_p3={prof['pt'][2]:.0f} mem_peak_gb={mem_gb:.1f}",
+                  f"pass_s_p3={prof['pt'][2]:.0f} "
+                  f"p2_formula_s={prof['p2f']:.1f} "
+                  f"p2_select_s={prof['p2s']:.1f} "
+                  f"p2s_hist={prof['p2s_hist']:.1f} "
+                  f"p2s_ar={prof['p2s_ar']:.1f} "
+                  f"p2s_cand={prof['p2s_cand']:.1f} "
+                  f"p2s_fill={prof['p2s_fill']:.1f} "
+                  f"gw_s={prof['gw']:.0f} "
+                  f"qwait_s={prof['qw']:.0f} "
+                  f"h2d_launch_s={prof['h2dl']:.1f} "
+                  f"p1_d2h_s={prof['p1d2h']:.1f} "
+                  f"p1_ar_s={prof['p1ar']:.1f} "
+                  f"hz_ar_s={prof['hzar']:.1f} "
+                  f"setup_s={prof['stp']:.1f} "
+                  f"clean_s={prof['cln']:.1f} "
+                  f"cov={_cov:.2f} "
+                  f"mem_peak_gb={mem_gb:.1f}",
                   flush=True)
             s0_profs.append(dict(prof))
 
