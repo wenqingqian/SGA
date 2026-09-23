@@ -1,6 +1,12 @@
 # Copyright (c) 2026, SGA framework contributors.
 """Index-form sparse allreduce backend on the raw nccl-sar sparse kernels.
 
+STATUS (2026-09-24): temporarily deprecated — the code, its three layout
+paths and its test suites are kept and still run, but the torch backends
+(``torch_pipelined_index`` / ``torch_pipelined_mask``) are the current
+active transport path; the nccl path is maintained, not recommended for
+new runs.
+
 Transport is the nccl-sar fork's sparse API (Ring+Simple, compact-domain
 wire cost that scales with the communicated count), dispatched by the
 backend LAYOUT (the er|eb|bb taxonomy):
@@ -16,13 +22,15 @@ backend LAYOUT (the er|eb|bb taxonomy):
   v16 contract derived in ``sga.support.block_desc_from_mask``); the
   kernel decodes heads inline and transfers whole runs.
 
-Both spellings are the v7 API-split names; the pre-split v5/v6 names
-(``ncclSparseAllReduce`` / ``ncclSparseAllReduceBlockDesc``) are kept as
-deprecated forwarders for one release window, and the loader probes new
-first / old as fallback so either library generation serves the run —
-except that a library with NEITHER block spelling is refused up front
-under layout bb (the probe precedes comm creation: no half-built raw
-communicator may survive a config the library cannot serve).
+Both spellings are the v7 API-split names and the ONLY spellings v8+
+libraries export: the pre-split v5/v6 names (``ncclSparseAllReduce`` /
+``ncclSparseAllReduceBlockDesc``) were deprecated forwarders for one
+release window and closed at v8. The loader probes the new names alone,
+so a library missing ``ncclSparseAllReduceIndex`` (any pre-split build)
+is refused fail-fast at load, as is a bb config on a library without
+``ncclSparseAllReduceBlockIndex`` — both refusals precede comm creation:
+no half-built raw communicator may survive a config the library cannot
+serve.
 
 The only backend-side data movement is the optional pre-scale when
 ``gradient_scaling_factor != 1``: element layout does an
@@ -198,10 +206,13 @@ class NcclPipelinedIndexBackend:
             _NcclUniqueId, ctypes.c_int,
         ]
         lib.ncclCommInitRank.restype = ctypes.c_int
-        # Dual-spelling probe (v7 API split, one-release alias window):
-        # the new names are primary, the pre-split forwarders keep v5/v6
-        # libraries usable. The resolved callables ride on the lib object
-        # (its __dict__, not an export) — every comm entry shares one lib.
+        # Single-spelling probe: the v7 API-split names are the only
+        # spellings v8+ libraries export (the pre-split forwarders closed
+        # with the v8 alias-window removal), so a library missing
+        # ncclSparseAllReduceIndex is an OLD (pre-split) build and is
+        # refused fail-fast below. The resolved callables ride on the lib
+        # object (its __dict__, not an export) — every comm entry shares
+        # one lib.
         _INDEX_AT = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int64, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
@@ -212,26 +223,23 @@ class NcclPipelinedIndexBackend:
             ctypes.c_int64, ctypes.c_int, ctypes.c_size_t, ctypes.c_int,
             ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
         ]
-        index_fn = block_fn = None
-        for name in ("ncclSparseAllReduceIndex", "ncclSparseAllReduce"):
-            fn = getattr(lib, name, None)
-            if fn is not None:
-                fn.argtypes = _INDEX_AT
-                fn.restype = ctypes.c_int
-                index_fn = fn
-                break
-        for name in ("ncclSparseAllReduceBlockIndex",
-                     "ncclSparseAllReduceBlockDesc"):
-            fn = getattr(lib, name, None)
-            if fn is not None:
-                fn.argtypes = _BLOCK_AT
-                fn.restype = ctypes.c_int
-                block_fn = fn
-                break
+        index_fn = getattr(lib, "ncclSparseAllReduceIndex", None)
+        if index_fn is not None:
+            index_fn.argtypes = _INDEX_AT
+            index_fn.restype = ctypes.c_int
+        block_fn = getattr(lib, "ncclSparseAllReduceBlockIndex", None)
+        if block_fn is not None:
+            block_fn.argtypes = _BLOCK_AT
+            block_fn.restype = ctypes.c_int
         if index_fn is None:
+            # Missing new name = pre-split library (v6 and earlier exported
+            # only the retired ncclSparseAllReduce spelling; the v8 window
+            # removed it). Fail fast at LOAD time, before any raw comm is
+            # created.
             raise RuntimeError(
-                f"{path!r} exports neither ncclSparseAllReduceIndex nor "
-                "the pre-split ncclSparseAllReduce — wrong library build?")
+                f"{path!r} does not export ncclSparseAllReduceIndex — "
+                "pre-split (pre-v8) library; point SGA_NCCL_SAR_LIB at a "
+                "v8+ nccl-sar build")
         if self.layout == "bb" and block_fn is None:
             # The refusal deliberately PRECEDES ncclCommInitRank in
             # prepare(): a library that cannot serve the configured path
@@ -240,10 +248,9 @@ class NcclPipelinedIndexBackend:
             # never reaches prepare() (the dispatch-time belt below still
             # refuses a block call on a symbol-less library).
             raise RuntimeError(
-                f"{path!r} exports neither ncclSparseAllReduceBlockIndex "
-                "nor the pre-split ncclSparseAllReduceBlockDesc — layout "
-                "bb needs a block-capable library (v6+); refusing before "
-                "comm creation")
+                f"{path!r} does not export ncclSparseAllReduceBlockIndex — "
+                "layout bb needs a block-capable v8+ library; refusing "
+                "before comm creation")
         lib._sga_index = index_fn
         lib._sga_block = block_fn
         return lib

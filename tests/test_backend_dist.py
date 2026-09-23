@@ -310,11 +310,13 @@ def main():
         if rank == 0:
             print("ok: bb frozen grid (5x2x2) four-transport bitwise, C2")
 
-        # --- old-library belt (C7): a block-incapable library under a
-        # bb config must refuse at LOAD time — before any raw comm is
-        # created (no half-built communicator may survive a config the
-        # library cannot serve). v5 exports the element API only and is
-        # staged as a SIBLING of the pinned generation (lib is
+        # --- old-library belt (C7, v8 semantics): a pre-split library is
+        # refused fail-fast at LOAD time — before any raw comm is created
+        # (no half-built communicator may survive a config the library
+        # cannot serve). The alias window closed at v8, so "old library"
+        # now means "missing ncclSparseAllReduceIndex" (v6 and earlier
+        # export only the retired pre-split spellings): v5 is staged as a
+        # SIBLING of the pinned generation (lib is
         # <libsroot>/<gen>/libnccl-mask.so — two dirname levels reach
         # <libsroot>).
         v5 = os.path.join(os.path.dirname(os.path.dirname(lib)),
@@ -327,16 +329,22 @@ def main():
                 be_old.layout = "bb"  # production ctor reads it concrete
                 try:
                     be_old.prepare(group, device=device)
-                    raise AssertionError("bb config accepted a library "
-                                         "without any block API")
+                    raise AssertionError("pre-split library accepted by "
+                                         "the loader")
                 except RuntimeError as e:
-                    assert "refusing before comm creation" in str(e), e
+                    assert "does not export ncclSparseAllReduceIndex" \
+                        in str(e), e
+                    assert "pre-v8" in str(e), e
                 assert not be_old._comms, "a comm survived the refusal"
             finally:
                 if saved is None:
                     del os.environ["SGA_NCCL_SAR_LIB"]
                 else:
                     os.environ["SGA_NCCL_SAR_LIB"] = saved
+            if rank == 0:
+                print("ok: C7 old-library belt — pre-split v5 refused "
+                      "fail-fast (missing ncclSparseAllReduceIndex), no "
+                      "comm created")
         else:
             if rank == 0:
                 print(f"skip: C7 old-library belt (v5 lib not staged "
