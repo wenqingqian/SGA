@@ -21,6 +21,7 @@ import torch
 
 from sga.config import get_args
 from sga.plugins import resolve_emission
+from sga import backend_timer
 
 
 class TorchPipelinedMaskBackend:
@@ -61,6 +62,22 @@ class TorchPipelinedMaskBackend:
     def allreduce_sparse(self, grad_data: torch.Tensor, support,
                          comm_group, gradient_scaling_factor: float,
                          reduce_op, key: int = None) -> None:
+        """Timer shell over ``_allreduce_sparse_impl`` (whole-call comm
+        process; see its docstring for the mask-transport contract)."""
+        token = backend_timer.begin()
+        try:
+            return self._allreduce_sparse_impl(
+                grad_data, support, comm_group, gradient_scaling_factor,
+                reduce_op, key)
+        finally:
+            backend_timer.end(
+                token, "sparse", backend="torch_pipelined_mask",
+                layout="mask", block_size=None, bucket=key,
+                k=getattr(support, "n_selected", None))
+
+    def _allreduce_sparse_impl(self, grad_data: torch.Tensor, support,
+                               comm_group, gradient_scaling_factor: float,
+                               reduce_op, key: int = None) -> None:
         """Sparse allreduce of ``grad_data`` restricted to the support mask.
 
         ``support`` is a ``sga.support.BucketSupport`` (this backend consumes

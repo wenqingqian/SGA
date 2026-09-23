@@ -78,6 +78,7 @@ from sga.config import get_args
 from sga.kernels import (gather_selected_blocks, pack_selected,
                          scatter_selected, scatter_selected_blocks)
 from sga.plugins import resolve_emission
+from sga import backend_timer
 
 # Escape hatch for the resume fail-closed in twin mode. Parsed as exactly
 # "1": any other value — "yes" included — keeps the safe refusal. Must be
@@ -401,6 +402,30 @@ class TorchPipelinedIndexBackend:
     def allreduce_sparse(self, grad_data: torch.Tensor, support, comm_group,
                          gradient_scaling_factor: float, reduce_op,
                          key: int):
+        """Timer shell over ``_allreduce_sparse_impl`` (see its docstring
+        for the emission/layout contract). The whole impl body is the
+        timed region — the pack/scatter that overlaps the transfer is
+        part of the comm process; index generation and the optimizer's
+        consumption sit outside this call."""
+        token = backend_timer.begin()
+        try:
+            return self._allreduce_sparse_impl(
+                grad_data, support, comm_group, gradient_scaling_factor,
+                reduce_op, key)
+        finally:
+            # n_selected = the raw cached field, NOT the lazy idx/count
+            # properties — deriving those inside the timer would run
+            # mask compaction (and a device sync) inside the timed region
+            backend_timer.end(
+                token, "sparse", backend="torch_pipelined_index",
+                emission=self.emission, layout=self.layout,
+                block_size=getattr(support, "block_size", None),
+                bucket=key,
+                k=getattr(support, "n_selected", None))
+
+    def _allreduce_sparse_impl(self, grad_data: torch.Tensor, support,
+                               comm_group, gradient_scaling_factor: float,
+                               reduce_op, key: int):
         """Sparse allreduce of ``grad_data`` at ``support.idx`` positions —
         the contract is conditional on the resolved ``self.emission``.
 

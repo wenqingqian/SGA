@@ -284,7 +284,7 @@ def test_inv4_every_knob_documented_and_typed():
         assert isinstance(action.help, str) and action.help.strip(), dest
         assert action.default is not None or dest in (
             "sga_score", "sga_selection_method", "sga_selection_ratio_percent",
-            "sga_backend", "sga_trace_dir",
+            "sga_backend", "sga_trace_dir", "sga_backend_timer",
             "sga_trace_branch_points", "sga_cycle_start_iter_percent",
             "sga_cycle_full_sync_interval", "sga_always_sync_layers"), dest
         assert _kind(action) in ("bool", "int", "int_or_null",
@@ -334,6 +334,7 @@ def test_inv4_historical_surface_pinned():
         "sga_backend_high_priority_group": (False, "bool", ()),
         "sga_backend_index_slices": (2, "int", ()),
         "sga_backend_mask_slices": (2, "int", ()),
+        "sga_backend_timer": (None, "str", ()),
     }
     actions = sga_actions()
     assert set(pin) == set(actions), set(pin) ^ set(actions)

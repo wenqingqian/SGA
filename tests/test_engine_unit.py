@@ -892,8 +892,9 @@ def test_compact_emission_state_invariants():
         # the residual at unselected coords is bitwise untouched
         assert torch.equal(bs.grad_data[rest], pre[rest])
         # num-zeros measurement point on a sparse compact step: the
-        # writeback view — raw post-pack zeros minus the communicated
-        # coords, re-counted through the values buffer
+        # PACKED view — the pack zeroed the communicated coords so they
+        # read as zeros (writeback-view correction waived: it would be a
+        # values-buffer scan only compact steps pay)
         eng._log_num_zeros = True
         ok, grad_norm, nz = eng.optimizer_step(mp, [chunk], 6)
         assert ok is True and grad_norm is not None
@@ -905,7 +906,7 @@ def test_compact_emission_state_invariants():
             grad_norm, oracle_norm
         )
         assert nz == (int((pre[rest] == 0).sum().item())
-                      + int((vals == 0).sum().item())), (nz,)
+                      + idx.numel()), (nz,)
         # observation point B: the post-consumption end state
         assert torch.count_nonzero(bs.grad_data[idx]).item() == 0
         assert torch.equal(bs.grad_data[rest], pre[rest])

@@ -226,6 +226,15 @@ if __name__ == "__main__":
         extra_args_provider=_extra_args_provider,
         args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
     )
+    # sga_backend_timer (breakdown instrument): knob-gated, NOT
+    # sga_enabled-gated — the dense arm runs with SGA off and still
+    # needs its fullsync records.
+    if args.sga_backend_timer:
+        from sga import backend_timer
+
+        backend_timer.configure(args.sga_backend_timer,
+                                int(os.environ.get("RANK", "0")))
+        backend_timer.install_fullsync_wrap()
     # The resume guard runs on the RAW parsed flags (no validation here:
     # build_engine validates at the waist's first attach, megatron-style —
     # disabled means zero checks). The sga_* attributes cannot be silently

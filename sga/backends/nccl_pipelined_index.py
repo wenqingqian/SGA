@@ -85,6 +85,7 @@ from sga.backends import COMM_WARMUP_ENV, RESUME_OVERRIDE_ENV
 from sga.config import get_args
 from sga.kernels import gather_selected_blocks, scatter_selected, \
     scatter_selected_blocks
+from sga import backend_timer
 from sga.plugins import resolve_emission
 
 # Path to the nccl-sar sparse library exporting the sparse allreduce API
@@ -519,23 +520,42 @@ class NcclPipelinedIndexBackend:
 
         calling = torch.cuda.current_stream(grad_data.device)
         if gradient_scaling_factor != 1.0:
+            # hoisted ABOVE the timed bracket: block_idx is a lazy
+            # property whose first materialization runs .any() host
+            # syncs — never inside a timed region
             heads = support.block_idx
-            sel = self._scale_buf(key, kb * x, grad_data.dtype,
-                                  grad_data.device)[:kb * x]
-            gather_selected_blocks(grad_data, support.mask_u8, heads, sel,
-                                   x, gradient_scaling_factor)
-            scatter_selected_blocks(grad_data, support.mask_u8, heads, sel,
-                                    x)
+            tok = backend_timer.begin()
+            try:
+                sel = self._scale_buf(key, kb * x, grad_data.dtype,
+                                      grad_data.device)[:kb * x]
+                gather_selected_blocks(grad_data, support.mask_u8, heads,
+                                       sel, x, gradient_scaling_factor)
+                scatter_selected_blocks(grad_data, support.mask_u8, heads,
+                                        sel, x)
+            finally:
+                backend_timer.end(
+                    tok, "prescale", backend="nccl_pipelined_index",
+                    api="block", layout=self.layout, block_size=x,
+                    bucket=key, k_blocks=kb)
 
-        # Same calling-stream completion contract as the element path.
-        ready = torch.cuda.Event()
-        ready.record(calling)
-        ready.wait(entry.stream)
-        self._launch_block(entry.lib, entry.comm, entry.stream, grad_data,
-                           desc, x)
-        done = torch.cuda.Event()
-        done.record(entry.stream)
-        done.wait(calling)
+        # Same timed-region choreography as in allreduce_sparse below:
+        # done chains the kernel back onto the calling stream INSIDE
+        # the bracket, so end()'s exit event observes it (isolated
+        # duration; see that note for the ordering contract).
+        tok = backend_timer.begin()
+        try:
+            ready = torch.cuda.Event()
+            ready.record(calling)
+            ready.wait(entry.stream)
+            self._launch_block(entry.lib, entry.comm, entry.stream,
+                               grad_data, desc, x)
+            done = torch.cuda.Event()
+            done.record(entry.stream)
+            done.wait(calling)
+        finally:
+            backend_timer.end(
+                tok, "sparse", backend="nccl_pipelined_index", api="block",
+                layout=self.layout, block_size=x, bucket=key, k_blocks=kb)
 
     def allreduce_sparse(self, grad_data: torch.Tensor, support, comm_group,
                          gradient_scaling_factor: float, reduce_op,
@@ -603,20 +623,45 @@ class NcclPipelinedIndexBackend:
 
         calling = torch.cuda.current_stream(grad_data.device)
         if gradient_scaling_factor != 1.0:
-            sel = self._scale_buf(key, k, grad_data.dtype,
-                                  grad_data.device)[:k]
-            torch.index_select(grad_data, 0, indices, out=sel)
-            sel *= gradient_scaling_factor
-            scatter_selected(grad_data, indices, sel)
+            # optional payload pre-scale — its own timer phase: the torch
+            # twins fuse their scale into the pack inside phase=sparse,
+            # so recording this apart keeps the calibers alignable
+            tok = backend_timer.begin()
+            try:
+                sel = self._scale_buf(key, k, grad_data.dtype,
+                                      grad_data.device)[:k]
+                torch.index_select(grad_data, 0, indices, out=sel)
+                sel *= gradient_scaling_factor
+                scatter_selected(grad_data, indices, sel)
+            finally:
+                backend_timer.end(
+                    tok, "prescale", backend="nccl_pipelined_index",
+                    api="index", layout=self.layout,
+                    block_size=getattr(support, "block_size", None),
+                    bucket=key, k=k)
 
-        # Order the (optional) pre-scale on the calling stream ahead of
-        # the kernel stream, and the kernel stream back ahead of the
-        # calling stream — the calling-stream completion contract, with no
-        # host synchronization anywhere.
-        ready = torch.cuda.Event()
-        ready.record(calling)
-        ready.wait(entry.stream)
-        self._launch(entry.lib, entry.comm, entry.stream, grad_data, indices)
-        done = torch.cuda.Event()
-        done.record(entry.stream)
-        done.wait(calling)
+        # The timed region spans the whole calling-stream completion
+        # choreography: ready orders the (optional) pre-scale on the
+        # calling stream ahead of the kernel stream, the ctypes call
+        # enqueues the kernel, done chains the kernel back onto the
+        # calling stream — end()'s calling-stream exit event then
+        # OBSERVES the kernel, so the record is the comm kernel's
+        # isolated duration (the event/launch enqueues are host-µs;
+        # begin()'s device-wide drain keeps the rest of the device
+        # idle). No host synchronization beyond the exit event's wait.
+        tok = backend_timer.begin()
+        try:
+            ready = torch.cuda.Event()
+            ready.record(calling)
+            ready.wait(entry.stream)
+            self._launch(entry.lib, entry.comm, entry.stream, grad_data,
+                         indices)
+            done = torch.cuda.Event()
+            done.record(entry.stream)
+            done.wait(calling)
+        finally:
+            backend_timer.end(
+                tok, "sparse", backend="nccl_pipelined_index", api="index",
+                layout=self.layout,
+                block_size=getattr(support, "block_size", None),
+                bucket=key, k=k)

@@ -50,6 +50,7 @@ import os
 
 import torch
 
+from sga import backend_timer
 from sga.kernels import (
     compact_norm_sq_contribution,
     masked_norm_sq_contribution,
@@ -419,6 +420,9 @@ class SGAEngine:
             # replication covers collectives too; no phase flags to stamp).
             return False
         step = self._iter + 1
+        # timer iter stamp: every timed region in this step (sparse
+        # backends + the boundary finish_grad_sync delegation) reads it
+        backend_timer.set_iter(step)
         forced = bool(force_all_reduce) or self._cycle.force_next
         if self._cycle.force_next:
             self._cycle.force_next = False
@@ -522,10 +526,10 @@ class SGAEngine:
 
         # 3. num_zeros BEFORE the optimizer template (its full step
         # overwrites main grads with the materialized score). Compact-
-        # emission sparse steps report the WRITEBACK view: the pack
-        # zeroed the communicated coords, so the count re-enters them
-        # through the values buffer (see _count_zeros) — the metric does
-        # not shift with the emission mode.
+        # emission sparse steps report the PACKED view (zeroed
+        # communicated coords read as zeros) — the writeback-view
+        # correction scan is waived so the diagnostic costs the same on
+        # every emission mode (see _count_zeros).
         num_zeros = self._count_zeros(mp_opt) if self._log_num_zeros_flag() else None
 
         # 3b. trace dump slot (frozen slot: AFTER count_zeros, BEFORE the
@@ -1269,32 +1273,28 @@ class SGAEngine:
         total_norm_sq.div_(world)
 
     def _count_zeros(self, mp_opt):
-        """Pre-optimizer zero count of the main grads (frozen measurement
-        point). Compact-emission sparse steps reproduce the writeback
-        view: the pack zeroed the communicated coords at grad_sync, so
-        per compact bucket with k > 0 the raw buffer count subtracts k
-        and re-counts the values buffer's own zeros (a communicated
-        exactly-0.0 value counts as a zero, same as after a writeback
-        scatter). The dict is empty on full steps and writeback backends,
-        so the adjustment is a no-op there."""
+        """Pre-optimizer zero count of the main grads (frozen ordering-
+        contract measurement point; diagnostic only — no control flow
+        consumes it). Per-record form stays the stock Megatron idiom
+        (count_zeros_fp32 uses the same numel - count_nonzero per
+        parameter) so the instrumentation cost is byte-identical on
+        sparse and full/dense steps.
+
+        Compact-emission sparse steps count the PACKED view: the pack
+        zeroed the communicated coords at grad_sync, so they all read as
+        zeros and the reported number is inflated by k - zeros_in_vals
+        per bucket. Accuracy is deliberately waived here (user ruling
+        2026-09-14): restoring the writeback-view number would require a
+        values-buffer scan that ONLY compact steps pay (+6.1ms/step in
+        the torch idiom — the exp_0004 cp e2e surcharge), i.e. a
+        diagnostic log would price one emission mode above the other."""
         records = self._records or self._refresh_records(mp_opt)
-        compact = self._compact_values
-        compact_seen = set()
         n = 0
         for rec in records:
             if rec.grad is None:
                 continue
             buf = rec.grad.data
             zeros = buf.numel() - int(torch.count_nonzero(buf).item())
-            bs_id = id(rec.bucket_state)
-            vals = compact.get(bs_id)
-            if vals is not None and vals.numel() > 0 and bs_id not in compact_seen:
-                # Bucket-level adjustment ONCE per bucket: the records
-                # tile the bucket, so their raw counts sum to the whole
-                # buffer while k spans it.
-                compact_seen.add(bs_id)
-                zeros -= vals.numel()
-                zeros += int((vals == 0).sum().item())
             n += zeros
         return n
 

@@ -420,3 +420,19 @@ def _add_sga_backend_args(parser: argparse.ArgumentParser):
         "--sga-backend-mask-slices", type=int, default=2,
         help="torch_pipelined_mask only: mask slices pipelined against "
              "NCCL ops (must be >= 1). Default 2.")
+    group.add_argument(
+        "--sga-backend-timer", type=str, default=None,
+        help="sync-isolated comm-process timing (breakdown instrument, "
+             "default off): set to an output DIRECTORY to enable — "
+             "records the sparse backends' comm regions plus every model "
+             "chunk's finish_grad_sync, as per-rank JSONL. The sync "
+             "brackets destroy pipelining exposure by design: read these "
+             "numbers as isolated comm durations, never as e2e "
+             "throughput. Full caliber contract (torch/nccl phase "
+             "semantics, iter=null for dense arm and shadow mode, "
+             "post-resume caveat): sga/backend_timer.py module "
+             "docstring. Legal with sga_enabled false; refused with "
+             "overlap_grad_reduce true. Run under torchrun only (a bare "
+             "launch would have every rank write "
+             "backend_timer_rank0.jsonl). Default None (off = no CUDA "
+             "calls, no I/O; behavior identical).")

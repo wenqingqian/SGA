@@ -418,6 +418,107 @@ def main():
     assert len(masks) == 1 and masks[0].numel() == 1024
     dist.barrier()
 
+    # --- backend_timer on: identical results + records ------
+    # The instrument must not change what the backend computes
+    # (bitwise on/off; records carry the engine iter stamp).
+    import json
+    import tempfile
+
+    from sga import backend_timer
+
+    tmp = tempfile.mkdtemp(prefix="sga_timer_dist_")
+    backend_timer.configure(tmp, rank=rank)
+    backend_timer.set_iter(1)
+    g_tim = local.clone()
+    _seed()
+    ret_tim = TorchPipelinedIndexBackend().allreduce_sparse(
+        g_tim, support, group, factor, op, key=0)
+    assert torch.equal(g_tim, g_idx), f"timer-on buffer differs (rank {rank})"
+    assert torch.equal(ret_tim, ret_idx), f"timer-on values differ (rank {rank})"
+    rec_path = os.path.join(tmp, f"backend_timer_rank{rank}.jsonl")
+    with open(rec_path) as f:
+        recs = [json.loads(x) for x in f if x.strip()]
+    trecs = [r for r in recs if r["backend"] == "torch_pipelined_index"]
+    assert trecs and all(r["phase"] == "sparse" for r in trecs), trecs
+    assert all(r["iter"] == 1 and r["bucket"] == 0 for r in trecs), trecs
+    assert all(r["wall_ms"] >= 0.0 for r in trecs), trecs
+    assert not any(r.get("error") for r in trecs), trecs
+
+    # --- nccl arm of the timer-on section (needs the sparse library) ---
+    # Same A/B identity contract for both APIs plus a magnitude
+    # guard: the timed region now chains the kernel back onto the
+    # calling stream INSIDE the bracket, so the sparse record blocks on
+    # the comm kernel — an enqueue-only region would record sub-noise
+    # µs instead.
+    if lib:
+        _seed()
+        be_t = NcclPipelinedIndexBackend()
+        be_t.prepare(group, device=device)
+        g_nccl_tim = local.clone()
+        be_t.allreduce_sparse(g_nccl_tim, support, group, factor, op,
+                              key=30)
+        torch.cuda.synchronize()
+        # bitwise on/off identity (element API): g_nccl is the same
+        # allreduce from the timer-off arm above
+        assert torch.equal(g_nccl_tim, g_nccl), \
+            f"timer-on nccl element result differs (rank {rank})"
+
+        # block API on a dedicated bb-SAFE support: aligned span, whole
+        # selected runs only (the descriptor contract's whole-run belt —
+        # bsupport/bmask above carry mask-partial listed blocks and a
+        # mid-block span start, torch-block-only shapes). At 2 ranks
+        # with the pow2 factor the ground truth is bitwise
+        # expected_selected — the same anchor the frozen grid asserts.
+        xt = 16
+        tmask = torch.zeros(n, dtype=torch.uint8)
+        tgen = torch.Generator().manual_seed(99)
+        for i in (torch.rand(n // xt, generator=tgen) < 0.25) \
+                .nonzero(as_tuple=True)[0].tolist():
+            tmask[i * xt:(i + 1) * xt] = 1
+        tsup = BucketSupport(tmask.to(device), block_size=xt,
+                             block_spans=[(0, n)])
+        tact = tmask.to(device) > 0
+        _seed(sga_backend_layout="bb")
+        be_tblk = NcclPipelinedIndexBackend()
+        be_tblk.prepare(group, device=device)
+        g_blk_tim = local.clone()
+        be_tblk.allreduce_sparse(g_blk_tim, tsup, group, factor, op,
+                                 key=31)
+        torch.cuda.synchronize()
+        assert torch.equal(g_blk_tim[~tact], local[~tact]), \
+            f"timer-on nccl block residual changed (rank {rank})"
+        assert torch.equal(g_blk_tim[tact], expected_selected[tact]), \
+            f"timer-on nccl block selected coords wrong (rank {rank})"
+
+        with open(rec_path) as f:
+            nrecs = [json.loads(x) for x in f if x.strip()]
+        nrecs = [r for r in nrecs
+                 if r["backend"] == "nccl_pipelined_index"]
+        assert all(r["iter"] == 1 for r in nrecs), nrecs
+        assert not any(r.get("error") for r in nrecs), nrecs
+        by_key = {(r["api"], r["phase"]): r for r in nrecs}
+        assert set(by_key) >= {("index", "prescale"), ("index", "sparse"),
+                               ("block", "prescale"),
+                               ("block", "sparse")}, sorted(by_key)
+        assert "k" in by_key[("index", "sparse")], nrecs       # elements
+        assert "k_blocks" in by_key[("block", "sparse")], nrecs
+        assert "k" not in by_key[("block", "sparse")], nrecs
+        # magnitude guard: sparse must clear the sub-noise floor or
+        # cover the pre-scale segment.
+        for api in ("index", "block"):
+            sp = by_key[(api, "sparse")]["wall_ms"]
+            ps = by_key[(api, "prescale")]["wall_ms"]
+            assert sp >= 0.05 or sp >= ps, \
+                f"nccl {api} sparse {sp}ms reads as enqueue noise " \
+                f"(prescale {ps}ms, rank {rank})"
+        if rank == 0:
+            print("ok: nccl timer-on records (element+block): " + ", ".join(
+                f"{api}/{ph}={by_key[(api, ph)]['wall_ms']:.3f}ms"
+                for api in ("index", "block")
+                for ph in ("prescale", "sparse")))
+    backend_timer.reset()  # back to off (closes the record file)
+    dist.barrier()
+
     if rank == 0:
         print("test_backend_dist: ALL PASS (2-rank CUDA)")
 
