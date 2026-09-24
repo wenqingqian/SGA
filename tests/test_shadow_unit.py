@@ -606,6 +606,9 @@ _BASE = {
         "sga_cycle_period": 8,
         "sga_score": "abs_m",
         "sga_selection_method": "histogram",
+        # the frozen selection combo: validation refuses any other
+        # method/mode pairing
+        "sga_selection_histogram_mode": "balanced",
         "sga_selection_ratio_percent": 30.0,
         "sga_optimizer": "adamw",
         "sga_backend": "torch_pipelined_index",

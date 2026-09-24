@@ -24,10 +24,12 @@ the config surface; these tests make that STRUCTURAL, not disciplinary:
        explicit; the historical surface is pinned as a golden table;
        the --sga-score choices stay synced with the score registry.
   INV-5 value rules, pinned behaviorally: topk's mode choices stay
-       synced with the kernel impls; dead config is silently ignored
-       (megatron semantics) EXCEPT the curated exception (block_size
-       under a non-histogram method); the block comm-path cross-field
-       rules and the emission pairing rule refuse loud; the zero-arg
+       synced with the kernel impls; the selection axis is FROZEN to
+       histogram balanced (any other method/mode refuses loud at
+       validation); dead config is silently ignored (megatron
+       semantics) EXCEPT the curated exception (block_size under a
+       non-histogram method); the block comm-path cross-field rules
+       and the emission pairing rule refuse loud; the zero-arg
        constructors keep their direct-construction backstops.
   INV-6 every declared dest has exactly one runtime consumer (AST scan
        of the singleton reads): with no central router, a declared dest
@@ -78,6 +80,9 @@ def _seed(over=None, base=True):
         ns.sga_enabled = True
         ns.sga_score = "update"
         ns.sga_selection_method = "histogram"
+        # the frozen selection combo: validation refuses any other
+        # method/mode pairing, so the base config must spell balanced
+        ns.sga_selection_histogram_mode = "balanced"
         ns.sga_selection_ratio_percent = 10.0
         ns.sga_backend = "torch_pipelined_index"
     for k, v in (over or {}).items():
@@ -383,40 +388,54 @@ def test_inv5_dead_config_silently_ignored_except_curated():
     ownership machinery) — EXCEPT the curated exception list
     (_dead_config_exceptions), whose only entry is block_size under a
     non-histogram method (its silent death would mean a wrong
-    experiment, not a no-op)."""
-    # sibling knobs at loud non-default values: silently ignored
+    experiment, not a no-op). The selection freeze refuses every
+    non-balanced method/mode BEFORE the curated gate, so through
+    validate_sga_args the freeze's refusal is the honest first error;
+    the gate itself stays pinned behaviorally via a direct call."""
+    # sibling knobs at loud non-default values: silently ignored (the
+    # adaptive-family knobs are dead under the frozen histogram
+    # selection)
     validate_sga_args(_seed({"sga_selection_adaptive_warmup_mode": "exact"}))
-    validate_sga_args(_seed({"sga_selection_method": "exact",
-                             "sga_selection_histogram_mode": "fast",
-                             "sga_selection_adaptive_warmup_syncs": None}))
+    validate_sga_args(_seed({"sga_selection_adaptive_warmup_syncs": None,
+                             "sga_selection_adaptive_warmup_mode": "fast"}))
     validate_sga_args(_seed({"sga_backend": "torch_pipelined_mask",
                              "sga_backend_index_slices": 7,
                              "sga_backend_high_priority_group": True}))
     validate_sga_args(_seed({"sga_selection_block_size": 1,
                              "sga_selection_block_reduce": "max"}))
-    # the curated exception: block_size off its live path (and off its
-    # default) refuses, naming the method (the block-carrying mask
-    # backend keeps the comm cross-field rule out of the way)
+    # the curated gate, called directly (its block_size refusal names
+    # the method — the comm cross-field rule stays out of the way)
+    from types import SimpleNamespace
+    expect_error(
+        lambda: V._dead_config_exceptions(SimpleNamespace(
+            **{**sga_defaults(), "sga_selection_method": "exact",
+               "sga_selection_block_size": 4})),
+        "only applies to the histogram method")
+    # through validation the freeze preempts it — for a non-histogram
+    # method at ANY block_size, default included (the freeze is
+    # value-level: argparse cannot distinguish set-at-default from
+    # unset, so 'exact' at defaults refuses too)
     expect_error(
         lambda: validate_sga_args(_seed({"sga_selection_method": "exact",
                                          "sga_backend": "torch_pipelined_mask",
                                          "sga_selection_block_size": 4})),
-        "only applies to the histogram method")
+        "frozen to histogram balanced")
     expect_error(
         lambda: validate_sga_args(_seed({"sga_selection_method": "adaptive",
                                          "sga_backend": "torch_pipelined_mask",
                                          "sga_selection_block_size": 4})),
-        "'adaptive'")
-    # ...but the at-default spelling under any method passes (argparse
-    # cannot distinguish it from unset — megatron semantics)
-    validate_sga_args(_seed({"sga_selection_method": "exact"}))
+        "frozen to histogram balanced")
+    expect_error(
+        lambda: validate_sga_args(_seed({"sga_selection_method": "exact"})),
+        "frozen to histogram balanced")
     # the curated list stays curated: exactly one gate lives there
     src = open(V.__file__, encoding="utf-8").read()
     body = src.split("def _dead_config_exceptions")[1].split("\ndef ")[0]
     gated = set(re.findall(r"sga_[a-z_0-9]+", body)) - {
         "sga_defaults", "sga_selection_method"}  # lookup + gate input
     assert gated == {"sga_selection_block_size"}, gated
-    print("ok: dead config silently ignored; block_size is the one gate")
+    print("ok: dead config silently ignored; block_size is the one gate "
+          "(shadowed by the selection freeze through validation)")
 
 
 def test_inv5_block_size_rules():
@@ -482,21 +501,26 @@ def test_inv5_block_backend_cross_field_rules():
 
 
 def test_inv5_block_fast_mode_refusal():
-    """fast + block is refused: fast's lower-edge threshold over-selects
-    and the block payload amplifies it past the ratio contract
-    (measured realized 0.253 vs the 0.20 target). balanced/exact carry
-    blocks; fast at element granularity stays legal."""
+    """fast is frozen outright with the rest of the non-balanced
+    selections: the freeze refuses before the block rules, at block
+    granularity and at element granularity alike (the fast+block
+    rationale gate below the freeze stays as shadowed defense).
+    balanced+block stays legal."""
     base = {"sga_selection_block_size": 16,
             "sga_backend": "torch_pipelined_mask"}
     expect_error(
         lambda: validate_sga_args(
             _seed({**base, "sga_selection_histogram_mode": "fast"})),
-        "over-selection")
+        "frozen to histogram balanced")
     validate_sga_args(_seed(
         {**base, "sga_selection_histogram_mode": "balanced"}))
-    # fast at element granularity (block_size at its default): legal
-    validate_sga_args(_seed({"sga_selection_histogram_mode": "fast"}))
-    print("ok: fast+block refused; balanced+block and fast+element legal")
+    # fast at element granularity (block_size at its default): equally
+    # frozen — the mode itself, not the block pairing, is what refuses
+    expect_error(
+        lambda: validate_sga_args(
+            _seed({"sga_selection_histogram_mode": "fast"})),
+        "frozen to histogram balanced")
+    print("ok: fast frozen at any block_size; balanced+block legal")
 
 
 def test_inv5_method_required_and_choices_on_real_routes():

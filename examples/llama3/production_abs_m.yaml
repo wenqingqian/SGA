@@ -68,9 +68,9 @@ sga:
   sga_cycle_start_iter: 4
   sga_cycle_period: 4
   sga_score: abs_m
-  sga_selection_method: adaptive
+  sga_selection_method: histogram
+  sga_selection_histogram_mode: balanced
   sga_selection_ratio_percent: 40.0
-  sga_selection_adaptive_warmup_syncs: 5
   sga_optimizer: adamw
   sga_optimizer_residual_mean: false
   sga_backend: torch_pipelined_index

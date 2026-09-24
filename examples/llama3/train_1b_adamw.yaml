@@ -68,6 +68,7 @@ sga:
 
   # selection (topk): method + its params
   sga_selection_method: histogram
+  sga_selection_histogram_mode: balanced
   sga_selection_ratio_percent: 10
 
   # optimizer (adamw)

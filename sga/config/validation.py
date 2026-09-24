@@ -40,6 +40,7 @@ both routes see argparse-typed values and one code path.
 
 import argparse
 import math
+import os
 
 from sga.config.arguments import add_sga_args
 
@@ -342,6 +343,34 @@ def validate_sga_args(args=None) -> None:
             raise ValueError(
                 "sga_selection_ratio_percent must be a finite float in "
                 f"(0, 100) (got {ratio!r})")
+        # --- selection freeze: only histogram balanced is supported for
+        # now — other method/mode combinations refuse here so different
+        # selections cannot confound the test comparisons. This sits
+        # ahead of every selection-conditional rule below (the curated
+        # dead-config gate and the block comm-path rules stay as shadowed
+        # defense); re-enabling another selection is a deliberate
+        # gate-lift, not a config choice. SGA_ALLOW_FROZEN_SELECTION=1 is
+        # an escape for the standing baseline-gate scripts only — their
+        # preregistered arms spell older selections and migrating them
+        # would re-baseline the gate; any other use is a gate-lift in
+        # disguise, and the escape prints loudly every time it opens.
+        if (args.sga_selection_method != "histogram"
+                or args.sga_selection_histogram_mode != "balanced"):
+            if os.environ.get("SGA_ALLOW_FROZEN_SELECTION") == "1":
+                print("[sga] WARNING: selection freeze lifted by "
+                      "SGA_ALLOW_FROZEN_SELECTION=1 — running method "
+                      f"'{args.sga_selection_method}' mode "
+                      f"'{args.sga_selection_histogram_mode}' outside the "
+                      "frozen histogram-balanced surface", flush=True)
+            else:
+                raise ValueError(
+                    "selection is frozen to histogram balanced for now: "
+                    "only sga_selection_method 'histogram' with "
+                    "sga_selection_histogram_mode 'balanced' is accepted "
+                    f"(got method '{args.sga_selection_method}', mode "
+                    f"'{args.sga_selection_histogram_mode}') — other "
+                    "selections are refused at config time so runs stay "
+                    "comparable; lift this gate to re-enable them")
         # --- block granularity (histogram-unlocked; see
         # _dead_config_exceptions for the method gate) ---
         block_size = args.sga_selection_block_size

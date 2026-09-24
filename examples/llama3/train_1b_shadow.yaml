@@ -6,7 +6,7 @@
 # Numerics must stay bitwise identical to a dense-only run.
 # sga.shadow_score=false (probe variant) strips even the read-only scoring.
 #
-# score=update + selection=topk method=histogram (exact tier) +
+# score=update + selection=topk method=histogram (balanced tier) +
 # optimizer=adamw (residual) + backend=torch_pipelined_index (never used
 # for communication in shadow — grad_sync always returns False).
 # Cycle: shadow reselection at every period-8 boundary after start_iter.
@@ -65,6 +65,7 @@ sga:
   sga_cycle_period: 8
   sga_score: update
   sga_selection_method: histogram
+  sga_selection_histogram_mode: balanced
   sga_selection_ratio_percent: 10
   sga_optimizer: adamw
   sga_optimizer_residual_mean: false

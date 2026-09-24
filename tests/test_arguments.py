@@ -33,6 +33,9 @@ ENABLED = {
     "sga_cycle_period": 8,
     "sga_score": "update",
     "sga_selection_method": "histogram",
+    # the frozen selection combo: validation refuses any other
+    # method/mode pairing
+    "sga_selection_histogram_mode": "balanced",
     "sga_selection_ratio_percent": 10.0,
     "sga_optimizer": "adamw",
     "sga_backend": "torch_pipelined_index",
@@ -153,6 +156,7 @@ def test_dual_form_equivalence():
     hand = ["--sga-enabled", "true", "--sga-cycle-start-iter", "20",
             "--sga-cycle-period", "8", "--sga-score", "update",
             "--sga-selection-method", "histogram",
+            "--sga-selection-histogram-mode", "balanced",
             "--sga-selection-ratio-percent", "10",
             "--sga-optimizer", "adamw",
             "--sga-backend", "torch_pipelined_index"]
@@ -167,10 +171,12 @@ def test_dual_form_explicit_null_round_trip():
     sga_selection_adaptive_warmup_syncs: null and the CLI
     --sga-selection-adaptive-warmup-syncs null validate identically
     (a launcher/OmegaConf conversion that dropped the null or reset it
-    to the default would fail here)."""
-    adaptive = dict(ENABLED, sga_selection_method="adaptive",
-                    sga_selection_adaptive_warmup_syncs=None)
-    cfg = _cfg_with_sga(dict(adaptive))
+    to the default would fail here). The nullable flag rides the frozen
+    histogram-balanced selection (under it the knob is dead config, but
+    the spelling still round-trips)."""
+    null_syncs = dict(ENABLED,
+                      sga_selection_adaptive_warmup_syncs=None)
+    cfg = _cfg_with_sga(dict(null_syncs))
     tokens = _flags_of(cfg)
     assert tokens[tokens.index("--sga-selection-adaptive-warmup-syncs") + 1] \
         == "null"
@@ -185,7 +191,8 @@ def test_dual_form_explicit_null_round_trip():
             "--sga-optimizer", "adamw",
             "--sga-score", "update",
             "--sga-selection-adaptive-warmup-syncs", "null",
-            "--sga-selection-method", "adaptive",
+            "--sga-selection-method", "histogram",
+            "--sga-selection-histogram-mode", "balanced",
             "--sga-selection-ratio-percent", "10.0"]
     ns_hand = _ns_from_flags(hand)
     assert ns_hand.sga_selection_adaptive_warmup_syncs is None
@@ -205,6 +212,7 @@ def test_decoupled_cycle_round_trip():
             "true", "--sga-cycle-full-sync-interval", "4",
             "--sga-score", "update",
             "--sga-selection-method", "histogram",
+            "--sga-selection-histogram-mode", "balanced",
             "--sga-selection-ratio-percent", "10",
             "--sga-optimizer", "adamw",
             "--sga-backend", "torch_pipelined_index"]
@@ -277,7 +285,8 @@ def test_explicit_false_and_null_spellings():
     """bools carry explicit false; the nullable warmup accepts null."""
     ns = _ns_from_flags([
         "--sga-enabled", "true", "--sga-score", "update",
-        "--sga-selection-method", "adaptive",
+        "--sga-selection-method", "histogram",
+        "--sga-selection-histogram-mode", "balanced",
         "--sga-selection-ratio-percent", "10",
         "--sga-optimizer", "adamw",
         "--sga-backend", "torch_pipelined_index",

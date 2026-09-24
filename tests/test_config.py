@@ -84,10 +84,12 @@ def _ns_of(cfg):
 
 
 def _enable_standard(cfg):
-    """The canonical enabled combo: abs_m + topk(histogram) + adamw."""
+    """The canonical enabled combo: abs_m + topk(histogram balanced —
+    the only selection validation accepts) + adamw."""
     cfg.sga = {"sga_enabled": True, "sga_cycle_start_iter": 0,
                "sga_cycle_period": 8, "sga_score": "abs_m",
                "sga_selection_method": "histogram",
+               "sga_selection_histogram_mode": "balanced",
                "sga_selection_ratio_percent": 30.0,
                "sga_optimizer": "adamw",
                "sga_backend": "torch_pipelined_index"}
@@ -166,7 +168,8 @@ def test_checks_master_switch():
             "sga_checks_norm_spread", "sga_checks_rng_bracket")
 
     base = {"sga_enabled": True, "sga_score": "update",
-            "sga_selection_method": "exact",
+            "sga_selection_method": "histogram",
+            "sga_selection_histogram_mode": "balanced",
             "sga_selection_ratio_percent": 10.0,
             "sga_backend": "torch_pipelined_index",
             "sga_cycle_period": 8}
@@ -307,7 +310,8 @@ def test_optimizer_dual_lr_scale_rules():
     stock-replication contract) and under sga_cycle_period 1 (no sparse
     rounds — dead config, refused instead of silently ignored)."""
     base = {"sga_enabled": True, "sga_score": "update",
-            "sga_selection_method": "exact",
+            "sga_selection_method": "histogram",
+            "sga_selection_histogram_mode": "balanced",
             "sga_selection_ratio_percent": 10.0,
             "sga_backend": "torch_pipelined_index",
             "sga_cycle_period": 8}
@@ -480,6 +484,7 @@ def test_enabled_emits_flat_flag_sequence():
     assert sga == ["--sga-backend", "--sga-cycle-period",
                    "--sga-cycle-start-iter", "--sga-enabled",
                    "--sga-optimizer", "--sga-score",
+                   "--sga-selection-histogram-mode",
                    "--sga-selection-method",
                    "--sga-selection-ratio-percent"], sga
     flags = {args[i]: args[i + 1] for i in range(len(args) - 1)
@@ -508,9 +513,12 @@ def test_plugin_param_dead_config_semantics():
     """Megatron dead-config semantics: a key no flag declares is
     loud at parse; a declared key of ANOTHER plugin (or under another
     selection method) is silently ignored — EXCEPT the curated exception
-    (block_size under a non-histogram method refuses)."""
+    (block_size under a non-histogram method refuses). Under the
+    selection freeze a non-histogram method refuses at the freeze first,
+    so the launch-route refusal names the freeze."""
     base = {"sga_enabled": True, "sga_score": "update",
             "sga_selection_method": "histogram",
+            "sga_selection_histogram_mode": "balanced",
             "sga_selection_ratio_percent": 10.0,
             "sga_optimizer": "adamw",
             "sga_backend": "torch_pipelined_index"}
@@ -528,12 +536,13 @@ def test_plugin_param_dead_config_semantics():
     # the curated exception: block_size is histogram-only
     cfg.sga = {**base, "sga_selection_block_size": 4,
                "sga_backend_emission": "writeback"}
-    _prevalidate_sga(cfg)  # histogram + writeback pairing: legal
+    _prevalidate_sga(cfg)  # histogram balanced + writeback pairing: legal
     cfg.sga = dict(base, sga_selection_method="exact",
                    sga_selection_block_size=4)
-    expect_error(lambda: _prevalidate_sga(cfg), "sga_selection_block_size")
-    print("ok: typos loud; sibling/method keys silently ignored; block_size "
-          "is the curated exception")
+    expect_error(lambda: _prevalidate_sga(cfg),
+                 "frozen to histogram balanced")
+    print("ok: typos loud; sibling/method keys silently ignored; "
+          "non-histogram methods meet the selection freeze")
 
 
 def test_float_spelling_normalized():
@@ -541,6 +550,7 @@ def test_float_spelling_normalized():
     cfg, _ = make_base()
     cfg.sga = {"sga_enabled": True, "sga_score": "update",
                "sga_selection_method": "histogram",
+               "sga_selection_histogram_mode": "balanced",
                "sga_selection_ratio_percent": 10,
                "sga_optimizer": "adamw",
                "sga_backend": "torch_pipelined_index"}
@@ -557,6 +567,7 @@ def test_wrong_types_fail_loud():
     value rules refuse them)."""
     base = {"sga_enabled": True, "sga_score": "update",
             "sga_selection_method": "histogram",
+            "sga_selection_histogram_mode": "balanced",
             "sga_selection_ratio_percent": 10.0,
             "sga_optimizer": "adamw",
             "sga_backend": "torch_pipelined_index"}
@@ -585,9 +596,9 @@ def test_wrong_types_fail_loud():
 
 
 def test_shipped_examples_validate():
-    """Every shipped example yaml passes pre-validation as-is (a renamed or
-    removed flag left behind in an example would otherwise surface only
-    at a user's launch)."""
+    """Every shipped example yaml passes pre-validation as-is: any error
+    (a renamed or removed flag left behind in an example, or a selection
+    outside the frozen histogram-balanced surface) fails this test."""
     import glob
 
     examples = sorted(glob.glob(os.path.join(
@@ -598,6 +609,39 @@ def test_shipped_examples_validate():
         cfg = OmegaConf.load(path)
         _prevalidate_sga(cfg)  # must not raise
     print(f"ok: all {len(examples)} shipped examples validate")
+
+
+def test_selection_freeze_and_escape():
+    """The freeze refuses non-balanced method/mode pairings by default;
+    the env escape opens the gate for the standing baseline-gate scripts
+    and prints loudly every time it does. The escape is read at validation
+    time, so dropping the var restores the refusal immediately."""
+    base = {"sga_enabled": True, "sga_score": "abs_m",
+            "sga_selection_method": "histogram",
+            "sga_selection_ratio_percent": 10.0,
+            "sga_optimizer": "adamw",
+            "sga_backend": "torch_pipelined_index"}
+
+    def _cfg(mode):
+        c, _ = make_base()
+        c.sga = {**base, "sga_selection_histogram_mode": mode}
+        return c
+
+    expect_error(lambda: _prevalidate_sga(_cfg("exact")),
+                 "frozen to histogram balanced")
+    saved = os.environ.pop("SGA_ALLOW_FROZEN_SELECTION", None)
+    try:
+        os.environ["SGA_ALLOW_FROZEN_SELECTION"] = "1"
+        _prevalidate_sga(_cfg("exact"))  # must not raise
+    finally:
+        if saved is None:
+            os.environ.pop("SGA_ALLOW_FROZEN_SELECTION", None)
+        else:
+            os.environ["SGA_ALLOW_FROZEN_SELECTION"] = saved
+    expect_error(lambda: _prevalidate_sga(_cfg("exact")),
+                 "frozen to histogram balanced")
+    print("ok: selection freeze refuses by default; env escape opens it "
+          "loudly and only while set")
 
 
 def _run_all():
