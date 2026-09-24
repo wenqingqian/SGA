@@ -122,23 +122,29 @@ from test_replay_cycle import reference_cycle
 # force test_fused_sort_device_bitwise's dev arm onto the CPU path and fail
 # with a misleading "patch did not engage". Covers both the pytest and the
 # main() entry paths.
-if "REPLAY_S0_PROFILE" in os.environ:
-    del os.environ["REPLAY_S0_PROFILE"]
-    replay_fused._S0_PROFILE = False
-if "REPLAY_FUSED_FRONT_SORT" in os.environ:
-    del os.environ["REPLAY_FUSED_FRONT_SORT"]
-# same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
-if "REPLAY_FUSED_SELECT" in os.environ:
-    del os.environ["REPLAY_FUSED_SELECT"]
-# same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
-if "REPLAY_FUSED_FRONT_RANK_BG" in os.environ:
-    del os.environ["REPLAY_FUSED_FRONT_RANK_BG"]
-# same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
-if "REPLAY_FUSED_KERNEL" in os.environ:
-    del os.environ["REPLAY_FUSED_KERNEL"]
-# same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
-if "REPLAY_FUSED_P1_READ" in os.environ:
-    del os.environ["REPLAY_FUSED_P1_READ"]
+# NOT under the __mp_main__ spelling: an mp.spawn child re-executes this
+# module under that name before unpickling the worker, and the world-2
+# fd-captured A/Bs need the env set in the parent to survive into the
+# child's import-time _S0_PROFILE bind (it is the only route there) —
+# deleting it here would silence the S0FRONT echo those tests assert on.
+if __name__ != "__mp_main__":
+    if "REPLAY_S0_PROFILE" in os.environ:
+        del os.environ["REPLAY_S0_PROFILE"]
+        replay_fused._S0_PROFILE = False
+    if "REPLAY_FUSED_FRONT_SORT" in os.environ:
+        del os.environ["REPLAY_FUSED_FRONT_SORT"]
+    # same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
+    if "REPLAY_FUSED_SELECT" in os.environ:
+        del os.environ["REPLAY_FUSED_SELECT"]
+    # same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
+    if "REPLAY_FUSED_FRONT_RANK_BG" in os.environ:
+        del os.environ["REPLAY_FUSED_FRONT_RANK_BG"]
+    # same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
+    if "REPLAY_FUSED_KERNEL" in os.environ:
+        del os.environ["REPLAY_FUSED_KERNEL"]
+    # same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
+    if "REPLAY_FUSED_P1_READ" in os.environ:
+        del os.environ["REPLAY_FUSED_P1_READ"]
 
 
 B1, B2, EPS, WD = 0.9, 0.95, 1e-8, 0.1
