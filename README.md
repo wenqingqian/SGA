@@ -6,18 +6,22 @@ error_feedback × backend) is pure configuration, not code.
 
 - `sga/launcher/` — multi-node ssh launcher (deep-copied from FlagScale's
   runner, train/ssh/megatron only; run/stop/query via `run.py` + hydra).
-- `sga/config/` — single-layer yaml validation; the `sga:` algorithm section
-  never reaches the megatron command line.
+- `sga/config/` — single-layer yaml validation; the `sga:` section rides to
+  the training entry as the exact flat `--sga-*` flag vocabulary and never
+  leaks into megatron's `train.*` flattening.
 - `sga/train_gpt.py` — the torchrun entrypoint, reusing megatron's stock
   pretrain implementations and stock GPT build chain verbatim.
-- `sga/plugins/`, `sga/backends/` — reserved for SGA algorithm plugins and
-  gradient-sync backends (day-one backend: `dense`).
+- `sga/plugins/` — the plugin registry (score / selection / optimizer /
+  backend axes); `sga/backends/` — the gradient-sync backends:
+  `torch_pipelined_index` + `torch_pipelined_mask` (active) and
+  `nccl_pipelined_index` (temporarily deprecated; code and tests kept).
+  `dense` is not a backend class — it is the SGA-off value of `sga_backend`.
 - `sga/replay.py`, `sga/replay_fused.py` — offline replay oracle: record a
   training window once (shadow-mode trace), then sweep any
   score × ratio × cycle-length configuration offline; the fused engine
   streams the window once for a whole config group, sharded across GPUs
   with an exact distributed top-k and a reusable dense-reference cache
-  (see docs/fused_replay.md).
+  (see docs/fused_replay_new.md).
 - `examples/llama3/train_1b_dense.yaml` — dense llama 1B config.
 - `tests/` — unit tests + the megatron arg audit tool.
 - `env.sh` — environment single source of truth (megatron source resolution +
@@ -30,13 +34,13 @@ SGA scheme research needs "what would training look like under a different
 selection scheme?" answered many times. Record a training window once
 (`sga_trace_dir` + `sga_trace_branch_points` + `sga_trace_window`, plus
 optional `sga_trace_dump_dtype=bf16` to store the per-step g dumps as bf16
-at rest — see `docs/fused_replay.md` §6.4) on a
+at rest — see `docs/fused_replay_new.md` §6.4) on a
 shadow run, then replay any configuration offline — the fused engine
 advances a whole group of score × ratio × cycle-length arms over a single
 window pass (mixed cycle lengths via `--cycle-lens`, group size derived
 from a state-byte budget via `--fused-state-budget-mb`), sharded across
 GPUs — and spans nodes with `--nodes` (ssh-launched shards over the shared
-NFS view; `docs/fused_replay.md` §6.8) — reproducing per-config replay
+NFS view; `docs/fused_replay_new.md` §6.8) — reproducing per-config replay
 bitwise (single shard)
 or within the frozen pure-reordering band (multi-shard). The branch point
 is a global training step number (train iteration): `--branch-point 40`
@@ -51,7 +55,8 @@ iteration, consuming the `--window` recorded gradient steps after it
         --dense-cache <cache-dir> --out report.json
 
 Details, precision guarantees, and a full parameter reference:
-[docs/fused_replay.md](docs/fused_replay.md) (中文).
+[docs/fused_replay_new.md](docs/fused_replay_new.md) (中文; the current
+version — `docs/fused_replay.md` is the superseded history).
 
 ## Quick start (in the training container)
 
@@ -61,9 +66,12 @@ bash setup.sh            # env + sibling-repo state report
 python tests/audit_megatron_args.py check examples/llama3/train_1b_dense.yaml
 python run.py --config-path examples/llama3 --config-name train_1b_dense \
     action=run experiment.exp_name=exp1 experiment.exp_dir=/path/to/exp1 \
-    experiment.runner.nnodes=3 experiment.runner.hostfile=examples/llama3/hostfile.txt \
+    experiment.runner.nnodes=3 experiment.runner.hostfile=<your-hostfile.txt> \
     train.model.global_batch_size=24 train.model.optimizer.lr_scheduler.lr=3e-05 \
     train.model.optimizer.lr_scheduler.min_lr=3e-06
+# hostfile (not committed; the example yamls default to
+# examples/llama3/hostfile.txt): one "<ip> slots=8" line per node.
+# A missing hostfile only WARNs and trains local-only.
 python run.py ... action=query   # / action=stop
 ```
 
