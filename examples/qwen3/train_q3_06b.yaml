@@ -1,0 +1,162 @@
+# Qwen3-0.6B base (L2-M 模型轴单元): 规格逐键 = HF Qwen/Qwen3-0.6B
+# 官方 config.json: hidden 1024 / 28L / GQA 16:8 / head_dim 128 显式 (q 2048 > hidden)
+# / FFN 3072 / vocab 151936 / tied / rope 1e6 / rms_eps 1e-6; 参数量 596,049,920
+# (RUN2 启动打印 = 官方卡两口径全吻合: 总 0.60B / 非嵌入 0.44B)。
+# 2026-10-11 模型轴全线 1.7B→0.6B (用户裁定); 历史档 train_q3_17b.yaml
+# (1.7B, 2026-10-10/11 两次实证 40GB 复制世界形 OOM)。
+# 骨架照 examples/llama3/train_1b_adamw.yaml, 非模型键不动 — 与 llama3 线直接可比。
+# SGA "radius" named preset: topk scheme (method=histogram) as a pure
+# four-field config combination. Everything outside the sga: section mirrors
+# examples/llama3/train_1b_dense.yaml so runs are directly comparable.
+#
+# score=update + selection=topk method=histogram (exact tier) +
+# optimizer=adamw (residual) + backend=torch_pipelined_index.
+# Cycle: full sync + reselect every period-8 boundary after start_iter;
+# residual folds undivided at boundaries (paper-exact).
+
+defaults:
+  - _self_
+
+experiment:
+  exp_name: UNDEFINED
+  exp_dir: UNDEFINED
+  task:
+    type: train
+    backend: megatron
+    entrypoint: ./sga/train_gpt.py
+  runner:
+    type: ssh
+    backend: torchrun
+    nnodes: 1
+    nproc_per_node: 8
+    ssh_port: 2222
+    master_port: 29512
+    no_shared_fs: false
+    rdzv_backend: static
+    hostfile: ./examples/qwen3/hostfile.txt
+  cmds:
+    before_start: |
+      source /root/miniconda3/etc/profile.d/conda.sh && conda activate flagscale
+      source /workspace/sga_framework/SGA/env.sh --check
+      export LD_LIBRARY_PATH=/root/miniconda3/envs/flagscale/lib:\${LD_LIBRARY_PATH}
+      export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  envs:
+    CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+    CUDA_DEVICE_MAX_CONNECTIONS: 1
+    NVTE_APPLY_QK_LAYER_SCALING: 0
+    NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+    NCCL_DEBUG: WARN
+    NCCL_IB_DISABLE: 0
+    NCCL_IB_GID_INDEX: 3
+    NCCL_NET_GDR_LEVEL: 5
+    NCCL_P2P_DISABLE: 0
+    NCCL_P2P_LEVEL: NVL
+    GLOO_SOCKET_IFNAME: enp226s0
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+action: run
+
+hydra:
+  run:
+    dir: ${experiment.exp_dir}/hydra
+
+sga:
+  # Flat SGA arguments — the same vocabulary as the --sga-* flags
+  # (underscores instead of hyphens). See sga/config/arguments.py for
+  # every knob, its default and its semantics.
+  sga_enabled: true
+
+  # cycle: the reselection calendar
+  sga_cycle_start_iter: 20
+  sga_cycle_period: 8
+
+  # score: the boundary score (registry data, no params)
+  sga_score: update
+
+  # selection (topk): method + its params
+  sga_selection_method: histogram
+  sga_selection_histogram_mode: balanced
+  sga_selection_ratio_percent: 10
+
+  # optimizer (adamw)
+  sga_optimizer: adamw
+  sga_optimizer_residual_mean: false
+
+  # backend: sparse allreduce transport
+  sga_backend: torch_pipelined_index
+
+#### model ####
+
+train:
+  system:
+    rerun_mode: disabled
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    disable_bias_linear: True
+    use_flash_attn: True
+    sequence_parallel: True
+    use_distributed_optimizer: False
+    data_parallel_sharding_strategy: no_shard
+    precision:
+      bf16: True
+      attention_softmax_in_fp32: true
+      accumulate_allreduce_grads_in_fp32: true
+    logging:
+      timing_log_level: 2
+      log_interval: 1
+      log_throughput: true
+      log_params_norm: true
+      log_num_zeros_in_grad: true
+    checkpoint:
+      save_interval: 100000
+
+  model:
+    transformer_impl: transformer_engine
+    num_layers: 28
+    hidden_size: 1024
+    ffn_hidden_size: 3072
+    num_attention_heads: 16
+    seq_length: 2048
+    group_query_attention: True
+    num_query_groups: 8
+    max_position_embeddings: 2048
+    norm_epsilon: 1e-6
+    use_rotary_position_embeddings: True
+    swiglu: True
+    normalization: RMSNorm
+    position_embedding_type: rope
+    rotary_base: 1000000
+    kv_channels: 128
+    qk_layernorm: True
+    untie_embeddings_and_output_weights: False
+    init_method_std: 0.02
+    attention_dropout: 0.0
+    hidden_dropout: 0.0
+    clip_grad: 1.0
+    train_iters: 5000
+    exit_interval: 200
+    eval_iters: 0
+    eval_interval: 10000000
+    micro_batch_size: 1
+    global_batch_size: 8
+    seed: 1234
+    optimizer:
+      weight_decay: 1e-2
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      lr_scheduler:
+        lr: 1.0e-5
+        min_lr: 1.0e-6
+        lr_warmup_fraction: 0.1
+        lr_decay_style: cosine
+
+  data:
+    data_path: /workspace/sga_framework/data/openwebtext/openwebtext-meg-qwen3_text_document
+    split: 1
+    tokenizer:
+      tokenizer_type: HuggingFaceTokenizer
+      tokenizer_model: /workspace/sga_framework/data/tokenizers/qwen3-0.6b
+      # qwen3 tokenizer 全尺寸同一家族 (0.6B/1.7B 同一 vocab 151936); 目录 qwen3-0.6b
+      # 为别名 (symlink → 原 qwen3-1.7b 目录, 文件同一物), openwebtext-meg-qwen3 数据不动
+      padded_vocab_size: 151936
+      make_vocab_size_divisible_by: 64
