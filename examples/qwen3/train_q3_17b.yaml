@@ -1,15 +1,16 @@
-# Qwen3-1.7B base — 历史档 (2026-10-10/11 两次实证 40GB 卡复制世界形 OOM,
-# 2026-10-11 用户裁定模型轴全线换 0.6B → 活跃规格 train_q3_06b.yaml; 本文件保留作 OOM 证据)。
-# 规格逐键 = smoke 腿核实记录 (参数量 1,720,574,976 smoke 实测吻合);
-# 骨架照 examples/llama3/train_1b_adamw.yaml, 非模型键不动 — 与 llama3 线直接可比。
-# SGA "radius" named preset: topk scheme (method=histogram) as a pure
-# four-field config combination. Everything outside the sga: section mirrors
+# Qwen3-1.7B base config — superseded by train_q3_06b.yaml as the active
+# model size (1.7B ran out of memory on 40GB A100s in this setup; kept as
+# a reference). Parameter count 1,720,574,976, matching the official
+# model. Structure follows examples/llama3/train_1b_adamw.yaml; non-model
+# keys are untouched, so runs compare directly against the llama3 line.
+# SGA preset: topk selection (method=histogram) as a pure four-field
+# config combination. Everything outside the sga: section mirrors
 # examples/llama3/train_1b_dense.yaml so runs are directly comparable.
 #
-# score=update + selection=topk method=histogram (exact tier) +
+# score=update + selection=topk method=histogram +
 # optimizer=adamw (residual) + backend=torch_pipelined_index.
 # Cycle: full sync + reselect every period-8 boundary after start_iter;
-# residual folds undivided at boundaries (paper-exact).
+# the residual folds into the boundary full sync undivided.
 
 defaults:
   - _self_
@@ -153,6 +154,6 @@ train:
     tokenizer:
       tokenizer_type: HuggingFaceTokenizer
       tokenizer_model: /workspace/sga_framework/data/tokenizers/qwen3-1.7b
-      # qwen3 vocab 151936 = 64x2374, no padding needed (smoke leg verified)
+      # qwen3 vocab 151936 = 64x2374, no padding needed
       padded_vocab_size: 151936
       make_vocab_size_divisible_by: 64

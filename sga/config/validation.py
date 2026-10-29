@@ -113,9 +113,8 @@ def parse_layer_patterns(raw):
 
 def _dead_config_exceptions(args) -> None:
     """Dead-config refusals that are worth their loudness (user-curated
-    list, 2026-09-06 x-grilling): everything else that a config path does
-    not read is silently ignored, megatron-style. New entries go HERE and
-    nowhere else.
+    list): everything else that a config path does not read is silently
+    ignored, megatron-style. New entries go HERE and nowhere else.
 
     block_size: the one knob whose silent death means a WRONG EXPERIMENT
     rather than a no-op — block-granular selection configured under a
@@ -251,9 +250,8 @@ def validate_sga_args(args=None) -> None:
         if dd not in ("fp32", "bf16"):
             raise ValueError(
                 f"sga_trace_dump_dtype must be 'fp32' or 'bf16' (got {dd!r})")
-        # Lazy import: sga.trace -> sga.config (package __init__) -> this
-        # module -> sga.trace is a cycle; deferring keeps both importable
-        # first.
+        # Lazy import: sga.trace pulls in torch, so import it only when a
+        # trace config is actually present.
         from sga.trace import parse_branch_points
         try:
             # write-back: the comma token parses into the sorted list
@@ -349,10 +347,9 @@ def validate_sga_args(args=None) -> None:
         # ahead of every selection-conditional rule below (the curated
         # dead-config gate and the block comm-path rules stay as shadowed
         # defense); re-enabling another selection is a deliberate
-        # gate-lift, not a config choice. SGA_ALLOW_FROZEN_SELECTION=1 is
-        # an escape for the standing baseline-gate scripts only — their
-        # preregistered arms spell older selections and migrating them
-        # would re-baseline the gate; any other use is a gate-lift in
+        # gate-lift, not a config choice. SGA_ALLOW_FROZEN_SELECTION=1
+        # exists only to keep legacy baseline scripts' existing
+        # configurations running; any other use is a gate-lift in
         # disguise, and the escape prints loudly every time it opens.
         if (args.sga_selection_method != "histogram"
                 or args.sga_selection_histogram_mode != "balanced"):
@@ -405,8 +402,7 @@ def validate_sga_args(args=None) -> None:
             # (systematic over-selection) and a block payload amplifies
             # it. Selection-layer gate: holds for eb AND bb.
             # TODO(fast-block): sound once the threshold moves to the
-            # crossing bin's midpoint/upper edge — that is its own plan;
-            # lift this gate there.
+            # crossing bin's midpoint/upper edge; lift this gate there.
             if args.sga_selection_histogram_mode == "fast":
                 raise ValueError(
                     "sga_selection_block_size > 1 with "

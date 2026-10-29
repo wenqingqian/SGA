@@ -1,10 +1,9 @@
 # Copyright (c) 2026, SGA framework contributors.
 """Triton kernels for the fused replay's fp32 elementwise passes.
 
-Every kernel here replicates one torch eager fp32 chain bit-for-bit (the
-conformance recipe was pinned by adversarial-lane probes against the
-torch 2.9.0+cu128 / triton 3.5.0 stack; see tests/test_replay_kernels.py
-for the conformance matrix):
+Every kernel here replicates one torch eager fp32 chain bit-for-bit (pinned on the
+torch 2.9.0+cu128 / triton 3.5.0 stack; the conformance matrix lives in
+tests/test_replay_kernels.py):
 
 - plain tensor mul/add/sub are correctly-rounded fp32 with no FMA
   contraction — plain f32 ops with ``enable_fp_fusion=False``;

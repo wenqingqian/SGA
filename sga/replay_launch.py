@@ -49,7 +49,7 @@ minutes on this cluster). A failed confirmation is a loud stop naming the node, 
 and the sizes — the operator warms/verifies manually and reruns; the
 launch has not started, so nothing needs cleanup.
 
-ssh discipline: remote paths are always /workspace view (host /nfs/gzlu
+ssh discipline: remote paths are always /workspace view (host-side mount
 paths do not exist on the nodes); conda activation precedes python; the
 cluster key is discovered via --ssh-key / $SGA_SSH_KEY / the nearest
 workspace ancestor holding ``cluster_ssh_key``.
@@ -65,6 +65,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 import torch
@@ -231,8 +232,7 @@ def _node_worker_preflight(args):
 
 def _node_worker_run(args):
     cfg = _cfg_from_b64(args.cfg_b64)
-    # cfg["device"] is the run phase's authority (the preflight tail carries
-    # --device only because preflight has no cfg to read)
+    # cfg["device"] is the run phase's authority
     _cuda_shard_gate(args.local_shards, cfg["device"])
     # the rendezvous endpoint arrives by env (Comms' multi-node mode); the
     # node-worker is its single authority on this machine
@@ -610,7 +610,6 @@ def run_fused_branch_multinode(args, ctx, t0, nodes, *, executor=None,
     complete branch dict (same JSON shape as the single-node path). The
     calling process must run on node 0 and share the NFS view of the other
     nodes (paths verbatim, /workspace view inside containers)."""
-    import tempfile
     import sga.replay as R
     from sga.replay_fused import (_common_gates, _fused_cfg,
                                   _populate_dense_cache)

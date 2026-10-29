@@ -1,18 +1,20 @@
-# Qwen3-0.6B base (L2-M 模型轴单元): 规格逐键 = HF Qwen/Qwen3-0.6B
-# 官方 config.json: hidden 1024 / 28L / GQA 16:8 / head_dim 128 显式 (q 2048 > hidden)
-# / FFN 3072 / vocab 151936 / tied / rope 1e6 / rms_eps 1e-6; 参数量 596,049,920
-# (RUN2 启动打印 = 官方卡两口径全吻合: 总 0.60B / 非嵌入 0.44B)。
-# 2026-10-11 模型轴全线 1.7B→0.6B (用户裁定); 历史档 train_q3_17b.yaml
-# (1.7B, 2026-10-10/11 两次实证 40GB 复制世界形 OOM)。
-# 骨架照 examples/llama3/train_1b_adamw.yaml, 非模型键不动 — 与 llama3 线直接可比。
-# SGA "radius" named preset: topk scheme (method=histogram) as a pure
-# four-field config combination. Everything outside the sga: section mirrors
+# Qwen3-0.6B base config. Model keys mirror the official Qwen/Qwen3-0.6B
+# config.json: hidden 1024 / 28 layers / GQA 16:8 / head_dim 128 explicit
+# (q dim 2048 > hidden) / FFN 3072 / vocab 151936 / tied embeddings /
+# rope 1e6 / rms_eps 1e-6; parameter count 596,049,920 (0.60B total,
+# 0.44B non-embedding, matching the official model card).
+# The 1.7B variant (train_q3_17b.yaml) ran out of memory on 40GB A100s
+# in this setup and is kept as a reference only.
+# Structure follows examples/llama3/train_1b_adamw.yaml; non-model keys
+# are untouched, so runs compare directly against the llama3 line.
+# SGA preset: topk selection (method=histogram) as a pure four-field
+# config combination. Everything outside the sga: section mirrors
 # examples/llama3/train_1b_dense.yaml so runs are directly comparable.
 #
-# score=update + selection=topk method=histogram (exact tier) +
+# score=update + selection=topk method=histogram +
 # optimizer=adamw (residual) + backend=torch_pipelined_index.
 # Cycle: full sync + reselect every period-8 boundary after start_iter;
-# residual folds undivided at boundaries (paper-exact).
+# the residual folds into the boundary full sync undivided.
 
 defaults:
   - _self_
@@ -156,7 +158,8 @@ train:
     tokenizer:
       tokenizer_type: HuggingFaceTokenizer
       tokenizer_model: /workspace/sga_framework/data/tokenizers/qwen3-0.6b
-      # qwen3 tokenizer 全尺寸同一家族 (0.6B/1.7B 同一 vocab 151936); 目录 qwen3-0.6b
-      # 为别名 (symlink → 原 qwen3-1.7b 目录, 文件同一物), openwebtext-meg-qwen3 数据不动
+      # qwen3 0.6B and 1.7B share the same tokenizer (vocab 151936); the
+      # qwen3-0.6b tokenizer directory is an alias of the qwen3-1.7b one
+      # (same files), so the openwebtext-meg-qwen3 data needs no change
       padded_vocab_size: 151936
       make_vocab_size_divisible_by: 64

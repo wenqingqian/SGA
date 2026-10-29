@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """Tokenizer equivalence assertion (container-only; run after `source env.sh`).
 
-The old baseline used FlagScale's Llama3TokenizerFS shim (HF AutoTokenizer over
-data/llama3_dataset, eod = eos_token_id, vocab = vocab_size + added tokens =
-64002 + 305 = 64307, padded to 64320). Megatron 0.18's HuggingFaceTokenizer
-reports vocab = len(tokenizer) = 64002 instead, and --vocab-size is unused on
-that branch: build_tokenizer pads from the tokenizer property alone whenever
---padded-vocab-size is absent. The bridge therefore pins the model vocab
-explicitly via `padded_vocab_size: 64320` in both run configs (the exact
-value the old runs derived and the base5k_owt checkpoint/embedding and the
-pretokenized indexed datasets were built with).
+Megatron 0.18 derives vocab from the tokenizer property (len(tokenizer) =
+64002), and --vocab-size is unused on that branch: build_tokenizer pads
+from the property alone whenever --padded-vocab-size is absent. The
+checkpoint/embedding and indexed datasets were built at 64320, so both
+run configs must pin padded_vocab_size: 64320.
 
 This asserts (1) eod equality with the old shim derivation and (2) that both
 run configs still pin padded_vocab_size so the embedding never silently
@@ -50,12 +46,7 @@ def main():
 
     tok = build_tokenizer(_Args())
 
-    # The old FlagScale shim (Llama3TokenizerFS) derived eod as
-    # AutoTokenizer.from_pretrained(dir).eos_token_id over the same directory
-    # (md5-identical files); 0.18's HuggingFaceTokenizer derives eod the same
-    # way. The vocab_size *property* formulas differ numerically (len(tok) =
-    # 64002 vs vocab+added = 64307), so the embedding vocab must come from the
-    # explicit padded_vocab_size pin, never from the property.
+    # same directory, same eos derivation; vocab property formulas differ (see module docstring)
     from transformers import AutoTokenizer
 
     hf = AutoTokenizer.from_pretrained(TOKENIZER_DIR, trust_remote_code=True)

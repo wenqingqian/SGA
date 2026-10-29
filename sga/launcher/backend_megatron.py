@@ -12,6 +12,7 @@ Megatron-LM must be provided by the user's ``cmds.before_start`` (normally
 
 import os
 import shlex
+import argparse
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -25,19 +26,17 @@ from sga.launcher.utils import (
     setup_logging_dirs,
 )
 from sga.logger import logger
+from sga.config.arguments import sga_int_or_null, add_sga_args
+from sga.config.validation import sga_actions, validate_sga_args
 
 
 def _sga_section_to_flags(config) -> list:
-    """Render the yaml ``sga:`` section into the exact ``--sga-*`` flag
-    list the training entry will see (FLAT keys — the same vocabulary as
-    the flags, underscores instead of hyphens). The sga_ prefix contract
-    is re-asserted at this transport point: every yaml sga: key IS the
-    full flat dest, no short form exists."""
+    """Render the yaml ``sga:`` section into the exact ``--sga-*`` flag list.
+    Keys must be the full flat dests (``sga_`` prefix, underscores); enforced
+    at emission (prefix assert + unknown-key rejection)."""
     sga = OmegaConf.to_container(config.sga, resolve=True)
     assert all(isinstance(k, str) and k.startswith("sga_") for k in sga), (
         f"sga: keys must be the full flat sga_* names (got {sorted(sga)})")
-    from sga.config.arguments import sga_int_or_null
-    from sga.config.validation import sga_actions
 
     flags = []
     for dest in sorted(sga):
@@ -97,11 +96,6 @@ def _prevalidate_sga(config) -> None:
     assert "sga" not in OmegaConf.to_container(config.train, resolve=True), \
         "sga section leaked into train.*"
 
-    import argparse
-
-    from sga.config.arguments import add_sga_args
-    from sga.config.validation import validate_sga_args
-
     class _LoudParser(argparse.ArgumentParser):
         """argparse's own complaints (typing, choices) as ValueError with
         the FLAG NAMED — a bare SystemExit(2) would swallow the message
@@ -139,7 +133,6 @@ def _get_args_megatron(config: DictConfig):
         "This function only supports megatron backend."
     )
 
-    # Convert the DictConfig to a regular dictionary
     config_dict = OmegaConf.to_container(config, resolve=True)
     config_dict = config_dict["train"]
 
@@ -149,13 +142,9 @@ def _get_args_megatron(config: DictConfig):
     new_config_dict.update(config_dict["data"])
 
     ignore_keys = ["log_dir", "details_dir", "scripts_dir", "pids_dir", "no_shared_fs"]
-    # Flatten the dictionary to a list of arguments
     args = flatten_dict_to_args(new_config_dict, ignore_keys)
 
-    # The sga: section becomes the visible flags themselves, pre-validated
-    # here (fail-fast before any process is spawned; the training entry
-    # re-validates on its parsed namespace). There is no translation
-    # layer and no JSON form.
+    # sga: flags are emitted pre-validated by _prevalidate_sga above.
     _prevalidate_sga(config)
     args.extend(_sga_section_to_flags(config))
 
@@ -342,7 +331,7 @@ class MegatronBackend(BackendBase):
             f.write("    pid=$(cat " + shlex.quote(host_pid_file) + ")\n")
             f.write("    pkill -P $pid\n")
             f.write("else\n")
-            # TODO: This is a temporary fix. We need to find a better way to stop the job.
+            # Fallback when the pid file is missing: kill every torchrun process.
             f.write("    pkill -f 'torchrun'\n")
             f.write("fi\n")
             f.write(f"{after_stop}\n")

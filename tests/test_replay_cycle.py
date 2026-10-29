@@ -12,12 +12,11 @@ accumulate the unselected pre-clip gradient into a residual; every
 ``cycle_len`` steps a full-sync boundary commits ``q = g + residual``
 (clipped by the folded norm), clears the residual, and re-selects the next
 cycle's mask from the boundary score computed on the pre-commit state.
-The classic in-process cycle engine (sparse_replay_cycle) was removed; this
-suite's FROM-SPEC REFERENCE (reference_cycle below) is the sole independent
-spec anchor for the semantics — the fused engine is validated against it
-(the pre-deletion classic engine is reproducible from the old tag).
+This suite's from-spec reference (reference_cycle below) is the sole
+independent spec anchor for the cycle semantics; the fused engine is
+validated against it.
 
-Tests (ported from the legacy oracle suite, importing sga.replay):
+Tests (importing sga.replay):
 1. T=1 degenerates to the dense trajectory (distortion exactly 0).
 2. T > window: residual accumulates but never folds (fixed mask from the
    branch selection) — matches an independent reference loop.
@@ -576,8 +575,7 @@ def test_cli_rejects_invalid_options():
     base = ["--trace-dir", "/nonexistent-sga-trace-dir"]
     cases = [
         (["--replay-mode", "cycle", "--cycle-len", "0"], "--cycle-len"),
-        # the loud post-consolidation gate: classic cycle-without-cache was
-        # removed; cycle now always routes to the fused engine, which
+        # the loud gate: cycle always routes to the fused engine, which
         # consumes --dense-cache (populated on the first run)
         (["--replay-mode", "cycle", "--branch-point", "5"], "--dense-cache"),
         # --fused is a deprecated no-op, but only where it ever made sense

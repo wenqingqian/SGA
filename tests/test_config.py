@@ -39,7 +39,7 @@ train:
 
 
 def make_base():
-    """A fresh BASE config with exp_dir in a private temp dir (auto-cleaned)."""
+    """A fresh BASE config with exp_dir in a private temp dir."""
     tmp = tempfile.mkdtemp(prefix="sga-test-exp-")
     cfg = OmegaConf.create(BASE)
     cfg.experiment.exp_dir = os.path.join(tmp, "exp")
@@ -144,7 +144,7 @@ def test_checks_validation():
 
     cfg.sga.sga_checks_count_guard = "no"
     expect_error(lambda: _prevalidate_sga(cfg), "true' or 'false")
-    # any checks key under a disabled config is silently ignored now
+    # any checks key under a disabled config is silently ignored
     # (megatron semantics: zero checks below sga_enabled=false)
     cfg2, _ = make_base()
     OmegaConf.update(cfg2, "sga.sga_checks_count_guard", False)
@@ -258,7 +258,7 @@ def test_start_iter_percent_resolves():
     cfg, _ = make_base()
     _enable_standard(cfg)
     del cfg.sga.sga_cycle_start_iter
-    cfg.sga.sga_cycle_start_iter_percent = 1.6  # of train_iters 2 below
+    cfg.sga.sga_cycle_start_iter_percent = 1.6  # 1.6% of train_iters=5000 -> 80
     OmegaConf.update(cfg, "train.model.train_iters", 5000)
     ns = _ns_of(cfg)
     assert ns.sga_cycle_start_iter == 80  # round(0.016*5000)
@@ -388,9 +388,9 @@ def test_shipped_layout_subtree_reads():
     """The two non-sga keys validation reads are selected through BOTH
     train subtrees in the flattening order (system first, model
     overrides): the SHIPPED layout carries pipeline_model_parallel_size
-    under train.system (all llama3 examples), so a single-subtree select
-    left the always-sync pp>1 rule dead at launch time for shipped
-    configs (build_engine only refused after spawn)."""
+    under train.system (all llama3 examples), so reading only one subtree
+    leaves the always-sync pp>1 rule dead at launch time for shipped
+    configs (build_engine refuses only after spawn)."""
     cfg, _ = make_base()
     _enable_standard(cfg)
     cfg.sga.sga_always_sync_layers = ["embed"]
@@ -449,7 +449,7 @@ def test_unknown_backend_lists_valid():
 def test_disabled_ignores_other_keys():
     """Megatron semantics: a disabled feature's sub-args are
     never validated — every explicit key under sga_enabled=false is
-    silently ignored (the old disabled-cleanliness contract is gone)."""
+    silently ignored."""
     cfg, _ = make_base()
     OmegaConf.update(cfg, "sga", {"sga_enabled": False, "sga_shadow": True,
                                   "sga_cycle_period": 8,
@@ -613,7 +613,7 @@ def test_shipped_examples_validate():
 
 def test_selection_freeze_and_escape():
     """The freeze refuses non-balanced method/mode pairings by default;
-    the env escape opens the gate for the standing baseline-gate scripts
+    the env escape exists to keep existing baseline scripts running
     and prints loudly every time it does. The escape is read at validation
     time, so dropping the var restores the refusal immediately."""
     base = {"sga_enabled": True, "sga_score": "abs_m",

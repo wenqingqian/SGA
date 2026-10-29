@@ -6,8 +6,8 @@ localhost carries the tiny control-plane exchanges):
 
     python SGA/tests/test_replay_fused.py
 
-Contract under test (the fused engine is the ONLY cycle engine — the
-classic in-process cycle replay was removed; cycle auto-routes here):
+Contract under test (the fused engine is the only cycle engine; cycle
+auto-routes here):
 1. world=1: the report's distortions match the from-spec reference
    (test_replay_cycle.reference_cycle) for every score x ratio x horizon;
    a miss run populates the cache and reports dense_cache_hit False, the
@@ -107,6 +107,7 @@ import zipfile
 from contextlib import redirect_stdout
 
 import torch
+import torch.multiprocessing as mp
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -337,8 +338,7 @@ def test_fused_world1_bitwise():
     same run invoked with the deprecated --fused flag (the comparison arm
     is a second cache HIT — the miss->hit roundtrip equality is anchored by
     test_replay_cycle.test_dense_cache_roundtrip), and every distortion
-    matches the from-spec reference (the classic comparison arm is gone
-    with the classic engine — reference_cycle is the spec anchor)."""
+    matches the from-spec reference (reference_cycle is the spec anchor)."""
     with tempfile.TemporaryDirectory() as td:
         (t0, W, pre, lrs, clip, absent, w0s, m0s, v0s, g0s) = \
             _build_fixture(td)
@@ -427,8 +427,7 @@ def test_fused_world2_band():
     """Two shards (mp.spawn + gloo): the score vectors themselves are
     elementwise (bitwise identical across shardings); only the fp64 scalar
     SUMS reorder (clip norms, distortion numerators, sum statistics) —
-    world=2 against the world=1 run (self-consistency; the classic
-    comparison arm is gone with the classic engine)."""
+    world=2 against the world=1 run (self-consistency)."""
     with tempfile.TemporaryDirectory() as td:
         t0, _W = _build_fixture(td)[0:2]
         cache = os.path.join(td, "dense_cache")
@@ -678,7 +677,6 @@ def test_comms_env_multinode_world2():
     init over the master endpoint (the port argument is 0, so only the env
     path can rendezvous) plus one sum_f64 and one all_gather_pad
     roundtrip."""
-    import torch.multiprocessing as mp
     _with_rendezvous_env(lambda: mp.spawn(
         _env_comms_worker, args=(2, 0, 2, 2.0), nprocs=2, join=True))
     print("PASS test_comms_env_multinode_world2")
@@ -690,7 +688,6 @@ def test_comms_env_global_local_split():
     4 meet), collectives return in global process-group rank order (the
     order shard_select's tie-fill indexes), and self.rank stays the local
     shard index."""
-    import torch.multiprocessing as mp
     _with_rendezvous_env(lambda: mp.spawn(
         _env_comms_worker, args=(4, 0, 2, 8.0), nprocs=4, join=True))
     print("PASS test_comms_env_global_local_split")
@@ -1045,8 +1042,7 @@ def test_pread_prefetch_bitwise():
                                               ["--fused-shards", "1"]))
                 assert echo in buf.getvalue(), (echo, buf.getvalue()[-500:])
                 reps.append(rep)
-            # the read arm must not move a report bit (hard gate 1 at
-            # fixture scale; the w1000 gate is the same comparison)
+            # the read arm must not move a report bit
             for rep in reps:
                 rep["branch_results"][str(t0)]["replay"].pop(
                     "dense_cache_hit")
@@ -1522,7 +1518,7 @@ def test_ranking_idcg_device_bitwise():
     lb[::5] = -0.0
     sc = torch.randint(0, 32, (n,), generator=g).float() / 4.0
     lsel = torch.rand(n, generator=g) < 0.3
-    k = n  # engine call sites: k == gathered-selection length
+    k = n
     parts = [lb[: n // 2], lb[n // 2:]]
     idcg_cpu = replay_fused._idcg_of_parts(parts)
     idcg_dev = replay_fused._idcg_of_parts(parts, dev="cuda:0")
@@ -2067,7 +2063,6 @@ def test_all_gather_pad_dev_world2():
     if torch.cuda.device_count() < 2:
         print("SKIP test_all_gather_pad_dev_world2 (needs 2 visible GPUs)")
         return
-    import torch.multiprocessing as mp
     mp.spawn(_agp_dev_world2_worker,
              args=(2, replay_fused._free_port()), nprocs=2, join=True)
     print("PASS test_all_gather_pad_dev_world2")
@@ -2477,7 +2472,7 @@ def test_s0_profile_counters():
                 # coverage: the buckets account for the group wall — loose
                 # bounds on this tiny CPU fixture (the glue outside the
                 # brackets is proportionally larger here); the production
-                # gate (>=80%) is checked on the w1000 run, not here
+                # gate (>=80%) is not checked here
                 cov = (prof["stp"] + prof["qw"] + prof["h2dl"]
                        + sum(prof["pt"]) + prof["hzar"] + prof["cln"]
                        ) / prof["gw"]

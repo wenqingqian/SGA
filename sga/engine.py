@@ -61,7 +61,7 @@ from sga.kernels import (
 from sga.plugins.optimizer import OptContext, ParamRecord
 from sga.plugins.scores import get_score_spec
 from sga.shadow import readonly_score
-from sga.support import BucketSupport, Support
+from sga.support import BucketSupport, IndexPool, Support
 from sga.trace import TraceCollector
 
 
@@ -263,8 +263,8 @@ class SGAEngine:
         if not (self._count_guard and self._support_consistency
                 and self._norm_spread and self._rng_bracket):
             # rank-once (ctor runs before self._rank is set below): the
-            # posture line is for the merged hostcat, eight copies of it
-            # say nothing new. The consequence sentences follow the
+            # posture line is for the merged hostcat; per-rank copies
+            # would say nothing new. The consequence sentences follow the
             # actual off layers — the shadow-local RNG bracket is not a
             # cross-rank detector, so its sentence must not claim one.
             if (not torch.distributed.is_initialized()
@@ -933,7 +933,6 @@ class SGAEngine:
     def _bucket_idx_pool(self, i: int):
         """Grow-only idx pool for bucket ``i`` (shared across cycles)."""
         if self._idx_pools is None:
-            from sga.support import IndexPool
             self._idx_pools = [IndexPool() for _ in self._bucket_states]
         return self._idx_pools[i]
 
@@ -1077,8 +1076,7 @@ class SGAEngine:
         # norm input (post-allreduce, pre-coeff) — a contiguous
         # deterministic reduction with no atomics (the masked kernel's
         # atomic accumulation was the run-to-run jitter source; the
-        # DP-bitwise fix below stays as an unconditional invariant, no
-        # longer load-bearing for it).
+        # DP-bitwise fix below stays an unconditional invariant).
         compact = (self._compact_values
                    if (not was_full and self._compact_values
                        and self.backend.emission == "compact")
@@ -1283,11 +1281,10 @@ class SGAEngine:
         Compact-emission sparse steps count the PACKED view: the pack
         zeroed the communicated coords at grad_sync, so they all read as
         zeros and the reported number is inflated by k - zeros_in_vals
-        per bucket. Accuracy is deliberately waived here (user ruling
-        2026-09-14): restoring the writeback-view number would require a
-        values-buffer scan that ONLY compact steps pay (+6.1ms/step in
-        the torch idiom — the exp_0004 cp e2e surcharge), i.e. a
-        diagnostic log would price one emission mode above the other."""
+        per bucket. Accuracy is deliberately waived here: restoring the
+        writeback-view number would require a values-buffer scan that
+        only compact steps pay, so the diagnostic log would price one
+        emission mode above the other."""
         records = self._records or self._refresh_records(mp_opt)
         n = 0
         for rec in records:
@@ -1308,7 +1305,7 @@ class SGAEngine:
         ONCE PER CYCLE, right after support activation: the per-bucket counts
         are the caches filled at activation and the support is immutable
         within the cycle, so the activation-time verdict covers every sparse
-        sync of the cycle (aligned with the legacy per-cycle check).
+        sync of the cycle.
         """
         group = self._dp_cp_group()
         if group is None or self._active_support is None:

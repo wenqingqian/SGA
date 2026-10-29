@@ -1,6 +1,5 @@
 # Copyright (c) 2026, SGA framework contributors.
-"""method=adaptive: persistent-tau topk controller (ported from
-scheme_xp's v3.1).
+"""method=adaptive: persistent-tau topk controller.
 
 A persistent scalar tau replaces the per-boundary histogram select after a
 gated warmup. Dead band ±_ADAPT_BAND around the target ratio; out-of-band
@@ -104,11 +103,11 @@ class AdaptiveTau:
 
     def warmup_sync_target(self, start_iter: int, period: int):
         """Gated warmup selects implied by THIS selection's warmup window
-        (the v3.1 anchor), anchored at start_iter.
+        (the anchor rule), anchored at start_iter.
 
         The window spans ``warmup_syncs * period`` iterations from the run
         start, so a selection starting at start_iter sees ``max(0, (window -
-        1 - start_iter) // period)`` of it. The ``-1`` encodes the v3.1
+        1 - start_iter) // period)`` of it. The ``-1`` encodes the
         boundary rule: a boundary landing EXACTLY at the window edge counts
         as post-warmup (start=0, period=4, N=5 -> iterations 4..20 are all
         inside the window but only 4 gated selects remain — at 4, 8, 12,
@@ -125,7 +124,7 @@ class AdaptiveTau:
         return thresh if thresh > 0.0 else _tau_floor(self.warmup_mode)
 
     def select(self, grads, k, comm_group, warmup_target):
-        """Persistent-threshold select (v3.1, ported from scheme_xp).
+        """Persistent-threshold select.
 
         Warmup: histogram select in ``warmup_mode`` (default fast), gated on
         the measured ratio; a miss resets the consecutive count (warmup is

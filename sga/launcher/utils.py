@@ -16,10 +16,8 @@ from sga.logger import logger
 def resolve_path(path, config_key="", check_exists=False, raise_missing=False):
     """Resolve a config path to an absolute path and optionally validate it.
 
-    Handles all path forms consistently:
-      - Absolute paths (starting with '/') are returned as-is.
-      - Relative paths ('./…', '../…', or bare like 'data/…') are resolved
-        against the current working directory via ``os.path.abspath``.
+    Absolute paths pass through unchanged; anything else is resolved
+    against the current working directory.
 
     Note: ``run.py`` restores the original cwd before any runner code executes
     (equivalent to ``hydra.job.chdir=False``), so ``os.path.abspath`` always
@@ -48,11 +46,7 @@ def resolve_path(path, config_key="", check_exists=False, raise_missing=False):
 
 
 def setup_exp_dir(config):
-    """Resolve experiment directory and ensure it exists.
-
-    Common setup shared by all task types: resolves ``config.experiment.exp_dir``
-    to an absolute path, creates it if necessary, and returns the resolved path.
-    """
+    """Resolve experiment directory and ensure it exists."""
     exp_dir = resolve_path(config.experiment.exp_dir, "experiment.exp_dir")
     os.makedirs(exp_dir, exist_ok=True)
     return exp_dir
@@ -63,8 +57,6 @@ def get_pkg_dir():
 
     Used to locate package-internal files (the ``sga`` package, scripts, etc.)
     in generated run scripts for PYTHONPATH, ``cd``, and script paths.
-
-    Resolves to the parent of the ``sga/`` package directory (repo root).
     """
     # sga/launcher/utils.py -> sga/launcher/ -> sga/ -> repo root
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -132,7 +124,6 @@ def parse_hostfile(hostfile_path):
         line = line.strip()
         match = pattern.search(line)
         if line.startswith("#") or line == "":
-            # hostfile comment or empty line, ignore
             continue
         elif match:
             host = match.group(1)
@@ -357,10 +348,8 @@ def update_nodes_envs(env_config, ip_addr, resource_info):
         )
         return cur_node_config
 
-    # update then envs according to the device type
     if device_types_envs is not None and device_type is not None:
         cur_node_config.update(device_types_envs.get(device_type, {}))
-    # update the envs according to the ip address
     if nodes_envs is not None:
         cur_node_config.update(nodes_envs.get(ip_addr, {}))
 
@@ -400,9 +389,8 @@ def update_cmd_with_node_specific_config(cmd, node_specific_config=None):
         else:
             if value.lower() == "true":
                 cmd_parts.append(option)
-            # NOTE: disable adding new options
-            # elif value.lower() != "false":
-            #     cmd_parts.extend([option, value])
+            # An option missing from the command is only ever added as a bare
+            # flag (value true); options that carry a value are never injected.
     return shlex.join(cmd_parts)
 
 

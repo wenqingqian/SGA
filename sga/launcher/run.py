@@ -16,12 +16,8 @@ from omegaconf.errors import OmegaConfBaseException
 from sga.launcher.runner_base import Runner
 from sga.logger import logger
 
-# To accommodate the scenario where the before_start field is used to switch to the actual environment during program execution,
-# we have placed the import statements inside the function body rather than at the beginning of the file.
-
 VALID_TASKS = {"train"}
 
-# task_type -> allowed actions
 TASK_ACTIONS = {
     "train": {"run", "dryrun", "test", "stop", "query"},
 }
@@ -90,11 +86,7 @@ def main(config: DictConfig) -> None:
 
 
 def _main(config: DictConfig) -> None:
-    """Core logic, separated from main() for error wrapping.
-
-    The sga: section is pre-validated inside the backend's flag assembly
-    (backend_megatron._prevalidate_sga), still fail-fast before any
-    process is spawned."""
+    """Core logic, separated from main() for error wrapping."""
     task_type = config.experiment.task.get("type", None)
     action = config.action
     validate_task(task_type, action)

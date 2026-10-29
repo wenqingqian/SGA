@@ -1,10 +1,9 @@
 # Copyright (c) 2026, SGA framework contributors.
 """Fused single-pass streaming replay (config-grouped, param-sharded).
 
-The removed classic path replayed the window once per arm (1 dense pass +
-one cycle pass per ratio×score), so a sweep re-read the multi-TB window
-~7× per run; this engine advances ALL arms of one config group over the
-window in lockstep — one window read per group — sharded across processes:
+A naive replay reads the whole window once per arm. This engine advances
+all arms of one config group together, so the window is read once per
+group — sharded across processes:
 
 - ``--fused-shards`` shard processes (one per GPU; gloo over localhost for
   the tiny control-plane exchanges, plus an optional single-node NCCL data
@@ -30,10 +29,9 @@ window in lockstep — one window read per group — sharded across processes:
   role below is keyed by the GLOBAL rank, so "rank 0" always means the
   launcher node's first shard.
 
-Arithmetic contract (historical): per-config math was op-identical to the
-removed ``sparse_replay_cycle`` — per-param per-chunk operations in the
-same order — so single-shard runs reproduced the classic report bitwise.
-The standing spec anchor is ``tests/test_replay_cycle.reference_cycle``. At world > 1 the
+Arithmetic contract: per-config math runs per-param per-chunk in the
+same order as ``tests/test_replay_cycle.reference_cycle``, so a
+single-shard run reproduces the reference bitwise. At world > 1 the
 only deviations are cross-shard fp64 scalar-sum reorderings (covered by
 the frozen pure-reordering band), plus the optional ``--norm-dtype fp32``
 quantization (gated by its own frozen band). The
@@ -54,11 +52,13 @@ import threading
 import time
 import queue
 import zipfile
+import tempfile
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
-# opt-in S0 profile: counts host syncs / gloo
+# opt-in stage-0 (S0) profile: counts host syncs / gloo
 # ops / H2D bytes per pass and per-pass wall time; zero effect when unset
 _S0_PROFILE = os.environ.get("REPLAY_S0_PROFILE", "") == "1"
 
@@ -660,8 +660,8 @@ class _FrontRankWorker:
 
 # pread-arm trace index: read a torch.save zip's data.pkl + record offsets
 # WITHOUT faulting any storage page, so the shard's slices can be pulled
-# with plain pread (measured ×1.246 aggregate over the mmap fault path on
-# this NFS — the fault/readahead machinery, not the wire, is the old cap)
+# with plain pread (page faults and readahead, not the wire, cap the mmap
+# path)
 _TRACE_DTYPES = {
     "DoubleStorage": torch.float64, "FloatStorage": torch.float32,
     "HalfStorage": torch.float16, "BFloat16Storage": torch.bfloat16,
@@ -1065,8 +1065,7 @@ def _worker(rank, world, cfg, port, frag_path):
         print(f"[fused] replay kernels: {'triton' if k_on else 'torch'}"
               f" (REPLAY_FUSED_KERNEL={kmode})", flush=True)
     # g-read kill-switch (A/B arms and emergencies): pread pulls the shard's
-    # slice bytes straight (measured ×1.246 aggregate over the mmap fault
-    # path on this NFS); mmap keeps the legacy page-fault reader. Same
+    # slice bytes straight; mmap keeps the page-fault reader. Same
     # unknown-values-must-raise contract as the other replay flags
     p1_read = os.environ.get("REPLAY_FUSED_P1_READ", "pread")
     if p1_read not in ("pread", "mmap"):
@@ -1322,8 +1321,8 @@ def _worker(rank, world, cfg, port, frag_path):
               flush=True)
 
     # ---- streaming passes over config groups ------------------------------
-    # (score, ratio, T) arms; a single T enumerates exactly the historical
-    # (score, ratio) order, so the max_configs partition is unchanged
+    # (score, ratio, T) arms; a single T enumerates the plain (score,
+    # ratio) order, so the max_configs partition is unchanged
     configs = [(s, r, t) for r in ratios for s in score_names
                for t in cycle_lens]
     # group-size cap: with a state byte budget set (>0) the cap is derived
@@ -1739,7 +1738,7 @@ def _worker(rank, world, cfg, port, frag_path):
         for r in ratios:
             scores = {}
             for s in score_names:
-                # a single T keeps the historical bare score key; with a T
+                # a single T uses the bare score key; with a T
                 # set the same score name recurs per T and would collide
                 for t in cycle_lens:
                     key = s if len(cycle_lens) == 1 else f"{s}@T{t}"
@@ -1791,10 +1790,9 @@ def _worker(rank, world, cfg, port, frag_path):
             "scores": stats,
             "per_ratio": per_ratio,
         }
-        # conditional echoes: the default (budget off) report must stay
-        # byte-identical to budget-off artifacts of this version (cycle_lens
-        # above is echoed unconditionally, so pre-knob artifacts already
-        # differ at byte level), so these keys only exist when the knob is on
+        # conditional echoes: the budget-off report shape is frozen — these
+        # keys only exist when the knob is on (cycle_lens above is echoed
+        # unconditionally)
         if cfg["state_budget_mb"] > 0:
             out["replay"]["state_budget_mb"] = float(cfg["state_budget_mb"])
             out["replay"]["group_cap"] = int(eff_cap)
@@ -2040,7 +2038,6 @@ def run_fused_branch(args, ctx, t0):
     """One branch point through the fused engine (single node); returns the
     complete branch dict (same JSON shape as process_branch). Multi-node
     runs go through sga.replay_launch.run_fused_branch_multinode."""
-    import tempfile
     score_names = _common_gates(args)
     world = args.fused_shards
     if world < 1:
@@ -2059,7 +2056,6 @@ def run_fused_branch(args, ctx, t0):
             _worker(0, 1, cfg, 0, frag_path)
         else:
             port = _free_port()
-            import torch.multiprocessing as mp
             mp.spawn(_worker, args=(world, cfg, port, frag_path),
                      nprocs=world, join=True)
         return torch.load(frag_path, map_location="cpu", weights_only=False)

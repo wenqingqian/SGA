@@ -35,8 +35,8 @@ Modes:
                                      then optionally dump the table
   diff-defaults <old.json> <new.json> compare two dumps flag-by-flag (old vs new fork)
 
-Run inside the container conda env after `source ../SGA/env.sh` so
-`megatron.training` resolves to the intended tree (or point PYTHONPATH at
+Run inside the container conda env after `source env.sh` from the SGA
+repo root so `megatron.training` resolves to the intended tree (or point PYTHONPATH at
 another tree to dump it).
 """
 

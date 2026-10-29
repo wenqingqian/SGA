@@ -241,9 +241,9 @@ class BucketSupport:
     # Merge-join directory table (derived lazily): table[j] ==
     # lower_bound(idx, j*1024). Lifetime = this cycle: idx is frozen once
     # built (the mask never changes within a cycle), so the table cannot
-    # go stale. Lives HERE rather than in the optimizer so every record of
-    # the bucket shares one build (~0.5ms, amortized over the cycle's
-    # sparse steps).
+    # go stale. Lives HERE rather than in the optimizer so every record
+    # of the bucket shares one build, amortized over the cycle's sparse
+    # steps.
     _dir_table: torch.Tensor = field(default=None, repr=False)
 
     @property

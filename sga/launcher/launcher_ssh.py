@@ -49,7 +49,6 @@ def _get_runner_cmd_train(
     log_dir = os.path.join(log_dir, datetime.now().strftime("%Y%m%d_%H%M%S.%f"))
     rdzv_backend = runner_config.get("rdzv_backend", "c10d")
     rdzv_endpoint = runner_config.get("rdzv_endpoint", f"{master_addr}:{master_port}")
-    # redirect = runner_config.get("redirects", "3")
     tee = runner_config.get("tee", "3")
 
     runner_args = OmegaConf.to_container(runner_config, resolve=True)
@@ -97,8 +96,6 @@ def _get_runner_cmd_train(
     if "perf_model_type" in runner_args:
         del runner_args["perf_model_type"]
     runner_args["rdzv_id"] = rdzv_id
-    # runner_args["master_addr"] = master_addr
-    # runner_args["master_port"] = master_port
     runner_args["nnodes"] = nnodes
     runner_args["node_rank"] = node_rank
     runner_args["nproc_per_node"] = nproc_per_node
@@ -135,7 +132,6 @@ def run_node(
 ):
     cur_envs = update_nodes_envs(user_envs, host, resource_info)
     # Get the number of visible devices from the environment variable, e.g. CUDA_VISIBLE_DEVICES, MLU_VISIBLE_DEVICES
-    # visible_devices = cur_envs.get("CUDA_VISIBLE_DEVICES", None)
     visible_devices = next((v for k, v in cur_envs.items() if k.endswith("_VISIBLE_DEVICES")), None)
     num_visible_devices = None
     if visible_devices is not None and isinstance(visible_devices, str):
@@ -235,7 +231,6 @@ class SshLauncher(LauncherBase):
             else:
                 self.user_args += ["--hetero-current-device-type", device_type]
         cmd = shlex.join(export_cmd + runner_cmd + [self.user_script] + self.user_args)
-        # update cmd with node_specific_config
         node_specific_config = {}
         if device_type is not None:
             node_specific_config = (
@@ -260,17 +255,14 @@ class SshLauncher(LauncherBase):
 
         if host != "localhost":
             ssh_port = self.config.experiment.runner.get("ssh_port", 22)
-            # Step 1: make sure the scripts_dir exists on the remote host
             run_ssh_command(host, f"mkdir -p {logging_config.scripts_dir}", ssh_port, dryrun)
 
-            # Step 2: copy the host_run_script_file to the remote host
             no_shared_fs = self.config.experiment.runner.get("no_shared_fs", False)
             if no_shared_fs:
                 run_scp_command(
                     host, host_run_script_file, logging_config.scripts_dir, ssh_port, dryrun
                 )
 
-            # Step 3: run the host_run_script_file on the remote host
             # For foreground + node 0, stream stdout through SSH to the
             # login node console so logs are visible without shared FS.
             run_ssh_command(
@@ -313,7 +305,6 @@ class SshLauncher(LauncherBase):
             _, _tail_stop = start_tail_log(lambda: find_latest_stdout_log(details_dir))
 
         try:
-            # If hostfile is provided, use the resources from the hostfile
             if self.resources is not None:
                 nnodes_from_hostfile = len(self.resources.keys())
                 nnodes_from_args = runner_config.get("nnodes", None)
@@ -343,7 +334,6 @@ class SshLauncher(LauncherBase):
                         tasks.append(args)
                     pool.starmap(run_node, tasks)
             else:
-                # If hostfile is not provided, run the job on localhost
                 nproc_from_args = runner_config.get("nproc_per_node", None)
                 nproc_per_node = get_nproc_per_node(None, nproc_from_args, num_visible_devices)
                 available_addr = runner_config.get("master_addr", "localhost")
@@ -360,7 +350,6 @@ class SshLauncher(LauncherBase):
                     cur_envs=self.user_envs,
                 )
 
-            # If need monitor, query status continually
             if monitor:
                 # sleep to wait task already started
                 time.sleep(interval)
@@ -386,15 +375,12 @@ class SshLauncher(LauncherBase):
 
         if host != "localhost":
             ssh_port = self.config.experiment.runner.get("ssh_port", 22)
-            # Step 1: make sure the scripts_dir exists on the remote host
             run_ssh_command(host, f"mkdir -p {logging_config.scripts_dir}", ssh_port)
-            # Step 2: copy the host_run_script_file to the remote host
             no_shared_fs = self.config.experiment.runner.get("no_shared_fs", False)
             if no_shared_fs:
                 run_scp_command(
                     host, host_stop_script_file, logging_config.scripts_dir, ssh_port
                 )
-            # Step 3: run the host_run_script_file on the remote host
             run_ssh_command(host, f"bash {host_stop_script_file}", ssh_port)
         else:
             run_local_command(f"bash {host_stop_script_file}")
@@ -434,7 +420,7 @@ class SshLauncher(LauncherBase):
             f.write("    pid=$(cat " + shlex.quote(host_pid_file) + ")\n")
             f.write("    ps -p $pid -o state --no-headers\n")
             f.write("else\n")
-            # TODO: This is a temporary fix. We need to find a better way to query the job.
+            # Fallback when the pid file is missing: pick the first torchrun process.
             f.write(
                 "    pid=$(ps aux | grep 'torchrun' | grep -v grep | head -n 1 | awk '{print $2}')\n"
             )
@@ -446,6 +432,7 @@ class SshLauncher(LauncherBase):
 
         return host_query_script_file
 
+
     def _query_each(self, host, node_rank):
         "Query each node status."
         host_query_script_file = self._generate_query_script(host, node_rank)
@@ -453,17 +440,14 @@ class SshLauncher(LauncherBase):
         result = ""
         if host != "localhost":
             ssh_port = self.config.experiment.runner.get("ssh_port", 22)
-            # Step 1: make sure the scripts_dir exists on the remote host
             run_ssh_command(
                 host, f"mkdir -p {logging_config.scripts_dir}", ssh_port, query=True
             )
-            # Step 2: copy the host_run_script_file to the remote host
             no_shared_fs = self.config.experiment.runner.get("no_shared_fs", False)
             if no_shared_fs:
                 run_scp_command(
                     host, host_query_script_file, logging_config.scripts_dir, ssh_port
                 )
-            # Step 3: run the host_run_script_file on the remote host
             try:
                 result = run_ssh_command(
                     host, f"bash {host_query_script_file}", ssh_port, query=True
@@ -477,6 +461,7 @@ class SshLauncher(LauncherBase):
                 logger.error(f"Failed to query job status on {host}: {e}")
         result = result.stdout.rstrip() if result else ""
         return result
+
 
     def _query_status(self):
         "Query Job status."
@@ -498,6 +483,7 @@ class SshLauncher(LauncherBase):
             job_status = JobStatus.TRANSITIONAL
         return job_status
 
+
     def query_once(self):
         """
         Query job status once (non-blocking).
@@ -514,10 +500,6 @@ class SshLauncher(LauncherBase):
     def query(self, interval=10, timeout=None):
         """
         Query job status and log with optional timeout (blocking).
-        There are three kinds of status for a Job:
-            RUNNING: The job is running.
-            COMPLETED_OR_IDLE: The job is completed or idle.
-            TRANSITIONAL: The job is starting or stopping.
 
         Args:
             interval (int, optional): The interval of querying job status. Default: 10.

@@ -1,23 +1,19 @@
 # Copyright (c) 2026, SGA framework contributors.
 """Bit-pattern histogram top-k select, in three geometry tiers.
 
-Ported verbatim from scheme_xp: per-rank histograms of the top N bits of the
-|x| fp32 bit patterns may be SUM-allreduced over the comm group (the
-``global_allreduce`` gate — default OFF, see the next paragraph) — with
-replicated inputs the merged histogram is exactly ``world`` times the local
-one and the select math is scale-invariant, so every rank derives the
-identical bin/threshold BY CONSTRUCTION (tied boundary values are all
-selected). Non-negative fp32 values sort identically to their int32 bit
+Ported from an earlier internal scheme: per-rank histograms of the top N
+bits of the |x| fp32 bit patterns may be SUM-allreduced over the comm group
+— the ``global_allreduce`` gate, wired from the
+``sga_selection_topk_histogram_add_global_allreduce`` flag (default false;
+True turns the merge on). With replicated inputs the merged histogram is
+exactly ``world`` times the local one and the select math is
+scale-invariant, so every rank derives the identical bin/threshold BY
+CONSTRUCTION with or without the merge (tied boundary values are all
+selected) — the collective is skippable on the local histogram alone, and
+the engine's mask consistency check aborts if the replication premise ever
+breaks. Non-negative fp32 values sort identically to their int32 bit
 patterns, so an exact ``torch.kthvalue`` on the crossing bin's candidates
 alone yields the bit-exact same threshold as over all elements.
-
-The SUM allreduce is gated by ``global_allreduce`` (wired from the
-``sga_selection_topk_histogram_add_global_allreduce`` flag, default false):
-with replicated inputs the merged histogram is only ``world`` times the
-local one, so the local histogram alone derives the identical bin/threshold
-and the collective is skippable — the engine's mask consistency check
-aborts if the replication premise ever breaks. ``global_allreduce=True``
-restores the merged form (the ported scheme_xp behavior).
 
 Tiers (``mode``):
 
@@ -34,14 +30,12 @@ The approximate tiers carry an over-selection BIAS, not a strict superset
 property: the whole crossing bin is included relative to the measured
 (subsampled) histogram, but the mask is applied to the full set, so stride
 subsampling fluctuation allows a small under-selection relative to exact.
-The executable criterion (from the migration source's own production tests)
-is two-sided: |n_approx - n_exact| / n < 0.5pp (balanced) / 2pp (fast); the
-lore claim "over-select (never under-select)" in the legacy docstring is
-idealized (exact only under a full-set histogram) and must not be read as a
-hard invariant.
+The two-sided criterion (pinned by tests/test_xp_capability.py) is
+|n_approx - n_exact| / n < 0.5pp (balanced) / 2pp (fast); over-selection
+is a bias, not a strict-superset guarantee.
 
 Every pass is chunked at ``_HIST_CHUNK`` elements: the int32 bit-pattern
-view/copy of a full 1.2B-element bucket is GB-scale on top of the resident
+view/copy of the largest buckets is GB-scale on top of the resident
 sparse-comm buffers. The chunk size is a multiple of the sample
 stride, so the chunked histogram/subsample is bitwise identical to the
 unchunked one.
@@ -122,8 +116,7 @@ def _histogram_select_threshold(hist, k, world, grads, shift=_HIST_SHIFT) -> flo
     n_above = (total - int(cum[b].item())) // world  # local elements in bins > b
 
     # Exact kthvalue within bin b's candidates only (replicas: the local
-    # candidate set equals the global one). Chunked extraction: a full-bucket
-    # int32 bit-pattern copy is GB-scale for the largest buckets.
+    # candidate set equals the global one).
     cands = []
     for g in grads:
         for s in range(0, g.numel(), _HIST_CHUNK):
@@ -169,8 +162,7 @@ def select_masks_histogram(grads, k, comm_group, mode="exact",
     else:
         # No merge requested (global_allreduce=False, the flag default) or
         # no group/dist to merge over: select on the local histogram
-        # (world=1) — identical to the merged form under the replicated-
-        # input scale invariance described above.
+        # (world=1) — same threshold as the merged form (module docstring).
         world = 1
 
     if mode == "exact":
@@ -184,8 +176,8 @@ def select_masks_histogram(grads, k, comm_group, mode="exact",
             masks.append(m)
         return thresh, masks
 
-    # Approximate: find the crossing bin in local rank units (the merged
-    # histogram is world × the local one, so the bin is scale-invariant).
+    # Approximate: find the crossing bin in local rank units (the bin is
+    # scale-invariant under the merge — module docstring).
     n_total = sum(g.numel() for g in grads)
     n_sampled = sum((g.numel() + stride - 1) // stride for g in grads)
     r = max(1, round(n_sampled * (n_total - k + 1) / n_total)) * world
@@ -206,8 +198,7 @@ def _block_reduce_views(grads, x, reduce):
     The tail block of a grad view (numel % x != 0) reduces over its REAL
     length, so mean never dilutes and sum-bias never discriminates it.
     Chunked at x-aligned slices of ``_HIST_CHUNK``: |g| never materializes
-    as a second full-size copy (a 1.2B-element bucket's fp32 abs is
-    GB-scale next to the resident sparse-comm buffers).
+    as a second full-size copy.
     """
     chunk = _HIST_CHUNK - (_HIST_CHUNK % x)
     out = []

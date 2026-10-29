@@ -656,7 +656,7 @@ def test_confirm_cache_visible_branches():
 def test_ssh_transport_and_probe_argv():
     """The cluster transport policy lives in ONE place: the cache-confirm
     probe argv and the node-worker render argv share the same ssh base
-    (explicit key, port 2222, root@node, the shared option block), and the
+    (explicit key, fixed port, user@node, the shared option block), and the
     remote one-liner carries the explicit PYTHONPATH prepend instead of a
     silenced `source env.sh`."""
     with tempfile.TemporaryDirectory() as td:

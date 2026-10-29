@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-"""Migrated scheme_xp capability tests.
-
-Ported from the legacy fork's tests/unit_tests/test_sga_scheme_xp.py and
-test_sga_scheme_xp_mask_score.py onto the plugin API. The
-megatron-integration plumbing those files mock (DDP stamps, wrapper state,
-phase dispatch) does not exist here — the engine/EF unit tests own it; what
-survives is the capability surface the migration promised:
+"""Capability tests for the plugin selection/optimizer pieces; the
+megatron-integration plumbing (DDP stamps, wrapper state, phase dispatch)
+is owned by the engine/EF unit tests:
 
 - the bit-pattern histogram select: exact tier bit-exact vs torch.kthvalue
   across adversarial distributions and k extremes, world-replica scale
@@ -315,7 +311,7 @@ def test_adapt_rule_band_wobble_and_steps():
                         rel_tol=1e-12)
     assert math.isclose(_adapt_threshold(1e-3, 0.0, 0.40), 1e-3 * 0.9,
                         rel_tol=1e-12)
-    # self-scaling: gentle at the band edge, clamped when far (the v3.1 fix)
+    # self-scaling: gentle at the band edge, clamped when far
     near = _adapt_threshold(1e-3, 0.42, 0.40) / 1e-3
     assert math.isclose(near, 1.05 ** 0.5, rel_tol=1e-12)
     assert math.isclose(_adapt_threshold(1e-3, 0.80, 0.40) / 1e-3, 1.15,
@@ -417,7 +413,7 @@ def test_adaptive_tau_feedback_and_collapse_mode():
 
 def _coi_reference(g, m, v, beta1, beta2, eps, step):
     """fp64 oracle of |U(g) - U(0)| (weight-decay-free, bias corrections of
-    the upcoming step) — the offline definition the legacy port checked."""
+    the upcoming step)."""
     bc1 = 1.0 - beta1 ** step
     bc2 = 1.0 - beta2 ** step
     g64, m64, v64 = g.double(), m.double(), v.double()

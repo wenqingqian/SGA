@@ -9,8 +9,7 @@ Covers:
   constructor contracts;
 - support lifecycle: bootstrap guard, force steps never reselect, the
   grad-norm bypass forces the next step full;
-- payload-scaling residual preservation (the regression test for the bug the
-  old fork dodged via average_in_collective=True): with a SUM-replica mocked
+- payload-scaling residual preservation: with a SUM-replica mocked
   collective, non-selected coordinates are BITWISE unchanged across a sparse
   sync and selected ones get exactly sum*scale;
 - the decoupled fold-divisor pin: adamw's selective reset divides the
@@ -25,8 +24,11 @@ Covers:
 Run: python tests/test_engine_unit.py  (or pytest tests/test_engine_unit.py)
 """
 
+import contextlib
+import io
 import os
 import sys
+import tempfile
 from types import SimpleNamespace
 
 import torch
@@ -68,7 +70,7 @@ def _seed(over=None):
 
 def test_cycle_boundary_full_pattern():
     # Boundaries are STRUCTURALLY full (reselection must read dense-averaged,
-    # rank-identical scores) — no optimizer declaration involved anymore.
+    # rank-identical scores).
     cm = CycleManager(start_iter=20, period=8, decouple=False,
                       full_sync_interval=None)
     fulls = [s for s in range(1, 61) if cm.is_full(s)]
@@ -129,9 +131,8 @@ def test_cycle_constructor_contracts():
         raise AssertionError("non-decoupled interval accepted")
 
 
-# (the v3.1 warmup-anchor formula moved INTO the selection impl with the
-# selection-owned warmup_sync_target hook; its pinning lives in
-# tests/test_plugins_unit.py::test_warmup_sync_target_anchor)
+# the warmup-anchor pinning lives in
+# tests/test_plugins_unit.py::test_warmup_sync_target_anchor
 
 
 # ------------------------------------------------- payload scaling residual
@@ -407,10 +408,7 @@ def test_resume_fail_closed_refusal_and_hermetic_override():
     hermetic even when it is pre-exported in the runner's shell (its
     documented use — 80GB hardware — is exactly exporting it before
     running the suite)."""
-    import tempfile
-
     import sga.backends.torch_pipelined_index as tpi
-    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 
     ns = SimpleNamespace
     base = dict(pipeline_model_parallel_size=1,
@@ -534,8 +532,6 @@ def test_nccl_pipelined_index_resume_fail_closed():
     is refused (raw-comm residency unmeasured for resume, conservative
     refusal), cold start passes, the shared escape hatch overrides; env
     scrubbed before the refusal assertion and restored after."""
-    import tempfile
-
     import sga.backends.nccl_pipelined_index as npi
     from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
 
@@ -652,7 +648,7 @@ class _FakeBucket:
     def __init__(self, params, spans, numel, bucket_id=0):
         # Deliberately REVERSED vs the optimizer's param order: real megatron
         # buckets reorder params, and the engine must not assume the two
-        # orders coincide (found by the first real run).
+        # orders coincide.
         self.params_list = list(reversed(params))
         self.param_to_index = {p: spans[p] for p in self.params_list}
         self.grad_data = torch.zeros(numel)
@@ -951,7 +947,7 @@ def test_reselect_boundary_orders_reset_before_activation():
     successful reselection boundary: optimizer full step -> model copy ->
     selection (reads the materialized score views) -> reset (zeroes the
     consumed grad buffers — captured here while the OLD support is still
-    the active one on the buckets; reset no longer reads the
+    the active one on the buckets; reset does not read the
     masks itself) -> activate(new support) -> host reset. The stub
     selection's consecutive masks are DISJOINT, so 'reset ran under the old
     support' is falsifiable: a refactor that activated the new support
@@ -1256,7 +1252,7 @@ def test_generic_optional_hooks_fire():
 
 
 def test_count_guard_once_per_cycle_and_flag_off():
-    """Layer-1 count guard placement (2026-08-28 ruling): it fires ONCE per
+    """Layer-1 count guard placement: it fires ONCE per
     support activation — never on sparse grad_sync steps (the counts are the
     activation-time caches and the support is immutable within a cycle, so
     per-step checks re-verify identical numbers). checks.count_guard=false
@@ -1309,8 +1305,6 @@ def test_checks_escape_hatch_gating():
     a divergence that the checks-on run refuses (SGAEngineError under
     _MutatingAllReduce) passes through silently — off removes DETECTION,
     nothing else."""
-    import contextlib
-    import io
 
     def _run(over, mutate=False):
         _seed({**_ABS_M["config"], "sga_selection_method": "histogram",
@@ -1781,8 +1775,6 @@ def test_always_sync_attach_log_and_overlapping_patterns():
     unmatched pattern WARNs, while an OVERLAPPING pattern (a stricter
     spelling hitting the same param) must not falsely WARN nor
     double-count the forced coords."""
-    import io
-    from contextlib import redirect_stdout
 
     def _attach_logged(layers):
         chunk = _FakeChunk(n_params=len(_AS_NAMES), names=_AS_NAMES)
@@ -1790,7 +1782,7 @@ def test_always_sync_attach_log_and_overlapping_patterns():
             _ALWAYS, config={**_ALWAYS["config"],
                              "sga_always_sync_layers": layers}))
         buf = io.StringIO()
-        with redirect_stdout(buf):
+        with contextlib.redirect_stdout(buf):
             eng.attach(chunk)
         return eng, buf.getvalue()
 

@@ -1,6 +1,6 @@
 # Copyright (c) 2026, SGA framework contributors.
-"""The SGA AdamW optimizer template (kernels ported from the historical
-radius scheme).
+"""The SGA AdamW optimizer template (kernels ported from an earlier
+internal scheme).
 
 The AdamW update is split so the weight-update direction can be materialized:
 
@@ -106,19 +106,17 @@ if _HAS_TRITON:
         buffer). Both paths apply ``w -= lr * update`` in this same pass.
 
         Sparse-step fusion (CLEAR/APPLY_COEFF/FOLD are sparse-only,
-        the dispatch refuses them on full steps):
-        - APPLY_COEFF: the clip coeff multiplies the loaded grad in-register
-          — bitwise the standalone masked-scale pass (round_fp32(x*coeff)
-          whether stored-and-reloaded or kept in a register).
-        - CLEAR: active positions store 0 after use — bitwise the standalone
-          selective-reset pass; nothing reads the grad buffer between this
-          kernel and the next backward's accumulation.
+        the dispatch refuses them on full steps; bitwise contract:
+        see adamw_grad_correct):
+        - APPLY_COEFF: the clip coeff multiplies the loaded grad in-register.
+        - CLEAR: active positions store 0 after use; nothing reads the grad
+          buffer between this kernel and the next backward's accumulation.
         - FOLD: inactive positions store grad*inv_interval (the host fp32
-          reciprocal, exactly the standalone reset kernel's fold). Needs the
-          raw grad at inactive positions, so the load widens to full-valid
-          only on fold steps (once per period at most) — the m/v commit
-          still sees zero there (``grad = where(active, raw, 0)``); the
-          residual enters the optimizer only via the boundary full step.
+          reciprocal). Needs the raw grad at inactive positions, so the
+          load widens to full-valid only on fold steps (once per period at
+          most) — the m/v commit still sees zero there (``grad =
+          where(active, raw, 0)``); the residual enters the optimizer only
+          via the boundary full step.
 
         Full-step dual-lr (LR_SPLIT, full steps with a mask only — the
         dispatch refuses the combination otherwise): the boundary commits
@@ -143,9 +141,8 @@ if _HAS_TRITON:
 
         if FOLD:
             # Fold needs the raw residual at inactive coords for the store,
-            # but the m/v commit must still see ZERO there (the old sequence
-            # committed via the active-masked load and folded in a separate
-            # kernel — the residual enters m only at the boundary full step).
+            # but the m/v commit must still see ZERO there (the residual
+            # enters m only at the boundary full step).
             raw = tl.load(grad_ptr + offsets, mask=valid, other=0.0)
             grad = tl.where(active, raw, 0.0)
         elif LR_SPLIT:
@@ -242,8 +239,7 @@ if _HAS_TRITON:
         inside it. The per-lane search therefore runs L1-resident and
         the second lower_bound is bounded to [p, min(k, p+BLOCK)] instead
         of [p, k] (the unbounded form walked ~log2(k) dependent
-        scalar loads per block and was the measured merge-join hotspot:
-        -7.3ms/step on the real top-k distribution). All bisection
+        scalar loads per block and was the merge-join hotspot). All bisection
         midpoints are overflow-safe (a + (b-a)//2): the naive (a+b)//2
         wraps int32 once the sum exceeds 2^31, i.e. k_total > 2^30.
         No CLEAR branch by design: the pack kernel zeroed the communicated
@@ -479,14 +475,11 @@ def build_dir_table(idx: torch.Tensor, total_n: int) -> torch.Tensor:
     n_table = (total_n >> 10) + 2 covering the last block's b+1 lookup
     plus one sentinel slot; keys past the bucket hold k (the
     torch.searchsorted 'left' convention). Built once per selection cycle
-    from the frozen bucket idx (~0.5ms at 500M elements — amortized over
-    the cycle's sparse steps it is ~0.01ms/step). No triton / CPU: the
+    from the frozen bucket idx. No triton / CPU: the
     caller's fallback path never asks for a table.
     """
     k = idx.numel()
     n_table = (total_n >> 10) + 2
-    # The kernel lives under the triton guard; the torch/CPU fallback in
-    # adamw_grad_correct_compact never asks for a table.
     assert _HAS_TRITON, "build_dir_table requires triton (CUDA compact path)"
     # int32 offset contract (the compact kernel's precedent): the kernel
     # forms j*BLOCK and t0 + r as int32 — crossing 2^31 wraps the table
@@ -559,8 +552,7 @@ def adamw_grad_correct(
     bias_correction2 = 1.0 - beta2 ** step
     if emit_score is not None and emit_score not in _TRITON_SCORE_MAP:
         # Owned text: covers both an unregistered name and a registered
-        # score without a kernel branch — either way there is no branch to
-        # materialize it, and silent fallback would train on wrong numerics.
+        # score without a kernel branch.
         raise ValueError(
             f"emit_score '{emit_score}' has no _grad_correct_kernel branch "
             f"(implemented: {sorted(_TRITON_SCORE_MAP)})")
@@ -615,8 +607,8 @@ def adamw_grad_correct(
 
     has_mask = mask is not None
     mask_u8 = mask.to(torch.uint8) if (has_mask and mask.dtype != torch.uint8) else mask
-    # fp32 reciprocal, computed exactly as the standalone reset kernel did
-    # (bitwise-matches CUDA scalar division on the multiply path).
+    # fp32 reciprocal (bitwise-matches CUDA scalar division on the
+    # multiply path).
     inv_interval = float(
         (torch.ones(1, dtype=torch.float32) / interval).item()
     ) if fold else 1.0
@@ -730,7 +722,7 @@ def adamw_grad_correct_compact(
         )
         return
 
-    # fp32 reciprocal, computed exactly as the masked dispatcher does.
+    # fp32 reciprocal — bitwise contract: see adamw_grad_correct.
     inv_interval = float(
         (torch.ones(1, dtype=torch.float32) / interval).item()
     ) if fold else 1.0
@@ -834,10 +826,9 @@ class SgaAdamW:
                 "finite float >= 0.0 (got "
                 f"{self.full_sync_inactive_lr_scale!r})")
         # Which registry score to materialize on full steps — read straight
-        # off the config (validation already required it). The name without
-        # a kernel branch fails loud HERE, at build time: the kernel would
-        # otherwise silently skip the materialization and the reselection
-        # would rank raw grads.
+        # off the config (validation already required it). A name without
+        # a kernel branch fails loud HERE, at build time (rationale:
+        # see _TRITON_SCORE_MAP).
         self.emit_score = args.sga_score
         try:
             _TRITON_SCORE_MAP[self.emit_score]
@@ -873,9 +864,9 @@ class SgaAdamW:
                 mask=m,
                 emit_score=emit_score,
                 # Degenerate mask-less bucket on a sparse step: plain full
-                # commit (old behavior) — the fusion knobs require a mask,
-                # and the engine scaled such a record explicitly; reset's
-                # mask-less branch zeroes it afterwards.
+                # commit — the fusion knobs require a mask, and the engine
+                # scaled such a record explicitly; reset's mask-less branch
+                # zeroes it afterwards.
                 coeff=coeff if m is not None else 1.0,
                 clear=clear and m is not None,
                 fold=fold and m is not None,
@@ -898,9 +889,8 @@ class SgaAdamW:
             values = ctx.compact_values.get(id(bs))
             if values is None:
                 # Degenerate mask-less bucket (no compact values): plain
-                # full-buffer commit, mirror of the masked path's contract
-                # (the engine scaled such a record explicitly; reset's
-                # mask-less branch zeroes it afterwards).
+                # full-buffer commit, mirror of the masked path's mask-less
+                # contract (see _records_pass).
                 adamw_grad_correct(
                     param_buffer=rec.main_param.data.view(-1),
                     grad_buffer=rec.grad.data.view(-1),
@@ -914,8 +904,8 @@ class SgaAdamW:
             bucket = ctx.support.buckets[bs.support_index]
             idx = bucket.idx
             # compact_search dual dispatch: the table is the bucket's lazy
-            # per-cycle derived field — first sparse step of the cycle pays
-            # the ~0.5ms build, the rest reuse it (idx frozen per cycle).
+            # per-cycle derived field — built on the cycle's first sparse
+            # step, the rest reuse it (idx frozen per cycle).
             # Gated on the REAL execution path, not just the configured
             # mode: on the torch fallback (CPU tensors / triton-less)
             # there is no table to build — asking for one would raise
@@ -982,9 +972,9 @@ class SgaAdamW:
         )
 
     def reset(self, ctx, was_full: bool):
-        """Sparse steps need no grad-buffer work anymore: writeback backends
-        got the clear inside grad_correct's fused pass; compact backends got
-        it from the pack kernel at grad_sync time. Zeroing here would
+        """Sparse steps do no grad-buffer work here: writeback backends
+        clear inside grad_correct's fused pass; compact backends were
+        cleared by the pack kernel at grad_sync time. Zeroing here would
         destroy the accumulating residual either way. Full steps (and the
         degenerate mask-less bucket): zero all. ``extra_main_grads`` zeroing
         stays."""

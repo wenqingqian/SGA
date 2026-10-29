@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Distributed (2-rank CUDA) tests for the sparse allreduce backends.
 
-Runs the real collectives through torchrun, mirroring the nccl-space
-prototype's methodology:
+Runs the real collectives through torchrun:
 
 - payload scaling under a real SUM allreduce: non-selected coordinates are
   BITWISE unchanged, selected ones equal (a + b) * factor;
@@ -23,8 +22,10 @@ prototype's methodology:
 Run: python tests/test_backend_dist.py   (re-execs itself under torchrun)
 """
 
+import json
 import os
 import sys
+import tempfile
 from types import SimpleNamespace
 
 import torch
@@ -33,11 +34,14 @@ import torch.distributed as dist
 SGA_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SGA_ROOT)
 
+from sga import backend_timer
+from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
 from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
 from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
 from sga.config import set_args
 from sga.config.validation import sga_defaults
-from sga.engine import SGAEngineError
+from sga.engine import SGAEngine, SGAEngineError
+from sga.plugins.selection.topk import TopkSelection
 from sga.support import BucketSupport
 
 
@@ -73,7 +77,7 @@ def main():
         return torch.randn(n, generator=torch.Generator().manual_seed(seed)).to(device)
 
     local = _vec(100 + rank)
-    expected_selected = (_vec(100) + _vec(101)) * factor  # (a + b) * factor
+    expected_selected = (_vec(100) + _vec(101)) * factor
 
     # --- masked backend (writeback emission) -------------------------------
     g_mask = local.clone()
@@ -104,8 +108,8 @@ def main():
     # --- the two emissions agree bitwise on the communicated values -------
     assert torch.equal(ret_idx, g_mask[active])
 
-    # --- indexed backend, emission=writeback (the restored historical
-    # choreography): pure-read gather + scatter-back, None return — the
+    # --- indexed backend, emission=writeback: pure-read gather +
+    # scatter-back, None return — the
     # written-back buffer must equal the mask backend's bitwise (same
     # payload elements in ascending order, same per-element SUMs) ---
     g_wb = local.clone()
@@ -180,7 +184,6 @@ def main():
     # (the kernel ABI floor is blockShift >= 2). Inside the domain a
     # block support is a LEGITIMATE bb config — the descriptor arm
     # below exercises it end to end.
-    from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
     nsup = BucketSupport(torch.ones(n, dtype=torch.uint8, device=device),
                          block_size=2, block_spans=[(0, n)])
     try:
@@ -194,8 +197,6 @@ def main():
     # --- raw-kernel backend (needs the sparse library; skip loudly) -------
     lib = os.environ.get("SGA_NCCL_SAR_LIB")
     if lib:
-        from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
-
         _seed()
         be = NcclPipelinedIndexBackend()
         be.prepare(group, device=device)
@@ -206,7 +207,7 @@ def main():
         torch.cuda.synchronize()
         assert torch.equal(g_nccl[~active], local[~active]), "residual changed"
         # pow2 factor + one add per coordinate: bitwise agreement with the
-        # torch backends (validated on A100 singlesocket + cross-node IB)
+        # torch backends
         assert torch.equal(g_nccl[active], expected_selected[active]), \
             f"nccl backend selected coords wrong (rank {rank})"
         assert torch.equal(g_nccl[active], ret_idx)
@@ -224,7 +225,7 @@ def main():
         assert torch.equal(g_fast[active], expected_fast[active]), \
             f"nccl fast-path selected coords wrong (rank {rank})"
 
-        # --- bb descriptor frozen grid (C2): the same whole-run
+        # --- bb descriptor frozen grid: the same whole-run
         # selected set through FOUR transports — mask backend, torch
         # element writeback (eb form), torch block heads (bb), nccl
         # packed descriptors (bb) — must land identical end states,
@@ -249,7 +250,7 @@ def main():
         _seed(sga_backend_layout="bb")
         be_bb = NcclPipelinedIndexBackend()
         assert be_bb.layout == "bb"
-        be_bb.prepare(group, device=device)  # block-form warmup (C6)
+        be_bb.prepare(group, device=device)  # block-form warmup
 
         def _grid_case(x, with_tail, fac):
             a = (n // 3 // x) * x
@@ -310,7 +311,7 @@ def main():
         if rank == 0:
             print("ok: bb frozen grid (5x2x2) four-transport bitwise, C2")
 
-        # --- old-library belt (C7, v8 semantics): a pre-split library is
+        # --- old-library belt (v8 semantics): a pre-split library is
         # refused fail-fast at LOAD time — before any raw comm is created
         # (no half-built communicator may survive a config the library
         # cannot serve). The alias window closed at v8, so "old library"
@@ -377,8 +378,6 @@ def main():
     dist.barrier()
 
     # --- layer-1 count check: pass on identical supports -------------------
-    from sga.engine import SGAEngine
-
     eng = object.__new__(SGAEngine)
     eng._dp_cp_group = lambda: group
     eng._bucket_states = [SimpleNamespace(grad_data=local)]
@@ -402,8 +401,6 @@ def main():
     # SUM, the other advances) — an undiagnosable hang. The one-time
     # packed MIN/MAX probe in TopkSelection.select must refuse on BOTH
     # ranks, naming the flag.
-    from sga.plugins.selection.topk import TopkSelection
-
     _seed(sga_selection_method="histogram",
           sga_selection_ratio_percent=30.0,
           sga_selection_topk_histogram_add_global_allreduce=bool(rank == 0))
@@ -429,11 +426,6 @@ def main():
     # --- backend_timer on: identical results + records ------
     # The instrument must not change what the backend computes
     # (bitwise on/off; records carry the engine iter stamp).
-    import json
-    import tempfile
-
-    from sga import backend_timer
-
     tmp = tempfile.mkdtemp(prefix="sga_timer_dist_")
     backend_timer.configure(tmp, rank=rank)
     backend_timer.set_iter(1)

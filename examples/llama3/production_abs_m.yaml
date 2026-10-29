@@ -1,20 +1,17 @@
-# SGA production preset "abs_m": the production-recommended
-# configuration as a named four-field combination (evidence: the old
-# workspace's 14-run online matrix — score ranking abs_m > abs_g > update
-# ≈ coi, abs_m at 40% retention within the ≤1% relative loss-deviation
-# criterion; see notes/online-matrix-evidence.md). Everything outside the
-# sga: section mirrors examples/llama3/train_1b_dense.yaml so runs are
+# SGA production preset "abs_m": the production-recommended four-field
+# combination. abs_m ranked best in our online comparisons (abs_m >
+# abs_g > update ≈ coi; abs_m at 40% retention stayed within the ≤1%
+# relative loss-deviation criterion). Everything outside the sga:
+# section mirrors examples/llama3/train_1b_dense.yaml so runs are
 # directly comparable.
 #
-# score=abs_m (|pre-commit first moment|, EF-kernel-emitted at full syncs) +
-# selection=topk method=adaptive (v3.1: fast-histogram warmup gated on the
-# measured ratio, then a persistent threshold with the ±1pp dead band and
-# log-space steps) + optimizer=adamw (residual) +
+# score=abs_m (|pre-commit first moment|, emitted by the EF kernel at
+# full syncs) + selection=topk method=adaptive (fast-histogram warmup
+# gated on the measured ratio, then a persistent threshold with a ±1pp
+# dead band and log-space steps) + optimizer=adamw (residual) +
 # backend=torch_pipelined_index with high_priority_group: true and S=3
-# slices on a twin high-priority NCCL process group). Cycle start_iter=4 / period=4 with
-# adaptive_warmup_syncs=5 (historical validation context: the transition was
-# originally confirmed within a 60-iter smoke; the preset now runs
-# train_iters=5000).
+# slices on a twin high-priority NCCL process group). Cycle
+# start_iter=4 / period=4 with adaptive_warmup_syncs=5.
 
 defaults:
   - _self_

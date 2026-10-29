@@ -22,6 +22,7 @@ span-alignment gate for descriptor-form backends and the layout
 resolution surface.
 """
 
+import importlib.util
 import os
 import sys
 from types import SimpleNamespace
@@ -157,7 +158,6 @@ def test_pack_parity_with_bench_reference():
     saved = os.environ.get("NCCL_LIBS_ROOT")
     os.environ["NCCL_LIBS_ROOT"] = lib_root
     try:
-        import importlib.util
         spec = importlib.util.spec_from_file_location(
             "bench_mask_utils", bench)
         bm = importlib.util.module_from_spec(spec)

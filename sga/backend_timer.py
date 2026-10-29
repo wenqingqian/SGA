@@ -105,7 +105,7 @@ def reset() -> None:
 
     A test / graceful-shutdown helper: production configures once per
     process and never resets. Tests use this instead of poking the
-    private ``_STATE`` (which leaked the open file handle).
+    private ``_STATE``.
     """
     global _STATE
     if _STATE is not None:

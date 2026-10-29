@@ -23,6 +23,7 @@ Run: python tests/test_replay_kernels.py  (or python -m pytest)
 
 import os
 import sys
+from fractions import Fraction
 
 import torch
 
@@ -118,7 +119,6 @@ def test_canary_no_contraction():
     ref = a * b + c
     assert _bit_eq(out, ref) == 0, "fusion off still contracted"
     # discrimination proof on a sample: exact fma != two-op chain somewhere
-    from fractions import Fraction
     idx = torch.randint(0, n, (4096,)).cpu()
     diff = 0
     for i in idx.tolist():

@@ -12,8 +12,7 @@ catalog's self-describing ``g_dtype`` tag, which flips to bf16: they hold
 the replay branch states (w/m/v), which stay fp32 — only the per-step
 gradients belong to the IO-halving being screened.
 
-Usage (container flagscale-gzlu + conda flagscale, SGA repo root on
-PYTHONPATH):
+Usage (SGA repo root on PYTHONPATH):
 
     python -m sga.trace_convert --src <trace-dir> --dst <dst-dir> \
         [--from-step S] [--to-step E] [--overwrite]

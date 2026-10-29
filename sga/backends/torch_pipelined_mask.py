@@ -110,7 +110,6 @@ class TorchPipelinedMaskBackend:
                 payload *= gradient_scaling_factor
             return payload
 
-        # Slice 0: extract and launch async allreduce.
         s0, e0 = boundaries[0], boundaries[1]
         prev_mask_slice = element_mask[s0:e0]
         prev_selected = _scale(grad_data[s0:e0][prev_mask_slice])
@@ -125,7 +124,6 @@ class TorchPipelinedMaskBackend:
             # Extract launches a CUDA kernel — overlaps with prev allreduce.
             cur_selected = _scale(grad_data[si:ei][cur_mask_slice])
 
-            # Wait for previous allreduce and scatter back.
             prev_work.wait()
             grad_data[prev_s:prev_e][prev_mask_slice] = prev_selected
 

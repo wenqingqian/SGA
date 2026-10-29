@@ -19,11 +19,8 @@ lr/betas/eps/wd), letting the new replay resolve exact per-group
 hyperparameters, and the catalog carries a top-level ``g_dtype``
 storage-dtype tag for the per-step g payloads (fp32|bf16; the runtime bf16
 dump's self-describing marker, enforced by the resume guard below and read
-by ``sga.trace_convert``). Catalog keys are canonical
-parameter names with every leading ``module.`` wrapper segment stripped —
-the legacy dumps keyed by ``module.module.*``, which tied traces to the
-wrapping stack for no benefit. The legacy ``_sga_trace_name`` param tagging
-and ``_sga_last_grad_norm`` staging are gone: the engine derives names from
+by ``sga.trace_convert``). Catalog keys are canonical parameter names with
+every leading ``module.`` wrapper stripped; the engine derives names from
 the attached chunks and reads the grad norm from its own clip.
 
 Numbering is the fork's ABSOLUTE iteration (0-indexed at the optimizer-step
@@ -55,8 +52,7 @@ writeback path, nothing dump-visible changes.
 Enabled by ``sga_trace_dir`` (yaml ``sga:`` section); absent (default)
 disables collection entirely: the engine holds ``_trace = None`` and the
 slot costs one None-check per step (zero-overhead-when-off, asserted
-structurally in tests; the ≤0.5% step-time gate is measured in the
-single-node validation).
+structurally in tests).
 """
 
 import os

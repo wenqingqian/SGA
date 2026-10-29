@@ -6,7 +6,6 @@
 #
 # Usage (HOST, from the SGA repo checkout under test):
 #   bash tests/smoke_replay_multinode.sh <master-ip> <worker-ip> <host-workdir>
-#   <host-workdir> e.g. $HOST_WS/AGENTSPACE/iterations/<iteration-dir>/data/it2_smoke
 #
 # <host-workdir> must live on the shared NFS (both nodes read the fixture
 # and the published dense cache through /workspace view). PASS criterion:

@@ -27,6 +27,9 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
+from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
+from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
 from sga.config import set_args
 from sga.config.validation import sga_defaults
 from sga.plugins import (
@@ -362,7 +365,7 @@ def test_warmup_sync_target_anchor():
 
     # null syncs + no engine anchor (warmup_target=None): the gate
     # short-circuits to a single bootstrap, then the persistent tau path
-    # takes over (an earlier revision crashed here with max(None, 1))
+    # takes over
     torch.manual_seed(4)
     grads = [torch.randn(2048)]
     _seed_sel(method="adaptive", ratio=10.0,
@@ -465,9 +468,9 @@ def test_hist_tiers_geometry_and_chunking():
     sel.select(_Ctx(grads, comm_group=None))
     bits = torch.tensor(sel.last_threshold, dtype=torch.float32).view(torch.int32).item()
     assert (bits & ((1 << 19) - 1)) == 0
+    from sga.plugins.selection._histogram import HistogramSelect
     try:
         sel.select(_Ctx(grads, comm_group=None, warmup_target=None))
-        from sga.plugins.selection._histogram import HistogramSelect
         HistogramSelect("turbo")
         raise AssertionError("unknown histogram_mode accepted")
     except ValueError:
@@ -835,12 +838,12 @@ def test_sparse_step_end_state_invariant():
 
 
 def test_compact_search_param_resolution():
-    """compact_search: the declared default 'table' (the benchmark-adjudicated
-    prod form) and 'bisection' both flow through the singleton (the enum
-    itself is the argparse choices' business on the flag routes — pinned in
-    test_config_flat's golden table). Silent no-op on writeback-emission
-    runs / torch fallback is the documented contract (they never reach the
-    compact merge-join; the CPU dispatch pin is below)."""
+    """compact_search: the declared default 'table' and 'bisection' both flow
+    through the singleton (the enum itself is the argparse choices' business
+    on the flag routes — pinned in test_config_flat's golden table). Silent
+    no-op on writeback-emission runs / torch fallback is the documented
+    contract (they never reach the compact merge-join; the CPU dispatch pin
+    is below)."""
     _seed()
     assert SgaAdamW().compact_search == "table"
     _seed(sga_optimizer_compact_search="bisection")
@@ -854,10 +857,6 @@ def test_backend_emission_param_resolution():
     torch_pipelined_index; explicit 'compact' on the writeback-inherent
     backends is refused with a pointer (direct-construction backstop; the
     config-layer rule catches real runs earlier)."""
-    from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
-    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
-    from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
-
     _seed()
     assert TorchPipelinedIndexBackend().emission == "compact"
     _seed(sga_backend_emission="writeback")
@@ -1138,10 +1137,6 @@ def test_registry_and_build_face():
     names, zero-arg builds reading the seeded singleton, and every
     registered backend class self-declaring its handoff facts (the engine
     and config validation route on them)."""
-    from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
-    from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
-    from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
-
     register_default_plugins()
     register_default_plugins()  # idempotent
 
@@ -1244,8 +1239,8 @@ def test_support_idx_pool_chunked_equals_nonzero():
 
 def test_support_split_and_idx_positional_equivalence():
     """BucketSupport.split: cached searchsorted midpoint split of the cached
-    flat-nonzero indices (the legacy topk_indices/topk_split pair); the
-    indices must address exactly the mask's set positions."""
+    flat-nonzero indices; the indices must address exactly the mask's set
+    positions."""
     from sga.support import BucketSupport
 
     mask = torch.tensor([0, 1, 1, 0, 1, 0], dtype=torch.uint8)  # mid = 3

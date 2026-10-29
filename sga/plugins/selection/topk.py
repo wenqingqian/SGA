@@ -14,7 +14,7 @@ count (see ``SelectionContext``). The selection ALGORITHM is the
   SUM-allreduced over the comm group only when
   ``sga_selection_topk_histogram_add_global_allreduce`` is on (default
   off: local histogram only — bit-identical under the engine's replicated
-  full-sync scores; on = the merged scheme_xp form). With replicated
+  full-sync scores; on = the merged-histogram form). With replicated
   inputs the merged histogram is exactly ``world`` times the local one
   and the select math is scale-invariant, so every rank derives the
   identical bin and threshold BY CONSTRUCTION either way (tied boundary
@@ -43,8 +43,7 @@ could still get wrong).
 full-sync boundary and persists unchanged in between; non-topk coordinates
 accumulate as residual, folded by the optimizer's reset contract at the
 next boundary) is ENGINE-CYCLE semantics, not a property of this selector —
-hence the bare registration name ``topk`` (registered historically as
-``circular_topk``).
+hence the bare registration name ``topk``.
 """
 
 import torch

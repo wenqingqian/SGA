@@ -1,8 +1,9 @@
-# SGA shadow-mode preset: the radius four-field combination with
+# SGA shadow-mode preset: the same four-field combination with
 # sga.shadow=true — the engine replicates the stock optimizer step literally
 # (stock clip, stock commit, dense finish_grad_sync, end-of-step full clear)
 # while running the boundary scoring/selection read-only with respect to
-# model/optimizer training tensors and RNG streams (against shadow support).
+# model/optimizer training tensors and RNG streams (the shadow support
+# code guarantees this).
 # Numerics must stay bitwise identical to a dense-only run.
 # sga.shadow_score=false (probe variant) strips even the read-only scoring.
 #

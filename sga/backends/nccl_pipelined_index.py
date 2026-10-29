@@ -1,11 +1,9 @@
 # Copyright (c) 2026, SGA framework contributors.
 """Index-form sparse allreduce backend on the raw nccl-sar sparse kernels.
 
-STATUS (2026-09-24): temporarily deprecated — the code, its three layout
-paths and its test suites are kept and still run, but the torch backends
-(``torch_pipelined_index`` / ``torch_pipelined_mask``) are the current
-active transport path; the nccl path is maintained, not recommended for
-new runs.
+STATUS: temporarily deprecated — the code, its three layout paths and
+its test suites are kept and still run, but the torch backends are the
+current active transport path.
 
 Transport is the nccl-sar fork's sparse API (Ring+Simple, compact-domain
 wire cost that scales with the communicated count), dispatched by the
@@ -335,13 +333,10 @@ class NcclPipelinedIndexBackend:
         op at/above the largest production op plus a 1-element op; the
         synchronize turns a sticky CUDA error into an immediate,
         well-located failure. The op FORM matches the configured layout
-        (the layout taxonomy): er/eb warms the element API; bb warms the block API
-        with one full-width descriptor set — heads = arange(0, n, 64),
-        every head a complete 64-run at the contract UPPER bound (n is a
-        multiple of 64), so the block decode path itself is instantiated
-        at production LANE width, not just the shared ring infrastructure
-        (the configured x is a host-side shift; channel sizing follows
-        the element width either way). ``flag`` is the resolved
+        (the layout taxonomy): er/eb warms the element API; bb warms the
+        block API with one full-width descriptor set (heads = arange(0,
+        n, 64)); the configured x is a host-side shift, channel sizing
+        follows the element width either way. ``flag`` is the resolved
         ``_WARMUP_ENV`` value, echoed on rank 0 so a divergent export is
         visible in the logs."""
         try:

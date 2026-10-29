@@ -315,8 +315,7 @@ class TorchPipelinedIndexBackend:
         """(lo, hi) index ranges into ``support.idx`` per slice.
 
         Plain mode with the default 2 slices uses the bucket-midpoint split
-        (``support.split``) — the historical partition, kept for arm
-        continuity. Everything else splits the selected set evenly
+        (``support.split``). Everything else splits the selected set evenly
         (``i*k//s``).
         """
         if not self._hiprio and self._slices == 2:
@@ -482,12 +481,6 @@ class TorchPipelinedIndexBackend:
                       and gradient_scaling_factor != 1.0) else 1.0)
 
         if self.emission == "writeback":
-            # The historical choreography (bit for bit the pre-compact
-            # form; end state bitwise-equal to the nccl backend's within
-            # the dist suite's 2-rank scope): pure-read gather, payload-only
-            # scale, pipelined allreduce, scatter the communicated values
-            # back into the dense grad; the optimizer's masked kernel
-            # reads them there and does the selective clear post-commit.
             prev = None  # (work, idx, sel)
             for lo, hi in self._bounds(support, k):
                 if hi <= lo:

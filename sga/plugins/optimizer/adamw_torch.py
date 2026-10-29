@@ -45,8 +45,7 @@ def grad_correct_torch(param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
     Sparse-fusion knobs (mirroring the kernel): ``coeff`` multiplies
     the working gradient at mask-active positions, ``clear`` zeroes the
     active positions of ``grad`` after use, ``fold`` divides ``grad`` by
-    ``interval`` (actives are 0 by then — 0/T == 0 exact, the same op
-    sequence the standalone torch reset performed).
+    ``interval`` (actives are 0 by then — 0/T == 0 exact).
 
     Full-step dual-lr (mirroring the kernel's LR_SPLIT): with
     ``inactive_lr_scale != 1.0`` the boundary commits the merged buffer

@@ -9,9 +9,9 @@ Stub legacy checkpoints under temp dirs; verifies the fail-closed cluster:
   checkpoint missing a newer key compares against its default — forward
   compatible);
 - a DIFFERENT SPELLING of the same cycle anchor (percent vs absolute
-  start_iter) refuses: the raw compare is deliberately spelling-faithful
-  (deliberately), and a percent spelling anchors to its side's own
-  train_iters, which rides the comparison;
+  start_iter) refuses: the raw compare is spelling-faithful by design,
+  and a percent spelling anchors to its side's own train_iters, which
+  rides the comparison;
 - differing / absent saved sga arguments refuse the resume (SystemExit);
   a legacy DENSE checkpoint cannot silently resume under active SGA, a
   JSON-era checkpoint (retired --sga-config string) is refused with a

@@ -12,8 +12,6 @@ from omegaconf import DictConfig
 from sga.launcher.backend_megatron import MegatronBackend
 from sga.launcher.launcher_ssh import SshLauncher
 
-# task_type -> allowed backends (the single megatron+ssh pair is wired
-# directly below; see the surgery note at the top of this file).
 TASK_TO_BACKEND_MAP = {
     "train": ["megatron"],
 }
@@ -27,13 +25,11 @@ class Runner(ABC):
 
         backend_attr = self.config.experiment.task.get("backend", None)
 
-        # backend is required for train
         assert backend_attr is not None, (
             f"backend_type is required for task_type='{self.task_type}'. "
             f"Allowed backends: {TASK_TO_BACKEND_MAP[self.task_type]}"
         )
 
-        # validate task_type and backend_type compatibility
         allowed_backends = TASK_TO_BACKEND_MAP[self.task_type]
         assert backend_attr in allowed_backends, (
             f"Unsupported backend type '{backend_attr}' for task_type='{self.task_type}'. "

@@ -13,4 +13,4 @@ repos:
     path: ../nccl-sar
     branch: sparse
     base_commit: 63cf786     # NCCL 2.30.7 fork; sparse allreduce kernel repo
-    note: built library libs/v8 (sealed at v8), auto-discovered by env.sh; the SGA nccl backend is temporarily deprecated
+    note: built library under libs/v8, auto-discovered by env.sh; the SGA nccl backend is temporarily deprecated

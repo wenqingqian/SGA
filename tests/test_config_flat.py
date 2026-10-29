@@ -166,8 +166,8 @@ def test_inv2_unknown_key_named_by_the_parser():
 
 
 def test_inv2_prefix_machines_are_gone():
-    """The prefix/short-name machines this suite once pinned in place are
-    deleted — and pinned ABSENT so they cannot creep back: no
+    """The prefix/short-name machines must stay absent — pinned ABSENT
+    so they cannot creep back: no
     engine_section_defaults, no runtime materialization of a nested read
     shape, no expand_plugin_params with a dest_prefix, and no name
     assembly/stripping anywhere in the config chain's source (the
@@ -456,7 +456,7 @@ def test_inv5_block_backend_cross_field_rules():
     the layout routes which index form the transport consumes. bb rides
     the torch block path (writeback-only) or the nccl descriptor API
     (block_size bounded to a pow2 in [4, 64]); er/eb ride the element
-    idx paths — so nccl+block 16 is now a LEGITIMATE bb config, and the
+    idx paths — so nccl+block 16 is a legitimate bb config, and the
     refusals are the dead/misaligned combinations instead."""
     base = {"sga_selection_block_size": 16}
     # tpi with the auto default: layout auto-derives bb and emission

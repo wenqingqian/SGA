@@ -1,9 +1,8 @@
 # Copyright (c) 2026, SGA framework contributors.
 """SGA offline replay oracle: score evaluation on recorded training traces.
 
-SGA-repository port of the legacy research tool; consumes pre-commit trace
-dumps
-produced by the engine-side trace collector (sga.trace config) and,
+consumes pre-commit trace dumps produced by the engine-side trace
+collector (sga.trace config) and,
 offline, computes per-coordinate oracle scores and evaluates their
 predictive power over a replay window. Trace format is byte-compatible with
 the legacy collector (catalog.pt / step_NNNNNN_state.pt / step_NNNNNN_g.pt),
@@ -29,8 +28,6 @@ Replay modes:
   (sga/replay_fused.py) and therefore requiring --dense-cache (populated
   automatically on the first run). Boundary steps are dense, so d@1 is
   structurally 0 — the informative within-cycle horizons start at H=2.
-  The classic in-process cycle replay was removed; single-shard fused
-  runs reproduced it bitwise (pinned by an e2e tiny-trace comparison).
 
 Evaluation: distortion(H) = ||w_sparse - w_dense||/||w_dense - w0|| against
 the dense replay arm; NDCG@k / recall@k / missed_label_mass /
@@ -57,8 +54,7 @@ catalog[name]["param_group"]); when present they take precedence per param
 (exact lr per group included). The fallback keeps old-trace replays
 bit-compatible with the legacy tool.
 
-Usage (container flagscale-gzlu + conda flagscale, SGA repo root on
-PYTHONPATH):
+Usage (SGA repo root on PYTHONPATH):
 
     python -m sga.replay --trace-dir <dir> --branch-point 40 \
         --replay-mode cycle --cycle-len 20 --ratios 10,20 --horizons 1,10 \
@@ -85,14 +81,12 @@ import time
 import torch
 
 
-# The score set IS the framework registry (single namespace, formulas
-# included); replay defines no score names of its own.
 from sga.plugins.scores import get_score_spec, score_names as all_score_names
 
 # Bump on ANY change to replay arithmetic or semantics (score formulas,
 # clip/norm handling, dtype rules, ...). Part of the dense-cache key: a stale
 # cache from an older semantics must fail loudly, never silently serve.
-REPLAY_SEMANTIC_VERSION = 2  # 1 = pre-dense-cache baseline
+REPLAY_SEMANTIC_VERSION = 2
 
 _G_STEP_RE = re.compile(r"step_(\d+)_g\.pt$")
 _STAT_STEP_RE = re.compile(r"step_(\d+)_state\.pt$")
@@ -344,7 +338,7 @@ def hist_threshold(t, k):
     """Exact k-th-largest value over the flat score vector via a 32769-bin
     bit-pattern histogram + candidate-bin kthvalue. Bit-exact same threshold
     as torch.kthvalue over all elements (the trick used by the online
-    Phase-3 selection), ~10x faster on 1.2B elements.
+    Phase-3 selection).
     ``t`` must be non-negative (all our scores are absolute values)."""
     top16 = _abs_bit_top16(t)
     hist = torch.bincount(top16, minlength=32769)
@@ -1258,7 +1252,7 @@ def run_self_check(ctx, from_step, to_step, args):
             "min": min(w_vals) if w_vals else None,
             "median": (sorted(w_vals)[len(w_vals) // 2] if w_vals else None),
             "max": max(w_vals) if w_vals else None,
-            "params": per_param,  # full per-param breakdown
+            "params": per_param,
         },
     }
     return res
@@ -1512,8 +1506,6 @@ def main(argv=None):
     # The cycle knob resolves to the per-config T list here: --cycle-len N is
     # the one-element list, the two spellings are mutually exclusive, and the
     # set is sorted/deduped so the config enumeration is deterministic.
-    # Validation covers zerofill too (the knob is unused there but still
-    # echoed into the report config).
     if args.cycle_len is not None and args.cycle_lens is not None:
         raise ValueError(
             "--cycle-len and --cycle-lens are mutually exclusive: pass the "
@@ -1538,7 +1530,7 @@ def main(argv=None):
         args.cycle_lens = sorted(set(lens))
     else:
         if args.cycle_len is None:
-            args.cycle_len = 20  # historical default
+            args.cycle_len = 20  # default T, kept for compatibility
         if args.cycle_len < 1:
             # cycle mode needs a positive full-sync interval; under zerofill
             # the knob is unused but still echoed into the report config, so
@@ -1552,9 +1544,6 @@ def main(argv=None):
         raise ValueError(
             "--replay-mode cycle cannot be combined with --self-check")
     if args.replay_mode == "cycle" and not args.dense_cache:
-        # behavior change vs the removed classic in-process cycle replay,
-        # which ran without a cache; named loudly instead of silently
-        # re-reading the window per arm
         raise ValueError(
             "--replay-mode cycle requires --dense-cache (the classic "
             "in-process cycle replay that ran without a cache was removed; "

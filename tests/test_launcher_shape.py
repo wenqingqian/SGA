@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Launcher script-shape gate (container-only; run after `source env.sh`).
 
-Pins the plan's central day-one invariants that nothing else exercised:
+Pins launcher invariants no other test exercises:
 
   a. golden shape: the real launch pipeline over examples/llama3/train_1b_dense.yaml
      (_update_config_train -> _get_args_megatron -> _get_runner_cmd_train) emits
      the expected megatron/torchrun flags and never leaks launcher-only keys;
   b. generated run-script skeleton (shebang/mkdir/cd/PYTHONPATH/cmd/nohup|tee);
-  c. regression: run_node tolerates hosts without any *_VISIBLE_DEVICES env
-     (UnboundLocalError fixed) and still honors them when present;
+  c. regression: run_node works on hosts without any *_VISIBLE_DEVICES env
+     and still honors them when present;
   d. regression: runner.no_shared_fs=true must not inject --no-shared-fs into
      the megatron command line (the strict fork parser rejects it);
   e. regression: the audit tool's parser equals the training-entry parser
@@ -52,7 +52,7 @@ train:
 
 
 def load_example_config(exp_dir):
-    """Day-one yaml with exp_dir redirected to a private temp dir.
+    """The example yaml with exp_dir redirected to a private temp dir.
 
     Deliberately NO container round-trip:OmegaConf.to_container(resolve=True)
     would turn the yaml's escaped ``\\${VAR}`` sequences in cmds.before_start
@@ -177,7 +177,7 @@ def test_run_node_without_visible_devices():
     resource_info = {"slots": 8, "type": None}
     runner_config = OmegaConf.create({})
 
-    # No *_VISIBLE_DEVICES anywhere: previously UnboundLocalError.
+    # No *_VISIBLE_DEVICES anywhere: must not raise UnboundLocalError.
     run_node(fake_func, 0, "localhost", resource_info, {}, runner_config,
              1, "localhost", 29510, True, True, {})
     assert captured["nproc_per_node"] == 8
@@ -240,9 +240,8 @@ def test_audit_parser_matches_training_entry():
 
 def test_entry_args_provider_returns_parser():
     """Megatron's parse_args REBINDS ``parser = extra_args_provider(parser)``:
-    a provider returning None (an early wiring, caught only by
-    the e2e gate, since the closure lived under __main__) killed every rank
-    with 'NoneType' object has no attribute 'parse_args'."""
+    a provider returning None kills every rank with
+    'NoneType' object has no attribute 'parse_args'."""
     from sga.train_gpt import _extra_args_provider
 
     parser = audit_megatron_args.build_megatron_parser(False)

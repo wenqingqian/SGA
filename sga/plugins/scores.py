@@ -150,11 +150,9 @@ def _u_g(w, m, v, g, beta1, beta2, eps, bias_correction1, bias_correction2,
     """
     sa, sb = scratch
     result = torch.empty_like(w)
-    # m_new = beta1 * m + (1.0 - beta1) * g
     torch.mul(m, beta1, out=sa)
     torch.mul(g, 1.0 - beta1, out=sb)
     torch.add(sa, sb, out=sa)
-    # v_new = beta2 * v + (1.0 - beta2) * g * g
     torch.mul(v, beta2, out=sb)
     torch.mul(g, 1.0 - beta2, out=result)
     torch.mul(result, g, out=result)

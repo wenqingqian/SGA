@@ -25,7 +25,7 @@ from omegaconf import OmegaConf
 from sga.config import sga_config_attrs
 from sga.config.arguments import add_sga_args
 from sga.config.validation import sga_actions, sga_defaults, validate_sga_args
-from sga.launcher.backend_megatron import _get_args_megatron
+from sga.launcher.backend_megatron import _get_args_megatron, _prevalidate_sga
 
 ENABLED = {
     "sga_enabled": True,
@@ -166,7 +166,7 @@ def test_dual_form_equivalence():
 
 
 def test_dual_form_explicit_null_round_trip():
-    """R5: the explicit-null spelling of the nullable warmup flag
+    """The explicit-null spelling of the nullable warmup flag
     survives the dual-form round trip — a yaml flat section carrying
     sga_selection_adaptive_warmup_syncs: null and the CLI
     --sga-selection-adaptive-warmup-syncs null validate identically
@@ -302,8 +302,6 @@ def test_legacy_nested_keys_are_unknown():
     (there is no short form and no nested section), never as a
     silently-ignored config; a prefixed but undeclared key fails with
     the unknown-key refusal."""
-    from sga.launcher.backend_megatron import _prevalidate_sga
-
     for legacy in ("cycle", "selection", "score", "trace", "checks"):
         cfg = _cfg_with_sga(dict(ENABLED, **{legacy: {"start_iter": 1}}))
         expect_error(lambda c=cfg: _prevalidate_sga(c),
@@ -314,8 +312,6 @@ def test_legacy_nested_keys_are_unknown():
 
 
 def test_typo_plugin_param_rejected():
-    from sga.launcher.backend_megatron import _prevalidate_sga
-
     expect_error(lambda: _prevalidate_sga(
         _cfg_with_sga(dict(ENABLED, sga_selection_ration=10.0))),
         "unknown sga: key")

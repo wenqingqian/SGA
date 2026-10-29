@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omegaconf import OmegaConf
 
+import sga.engine as engine_mod
 from sga.engine import SGAEngine
 from sga.launcher.backend_megatron import _prevalidate_sga
 from sga.plugins import (
@@ -40,6 +41,9 @@ from sga.shadow import readonly_score
 
 from test_engine_unit import (
     _ABS_M,
+    _ALWAYS,
+    _AS_NAMES,
+    _AS_PATTERNS,
     _FakeChunk,
     _FakeMPOpt,
     _ReplicaWorld,
@@ -205,7 +209,6 @@ def test_shadow_found_inf_full_clear_and_skip():
 def test_shadow_rng_guard_raises():
     """RNG consumption inside the boundary insertion (here: the readonly
     score evaluation) fails the RNG assert — the shadow guard dog."""
-    import sga.engine as engine_mod
 
     torch.manual_seed(3)
     chunk = _FakeChunk()
@@ -250,7 +253,6 @@ def test_shadow_rng_bracket_off_leg():
     hatch must not disable the machinery it watches). Companion leg: the
     shadow-path L3 gate (checks_norm_spread=false) skips the spread check
     inside _shadow_reselect."""
-    import sga.engine as engine_mod
 
     torch.manual_seed(3)
     chunk = _FakeChunk()
@@ -400,7 +402,7 @@ def test_readonly_score_matches_optimizer_torch_reference():
 
 
 def test_readonly_score_mixed_numel_records_share_one_scratch_pair():
-    """C1 regression: two records of DIFFERENT numel AND rank score through
+    """two records of DIFFERENT numel AND rank score through
     ONE shared scratch pair sized to the max numel — exactly what the engine
     allocates per shadow boundary (a single flat max_n pair reused for every
     param in meta order, smaller-before-larger in practice). The formulas'
@@ -663,7 +665,6 @@ def test_shadow_rng_guard_cuda_half_raises():
     RNG stream fails the assert even when the CPU stream stays clean (the
     CPU-only test is structurally blind to this half on CPU-only test envs —
     exercised via monkeypatched torch.cuda state accessors)."""
-    import sga.engine as engine_mod
 
     torch.manual_seed(3)
     chunk = _FakeChunk()
@@ -811,7 +812,6 @@ def test_shadow_always_sync_inherits_eligible_interception():
     """The shadow boundary rides the SAME shared selection tail —
     the forced spans land all-ones in the shadow support and the selector
     sees only the eligible pool (no live/shadow support divergence)."""
-    from test_engine_unit import _ALWAYS, _AS_NAMES, _AS_PATTERNS
 
     torch.manual_seed(0)
     chunk = _FakeChunk(n_params=len(_AS_NAMES), names=_AS_NAMES)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-GPU Triton-vs-torch A/B tests for the SGA kernels (R9 gap 3).
+"""Single-GPU Triton-vs-torch A/B tests for the SGA kernels.
 
 Runs only when CUDA + Triton are available (the container has GPUs); each
 fused kernel path is compared against the pure-torch fallback that the CPU
@@ -30,11 +30,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sga.kernels import (
     compact_norm_sq_contribution,
+    gather_selected_blocks,
     masked_norm_sq_contribution,
     pack_selected,
     scatter_selected,
+    scatter_selected_blocks,
 )
-from sga.kernels_torch import pack_selected_torch
+from sga.kernels_torch import (
+    gather_selected_blocks_torch,
+    pack_selected_torch,
+    scatter_selected_blocks_torch,
+)
+from sga.support import BucketSupport, block_idx_from_mask
 from sga.plugins.optimizer.adamw import (
     adamw_grad_correct,
     adamw_grad_correct_compact,
@@ -227,8 +234,7 @@ def test_grad_correct_sparse_fusion_bitwise():
     (interval 7.0 exercises the non-power-of-two reciprocal; within ONE
     backend mul-by-reciprocal is self-consistent — the CPU fallback's true
     division may sit 1 ulp from it). Any coeff value is fair game — there is
-    no add adjacent for FMA contraction, which the C1 on-GPU bench (99
-    records, real coeffs) already confirmed at full scale.
+    no add adjacent for FMA contraction.
     """
     device = "cuda"
     n = 8192
@@ -286,7 +292,6 @@ def test_scatter_selected_roundtrip():
     dst = torch.zeros(numel, device=device)
     scatter_selected(dst, idx, src)
     assert torch.equal(dst[idx.long()].cpu(), src.cpu())
-    # untouched coordinates remain zero
     rest = torch.ones(numel, dtype=torch.bool)
     rest[idx.long()] = False
     assert torch.all(dst.cpu()[rest] == 0)
@@ -617,9 +622,7 @@ def test_compact_grad_correct_full_density_clustered_and_bracket_fill():
         ab(full.clone(), fold=fold, interval=interval, rec_lo=5000)
 
     # (b) heterogeneous occupancy, constructed explicitly: 5 full + 4
-    # partial (~30% Bernoulli) + 7 empty 1024-blocks — the shape the
-    # bench's real arm measures (empty_frac 0.63 / full_frac 0.15). A
-    # global top-k of IID scores cannot produce it (per-block occupancy is
+    # partial (~30% Bernoulli) + 7 empty 1024-blocks. A global top-k of IID scores cannot produce it (per-block occupancy is
     # exchangeable around ~k/BLOCK, no empty blocks), so the construction
     # is deterministic and its heterogeneity is asserted.
     bsz = 1024
@@ -676,7 +679,6 @@ def test_compact_grad_correct_dir_table():
     the m/v ulp asserts catch (the p-side under-convergence alone is
     lane-absorbed: the lane search re-derives within [p, q)).
     """
-    from sga.support import BucketSupport
 
     device = "cuda"
     kw = dict(lr=1e-3, beta1=0.9, beta2=0.95, eps=1e-8,
@@ -725,7 +727,7 @@ def test_compact_grad_correct_dir_table():
     except AssertionError as e:
         assert "2^31" in str(e), e
     # companion happy path just below the guard's edge (host arithmetic:
-    # ((2^31 - 2048) >> 10 + 1) * 1024 = 2^31 - 1024 < 2^31) must NOT
+    # (((2^31 - 2048) >> 10) + 1) * 1024 = 2^31 - 1024 < 2^31) must NOT
     # raise — no oversized tensor is constructed, the 8-entry idx slice
     # keeps the launch trivial
     build_dir_table(idx[:8].contiguous(), (1 << 31) - 1024 * 2)
@@ -1040,11 +1042,6 @@ def test_block_gather_scatter_ab():
     refused loudly. block_idx comes from block_idx_from_mask itself so the
     ANY-rule derivation is exercised end to end.
     """
-    from sga.kernels import (gather_selected_blocks,
-                             scatter_selected_blocks)
-    from sga.kernels_torch import (gather_selected_blocks_torch,
-                                   scatter_selected_blocks_torch)
-    from sga.support import block_idx_from_mask
 
     device = "cuda"
     for x in (1, 8, 64):
@@ -1138,10 +1135,9 @@ def test_block_gather_scatter_ab():
 
 def test_compact_norm_deterministic():
     """Compact norm: same aggregate as the masked contribution (within the
-    declared ulp-class reduction-order difference) and DETERMINISTIC across
-    reruns — the masked atomic kernel this replaces was the run-to-run
-    clip-coeff jitter source the masked atomic kernel carried; the
-    compact path removes it from the sparse path)."""
+    declared ulp-class reduction-order difference) and deterministic across
+    reruns — it replaces the masked atomic kernel, which was the run-to-run
+    clip-coeff jitter source."""
     device = "cuda"
     n = 8192 * 64
     vals = torch.rand(n, device=device) * 2 - 1
@@ -1149,7 +1145,7 @@ def test_compact_norm_deterministic():
     got = torch.zeros(1, device=device)
     compact_norm_sq_contribution(vals, got)
     assert abs(got.item() - ref_sq) <= 1e-5 * max(1.0, abs(ref_sq))
-    # determinism: 20 runs, exactly one distinct sum (pre-registered probe)
+    # determinism: 20 runs, exactly one distinct sum
     sums = set()
     for _ in range(20):
         t = torch.zeros(1, device=device)
@@ -1166,8 +1162,7 @@ def test_score_modes_purity_and_content():
     in the grad buffer with the apply fused in the same pass, and the
     emitted score matches its reference from the PRE-commit state; the
     kernel's internal EMIT_MODE ints are pinned via _TRITON_SCORE_MAP
-    (the name->branch map IS the namespace; migrated from
-    test_sga_scheme_xp_mask_score.py)."""
+    (the name->branch map IS the namespace)."""
     device = "cuda"
     n = 999_999
     lr, b1, b2, eps, wd, step = 5e-5, 0.9, 0.95, 1e-8, 0.1, 1501
@@ -1219,8 +1214,8 @@ def test_score_modes_purity_and_content():
 
     # an unknown name is rejected host-side before any launch, with the
     # owned wrapper message (covers both unregistered names and a
-    # registered score without a kernel branch — there is no public
-    # int-mode face anymore; EMIT_MODE ints are this map's business)
+    # registered score without a kernel branch — the int-mode namespace is
+    # private to this map)
     for bogus in ("bogus", "offline"):
         try:
             adamw_grad_correct(w0.clone(), g0.clone(), m0.clone(),
