@@ -764,12 +764,6 @@ _ABS_M = {
 }
 
 
-def _flat_config(over=None):
-    """Seed the singleton with defaults + overlays (kept under the
-    historical name: test_trace imports it). Returns the seeded namespace."""
-    return _seed(over)
-
-
 def _seed_combo(combo, extra=None):
     """Merge one combo's four param dicts into the single seed every
     zero-arg constructor reads."""
