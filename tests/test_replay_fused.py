@@ -2556,6 +2556,7 @@ def main():
     test_state_budget_cap_semantics()
     test_state_budget_cuda()
     test_s0_profile_counters()
+    test_replay_kernels_killswitch()
     print("\nall replay-fused tests passed")
 
 

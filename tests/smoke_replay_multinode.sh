@@ -59,7 +59,7 @@ run "$MASTER" "$COND && python - <<'PYEOF'
 import inspect, sys
 sys.path[:0] = ['$REMOTE_SGA', '$REMOTE_SGA/tests']
 from test_replay_fused import _build_fixture, _compare_world2
-assert len(inspect.signature(_build_fixture).parameters) == 1, \
+assert len(inspect.signature(_build_fixture).parameters) == 2, \
     '_build_fixture signature drifted'
 assert len(inspect.signature(_compare_world2).parameters) == 3, \
     '_compare_world2 signature drifted'
