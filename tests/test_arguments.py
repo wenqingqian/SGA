@@ -113,9 +113,9 @@ def _raw_json(attrs_owner):
 
 def test_flag_table_declared_in_arguments_py():
     """The vocabulary IS the add_argument set: every dest hyphenates to its
-    flag and the historical surface is pinned (39 dests)."""
+    flag and the historical surface is pinned (42 dests)."""
     actions = sga_actions()
-    assert len(actions) == 39, sorted(actions)
+    assert len(actions) == 42, sorted(actions)
     for dest, action in actions.items():
         assert action.option_strings == ["--" + dest.replace("_", "-")], dest
     assert set(sga_defaults()) == {
@@ -129,6 +129,8 @@ def test_flag_table_declared_in_arguments_py():
         "sga_checks_rng_bracket",
         "sga_trace_dir", "sga_trace_branch_points", "sga_trace_window",
         "sga_trace_dump_dtype",
+        "sga_trace_async", "sga_trace_async_queue_depth",
+        "sga_trace_async_max_workset_gib",
         "sga_score",
         "sga_selection", "sga_selection_method",
         "sga_selection_ratio_percent", "sga_selection_histogram_mode",
@@ -144,7 +146,7 @@ def test_flag_table_declared_in_arguments_py():
         "sga_backend_index_slices", "sga_backend_mask_slices",
         "sga_backend_timer",
     }
-    print("ok: 39 flat flags declared, hyphenation 1:1")
+    print("ok: 42 flat flags declared, hyphenation 1:1")
 
 
 def test_dual_form_equivalence():
@@ -219,6 +221,49 @@ def test_decoupled_cycle_round_trip():
     ns_hand = _ns_from_flags(hand)
     assert _raw_json(ns_launcher) == _raw_json(ns_hand)
     print("ok: decoupled cycle round-trips through the flags")
+
+
+def test_trace_async_round_trip():
+    """The async trace knobs ride both spellings identically: a yaml sga:
+    section carrying sga_trace_dir + sga_trace_async + the two budget knobs
+    and the hand-written --sga-trace-* flag spelling validate to the same
+    raw attrs (opt-in flags with explicit defaults 2 / 16.0)."""
+    cfg = _cfg_with_sga(dict(
+        ENABLED, sga_trace_dir="/tmp/sga-trace-async",
+        sga_trace_branch_points="4000", sga_trace_async=True,
+        sga_trace_async_queue_depth=2,
+        sga_trace_async_max_workset_gib=16.0))
+    tokens = _flags_of(cfg)
+    for flag, want in (("--sga-trace-async", "true"),
+                       ("--sga-trace-async-queue-depth", "2"),
+                       ("--sga-trace-async-max-workset-gib", "16.0")):
+        assert tokens[tokens.index(flag) + 1] == want, flag
+    ns_launcher = _ns_from_flags(tokens)
+    assert ns_launcher.sga_trace_async is True
+    assert ns_launcher.sga_trace_async_queue_depth == 2
+    assert ns_launcher.sga_trace_async_max_workset_gib == 16.0
+    hand = ["--sga-enabled", "true",
+            "--sga-backend", "torch_pipelined_index",
+            "--sga-cycle-period", "8",
+            "--sga-cycle-start-iter", "20",
+            "--sga-optimizer", "adamw",
+            "--sga-score", "update",
+            "--sga-selection-method", "histogram",
+            "--sga-selection-histogram-mode", "balanced",
+            "--sga-selection-ratio-percent", "10.0",
+            "--sga-trace-branch-points", "4000",
+            "--sga-trace-dir", "/tmp/sga-trace-async",
+            "--sga-trace-async", "true",
+            "--sga-trace-async-queue-depth", "2",
+            "--sga-trace-async-max-workset-gib", "16.0"]
+    ns_hand = _ns_from_flags(hand)
+    assert _raw_json(ns_launcher) == _raw_json(ns_hand)
+    # defaults: async off, depth 2, cap 16 GiB (the opt-in posture)
+    ns_plain = _ns_from_flags(_flags_of(_cfg_with_sga(dict(ENABLED))))
+    assert ns_plain.sga_trace_async is False
+    assert ns_plain.sga_trace_async_queue_depth == 2
+    assert ns_plain.sga_trace_async_max_workset_gib == 16.0
+    print("ok: trace async knobs round-trip; defaults 2 / 16.0")
 
 
 def test_percent_resolves_train_side():

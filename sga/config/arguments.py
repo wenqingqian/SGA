@@ -238,6 +238,30 @@ def _add_sga_trace_args(parser: argparse.ArgumentParser):
              "sga.trace_convert), halving dump volume and skipping the "
              "post-hoc conversion pass; state files stay fp32 either "
              "way. Default fp32 (zero-drift).")
+    group.add_argument(
+        "--sga-trace-async", type=sga_bool, default=False,
+        help="offload each step's g-file serialization+write to a single "
+             "background writer after the main thread takes an independent "
+             "blocking CPU snapshot. The queue never holds training/CUDA "
+             "tensors; catalog and branch-point state files stay synchronous. "
+             "Writer failures re-raise fail-closed and the queue drains after "
+             "the last target gradient step. Default false (synchronous).")
+    group.add_argument(
+        "--sga-trace-async-queue-depth", type=int, default=2,
+        help="sga_trace_async only: max in-flight g items (queued + being "
+             "written) before the dump slot blocks (backpressure). "
+             "Default 2 — the queue hides latency spikes, not a "
+             "steady-state writer bottleneck.")
+    group.add_argument(
+        "--sga-trace-async-max-workset-gib", type=float, default=16.0,
+        help="sga_trace_async only: hard cap in GiB on the writer's "
+             "host-RAM workset (queued snapshots + the item being "
+             "written + one conservative serialization copy). Each item "
+             "reserves 2x its fp32 snapshot bytes BEFORE the snapshot is "
+             "allocated; a single item whose reservation alone exceeds "
+             "the cap fails before any allocation (no oversized bypass). "
+             "Synchronous state saves are NOT part of this budget. "
+             "Default 16.0.")
 
 
 def _add_sga_score_args(parser: argparse.ArgumentParser):

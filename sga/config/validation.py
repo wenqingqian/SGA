@@ -235,7 +235,13 @@ def validate_sga_args(args=None) -> None:
         or args.sga_trace_window
         != sga_defaults()["sga_trace_window"]
         or args.sga_trace_dump_dtype
-        != sga_defaults()["sga_trace_dump_dtype"])
+        != sga_defaults()["sga_trace_dump_dtype"]
+        or args.sga_trace_async
+        != sga_defaults()["sga_trace_async"]
+        or args.sga_trace_async_queue_depth
+        != sga_defaults()["sga_trace_async_queue_depth"]
+        or args.sga_trace_async_max_workset_gib
+        != sga_defaults()["sga_trace_async_max_workset_gib"])
     if trace_present:
         tdir = args.sga_trace_dir
         if not isinstance(tdir, str) or not tdir:
@@ -263,6 +269,18 @@ def validate_sga_args(args=None) -> None:
         if not isinstance(window, int) or isinstance(window, bool) or window < 1:
             raise ValueError(
                 f"sga_trace_window must be an int >= 1 (got {window!r})")
+        depth = args.sga_trace_async_queue_depth
+        if (not isinstance(depth, int) or isinstance(depth, bool)
+                or depth < 1):
+            raise ValueError(
+                f"sga_trace_async_queue_depth must be an int >= 1 "
+                f"(got {depth!r})")
+        gib = args.sga_trace_async_max_workset_gib
+        if (not isinstance(gib, (int, float)) or isinstance(gib, bool)
+                or not math.isfinite(gib) or gib <= 0.0):
+            raise ValueError(
+                f"sga_trace_async_max_workset_gib must be a finite float "
+                f"> 0 (got {gib!r})")
 
     # --- shadow ---
     shadow = bool(args.sga_shadow)

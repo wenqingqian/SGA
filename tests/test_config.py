@@ -247,11 +247,39 @@ def test_trace_validation():
     cfg2.sga.sga_trace_dump_dtype = "fp16"
     expect_error(lambda: _prevalidate_sga(cfg2), "sga-trace-dump-dtype")
 
+    # async writer knobs: defaults resolve (off / depth 2 / 16 GiB), the
+    # value rules refuse depth < 1 and non-finite/non-positive caps, and
+    # any non-default async knob without sga_trace_dir meets the same
+    # "dir required" refusal as the other trace keys
+    cfg4, _ = make_base()
+    _enable_standard(cfg4)
+    cfg4.sga.sga_trace_dir = "/tmp/sga-trace-async"
+    cfg4.sga.sga_trace_async = True
+    ns = _ns_of(cfg4)
+    assert ns.sga_trace_async is True
+    assert ns.sga_trace_async_queue_depth == 2
+    assert ns.sga_trace_async_max_workset_gib == 16.0
+
+    cfg4.sga.sga_trace_async_queue_depth = 0
+    expect_error(lambda: _prevalidate_sga(cfg4), "queue_depth")
+    cfg4.sga.sga_trace_async_queue_depth = 2
+    cfg4.sga.sga_trace_async_max_workset_gib = 0.0
+    expect_error(lambda: _prevalidate_sga(cfg4), "max_workset_gib")
+    cfg4.sga.sga_trace_async_max_workset_gib = float("nan")
+    expect_error(lambda: _prevalidate_sga(cfg4), "max_workset_gib")
+    cfg4.sga.sga_trace_async_max_workset_gib = 16.0
+    _prevalidate_sga(cfg4)  # legal posture again
+
+    cfg5, _ = make_base()
+    _enable_standard(cfg5)
+    cfg5.sga.sga_trace_async = True  # no sga_trace_dir: the dir is required
+    expect_error(lambda: _prevalidate_sga(cfg5), "sga_trace_dir")
+
     cfg3, _ = make_base()
     _enable_standard(cfg3)
     OmegaConf.update(cfg3, "sga.sga_trace_bogus", 1)
     expect_error(lambda: _prevalidate_sga(cfg3), "sga_trace_bogus")
-    print("ok: trace validation (dir/branch/window/dump-dtype/unknown)")
+    print("ok: trace validation (dir/branch/window/dump-dtype/async/unknown)")
 
 
 def test_start_iter_percent_resolves():
