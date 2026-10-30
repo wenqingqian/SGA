@@ -518,8 +518,7 @@ def _abs_bit_top16(t):
 def hist_threshold(t, k):
     """Exact k-th-largest value over the flat score vector via a 32769-bin
     bit-pattern histogram + candidate-bin kthvalue. Bit-exact same threshold
-    as torch.kthvalue over all elements (the trick used by the online
-    Phase-3 selection).
+    as torch.kthvalue over all elements.
     ``t`` must be non-negative (all our scores are absolute values)."""
     top16 = _abs_bit_top16(t)
     hist = torch.bincount(top16, minlength=32769)
@@ -1107,8 +1106,7 @@ def _dense_cache_ident(trace_dir, t0, window_steps, eff_horizons,
     optimizer axis (the dense reference trajectory itself — label, den,
     snapshots — depends on the step recursion) is appended only for
     non-adamw values so every existing adamw cache keeps its exact ident and
-    stays a hit (the adamw arithmetic is unchanged); an adamw run and an
-    adams run therefore never share a cache file."""
+    stays a hit (the adamw arithmetic is unchanged)."""
     parts = [
         f"semver={REPLAY_SEMANTIC_VERSION}",
         f"trace={trace_dir}",

@@ -43,27 +43,17 @@ auto-routes here):
    misconfigurations raise loudly.
 9. Perf-flag mechanism (not just report values): the --fused-g-residency
    / --fused-dev-reduce echoes, the REPLAY_S0_PROFILE counters carried in
-   the fragment (residency books every shared H2D byte to pass 1,
-   dev-reduce collapses the host syncs to the per-pass fetches), the
-   pinned prefetcher buffers on CUDA, and a --trace-dtype bf16 leg of
-   the slice-first prefetcher (reference anchor + bitwise fp32-twin A/B).
-   The prefetcher's pread arm (REPLAY_FUSED_P1_READ, default on) is pinned
-   bitwise against the mmap arm across payload dtypes, range splits and
-   the pinned construction, its torch.save zip index parser against
-   torch.load ground truth (with the non-contiguous / foreign-class
-   guards), and the knob's echo + bogus-raise + report-bitwise contract.
-   The same gate carries the p2 attribution split (p2f/p2s counter keys
-   and the p2_formula_s/p2_select_s line fields): device-sync-bracketed
-   sub-timers nesting inside the pass-2 bracket, pinned by the nesting
-   bound on their sum. The select bracket splits further into the
-   p2s_hist/p2s_ar/p2s_cand/p2s_fill sub-buckets (top16+bincount /
-   histogram all_reduce / candidate+kthvalue / gt-eq-tie fill), pinned
-   by the same nesting bound inside p2s. The same gate also carries the
-   gap buckets (qw/h2dl/p1d2h/p1ar/hzar/stp/cln/gw): a three-way split of
-   the streaming residual outside the pass brackets into own read-wait
-   (prefetch q.get), lockstep wait (clip-norm / horizon all_reduce), and
-   real work, coverage-checked against the group wall with the p1
-   sub-buckets pinned by the nesting bound inside pt[0].
+   the fragment, pinned prefetcher buffers on CUDA, and a --trace-dtype
+   bf16 leg of the slice-first prefetcher (reference anchor + bitwise
+   fp32-twin A/B). The same gates pin the pread arm (REPLAY_FUSED_P1_READ)
+   bitwise against the mmap arm (across payload dtypes, range splits, and
+   the pinned construction, plus its torch.save zip-index parser against
+   torch.load ground truth), the p2 attribution split (p2f/p2s counter
+   keys, p2_formula_s/p2_select_s line fields, and the p2s_hist/p2s_ar/
+   p2s_cand/p2s_fill sub-buckets — all pinned by sub-timer nesting
+   bounds), and the gap buckets (qw/h2dl/p1d2h/p1ar/hzar/stp/cln/gw:
+   read-wait vs lockstep wait vs real work outside the pass brackets,
+   coverage-checked against the group wall).
 10. --fused-state-budget-mb: the resident-state byte budget derives the
    config group size (overrides --fused-max-configs); reports stay
    bit-identical to the count knob at the same partition AND across
@@ -143,13 +133,10 @@ if __name__ != "__mp_main__":
     # same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
     if "REPLAY_FUSED_SELECT" in os.environ:
         del os.environ["REPLAY_FUSED_SELECT"]
-    # same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
     if "REPLAY_FUSED_FRONT_RANK_BG" in os.environ:
         del os.environ["REPLAY_FUSED_FRONT_RANK_BG"]
-    # same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
     if "REPLAY_FUSED_KERNEL" in os.environ:
         del os.environ["REPLAY_FUSED_KERNEL"]
-    # same suite-immunity rationale as REPLAY_FUSED_FRONT_SORT above
     if "REPLAY_FUSED_P1_READ" in os.environ:
         del os.environ["REPLAY_FUSED_P1_READ"]
 

@@ -307,10 +307,9 @@ def _add_sga_selection_args(parser: argparse.ArgumentParser):
              "semantics) — bit-identical to the merged form under the "
              "engine's replicated full-sync scores (scale-invariant select "
              "math); the engine's mask consistency check aborts loudly if "
-             "inputs ever diverge. true restores the merged-histogram form "
-             "(the ported scheme_xp behavior). A dead knob under "
-             "method=exact — silently ignored there (megatron dead-config "
-             "semantics).")
+             "inputs ever diverge. true restores the merged-histogram form. "
+             "A dead knob under method=exact — silently ignored there "
+             "(megatron dead-config semantics).")
     group.add_argument(
         "--sga-selection-adaptive-warmup-syncs", type=sga_int_or_null,
         default=5,

@@ -1,6 +1,6 @@
 # Step 3 of the minimal example: real SGA sparse training.
 # run_example.sh overrides sga_score / sga_selection_ratio_percent /
-# sga_cycle_period with the offline replay argmin.
+# sga_cycle_period / sga_cycle_start_iter with the offline replay argmin.
 
 defaults:
   - _self_

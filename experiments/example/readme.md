@@ -2,7 +2,7 @@
 
 This directory is a runnable, single-node walkthrough of the SGA workflow.
 It is deliberately small: a toy llama-architecture model, a short gradient
-window, and the same 48-cell grid used by the E-series replay experiments.
+window, and a 48-cell grid.
 
 The three steps are:
 
@@ -73,9 +73,8 @@ snapshot). The run stops at `branch + window + 1` steps.
 over the 48-cell grid. Selection uses the production-default
 `balanced-histogram` semantics, so replay and online selection share the
 same histogram implementation. The evaluation horizon is the full window:
-`--horizons` is pinned to `--window` (the E-series campaign convention —
-selection reads the full-window distortion). The report contains, for
-every cell, the full-window `distortion`.
+`--horizons` is pinned to `--window`, and the report carries, for every
+cell, the full-window `distortion`.
 
 For each cell, distortion is
 
@@ -90,8 +89,8 @@ full-window distortion and writes shell assignments to `best.env`.
 
 `configs/llama_tiny_sga.yaml` is a normal SGA configuration. The launcher
 overrides only `sga_score`, `sga_selection_ratio_percent`,
-`sga_cycle_period`, and the step count, using the replay argmin. This is
-the same path a production run uses; no replay-specific code is involved.
+`sga_cycle_period`, `sga_cycle_start_iter`, and the step count, using the
+replay argmin. This is the same path a production run uses.
 If `SGA_STEPS` would stop before the first cycle boundary
 (`start_iter + cycle_period`), the launcher extends the run to cross one
 boundary and execute at least one sparse step.
@@ -121,8 +120,7 @@ Use a longer window for a meaningful cycle-length comparison.
   Swap in `examples/llama3/train_1b_*.yaml` and a checkpoint for a real
   study.
 - The window and step counts are intentionally short. The replay decision
-  is only meaningful on a representative window (the E-series uses 1000+
-  steps).
+  is only meaningful on a representative window (1000+ steps in practice).
 - Single node only. Multi-node replay currently requires
   `--selection-semantics topk`; balanced-histogram replay is single-node.
 

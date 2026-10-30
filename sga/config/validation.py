@@ -4,10 +4,7 @@
 Everything a config may say lives in ``sga/config/arguments.py`` (plain
 ``add_argument`` declarations); THIS module derives the flag vocabulary from
 that file by parser introspection (no key set or default is restated
-anywhere; the one deliberate choice restatement is the
-sga_trace_dump_dtype membership check below — defense-in-depth for
-namespaces built without the parser, since both production routes go
-through the parser's ``choices``) and adds the context argparse cannot
+anywhere) and adds the context argparse cannot
 express as PLAIN CONDITIONAL
 RULES over the args (``if args.xxx: raise ...``), exactly the way megatron's
 own validate_args works:
@@ -28,8 +25,8 @@ own validate_args works:
     spelling resolves into ``sga_cycle_start_iter``, the comma-token list
     keys parse into sorted lists, a false ``sga_checks`` forces every
     ``sga_checks_*`` sub-flag False, and the layout 'auto' spelling
-    resolves into er|eb|bb. Exactly five write-back sites exist; every
-    other key passes through untouched.
+    resolves into er|eb|bb. Write-backs happen only at the sites marked
+    below; every other key passes through untouched.
 
 Inputs: an args-like namespace (attribute access). ``args=None`` reads the
 sga singleton (``sga.config.get_args`` — the copy build_engine seeded from
@@ -143,8 +140,7 @@ def validate_sga_args(args=None) -> None:
         from sga.config import get_args
         args = get_args()
     if not args.sga_enabled:
-        # Feature off → zero checks (megatron semantics: a disabled
-        # feature's sub-args are never validated).
+        # Feature off → zero checks.
         return
     # The name checks below consult the plugin registries; populate them
     # first (idempotent; function-level import keeps the cycle closed —
@@ -349,8 +345,7 @@ def validate_sga_args(args=None) -> None:
                 "every step is a full sync (no sparse rounds, no "
                 "mask-inactive tail), the knob would be dead config")
 
-    # --- emission ↔ backend pairing (the one cross-axis combination rule
-    # that survives the registry simplification: 'compact' is a switch only
+    # --- emission ↔ backend pairing ('compact' is a switch only
     # torch_pipelined_index implements — the writeback-inherent backends
     # have no compact handoff to give) ---
     emission = args.sga_backend_emission

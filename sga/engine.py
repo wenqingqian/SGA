@@ -248,9 +248,6 @@ class SGAEngine:
         self._mp_opt = None
         self._log_num_zeros = None        # resolved from args at first step
         # Layer-1 count guard toggle (sga_checks_count_guard, default on).
-        # The guard runs once per cycle at support activation — within a
-        # cycle the support is immutable and its counts are cached, so
-        # per-step re-checks re-verify identical numbers.
         self._count_guard = cfg.sga_checks_count_guard
         # Layer-2/3 + shadow-RNG-bracket toggles (sga_checks_*, default
         # on). These are the RESOLVED values: a false sga_checks master
@@ -600,10 +597,7 @@ class SGAEngine:
         self.opt.reset(opt_ctx, was_full=was_full)
         if new_support is not None:
             self._activate_support(new_support)
-            # Layer-1 deadlock guard, once per cycle at activation: the counts
-            # being verified are the activation-time caches, and the support
-            # is immutable until the next reselection — checking here covers
-            # every sparse sync of the coming cycle.
+            # Layer-1 deadlock guard (once per cycle — see _check_counts).
             if self._count_guard:
                 self._check_counts()
 
