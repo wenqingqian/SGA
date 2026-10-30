@@ -240,7 +240,7 @@ def _base_args(td, cache, t0, extra=(), cycle=("--cycle-len", "2"),
     selection_args = (() if selection is None else
                       ("--selection-semantics", selection))
     return ["--trace-dir", td, "--branch-point", str(t0), "--window", "6",
-            "--horizons", "1,3,6", "--ratios", "20,30",
+            "--horizons", "6", "--ratios", "20,30",
             "--score-names", "abs_g,update", "--replay-mode", "cycle",
             *cycle, "--dense-cache", cache, "--device", "cpu",
             "--chunk-mb", "1", *selection_args, *extra]
@@ -559,8 +559,8 @@ def test_fused_cli_gates():
         t0, _W = _build_fixture(td)[0:2]
         cache = os.path.join(td, "dense_cache")
         base = ["--trace-dir", td, "--branch-point", str(t0),
-                "--ratios", "20", "--horizons", "3", "--device", "cpu",
-                "--selection-semantics", "topk"]
+                "--ratios", "20", "--horizons", "3", "--window", "3",
+                "--device", "cpu", "--selection-semantics", "topk"]
         default_balanced = base[:-2]
         cases = [
             # The unconditional balanced default rejects unsupported modes

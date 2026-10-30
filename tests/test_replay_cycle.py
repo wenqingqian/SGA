@@ -871,11 +871,11 @@ def test_print_summary_zero_distortion():
         with redirect_stdout(buf):
             report = soa.main(["--trace-dir", td, "--branch-point", str(t0),
                                "--window", str(W), "--ratios", "50",
-                               "--horizons", "2",
+                               "--horizons", str(W),
                                "--selection-semantics", "topk"])
     met = report["branch_results"][str(t0)]["per_ratio"]["50.0"]["scores"]
     for m in met.values():
-        assert m["distortion"] == {"2": None}
+        assert m["distortion"] == {str(W): None}
     # pure zerofill run: the CLI echo stays False and so does the
     # effective-engine flag (only cycle routes to the fused engine)
     assert report["config"]["fused"] is False
@@ -897,7 +897,7 @@ def test_dense_cache_roundtrip():
     with tempfile.TemporaryDirectory() as td:
         _make_trace(td, pre, lrs, 1.0, t0, n)
         argv = ["--trace-dir", td, "--branch-point", str(t0),
-                "--window", str(W), "--ratios", "25,50", "--horizons", "2,5",
+                "--window", str(W), "--ratios", "25,50", "--horizons", str(W),
                 "--replay-mode", "cycle", "--cycle-len", "2",
                 "--score-names", "abs_g,update",
                 "--fused-shards", "1",

@@ -5,17 +5,18 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SGA_ROOT="$(cd "$HERE/../.." && pwd)"
+SGA_PARENT="$(cd "$SGA_ROOT/.." && pwd)"
 
 NODE="${NODE:?set NODE to the single node IP reachable over ssh}"
 SSH_PORT="${SSH_PORT:-2222}"
 GPUS="${GPUS:-8}"
-WORKDIR="${WORKDIR:-/workspace/sga_framework/example_run}"
+WORKDIR="${WORKDIR:-$SGA_PARENT/example_run}"
 BRANCH="${BRANCH:-4}"
 WINDOW="${WINDOW:-64}"
 SGA_STEPS="${SGA_STEPS:-16}"
 MASTER_PORT="${MASTER_PORT:-29620}"
-HORIZONS="${HORIZONS:-1,2,4,8,16,32,64}"
 TRACE_DTYPE="${TRACE_DTYPE:-bf16}"
+DATA_ROOT="${DATA_ROOT:-$SGA_PARENT/data}"
 
 if (( SGA_STEPS < 2 )); then
   echo "SGA_STEPS must be >= 2 (a sparse step needs a cycle)" >&2
@@ -49,6 +50,9 @@ run_train () {  # $1=config name, $2=exp dir, rest=hydra overrides
     experiment.runner.ssh_port="$SSH_PORT" \
     experiment.runner.master_port="$MASTER_PORT" \
     experiment.runner.nproc_per_node="$GPUS" \
+    ++experiment.envs.SGA_FRAMEWORK_ROOT="$SGA_PARENT" \
+    ++train.data.data_path="$DATA_ROOT/openwebtext/openwebtext-meg-llama_text_document" \
+    ++train.data.tokenizer.tokenizer_model="$DATA_ROOT/llama3_dataset" \
     "$@"
 }
 
@@ -69,7 +73,7 @@ python -m sga.replay \
   --trace-dir "$TRACE_DIR" \
   --branch-point "$BRANCH" \
   --window "$WINDOW" \
-  --horizons "$HORIZONS" \
+  --horizons "$WINDOW" \
   --ratios 20,30,40 \
   --score-names abs_m,abs_g,update,coi \
   --replay-mode cycle \

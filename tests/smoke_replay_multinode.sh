@@ -5,10 +5,12 @@
 # on CPU so it can share nodes with GPU jobs.
 #
 # Usage (HOST, from the SGA repo checkout under test):
-#   bash tests/smoke_replay_multinode.sh <master-ip> <worker-ip> <host-workdir>
+#   HOST_WS=<host-view workspace root> REMOTE_WS=<remote-view workspace root> \
+#     bash tests/smoke_replay_multinode.sh <master-ip> <worker-ip> <host-workdir>
 #
-# <host-workdir> must live on the shared NFS (both nodes read the fixture
-# and the published dense cache through /workspace view). PASS criterion:
+# <host-workdir> and the checkout must live under HOST_WS; the nodes see
+# the same shared tree under REMOTE_WS (the script rewrites host-view
+# prefixes to the remote view for ssh commands). PASS criterion:
 # the cross-node world=2 branch report sits in the pure-reordering band
 # against the master-local world=1 reference (same comparator as the
 # unit tests: sums rel<=1e-6, everything else exact).
@@ -16,10 +18,10 @@ set -euo pipefail
 
 MASTER="${1:?master node ip}"
 WORKER="${2:?worker node ip}"
-HOST_WORK="${3:?host-side NFS workdir, e.g. /nfs/gzlu/sga_framework/AGENTSPACE/iterations/<iteration-dir>/data/it2_smoke}"
+HOST_WORK="${3:?host-side workdir under the shared workspace (host view)}"
 
-HOST_WS="/nfs/gzlu/sga_framework"
-REMOTE_WS="/workspace/sga_framework"
+HOST_WS="${HOST_WS:?host-view workspace root}"
+REMOTE_WS="${REMOTE_WS:?remote-view workspace root}"
 HOST_SGA="$(cd "$(dirname "$0")/.." && pwd)"
 REMOTE_SGA="${HOST_SGA/#$HOST_WS/$REMOTE_WS}"
 [ "$REMOTE_SGA" != "$HOST_SGA" ] || { echo "SGA checkout must live under $HOST_WS (got $HOST_SGA)" >&2; exit 2; }
@@ -36,7 +38,7 @@ MEGATRON_SGA_DIR_OPT="MEGATRON_SGA_DIR=$REMOTE_WS/Megatron-LM"
 
 T0=900
 ARGS="--trace-dir $REMOTE_WORK/trace --branch-point $T0 --window 6 \
- --horizons 1,3,6 --ratios 20,30 --score-names abs_g,update \
+ --horizons 6 --ratios 20,30 --score-names abs_g,update \
  --replay-mode cycle --cycle-len 2 --dense-cache $REMOTE_WORK/cache \
  --selection-semantics topk --device cpu --chunk-mb 1"
 

@@ -16,18 +16,19 @@ The three steps are:
 
 ## Prerequisites
 
-- Run inside the training container (`flagscale-gzlu`) with the
-  `flagscale` conda environment.
-- One node with 8 visible GPUs and the workspace mounted at
-  `/workspace/sga_framework` (the scripts use container-side paths).
+- Run inside the training container, with the project conda environment
+  active (see the `before_start` hook in `configs/*.yaml`).
+- One node with 8 visible GPUs that shares the launcher's filesystem
+  view (trace, cache, and report files are exchanged by path).
 - `SGA/env.sh` resolves Megatron-LM from the sibling checkout.
-- The dataset paths in `configs/*.yaml` exist
-  (`data/openwebtext`, `data/llama3_dataset`).
+- A dataset root holding the openwebtext shards and the llama3
+  tokenizer; `run_example.sh` overrides the placeholder paths in
+  `configs/*.yaml` from `DATA_ROOT` (default `<repo-parent>/data`).
 
 ## Quick start
 
 ```bash
-cd /workspace/sga_framework/SGA
+cd <repo-parent>/SGA
 source env.sh
 
 NODE=<node-ip> SSH_PORT=2222 bash experiments/example/run_example.sh
@@ -36,7 +37,7 @@ NODE=<node-ip> SSH_PORT=2222 bash experiments/example/run_example.sh
 `NODE` must be reachable over ssh from the launcher process; for a
 non-default ssh port pass `SSH_PORT` (for example `4399`).
 
-Outputs go to `WORKDIR` (default `/workspace/sga_framework/example_run`):
+Outputs go to `WORKDIR` (default `<repo-parent>/example_run`):
 
 ```text
 example_run/
@@ -71,17 +72,19 @@ snapshot). The run stops at `branch + window + 1` steps.
 `sga.replay` consumes the trace and runs the fused engine in cycle mode
 over the 48-cell grid. Selection uses the production-default
 `balanced-histogram` semantics, so replay and online selection share the
-same histogram implementation. The report contains, for every cell,
-`distortion` at each horizon.
+same histogram implementation. The evaluation horizon is the full window:
+`--horizons` is pinned to `--window` (the E-series campaign convention —
+selection reads the full-window distortion). The report contains, for
+every cell, the full-window `distortion`.
 
 For each cell, distortion is
 
 ```text
-||w_sparse(h) - w_dense(h)|| / ||w_dense(h) - w_start||
+||w_sparse(H) - w_dense(H)|| / ||w_dense(H) - w_start||,  H = WINDOW
 ```
 
-so lower is better. `select_best.py` picks the smallest distortion at the
-largest common horizon and writes shell assignments to `best.env`.
+so lower is better. `select_best.py` picks the cell with the smallest
+full-window distortion and writes shell assignments to `best.env`.
 
 ### 3. Sparse training
 
@@ -100,12 +103,12 @@ boundary and execute at least one sparse step.
 | `NODE` | required | node IP reachable over ssh |
 | `SSH_PORT` | `2222` | ssh port of that node |
 | `GPUS` | `8` | visible GPUs and replay shards |
-| `WORKDIR` | `/workspace/sga_framework/example_run` | output root (NFS-visible) |
+| `WORKDIR` | `<repo-parent>/example_run` | output root (shared with the training node) |
+| `DATA_ROOT` | `<repo-parent>/data` | dataset root overriding the placeholder paths in `configs/*.yaml` |
 | `BRANCH` | `4` | trace branch point (training step) |
 | `WINDOW` | `64` | captured gradient steps after the branch point |
 | `SGA_STEPS` | `16` | steps for the final sparse run |
 | `MASTER_PORT` | `29620` | torchrun rendezvous port |
-| `HORIZONS` | `1,2,4,8,16,32,64` | replay horizons (truncated to `WINDOW`) |
 
 `WINDOW` must be long enough to make the larger cycle lengths observable.
 With the default `WINDOW=64`, `T=10` and `T=50` reach a boundary; `T=100`
@@ -126,5 +129,5 @@ Use a longer window for a meaningful cycle-length comparison.
 ## Cleanup
 
 ```bash
-rm -rf /workspace/sga_framework/example_run
+rm -rf <repo-parent>/example_run
 ```

@@ -62,7 +62,7 @@ bit-compatible with the legacy tool.
 Usage (SGA repo root on PYTHONPATH):
 
     python -m sga.replay --trace-dir <dir> --branch-point 40 \
-        --replay-mode cycle --cycle-len 20 --ratios 10,20 --horizons 1,10 \
+        --replay-mode cycle --cycle-len 20 --ratios 10,20 \
         --score-names abs_m,update --dense-cache <cache-dir> --out report.json
 
     # replay-machinery validation against real state dumps:
@@ -1620,8 +1620,10 @@ def main(argv=None):
                          "w/m/v against the real state dump at TO_STEP")
     ap.add_argument("--ratios", default="10,20",
                     help="comma list of support sizes in percent of elements")
-    ap.add_argument("--horizons", default="1,10,100",
-                    help="comma list of replay horizons (clipped to window)")
+    ap.add_argument("--horizons", default=None,
+                    help="replay horizon, pinned to --window (the selection "
+                         "read-out is the full-window distortion); the only "
+                         "accepted value is the window itself")
     ap.add_argument("--out", default=None, help="path to write the JSON report")
     ap.add_argument("--device", default="cpu", help="cpu | cuda:N")
     ap.add_argument("--chunk-mb", type=int, default=256,
@@ -1920,9 +1922,19 @@ def main(argv=None):
             if not (math.isfinite(r) and 0.0 < r <= 100.0):
                 raise ValueError(
                     f"--ratios value must be finite in (0, 100], got {tok!r}")
-    for tok in args.horizons.split(","):
+    for tok in (args.horizons or "").split(","):
         if tok.strip() and int(tok) < 1:
             raise ValueError(f"--horizons values must be >= 1, got {tok!r}")
+    # Horizons are pinned to the window: the selection read-out is the
+    # full-window distortion, so any horizon list other than [window] is
+    # rejected outright.
+    args.horizons = ([args.window] if args.horizons is None else
+                     sorted({int(x) for x in args.horizons.split(",")
+                             if x.strip()}))
+    if args.horizons != [args.window]:
+        raise ValueError(
+            f"--horizons must equal the window (window {args.window}, got "
+            f"{args.horizons}): replay reads the full-window distortion")
     if (args.branch_point is not None and args.self_check is None
             and args.branch_point.strip().lower() != "all"
             and not [t for t in args.branch_point.replace(" ", "").split(",")
@@ -1961,7 +1973,6 @@ def main(argv=None):
     # ---- self-check mode: validate the dense replay against real state ----
     if args.self_check is not None:
         args.ratios = sorted({float(x) for x in args.ratios.split(",") if x.strip()})
-        args.horizons = sorted({int(x) for x in args.horizons.split(",") if x.strip()})
         sc = run_self_check(ctx, args.self_check[0], args.self_check[1], args)
         report = {
             "trace_dir": trace_dir,
@@ -1986,11 +1997,8 @@ def main(argv=None):
         return report
 
     args.ratios = sorted({float(x) for x in args.ratios.split(",") if x.strip()})
-    args.horizons = sorted({int(x) for x in args.horizons.split(",") if x.strip()})
     if not args.ratios:
         raise ValueError("--ratios empty")
-    if not args.horizons:
-        raise ValueError("--horizons empty")
     if args.score_names is not None:
         args.score_names = [s for s in
                             (x.strip() for x in args.score_names.split(",")) if s]
