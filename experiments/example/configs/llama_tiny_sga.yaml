@@ -1,0 +1,128 @@
+# Step 3 of the minimal example: real SGA sparse training.
+# run_example.sh overrides sga_score / sga_selection_ratio_percent /
+# sga_cycle_period with the offline replay argmin.
+
+defaults:
+  - _self_
+
+experiment:
+  exp_name: sga_example_sparse
+  exp_dir: UNDEFINED
+  task:
+    type: train
+    backend: megatron
+    entrypoint: ./sga/train_gpt.py
+  runner:
+    type: ssh
+    backend: torchrun
+    nnodes: 1
+    nproc_per_node: 8
+    ssh_port: 2222
+    master_port: 29621
+    no_shared_fs: false
+    rdzv_backend: static
+    hostfile: ./experiments/example/hostfile.txt
+  cmds:
+    before_start: |
+      source /root/miniconda3/etc/profile.d/conda.sh && conda activate flagscale
+      source /workspace/sga_framework/SGA/env.sh --check
+      export LD_LIBRARY_PATH=/root/miniconda3/envs/flagscale/lib:\${LD_LIBRARY_PATH}
+      export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  envs:
+    CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+    CUDA_DEVICE_MAX_CONNECTIONS: 1
+    NVTE_APPLY_QK_LAYER_SCALING: 0
+    NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+    NCCL_DEBUG: WARN
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+action: run
+
+hydra:
+  run:
+    dir: ${experiment.exp_dir}/hydra
+
+sga:
+  sga_enabled: true
+  sga_shadow: false
+
+  sga_cycle_start_iter: 4
+  sga_cycle_period: 8
+
+  sga_score: update
+  sga_selection_method: histogram
+  sga_selection_histogram_mode: balanced
+  sga_selection_ratio_percent: 10
+  sga_optimizer: adamw
+  sga_optimizer_residual_mean: false
+  sga_backend: torch_pipelined_index
+
+train:
+  system:
+    rerun_mode: disabled
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    disable_bias_linear: True
+    use_flash_attn: True
+    sequence_parallel: True
+    use_distributed_optimizer: False
+    data_parallel_sharding_strategy: no_shard
+    precision:
+      bf16: True
+      attention_softmax_in_fp32: true
+      accumulate_allreduce_grads_in_fp32: true
+    logging:
+      timing_log_level: 2
+      log_interval: 1
+      log_throughput: true
+      log_params_norm: true
+      log_num_zeros_in_grad: true
+    checkpoint:
+      save_interval: 100000
+
+  model:
+    transformer_impl: transformer_engine
+    num_layers: 4
+    hidden_size: 512
+    ffn_hidden_size: 2048
+    num_attention_heads: 8
+    seq_length: 512
+    group_query_attention: True
+    num_query_groups: 2
+    max_position_embeddings: 512
+    norm_epsilon: 1e-5
+    use_rotary_position_embeddings: True
+    swiglu: True
+    normalization: RMSNorm
+    position_embedding_type: rope
+    rotary_base: 500000
+    untie_embeddings_and_output_weights: True
+    init_method_std: 0.02
+    attention_dropout: 0.0
+    hidden_dropout: 0.0
+    clip_grad: 1.0
+    train_iters: 16
+    exit_interval: 16
+    eval_iters: 0
+    eval_interval: 10000000
+    micro_batch_size: 1
+    global_batch_size: 8
+    seed: 1234
+    optimizer:
+      weight_decay: 1e-2
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      lr_scheduler:
+        lr: 1.0e-4
+        min_lr: 1.0e-5
+        lr_warmup_fraction: 0.1
+        lr_decay_style: cosine
+
+  data:
+    data_path: /workspace/sga_framework/data/openwebtext/openwebtext-meg-llama_text_document
+    split: 1
+    tokenizer:
+      tokenizer_type: HuggingFaceTokenizer
+      tokenizer_model: /workspace/sga_framework/data/llama3_dataset
+      padded_vocab_size: 64320
+      make_vocab_size_divisible_by: 64
