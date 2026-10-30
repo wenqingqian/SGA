@@ -270,6 +270,20 @@ def validate_sga_args(args=None) -> None:
         raise ValueError(
             "sga_shadow_score is set but sga_shadow is not true; it only "
             "modifies shadow runs")
+    if shadow and args.sga_optimizer == "adams":
+        # Shadow is the one run shape whose optimizer step is the STOCK
+        # megatron optimizer (a literal MixedPrecisionOptimizer.step()
+        # replication) — every live path (sparse, full-sync and the dense
+        # bootstrap phases) runs the configured plugin template. Under
+        # AdamS that step would silently train AdamW stock numerics while
+        # the config claims AdamS, so the combination is refused outright:
+        # AdamS runs own every step they take.
+        raise ValueError(
+            "sga_optimizer 'adams' is refused with sga_shadow true: shadow "
+            "replicates the stock optimizer step literally (AdamW "
+            "numerics), so an AdamS-configured shadow run would silently "
+            "train stock AdamW instead of AdamS — shadow probes exist to "
+            "benchmark stock replication, which AdamS is not")
 
     # --- always-sync layer patterns (the per-parameter dense axis) ---
     # write-back: the comma token parses into the sorted pattern list
@@ -289,7 +303,11 @@ def validate_sga_args(args=None) -> None:
             "param sets); v1 pins pipeline_model_parallel_size == 1 — "
             "drop the flag or run with pp == 1")
 
-    # --- optimizer (adamw): the boundary dual-lr knob ---
+    # --- optimizer (adamw | adams): the boundary dual-lr knob ---
+    # The knob's rules below are optimizer-symmetric: both templates
+    # implement the same split (the applied step's lr scales on the
+    # mask-inactive tail, weight-decay component included), so the same
+    # gates fire for either name.
     lr_scale = args.sga_optimizer_full_sync_inactive_lr_scale
     if lr_scale != 1.0:
         # argparse's float typing ACCEPTS "nan"/"inf" spellings — the

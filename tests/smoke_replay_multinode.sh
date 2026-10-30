@@ -38,7 +38,7 @@ T0=900
 ARGS="--trace-dir $REMOTE_WORK/trace --branch-point $T0 --window 6 \
  --horizons 1,3,6 --ratios 20,30 --score-names abs_g,update \
  --replay-mode cycle --cycle-len 2 --dense-cache $REMOTE_WORK/cache \
- --device cpu --chunk-mb 1"
+ --selection-semantics topk --device cpu --chunk-mb 1"
 
 echo "== [1/5] build tiny fixture on master ($MASTER) -> $REMOTE_WORK =="
 rm -rf "$HOST_WORK"

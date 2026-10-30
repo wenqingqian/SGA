@@ -10,17 +10,21 @@ registered-data style (``register_score`` + ``register_default_scores``,
 idempotent), the same idiom as the class-plugin registries in
 ``sga/plugins/__init__.py``.
 
-Adding an ONLINE score touches exactly TWO places: one entry here, and one
-branch in the optimizer kernel (``_TRITON_SCORE_MAP`` + the kernel's
-``EMIT_MODE`` if-chain live together in ``sga/plugins/optimizer/adamw.py``;
-a registered score without a map entry fails loud at optimizer
-construction, never silently mis-materializes). A replay-only score needs
+Adding an ONLINE score touches one entry here plus one branch in EVERY
+optimizer kernel template: ``_TRITON_SCORE_MAP`` + the kernel's
+``EMIT_MODE`` if-chain live together in each kernel file
+(``sga/plugins/optimizer/adamw.py`` and ``sga/plugins/optimizer/adams.py``,
+one map per file). A registered score without a map entry fails loud at
+THAT template's construction, never silently mis-materializes — so a
+branch added to adamw only surfaces as a loud AdamS construction failure,
+not at registration; keep the maps in lockstep. A replay-only score needs
 only the entry here — but then no config may select it usefully; keep
-research candidates out of the registry until they have their branch.
+research candidates out of the registry until they have their branch in
+every template.
 
 Each formula computes the score from one coordinate's pre-commit state:
 
-    (w, m, v, g) + AdamW hyperparameters + the bias corrections of the
+    (w, m, v, g) + Adam hyperparameters + the bias corrections of the
     UPCOMING commit
 
 and returns the MATERIALIZED form — exactly what the online optimizer's
@@ -29,6 +33,16 @@ SIGNED weight update, the others are magnitudes. Consumers that need a
 non-negative ranking input (the histogram/kthvalue selects) take the
 absolute value at the call site; abs(abs(x)) is identity, so one contract
 serves both.
+
+Optimizer awareness (``optimizer="adamw"`` default | ``"adams"``): the
+``update``/``coi`` formulas read the optimizer's own moment recursion —
+AdamW folds the stored second moment (``v' = beta2*v + (1-beta2)*g*g``,
+bias-corrected), AdamS rebuilds it from the PRE-commit first moment
+(``v' = beta2*m*m + (1-beta2)*g*g``) with NO bias correction (the
+bias-correction channels are forced to 1.0 for AdamS inside the formula,
+whatever the caller passes — dividing by 1.0 is the identity, so the
+division is elided). ``abs_g``/``abs_m`` do not depend on the recursion
+and accept the keyword inertly. An unknown optimizer name fails loud.
 
 ``scratch=True`` marks formulas that route their dying temporaries through a
 caller-provided scratch pair via ``out=`` — op-for-op the same elementwise
@@ -56,7 +70,8 @@ class ScoreSpec:
     name and the replay CLI name)."""
 
     # (w, m, v, g, beta1, beta2, eps, weight_decay, bias_correction1,
-    #  bias_correction2, update_includes_wd, scratch) -> score tensor
+    #  bias_correction2, update_includes_wd, optimizer, scratch)
+    # -> score tensor
     formula: Callable[..., torch.Tensor]
     doc: str
     scratch: bool = False
@@ -77,9 +92,11 @@ def register_default_scores() -> None:
     test that pre-registers a custom score does not block the defaults)."""
     _SCORES.setdefault("update", ScoreSpec(
         formula=_formula_update,
-        doc="the SIGNED AdamW weight update wd*w + U(g) (U(g) from the "
+        doc="the SIGNED weight update wd*w + U(g) (U(g) from the "
             "pre-commit moments and this step's gradient, upcoming-commit "
-            "bias corrections); consumers rank by absolute value",
+            "bias corrections; the moment recursion follows the optimizer "
+            "— AdamW's stored-v fold, AdamS's pre-commit-m rebuild with "
+            "no correction); consumers rank by absolute value",
         scratch=True,
     ))
     _SCORES.setdefault("abs_g", ScoreSpec(
@@ -92,7 +109,9 @@ def register_default_scores() -> None:
     ))
     _SCORES.setdefault("coi", ScoreSpec(
         formula=_formula_coi,
-        doc="counterfactual optimizer impact |U(g) - U(0)| (wd cancels)",
+        doc="counterfactual optimizer impact |U(g) - U(0)| (wd cancels; "
+            "AdamS's U(0) rebuilds v from the pre-commit m — provisional "
+            "reading)",
         scratch=True,
     ))
 
@@ -127,46 +146,69 @@ def _resolve_scratch(w: torch.Tensor, scratch):
 
 def _formula_abs_g(w, m, v, g, beta1, beta2, eps, weight_decay,
                    bias_correction1, bias_correction2,
-                   update_includes_wd=True, scratch=None):
-    """|g| of the gradient being committed (the fully-synced step's)."""
+                   update_includes_wd=True, optimizer="adamw", scratch=None):
+    """|g| of the gradient being committed (the fully-synced step's).
+
+    The formula is optimizer-inert (no moment recursion in it): the
+    ``optimizer`` keyword is accepted and ignored."""
     return g.abs()
 
 
 def _formula_abs_m(w, m, v, g, beta1, beta2, eps, weight_decay,
                    bias_correction1, bias_correction2,
-                   update_includes_wd=True, scratch=None):
-    """|m| of the pre-commit first moment."""
+                   update_includes_wd=True, optimizer="adamw", scratch=None):
+    """|m| of the pre-commit first moment.
+
+    The formula is optimizer-inert (no moment recursion in it): the
+    ``optimizer`` keyword is accepted and ignored."""
     return m.abs()
 
 
 def _u_g(w, m, v, g, beta1, beta2, eps, bias_correction1, bias_correction2,
-         scratch):
+         scratch, optimizer="adamw"):
     """U(g) = m_hat / (sqrt(v_hat) + eps) into ``sa``; returns (sa, sb, result).
 
-    m_hat/v_hat use the moments AFTER folding in this step's gradient, with
-    the upcoming commit's bias corrections — the update direction the commit
-    is about to apply. ``result`` is one fresh per-call tensor the caller's
-    tail may reuse; sa/sb are the (possibly caller-provided) scratch pair.
+    m_hat/v_hat use the moments AFTER folding in this step's gradient —
+    the update direction the commit is about to apply. ``result`` is one
+    fresh per-call tensor the caller's tail may reuse; sa/sb are the
+    (possibly caller-provided) scratch pair. The second moment's memory
+    base is the optimizer's: AdamW folds the stored v (bias-corrected by
+    the upcoming commit's corrections), AdamS rebuilds it from the
+    PRE-commit first moment (``v = beta2*m^2 + (1-beta2)*g^2``) with no
+    bias correction (channels forced to 1.0; the identity division is
+    elided).
     """
     sa, sb = scratch
     result = torch.empty_like(w)
     torch.mul(m, beta1, out=sa)
     torch.mul(g, 1.0 - beta1, out=sb)
     torch.add(sa, sb, out=sa)
-    torch.mul(v, beta2, out=sb)
-    torch.mul(g, 1.0 - beta2, out=result)
-    torch.mul(result, g, out=result)
-    torch.add(sb, result, out=sb)
-    # m_hat = m_new / bc1; v_hat = v_new / bc2 (in place: m_new/v_new die here)
-    torch.div(sa, bias_correction1, out=sa)
-    torch.div(sb, bias_correction2, out=sb)
+    if optimizer == "adamw":
+        torch.mul(v, beta2, out=sb)
+        torch.mul(g, 1.0 - beta2, out=result)
+        torch.mul(result, g, out=result)
+        torch.add(sb, result, out=sb)
+        torch.div(sa, bias_correction1, out=sa)
+        torch.div(sb, bias_correction2, out=sb)
+    elif optimizer == "adams":
+        # Square the pre-commit m before scaling; AdamS has no bias correction.
+        torch.mul(m, m, out=sb)
+        torch.mul(sb, beta2, out=sb)
+        torch.mul(g, 1.0 - beta2, out=result)
+        torch.mul(result, g, out=result)
+        torch.add(sb, result, out=sb)
+    else:
+        raise ValueError(
+            f"Unknown SGA optimizer '{optimizer}' for the score formulas "
+            "(registered: adamw, adams)")
     return sa, sb, result
 
 
 def _formula_update(w, m, v, g, beta1, beta2, eps, weight_decay,
                     bias_correction1, bias_correction2,
-                    update_includes_wd=True, scratch=None):
-    """The materialized AdamW weight update.
+                    update_includes_wd=True, optimizer="adamw", scratch=None):
+    """The materialized weight update (AdamW or AdamS recursion via
+    ``optimizer``).
 
     update_includes_wd=True (the online semantics): the SIGNED
     ``weight_decay * w + U(g)`` the full-step commit materializes — the
@@ -175,7 +217,8 @@ def _formula_update(w, m, v, g, beta1, beta2, eps, weight_decay,
     """
     sa, sb = _resolve_scratch(w, scratch)
     sa, sb, _result = _u_g(w, m, v, g, beta1, beta2, eps,
-                           bias_correction1, bias_correction2, (sa, sb))
+                           bias_correction1, bias_correction2, (sa, sb),
+                           optimizer=optimizer)
     torch.sqrt(sb, out=sb)
     sb.add_(eps)
     torch.div(sa, sb, out=sa)
@@ -190,21 +233,32 @@ def _formula_update(w, m, v, g, beta1, beta2, eps, weight_decay,
 
 def _formula_coi(w, m, v, g, beta1, beta2, eps, weight_decay,
                  bias_correction1, bias_correction2,
-                 update_includes_wd=True, scratch=None):
+                 update_includes_wd=True, optimizer="adamw", scratch=None):
     """|U(g) - U(0)|: counterfactual optimizer impact.
 
     U(0) is the update direction the SAME commit would apply with a zero
     gradient, from the same pre-commit moments — the weight-decay term is
-    identical in both and cancels in the difference.
+    identical in both and cancels in the difference. AdamS's U(0) rebuilds
+    its v from the pre-commit first moment too (``v_0 = beta2*m^2 + 0``),
+    bias-correction-free like every AdamS term; the AdamS reading of the
+    counterfactual contrast is provisional (no validated interpretation
+    yet — it ships for the frozen score axis's completeness).
     """
     sa, sb = _resolve_scratch(w, scratch)
     sa, sb, result = _u_g(w, m, v, g, beta1, beta2, eps,
-                          bias_correction1, bias_correction2, (sa, sb))
-    # u_0 = (beta1 * m / bc1) / (sqrt(beta2 * v / bc2) + eps) -> result
-    torch.mul(m, beta1, out=result)
-    torch.div(result, bias_correction1, out=result)
-    den = torch.mul(v, beta2)
-    torch.div(den, bias_correction2, out=den)
+                          bias_correction1, bias_correction2, (sa, sb),
+                          optimizer=optimizer)
+    if optimizer == "adams":
+        # u_0 = (beta1 * m) / (sqrt(beta2 * m^2) + eps) -> result
+        torch.mul(m, beta1, out=result)
+        den = torch.mul(m, m)
+        torch.mul(den, beta2, out=den)
+    else:
+        # u_0 = (beta1 * m / bc1) / (sqrt(beta2 * v / bc2) + eps) -> result
+        torch.mul(m, beta1, out=result)
+        torch.div(result, bias_correction1, out=result)
+        den = torch.mul(v, beta2)
+        torch.div(den, bias_correction2, out=den)
     torch.sqrt(den, out=den)
     den.add_(eps)
     torch.div(result, den, out=result)
@@ -217,7 +271,7 @@ def _formula_coi(w, m, v, g, beta1, beta2, eps, weight_decay,
 
 # Populate the built-ins at import: a caller could otherwise
 # pre-register a custom formula under a built-in name before the lazy fill
-# ran, silently divorcing the registry from the optimizer's fixed
-# _TRITON_SCORE_MAP branch. After this call, register_score on a built-in
+# ran, silently divorcing the registry from the optimizer templates' fixed
+# _TRITON_SCORE_MAP branches. After this call, register_score on a built-in
 # name fails loud through the duplicate check.
 register_default_scores()

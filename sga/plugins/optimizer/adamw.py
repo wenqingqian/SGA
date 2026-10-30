@@ -70,7 +70,8 @@ except ImportError:  # pragma: no cover
 # skip the score materialization and training would run on wrong numerics),
 # and the human-readable branch inventory kept next to the kernel's own
 # if-chain (same file, same edit). Adding an online score: registry entry
-# (scores.py) + kernel branch + one line here.
+# (scores.py) + kernel branch + one line here AND in adams.py's twin map
+# (every template's map must carry the name).
 _TRITON_SCORE_MAP = {
     "update": 0,   # wd*w + U(g), signed — the default topk input
     "abs_g": 1,    # |g| of the committed gradient

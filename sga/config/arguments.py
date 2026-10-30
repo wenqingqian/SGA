@@ -320,10 +320,19 @@ def _add_sga_selection_args(parser: argparse.ArgumentParser):
 
 def _add_sga_optimizer_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group(
-        "SGA optimizer", "the optimizer template (adamw)")
+        "SGA optimizer", "the optimizer template (adamw | adams)")
     group.add_argument(
         "--sga-optimizer", type=str, default="adamw",
-        help="optimizer template name (adamw, the only template).")
+        help="optimizer template name (registered names are the choices). "
+             "adamw: the AdamW template. adams: AdamW feature-complete "
+             "with the second moment rebuilt from the PRE-commit first "
+             "moment (v = beta2*m_old^2 + (1-beta2)*g^2; the m recursion "
+             "and the decoupled weight decay are AdamW's) and NO bias "
+             "correction anywhere; every other optimizer knob "
+             "(residual_mean, compact_search, the boundary dual-lr) "
+             "applies identically. Refused with --sga-shadow true (shadow "
+             "replicates the stock AdamW step; see validation). "
+             "Default adamw.")
     group.add_argument(
         "--sga-optimizer-residual-mean", type=sga_bool, default=False,
         help="pre-fold the accumulated residual by the fold window (the "

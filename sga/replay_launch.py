@@ -665,16 +665,29 @@ def run_fused_branch_multinode(args, ctx, t0, nodes, *, executor=None,
     # 1. node-0 parent: config + dense-cache populate on miss (before any
     # shard exists — the dense pass must never run inside the process
     # group), then the publish is confirmed out of band, never polled.
+    # One cache per optimizer of the run (the dense reference trajectory
+    # depends on the step recursion); every cache file must be visible on
+    # every node before any shard starts.
     cfg = _fused_cfg(args, ctx, t0, score_names)
-    _ws, _eff, ident = _populate_dense_cache(args, ctx, cfg, t0)
-    cache_path = R._dense_cache_path(args.dense_cache, ident)
-    cache_bytes = os.path.getsize(cache_path)
-    for node_rank, node in enumerate(nodes[1:], start=1):
-        _confirm_cache_visible(node, cache_path, cache_bytes,
-                               executor=executor, ssh_key=ssh_key)
-    print(f"[fused-multinode] t0={t0} dense cache confirmed on "
-          f"{m_nodes - 1} remote node(s): {cache_path} ({cache_bytes} B)",
-          flush=True)
+    if cfg.get("selection_semantics", "balanced-histogram") != "topk":
+        # mirror of the CLI gate in sga.replay.main for programmatic
+        # callers — this path is multi-node by construction and the
+        # sharded balanced select is single-node only; fail before the
+        # dense-cache populate and any node spawn
+        raise ValueError(
+            "--selection-semantics balanced-histogram requires a "
+            "single-node run (--nodes is not supported; single-node "
+            "runs may use any --fused-shards)")
+    idents = _populate_dense_cache(args, ctx, cfg, t0)
+    for _opt, ident in idents.items():
+        cache_path = R._dense_cache_path(args.dense_cache, ident)
+        cache_bytes = os.path.getsize(cache_path)
+        for node_rank, node in enumerate(nodes[1:], start=1):
+            _confirm_cache_visible(node, cache_path, cache_bytes,
+                                   executor=executor, ssh_key=ssh_key)
+        print(f"[fused-multinode] t0={t0} dense cache ({_opt}) confirmed on "
+              f"{m_nodes - 1} remote node(s): {cache_path} "
+              f"({cache_bytes} B)", flush=True)
 
     # 2. rendezvous endpoints + fragment + logs
     pf_port, port = _pick_ports()

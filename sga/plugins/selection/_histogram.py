@@ -86,17 +86,41 @@ def _bin_edge_float(b: int, shift: int) -> float:
     return torch.tensor([bits], dtype=torch.int32).view(torch.float32).item()
 
 
+def _sampled_count(n, stride, phase=0):
+    """Count indices ``phase + i*stride`` in one length-``n`` view."""
+    assert stride > 0 and 0 <= phase < stride
+    return len(range(phase, n, stride))
+
+
+def _accumulate_histogram(hist, g, shift, stride, phase=0):
+    """Add one view's phased, chunked subsample to ``hist`` in place."""
+    assert _HIST_CHUNK % stride == 0
+    for s in range(0, g.numel(), _HIST_CHUNK):
+        top = _abs_bit_top(g[s:s + _HIST_CHUNK], shift)
+        sampled = top[phase::stride] if stride > 1 else top
+        hist += torch.bincount(
+            sampled, minlength=hist.numel()).to(hist.device)
+        del top
+
+
 def _build_histogram(grads, shift: int, nbins: int, stride: int) -> torch.Tensor:
     """Chunked per-rank histogram of the top-``shift`` bits of |g|."""
     device = grads[0].device
     hist = torch.zeros(nbins, dtype=torch.int64, device=device)
     for g in grads:
-        for s in range(0, g.numel(), _HIST_CHUNK):
-            top = _abs_bit_top(g[s:s + _HIST_CHUNK], shift)
-            hist += torch.bincount(top[::stride] if stride > 1 else top,
-                                   minlength=nbins)
-            del top
+        _accumulate_histogram(hist, g, shift, stride)
     return hist
+
+
+def _balanced_crossing_bin(hist, n_total, n_sampled, k, *, replicas=1):
+    """Find the approximate crossing bin in local catalog units.
+
+    ``replicas`` is the number of identical online inputs merged into
+    ``hist``. Disjoint replay shards reconstruct one catalog and therefore
+    pass one, not their shard count.
+    """
+    r = max(1, round(n_sampled * (n_total - k + 1) / n_total)) * replicas
+    return int(torch.searchsorted(torch.cumsum(hist, 0), r).item())
 
 
 def _histogram_select_threshold(hist, k, world, grads, shift=_HIST_SHIFT) -> float:
@@ -176,12 +200,12 @@ def select_masks_histogram(grads, k, comm_group, mode="exact",
             masks.append(m)
         return thresh, masks
 
-    # Approximate: find the crossing bin in local rank units (the bin is
-    # scale-invariant under the merge — module docstring).
+    # Approximate: replicated online inputs scale the rank with the merged
+    # histogram; disjoint replay shards use replicas=1 in the same helper.
     n_total = sum(g.numel() for g in grads)
-    n_sampled = sum((g.numel() + stride - 1) // stride for g in grads)
-    r = max(1, round(n_sampled * (n_total - k + 1) / n_total)) * world
-    b = int(torch.searchsorted(torch.cumsum(hist, 0), r).item())
+    n_sampled = sum(_sampled_count(g.numel(), stride) for g in grads)
+    b = _balanced_crossing_bin(
+        hist, n_total, n_sampled, k, replicas=world)
     masks = []
     for g in grads:
         m = torch.empty(g.numel(), dtype=torch.uint8, device=g.device)

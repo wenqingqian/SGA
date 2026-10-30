@@ -40,7 +40,8 @@ except ImportError:
 
 from sga import replay_kernels as K
 from sga.plugins.scores import get_score_spec
-from sga.replay import _adam_step_inplace
+from sga.replay import (_adams_step_inplace, _adam_step_inplace,
+                        _opt_step_inplace)
 
 DEV = "cuda"
 
@@ -207,6 +208,81 @@ def test_adam_bitwise():
     print("PASS test_adam_bitwise")
 
 
+def test_adam_variants_bitwise():
+    """The AdamS twin and the boundary dual-lr split twin against the torch
+    chains — m/v/w(/lab) bitwise across scalar settings; plus the sanity
+    side that the AdamS arm genuinely differs from AdamW on the same inputs
+    (v basis + bc channels) and that the split arm moves only what it may
+    (m/v/lab are mask-blind and identical to the plain apply; w differs)."""
+    if not HAVE:
+        print("SKIP test_adam_variants_bitwise (no CUDA/triton)")
+        return
+    n = 1 << 18
+    b1, b2, eps = 0.9, 0.999, 1e-8
+    rng = np.random.default_rng(67)
+    inactive = torch.from_numpy(
+        rng.integers(0, 2, size=n).astype(np.bool_)).to(DEV)
+    for lr, wd, count, has_lab in ((1e-3, 0.01, 7, True),
+                                   (3e-4, 0.0, 1, False)):
+        bc1c, bc2c = 1.0 - b1 ** count, 1.0 - b2 ** count
+        q = torch.from_numpy(_adv(n, 66)).to(DEV)
+        m0 = torch.from_numpy(_adv(n, 67)).to(DEV)
+        v0 = torch.from_numpy(_adv(n, 68, nonneg=True)).to(DEV)
+        w0 = torch.from_numpy(_adv(n, 69)).to(DEV)
+        lab0 = torch.from_numpy(_adv(n, 70, nonneg=True)).to(DEV)
+        for lr_i in (lr * 0.5, lr * 2.0, 0.0):
+            # AdamS family: v rebuilt from the pre-commit m, bc channels 1
+            tm, tv, tw, tl = m0.clone(), v0.clone(), w0.clone(), lab0.clone()
+            _adams_step_inplace(q, tm, tv, tw, tl if has_lab else None,
+                                lr, wd, b1, b2, 1.0, 1.0, eps,
+                                inactive=inactive, lr_inactive=lr_i)
+            m, v, w, lab = m0.clone(), v0.clone(), w0.clone(), lab0.clone()
+            K.opt_step_inplace(q, m, v, w, lab if has_lab else None,
+                               lr, wd, b1, b2, 1.0, 1.0, eps,
+                               optimizer="adams", inactive=inactive,
+                               lr_inactive=lr_i)
+            for nm, a, b_ in (("m", m, tm), ("v", v, tv), ("w", w, tw)):
+                assert _bit_eq(a, b_) == 0, f"adams {nm} ({lr},{wd},{lr_i})"
+            if has_lab:
+                assert _bit_eq(lab, tl) == 0, f"adams lab ({lr},{wd},{lr_i})"
+            # AdamW family under the same split
+            tm, tv, tw, tl = m0.clone(), v0.clone(), w0.clone(), lab0.clone()
+            _adam_step_inplace(q, tm, tv, tw, tl if has_lab else None,
+                               lr, wd, b1, b2, bc1c, bc2c, eps,
+                               inactive=inactive, lr_inactive=lr_i)
+            m, v, w, lab = m0.clone(), v0.clone(), w0.clone(), lab0.clone()
+            K.opt_step_inplace(q, m, v, w, lab if has_lab else None,
+                               lr, wd, b1, b2, bc1c, bc2c, eps,
+                               inactive=inactive, lr_inactive=lr_i)
+            for nm, a, b_ in (("m", m, tm), ("v", v, tv), ("w", w, tw)):
+                assert _bit_eq(a, b_) == 0, f"split {nm} ({lr},{wd},{lr_i})"
+            if has_lab:
+                assert _bit_eq(lab, tl) == 0, f"split lab ({lr},{wd},{lr_i})"
+        # the two families genuinely differ on the same inputs: v (basis)
+        # and w (basis + bc) move; the m recursion is shared
+        tma, tva, twa = m0.clone(), v0.clone(), w0.clone()
+        _adam_step_inplace(q, tma, tva, twa, None, lr, wd, b1, b2,
+                           bc1c, bc2c, eps)
+        tms, tvs, tws = m0.clone(), v0.clone(), w0.clone()
+        _adams_step_inplace(q, tms, tvs, tws, None, lr, wd, b1, b2,
+                            1.0, 1.0, eps)
+        assert torch.equal(tma, tms), "m recursion must be shared"
+        assert _bit_eq(tva, tvs) > 0, "AdamS v did not move vs AdamW"
+        assert _bit_eq(twa, tws) > 0, "AdamS w did not move vs AdamW"
+        # the split moves only w: m/v identical to the plain apply
+        tmn, tvn, twn = m0.clone(), v0.clone(), w0.clone()
+        _adam_step_inplace(q, tmn, tvn, twn, None, lr, wd, b1, b2,
+                           bc1c, bc2c, eps)
+        tmp, tvp, twp = m0.clone(), v0.clone(), w0.clone()
+        _adam_step_inplace(q, tmp, tvp, twp, None, lr, wd, b1, b2,
+                           bc1c, bc2c, eps, inactive=inactive,
+                           lr_inactive=lr * 0.5)
+        assert torch.equal(tmn, tmp) and torch.equal(tvn, tvp), \
+            "m/v must stay mask-blind under the split"
+        assert _bit_eq(twn, twp) > 0, "split apply did not move w"
+    print("PASS test_adam_variants_bitwise")
+
+
 def test_select_hist_bitwise():
     """One-sweep histogram vs the torch bitcast+bincount chain, with the
     folded finite guard counting exactly the nonfinite lanes."""
@@ -300,6 +376,7 @@ def main():
     test_canary_div_sqrt_recipe()
     test_formula_bitwise()
     test_adam_bitwise()
+    test_adam_variants_bitwise()
     test_select_hist_bitwise()
     test_select_cand_bitwise()
     test_select_gt_eq_bitwise()

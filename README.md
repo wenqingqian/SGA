@@ -19,9 +19,11 @@ error_feedback × backend) is pure configuration, not code.
 - `sga/replay.py`, `sga/replay_fused.py` — offline replay oracle: record a
   training window once (shadow-mode trace), then sweep any
   score × ratio × cycle-length configuration offline; the fused engine
-  streams the window once for a whole config group, sharded across GPUs
-  with an exact distributed top-k and a reusable dense-reference cache
-  (see docs/fused_replay_new.md).
+  streams the window once for a whole config group, sharded across GPUs,
+  with a reusable dense-reference cache. Single-node cycle replay defaults
+  to the online-compatible balanced-histogram selector; explicit `topk`
+  retains exact distributed top-k and is required for multi-node runs
+  (see docs/fused_replay.md).
 - `examples/llama3/train_1b_dense.yaml` — dense llama 1B config.
 - `tests/` — unit tests + the megatron arg audit tool.
 - `env.sh` — environment single source of truth (megatron source resolution +
@@ -34,14 +36,15 @@ SGA scheme research needs "what would training look like under a different
 selection scheme?" answered many times. Record a training window once
 (`sga_trace_dir` + `sga_trace_branch_points` + `sga_trace_window`, plus
 optional `sga_trace_dump_dtype=bf16` to store the per-step g dumps as bf16
-at rest — see `docs/fused_replay_new.md` §6.4) on a
+at rest — see `docs/fused_replay.md` §6.4) on a
 shadow run, then replay any configuration offline — the fused engine
 advances a whole group of score × ratio × cycle-length arms over a single
 window pass (mixed cycle lengths via `--cycle-lens`, group size derived
 from a state-byte budget via `--fused-state-budget-mb`), sharded across
 GPUs — and spans nodes with `--nodes` (ssh-launched shards over the shared
-NFS view; `docs/fused_replay_new.md` §6.8) — reproducing per-config replay
-bitwise (single shard)
+NFS view; `docs/fused_replay.md` §6.8, with explicit
+`--selection-semantics topk`) — reproducing per-config replay under the
+same selector semantics bitwise (single shard)
 or within the frozen pure-reordering band (multi-shard). The branch point
 is a global training step number (train iteration): `--branch-point 40`
 replays from the optimizer-state snapshot saved at the 40th train
@@ -55,8 +58,7 @@ iteration, consuming the `--window` recorded gradient steps after it
         --dense-cache <cache-dir> --out report.json
 
 Details, precision guarantees, and a full parameter reference:
-[docs/fused_replay_new.md](docs/fused_replay_new.md) (中文; the current
-version — `docs/fused_replay.md` is the superseded history).
+[docs/fused_replay.md](docs/fused_replay.md) (中文).
 
 ## Quick start (in the training container)
 

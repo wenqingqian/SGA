@@ -160,26 +160,53 @@ if triton is not None:
         tl.store(out + i, tl.abs(inner - res), mask=mk)
 
     @triton.jit
-    def _k_adam(q, m, v, w, lab, n,
+    def _k_adam(q, m, v, w, lab, sel, n,
                 b1f, om1f, b2f, om2f, r_bc1, r_bc2, epsf,
-                omlwdf, neglrf, lr2f,
-                HAS_LAB: tl.constexpr, BS: tl.constexpr):
-        # one AdamW commit in place: mul_ / add_(alpha=) / addcmul_ are
-        # the FMA-contraction points, the rest follows the recipe
+                omlwdf, neglrf, lr2f, lrf, lri_f, wdf,
+                HAS_LAB: tl.constexpr, ADAMS: tl.constexpr,
+                SPLIT: tl.constexpr, BS: tl.constexpr):
+        # one in-place commit (AdamW's recursion, or the AdamS v basis under
+        # ADAMS): mul_ / add_(alpha=) / addcmul_ are the FMA-contraction
+        # points, the rest follows the recipe. ADAMS rebuilds v from the
+        # PRE-commit m (the torch twin's copy_/mul_/mul_ chain — three
+        # correctly-rounded muls — then the addcmul_ FMA) before m updates;
+        # SPLIT is the boundary dual-lr apply (_apply_lr_split): the step
+        # rate is lr on the sel-active coords and lri on the inactive tail,
+        # the applied vector is wd*w + upd (two correctly-rounded ops) and
+        # the final subtract rides the addcmul_ FMA with its tensor product
+        # rounded first — the split scales the WHOLE step, weight-decay
+        # component included
         i = tl.program_id(0) * BS + tl.arange(0, BS)
         mk = i < n
         tq = tl.load(q + i, mask=mk)
         tm = tl.load(m + i, mask=mk)
         tv = tl.load(v + i, mask=mk)
         tw = tl.load(w + i, mask=mk)
-        tm = tl.math.fma(om1f, tq, tm * b1f)
-        tqq = tq * tq
-        tv = tl.math.fma(om2f, tqq, tv * b2f)
+        if ADAMS:
+            tqq = tq * tq
+            tmm = tm * tm
+            tv = tl.math.fma(om2f, tqq, tmm * b2f)
+            tm = tl.math.fma(om1f, tq, tm * b1f)
+        else:
+            tm = tl.math.fma(om1f, tq, tm * b1f)
+            tqq = tq * tq
+            tv = tl.math.fma(om2f, tqq, tv * b2f)
         tmh = tm * r_bc1
         tvh = tl.sqrt((tv * r_bc2).to(tl.float64)).to(tl.float32)
         upd = (tmh.to(tl.float64)
                / (tvh + epsf).to(tl.float64)).to(tl.float32)
-        tw = tl.math.fma(neglrf, upd, tw * omlwdf)
+        if SPLIT:
+            # sel carries the INACTIVE mask bytes (True = the
+            # never-communicated tail): those lanes step at lri, the rest
+            # at lr
+            act = tl.load(sel + i, mask=mk, other=0)
+            stepv = tl.where(mk & (act != 0), lri_f, lrf)
+            fullv = tw * wdf
+            fullv = fullv + upd
+            prodv = fullv * stepv
+            tw = tl.math.fma(-1.0, prodv, tw)
+        else:
+            tw = tl.math.fma(neglrf, upd, tw * omlwdf)
         tl.store(m + i, tm, mask=mk)
         tl.store(v + i, tv, mask=mk)
         tl.store(w + i, tw, mask=mk)
@@ -300,20 +327,46 @@ if triton is not None:
     })
 
 
-def adam_step_inplace(q, m, v, w, lab, lr, wd, b1, b2, bc1c, bc2c, eps):
-    """The kernel twin of sga.replay._adam_step_inplace (fp32 CUDA,
-    contiguous, in place)."""
+def opt_step_inplace(q, m, v, w, lab, lr, wd, b1, b2, bc1c, bc2c, eps,
+                     optimizer="adamw", inactive=None, lr_inactive=None):
+    """The kernel twin of sga.replay._opt_step_inplace (fp32 CUDA,
+    contiguous, in place): the AdamW recursion or the AdamS v basis
+    (``optimizer='adams'`` — v rebuilt from the pre-commit m, the bc
+    channels already pinned to 1.0 by the caller), plus the optional
+    boundary dual-lr split (``inactive``: bool mask, True = the
+    never-communicated tail applying at ``lr_inactive``)."""
     _check_contig(q=q, m=m, v=v, w=w)
     if lab is not None:
         _check_contig(lab=lab)
+    if inactive is not None:
+        _check_contig(inactive=inactive)
+    if (inactive is None) != (lr_inactive is None):
+        raise ValueError(
+            "opt_step_inplace: inactive and lr_inactive come as a pair "
+            f"(got inactive={inactive is not None}, "
+            f"lr_inactive={lr_inactive!r})")
     n = q.numel()
+    # torch.bool's byte-per-element buffer is not a pointer type a triton
+    # load honors bit-exactly — reinterpret the SAME bytes as uint8
+    # (one 0/1 byte per lane) for the kernel's step-rate select
     _k_adam[_grid(n)](
-        q, m, v, w, lab if lab is not None else q, n,
+        q, m, v, w, lab if lab is not None else q,
+        (inactive.view(torch.uint8)
+         if inactive is not None else q), n,
         _f32(b1), _f32(1.0 - b1), _f32(b2), _f32(1.0 - b2),
         _recip32(bc1c), _recip32(bc2c), _f32(eps),
         _f32(1.0 - lr * wd), _f32(-lr), _f32(lr * lr),
-        HAS_LAB=lab is not None, BS=_BS, num_warps=_WARPS,
+        _f32(lr), _f32(lr_inactive if lr_inactive is not None else 0.0),
+        _f32(wd),
+        HAS_LAB=lab is not None, ADAMS=(optimizer == "adams"),
+        SPLIT=inactive is not None, BS=_BS, num_warps=_WARPS,
         enable_fp_fusion=False)
+
+
+def adam_step_inplace(q, m, v, w, lab, lr, wd, b1, b2, bc1c, bc2c, eps):
+    """The kernel twin of sga.replay._adam_step_inplace (fp32 CUDA,
+    contiguous, in place)."""
+    opt_step_inplace(q, m, v, w, lab, lr, wd, b1, b2, bc1c, bc2c, eps)
 
 
 def hist_top16(score):

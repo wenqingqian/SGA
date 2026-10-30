@@ -114,12 +114,14 @@ def register_default_plugins() -> None:
     never silently clobbered)."""
     from sga.plugins.selection.topk import TopkSelection
     from sga.plugins.optimizer.adamw import SgaAdamW
+    from sga.plugins.optimizer.adams import SgaAdamS
     from sga.backends.nccl_pipelined_index import NcclPipelinedIndexBackend
     from sga.backends.torch_pipelined_index import TorchPipelinedIndexBackend
     from sga.backends.torch_pipelined_mask import TorchPipelinedMaskBackend
 
     _SELECTIONS.setdefault("topk", TopkSelection)
     _OPTIMIZERS.setdefault("adamw", SgaAdamW)
+    _OPTIMIZERS.setdefault("adams", SgaAdamS)
     _BACKENDS.setdefault("torch_pipelined_index", TorchPipelinedIndexBackend)
     _BACKENDS.setdefault("torch_pipelined_mask", TorchPipelinedMaskBackend)
     _BACKENDS.setdefault("nccl_pipelined_index", NcclPipelinedIndexBackend)

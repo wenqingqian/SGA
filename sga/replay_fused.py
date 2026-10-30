@@ -17,7 +17,13 @@ group — sharded across processes:
   integer score histograms and per-shard (above, tie) counts — the global
   top-k stays exact, with the tie layer filled in global flat-index order
   (= shard order, then in-shard order), bit-identical to
-  ``select_topk_flat`` on the concatenated vector.
+  ``select_topk_flat`` on the concatenated vector. With
+  ``--selection-semantics balanced-histogram`` (the default) the two select
+  sites swap
+  the exact tie-filled topk for the online engine's whole-crossing-bin
+  histogram select — the same int64 histogram exchange, without the tie
+  counts, reconstructed catalog-wide across shards
+  (``shard_select_balanced``; single node only).
 - The dense arm is never re-run inside a pass: den_at / snapshots / label /
   recon come from the dense cache (``--dense-cache``); on a miss the parent
   process computes the dense pass with the classic machinery and saves the
@@ -30,8 +36,10 @@ group — sharded across processes:
   launcher node's first shard.
 
 Arithmetic contract: per-config math runs per-param per-chunk in the
-same order as ``tests/test_replay_cycle.reference_cycle``, so a
-single-shard run reproduces the reference bitwise. At world > 1 the
+same order as ``tests/test_replay_cycle.reference_cycle``, so an explicit
+``--selection-semantics topk`` single-shard run reproduces the reference
+bitwise. Balanced runs instead follow the online whole-crossing-bin
+semantics at both selection sites. At world > 1 the
 only deviations are cross-shard fp64 scalar-sum reorderings (covered by
 the frozen pure-reordering band), plus the optional ``--norm-dtype fp32``
 quantization (gated by its own frozen band). The
@@ -40,6 +48,23 @@ min/max/zero-fractions stay exact. Ranking metrics are exact: the selected
 coordinates' (score, label, label-sel) values are gathered to shard 0 in
 global index order and the same arithmetic as ``ranking_metrics`` runs on
 the reconstructed vectors.
+
+Per-config axes (``--optimizer`` / ``--fold`` / ``--dual-lr``): every
+(score, ratio, T) tuple fans out over the three axes and all arms advance
+in the same lockstep window pass. ``optimizer`` selects the step recursion
+(adamw | adams — AdamS rebuilds v from the pre-commit m with bias
+correction dropped, see sga.replay.ADAMS_V_BASIS; the dense reference —
+label/den/snapshots — is per-optimizer, one dense cache file each).
+``fold=on`` divides the accumulated residual by T at the boundary commit
+(the online residual_mean fold), in place ahead of the boundary clip norm
+so the norm, the boundary re-selection score and the commit all read the
+folded value. ``--dual-lr`` resolves T-relative tokens (``T``, ``T/2``)
+to the full-sync inactive-lr scale: at boundaries the never-communicated
+tail applies the whole step (weight-decay component included) at
+lr * scale against the OUTGOING window's mask. The default singletons
+(adamw / off / 1) reduce the config space to the historical
+(score, ratio, T) behavior; explicit topk also retains the legacy report
+shape, while balanced adds its semantic echo.
 """
 import datetime
 import io
@@ -61,6 +86,8 @@ import torch.multiprocessing as mp
 # opt-in stage-0 (S0) profile: counts host syncs / gloo
 # ops / H2D bytes per pass and per-pass wall time; zero effect when unset
 _S0_PROFILE = os.environ.get("REPLAY_S0_PROFILE", "") == "1"
+# replay selection is balanced-histogram unless explicit legacy topk is used
+BALANCED_HISTOGRAM = "balanced-histogram"
 
 
 # ----------------------------------------------------------------------------
@@ -375,6 +402,93 @@ def shard_select(score, k, comms, prof=None):
     return gt, thresh
 
 
+def shard_select_balanced(score, k, comms, entries):
+    """Bit-faithful replay of the online engine's balanced-histogram
+    selection (``sga.plugins.selection._histogram.select_masks_histogram(
+    mode="balanced", global_allreduce=False)``) for the replay select
+    sites, single- or multi-shard on ONE node.
+
+    The online engine selects on per-param score views with the histogram
+    built on a stride-8 subsample — per view, per ``_HIST_CHUNK`` block
+    (the chunk length is a stride multiple, so both reduce to the view's
+    param-relative ``[::8]``); the crossing bin is searched with ``r =
+    max(1, round(n_sampled * (n_total - k + 1) / n_total))`` in world-1
+    local units (the engine's replicated full-sync scores make every
+    rank's local histogram the full one, so the un-merged select derives
+    the same bin the merged form would); the mask keeps the WHOLE
+    crossing bin — approximate by construction (the ±0.5pp two-sided
+    executable criterion), which is exactly the selection-set difference
+    vs the exact topk replay.
+
+    Sharded replay reconstructs that full-catalog select exactly.
+    ``entries`` are the shard's ``sp.entries`` records (``{"a": shard-local
+    flat offset, "p_off": param-relative slice start, "n": slice numel}``;
+    whole-view callers may omit ``p_off`` — it is 0 there) and every
+    per-param subsample keeps the ONLINE plugin's param-relative grid:
+    the sampled local indices are ``(-p_off) % stride`` plus stride
+    steps, so the shard partial histograms SUM to exactly the world-1
+    histogram (one int64 all_reduce) and the shard-local n_total /
+    n_sampled sum to the catalog-wide values (one int64 all_reduce).
+    ``r`` stays in world-1 units — NOT scaled by the replay's shard
+    world, because the partials are disjoint slices, not the online
+    engine's replicated copies. The crossing bin b is therefore identical
+    on every rank: the returned mask is that rank's exact slice of the
+    world-1 mask and the threshold is bitwise the same everywhere.
+
+    Only the single-node engine is supported (the mp.spawn shards; a
+    multi-node rendezvous sets SGA_MASTER_ADDR and is rejected here AND
+    by the CLI gate).
+
+    Unlike the online plugin (which has no guard) this entry raises on
+    non-finite scores — the replay's NaN/Inf canary, mirroring
+    shard_select; the check only fires where parity is undefined anyway,
+    so finite-input results stay bit-identical (a deliberate asymmetry:
+    replay is the measurement instrument).
+    """
+    if os.environ.get("SGA_MASTER_ADDR") is not None:
+        raise ValueError(
+            "--selection-semantics balanced-histogram supports only the "
+            "single-node fused engine (the multi-node launcher's shards "
+            "do not implement the sharded balanced select)")
+    from sga.plugins.selection._histogram import (
+        _HIST_MODES, _abs_bit_top, _accumulate_histogram,
+        _balanced_crossing_bin, _bin_edge_float, _sampled_count)
+    if not bool(torch.isfinite(score).all().item()):
+        # NaN/Inf land in the histogram's top bit-pattern bins and would
+        # be selected FIRST — mirror shard_select's canary (the online
+        # plugin has none; deliberate asymmetry, see the docstring)
+        raise ValueError(
+            "shard_select_balanced requires finite scores (NaN/Inf land "
+            "in the top bit-pattern bins and would be selected; parity "
+            "is undefined there)")
+
+    shift, nbins, stride = _HIST_MODES["balanced"]
+    hist = torch.zeros(nbins, dtype=torch.int64)
+    # [n_total, n_sampled] shard partials: the shards partition every
+    # param view, so their sum is the full-catalog pair
+    counts = torch.zeros(2, dtype=torch.int64)
+    for e in entries:
+        v = score[e["a"]:e["a"] + e["n"]]
+        n = v.numel()
+        counts[0] += n
+        phase = (-int(e.get("p_off", 0))) % stride
+        counts[1] += _sampled_count(n, stride, phase)
+        _accumulate_histogram(hist, v, shift, stride, phase)
+    if comms.distributed:
+        # gloo all_reduce of the int64 histogram + counts: the shard
+        # partials are DISJOINT slices of the catalog, so the sum is the
+        # online engine's full histogram and the crossing-bin search
+        # below reads world-1 quantities (no world factor anywhere)
+        dist.all_reduce(hist, op=dist.ReduceOp.SUM)
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+    n_total = int(counts[0].item())
+    n_sampled = int(counts[1].item())
+    b = _balanced_crossing_bin(hist, n_total, n_sampled, k, replicas=1)
+    mask = _abs_bit_top(score, shift) >= b
+    thresh = _bin_edge_float(b, shift)
+    return mask, thresh
+
+
 # ----------------------------------------------------------------------------
 # ranking metrics over gathered selections (exact; mirrors ranking_metrics)
 # ----------------------------------------------------------------------------
@@ -550,13 +664,13 @@ class _FrontRankWorker:
 
     _SENTINEL = object()
 
-    def __init__(self, sort_dev, cycle_lens, ks, stats, label_total,
+    def __init__(self, sort_dev, ks, stats, label_total,
                  maxsize=4):
         self.sort_dev = sort_dev
         # read-only inputs shared with the main thread (never mutated after
-        # the pre-loop computation — the FIFO hand-off needs no copies)
-        self.cycle_lens, self.ks = cycle_lens, ks
-        self.stats, self.label_total = stats, label_total
+        # the pre-loop computation — the FIFO hand-off needs no copies);
+        # stats is keyed (score, optimizer), label_total by optimizer
+        self.ks, self.stats, self.label_total = ks, stats, label_total
         self.idcg, self.rankmet = {}, {}
         self.rank_s, self.qwait_s = 0.0, 0.0
         self.error = None
@@ -584,18 +698,22 @@ class _FrontRankWorker:
                     return
                 _t = time.perf_counter()
                 if item[0] == "idcg":
-                    _, r, parts = item
-                    self._cur = f"idcg r={r}"
-                    self.idcg[r] = _idcg_of_parts(parts, dev=self.sort_dev)
+                    _, opt, r, parts = item
+                    self._cur = f"idcg opt={opt} r={r}"
+                    self.idcg[(opt, r)] = _idcg_of_parts(
+                        parts, dev=self.sort_dev)
                 else:
-                    _, s, r, sc_parts, lb_parts, ls_parts = item
-                    self._cur = f"rank s={s} r={r}"
+                    _, s, opt, r, sc_parts, lb_parts, ls_parts = item
+                    self._cur = f"rank s={s} opt={opt} r={r}"
                     met = _fused_ranking(
                         torch.cat(sc_parts), torch.cat(lb_parts), ls_parts,
-                        self.ks[r], self.stats[s]["sum"], self.label_total,
-                        self.idcg[r], dev=self.sort_dev)
-                    for t in self.cycle_lens:
-                        self.rankmet[(s, r, t)] = met
+                        self.ks[r], self.stats[(s, opt)]["sum"],
+                        self.label_total[opt], self.idcg[(opt, r)],
+                        dev=self.sort_dev)
+                    # the ranking metrics depend on (score, ratio,
+                    # optimizer) only — every T/fold/dual-lr arm of one
+                    # (s, r, opt) shares this entry
+                    self.rankmet[(s, r, opt)] = met
                 self.rank_s += time.perf_counter() - _t
         except BaseException as e:  # captured for the main thread
             self.error = e
@@ -1006,6 +1124,10 @@ def _window_and_horizons(g_files, t0, window, horizons):
 def _worker(rank, world, cfg, port, frag_path):
     import sga.replay as R
 
+    R.require_scan_dtypes(
+        cfg.get("replay_dtype"),
+        "fp32" if cfg.get("norm_fp32") is True else "fp64",
+    )
     torch.manual_seed(cfg["seed"])
     dev = "cpu" if cfg["device"] == "cpu" else f"cuda:{rank}"
     # sort_dev feeds the ranking/idcg sorts (device computes the
@@ -1048,8 +1170,7 @@ def _worker(rank, world, cfg, port, frag_path):
     comms = Comms(rank, world, port)
 
     t0 = cfg["t0"]
-    replay_dtype = (torch.float64 if cfg["replay_dtype"] == "fp64"
-                    else torch.float32)
+    replay_dtype = R.resolve_replay_dtype(cfg["replay_dtype"])
     # replay-kernel kill-switch (A/B arms and emergencies): force the
     # torch eager path — same unknown-values-must-raise contract as the
     # other replay flags
@@ -1115,62 +1236,86 @@ def _worker(rank, world, cfg, port, frag_path):
     # ---- branch scores (per score_name, elementwise fp64 math -> fp32) ----
     _tf0 = time.perf_counter() if _S0_PROFILE else 0.0
     score_names = cfg["score_names"]
+    optimizers = cfg["optimizers"]
     specs = {s: R.get_score_spec(s) for s in score_names}
     t0step = int(meta["step"])
     chunk_n = R._chunk_elems(cfg["chunk_mb"], 8)
-    score_loc = {s: torch.empty(sp.n, dtype=torch.float32)
-                 for s in score_names}
+    # score vectors are per (score, optimizer): the branch-point selection
+    # and stats depend on the optimizer through the formula's v-basis and
+    # bias corrections (fold/dual-lr do not touch the branch point — no
+    # residual exists yet and the split applies at commits only)
+    score_loc = {(s, o): torch.empty(sp.n, dtype=torch.float32)
+                 for s in score_names for o in optimizers}
     for e in sp.entries:
         b1, b2, eps, wd = e["b1"], e["b2"], e["eps"], e["wd"]
-        bc1p = 1.0 - b1 ** (t0step + 1)
-        bc2p = 1.0 - b2 ** (t0step + 1)
+        bcs = {opt: R._bc_pair(opt, t0step + 1, b1, b2)
+               for opt in optimizers}
+        # the fp64 chunk casts/upload read the SAME w0/m0/v0/g0 basis for
+        # every optimizer family — build them once per chunk, shared
+        # across the optimizer loop, so an N-optimizer run pays the input
+        # cost once instead of N times (the per-opt outputs and the bc
+        # pairs are the only optimizer-dependent state)
         for a in range(0, e["n"], chunk_n):
             b = min(e["n"], a + chunk_n)
             w64 = e["w0"][a:b].to(dtype=torch.float64, device=dev)
             m64 = e["m0"][a:b].to(dtype=torch.float64, device=dev)
             v64 = e["v0"][a:b].to(dtype=torch.float64, device=dev)
             g64 = e["g0"][a:b].to(dtype=torch.float64, device=dev)
-            for s in score_names:
-                sc = specs[s].formula(w64, m64, v64, g64, b1, b2, eps, wd,
-                                      bc1p, bc2p,
-                                      update_includes_wd=cfg["cycle_mode"])
-                score_loc[s][e["a"] + a:e["a"] + b] = sc.abs()
+            for opt in optimizers:
+                bc1p, bc2p = bcs[opt]
+                for s in score_names:
+                    sc = R.score_formula(specs[s], w64, m64, v64, g64,
+                                         b1, b2, eps, wd, bc1p, bc2p, opt,
+                                         update_includes_wd=cfg["cycle_mode"])
+                    score_loc[(s, opt)][e["a"] + a:e["a"] + b] = sc.abs()
 
     # ---- dense artifacts: the parent populated the cache before spawn -----
-    # (the cache roundtrip is bitwise — pinned by test_dense_cache_roundtrip)
+    # (the cache roundtrip is bitwise — pinned by test_dense_cache_roundtrip;
+    # one cache per optimizer: the dense reference trajectory — label, den,
+    # snapshots — depends on the step recursion)
     if _S0_PROFILE:
         _tf_scores = time.perf_counter() - _tf0
         _tf0 = time.perf_counter()
     else:
         _tf_scores = 0.0
-    ident = R._dense_cache_ident(cfg["trace_dir"], t0, window_steps,
-                                 eff_horizons, replay_dtype,
-                                 cfg["trace_dtype"],
-                                 "cpu" if cfg["device"] == "cpu" else "dev")
-    cached = R.load_dense_cache(cfg["dense_cache"], ident)
-    if cached is None:
-        raise RuntimeError("dense cache still missing after parent populate")
-    label_loc = cached["label_flat"][lo:hi].clone()
-    # the device-permutation fast path relies on finite non-negative sort
-    # keys (score_loc passes the shard_select isfinite gate; label gets one
-    # upfront check here — non-finite labels would sort inconsistently
-    # across backends)
-    if not bool(torch.isfinite(label_loc).all().item()):
-        raise ValueError("dense-cache label vector contains non-finite "
-                         "entries; check the trace/cache integrity")
-    den_at = cached["den_at"]
-    recon_steps = cached["recon_steps"]
-    label_total = cached["label_total"]
-    snap_loc = {}
-    for h in eff_horizons:
-        snap_loc[h] = {}
-        for e in sp.entries:
-            t = cached["snap_d"][h][e["name"]].reshape(-1)
-            snap_loc[h][e["name"]] = t[e["p_off"]:e["p_off"] + e["n"]] \
-                .clone()
+    label_loc, den_at, label_total, snap_loc, stats_label = {}, {}, {}, {}, {}
+    recon_steps = None
+    for opt in optimizers:
+        ident = R._dense_cache_ident(
+            cfg["trace_dir"], t0, window_steps, eff_horizons, replay_dtype,
+            cfg["trace_dtype"],
+            "cpu" if cfg["device"] == "cpu" else "dev", opt)
+        cached = R.load_dense_cache(cfg["dense_cache"], ident)
+        if cached is None:
+            raise RuntimeError(
+                "dense cache still missing after parent populate "
+                f"(optimizer {opt})")
+        lv = cached["label_flat"][lo:hi].clone()
+        # the device-permutation fast path relies on finite non-negative sort
+        # keys (score_loc passes the shard_select isfinite gate; label gets one
+        # upfront check here — non-finite labels would sort inconsistently
+        # across backends)
+        if not bool(torch.isfinite(lv).all().item()):
+            raise ValueError("dense-cache label vector contains non-finite "
+                             "entries; check the trace/cache integrity")
+        label_loc[opt] = lv
+        den_at[opt] = cached["den_at"]
+        # the per-step pre-clip reconstruction diagnostics are pure functions
+        # of the logged gradients (no optimizer state) — identical in every
+        # optimizer's cache; report the first optimizer's copy
+        if recon_steps is None:
+            recon_steps = cached["recon_steps"]
+        label_total[opt] = cached["label_total"]
+        snap_loc[opt] = {}
+        for h in eff_horizons:
+            snap_loc[opt][h] = {}
+            for e in sp.entries:
+                t = cached["snap_d"][h][e["name"]].reshape(-1)
+                snap_loc[opt][h][e["name"]] = \
+                    t[e["p_off"]:e["p_off"] + e["n"]].clone()
+        del cached
     dense_cache_hit = cfg["dense_cache_hit"]  # parent-side load outcome;
     # the streaming pass itself only ever consumes the cache
-    del cached
     if _S0_PROFILE:
         _tf_cache = time.perf_counter() - _tf0
     else:
@@ -1178,15 +1323,25 @@ def _worker(rank, world, cfg, port, frag_path):
 
     # ---- score / label statistics (sums shard-partial; min/max exact) ------
     stats = {}
-    for s in score_names:
-        stats[s] = _shard_stats(score_loc[s], comms)
-    stats_label = _shard_stats(label_loc, comms)
+    for opt in optimizers:
+        for s in score_names:
+            stats[(s, opt)] = _shard_stats(score_loc[(s, opt)], comms)
+        stats_label[opt] = _shard_stats(label_loc[opt], comms)
 
     # ---- branch selections + label selections + ranking metrics -----------
     ratios = cfg["ratios"]
     cycle_lens = cfg["cycle_lens"]
+    folds = cfg["folds"]
+    dual_lrs = cfg["dual_lrs"]
     ks = {r: max(1, int(round(r / 100.0 * N))) for r in ratios}
     idcg, sel0, thresh0, rankmet = {}, {}, {}, {}
+    # selection semantics applies to BOTH select sites (the branch-point
+    # front select below AND the boundary reselection in the streaming
+    # loop): the online engine selects with the same semantics at the
+    # branch point and at every boundary — an arm wired at only one site
+    # diverges from step 0. Read once here; both select sites below
+    # reuse the same name.
+    sel_semantics = cfg.get("selection_semantics", "balanced-histogram")
     # device front-select decision: unanimous across ranks (a partial
     # fallback would split the gather collectives and deadlock). With the
     # arm engaged, the CPU originals stay untouched for _shard_stats (its
@@ -1196,13 +1351,14 @@ def _worker(rank, world, cfg, port, frag_path):
     # original CPU expression path.
     _sel_ok = (front_sel == "auto" and dev.startswith("cuda")
                and _device_ok_for_select(sp.n, ks[max(ratios)], world,
-                                         len(score_names), dev))
+                                         len(score_names) * len(optimizers),
+                                         dev))
     sel_dev_used = dev if comms.vote_unanimous(_sel_ok) else None
     gather_backend = (comms.vote_gather_backend()
                       if sel_dev_used is not None else "gloo")
     if sel_dev_used is not None:
-        score_sel = {s: score_loc[s].to(sel_dev_used) for s in score_names}
-        label_sel = label_loc.to(sel_dev_used)
+        score_sel = {k: v.to(sel_dev_used) for k, v in score_loc.items()}
+        label_sel = {o: label_loc[o].to(sel_dev_used) for o in optimizers}
     else:
         score_sel, label_sel = score_loc, label_loc
 
@@ -1221,54 +1377,73 @@ def _worker(rank, world, cfg, port, frag_path):
     # compute there too). rank_bg=off keeps the synchronous path.
     rank_worker = None
     if rank_bg == "auto" and comms.global_rank == 0:
-        rank_worker = _FrontRankWorker(sort_dev, cycle_lens, ks, stats,
-                                       label_total)
+        rank_worker = _FrontRankWorker(sort_dev, ks, stats, label_total)
         rank_worker.start()
     _front_failed = False
     try:
-        for r in ratios:
-            _tq = time.perf_counter() if _S0_PROFILE else 0.0
-            lsel, _lt = shard_select(label_sel, ks[r], comms)
-            parts = _gather(label_sel[lsel].clone())
-            if _S0_PROFILE:
-                _tf_sel += time.perf_counter() - _tq
-                _tq = time.perf_counter()
-            if rank_worker is not None:
-                rank_worker.submit(("idcg", r, parts))
-            elif comms.global_rank == 0:
-                idcg[r] = _idcg_of_parts(parts, dev=sort_dev)
-            if _S0_PROFILE and rank_worker is None:
-                _tf_rank += time.perf_counter() - _tq
-            for s in score_names:
-                # the branch-point selection is a function of (score, ratio)
-                # only, and shard_select is deterministic on its inputs — every
-                # T arm of one (s, r) shares a single select instead of paying
-                # len(cycle_lens) redundant global selects; sel0 is only read to
-                # build the per-config device masks (never mutated)
+        for opt in optimizers:
+            for r in ratios:
                 _tq = time.perf_counter() if _S0_PROFILE else 0.0
-                sel, th = shard_select(score_sel[s], ks[r], comms)
-                sc_parts = _gather(score_sel[s][sel].clone())
-                lb_parts = _gather(label_sel[sel].clone())
-                ls_parts = _gather(lsel[sel].clone())
+                lsel, _lt = shard_select(label_sel[opt], ks[r], comms)
+                parts = _gather(label_sel[opt][lsel].clone())
                 if _S0_PROFILE:
                     _tf_sel += time.perf_counter() - _tq
                     _tq = time.perf_counter()
-                met_sr = None
                 if rank_worker is not None:
-                    rank_worker.submit(("rank", s, r, sc_parts, lb_parts,
-                                        ls_parts))
+                    rank_worker.submit(("idcg", opt, r, parts))
                 elif comms.global_rank == 0:
-                    met_sr = _fused_ranking(
-                        torch.cat(sc_parts), torch.cat(lb_parts), ls_parts,
-                        ks[r], stats[s]["sum"], label_total, idcg[r],
-                        dev=sort_dev)
+                    idcg[(opt, r)] = _idcg_of_parts(parts, dev=sort_dev)
                 if _S0_PROFILE and rank_worker is None:
                     _tf_rank += time.perf_counter() - _tq
-                for t in cycle_lens:
-                    sel0[(s, r, t)] = sel
-                    thresh0[(s, r, t)] = th
+                for s in score_names:
+                    # the branch-point selection is a function of (score,
+                    # ratio, optimizer) only, and the selector is
+                    # deterministic on its inputs — every T/fold/dual-lr arm
+                    # of one (s, r, opt) shares a single select instead of
+                    # paying the axis product in redundant global selects;
+                    # sel0 is only read to build the per-config device masks
+                    # (never mutated)
+                    _tq = time.perf_counter() if _S0_PROFILE else 0.0
+                    # the ranking diagnostics (idcg/DCG/rankmet below) are
+                    # size-pinned to exact k and cross-arm comparable only
+                    # under ONE selection rule — they stay on exact topk
+                    # for every semantics; the balanced arm swaps ONLY the
+                    # trajectory-driving mask (sel0/thresh0).
+                    sel, th = shard_select(score_sel[(s, opt)], ks[r],
+                                           comms)
+                    sc_parts = _gather(score_sel[(s, opt)][sel].clone())
+                    lb_parts = _gather(label_sel[opt][sel].clone())
+                    ls_parts = _gather(lsel[sel].clone())
+                    if _S0_PROFILE:
+                        _tf_sel += time.perf_counter() - _tq
+                        _tq = time.perf_counter()
+                    met_sr = None
+                    if rank_worker is not None:
+                        rank_worker.submit(("rank", s, opt, r, sc_parts,
+                                            lb_parts, ls_parts))
+                    elif comms.global_rank == 0:
+                        met_sr = _fused_ranking(
+                            torch.cat(sc_parts), torch.cat(lb_parts),
+                            ls_parts, ks[r], stats[(s, opt)]["sum"],
+                            label_total[opt], idcg[(opt, r)], dev=sort_dev)
+                    if _S0_PROFILE and rank_worker is None:
+                        _tf_rank += time.perf_counter() - _tq
+                    if sel_semantics == BALANCED_HISTOGRAM:
+                        # S0: the full-vector balanced pass is a front
+                        # select too — bracket it into select_s instead of
+                        # leaving its cost attributed to nothing
+                        _tq = time.perf_counter() if _S0_PROFILE else 0.0
+                        sel0[(s, r, opt)], thresh0[(s, r, opt)] = (
+                            shard_select_balanced(
+                                score_sel[(s, opt)], ks[r], comms,
+                                sp.entries))
+                        if _S0_PROFILE:
+                            _tf_sel += time.perf_counter() - _tq
+                    else:
+                        sel0[(s, r, opt)] = sel
+                        thresh0[(s, r, opt)] = th
                     if rank_worker is None and comms.global_rank == 0:
-                        rankmet[(s, r, t)] = met_sr
+                        rankmet[(s, r, opt)] = met_sr
     except BaseException:
         _front_failed = True
         raise
@@ -1321,10 +1496,13 @@ def _worker(rank, world, cfg, port, frag_path):
               flush=True)
 
     # ---- streaming passes over config groups ------------------------------
-    # (score, ratio, T) arms; a single T enumerates the plain (score,
-    # ratio) order, so the max_configs partition is unchanged
-    configs = [(s, r, t) for r in ratios for s in score_names
-               for t in cycle_lens]
+    # The three optimizer-axis values enumerate innermost; default singletons
+    # preserve the historical (score, ratio, T) order and group partition.
+    configs = [(s, r, t, opt, fold, dl)
+               for r in ratios for s in score_names for t in cycle_lens
+               for opt in optimizers for fold in folds for dl in dual_lrs]
+    # T-relative dual-lr tokens resolve against each arm's own cycle length.
+    dl_scale_of = {c: R.resolve_dual_lr_token(c[5], c[2]) for c in configs}
     # group-size cap: with a state byte budget set (>0) the cap is derived
     # from the resident {w,m,v,res} bytes of ONE config over the WIDEST
     # shard — ceil(N/world) elements on every rank, so the partition stays a
@@ -1343,8 +1521,7 @@ def _worker(rank, world, cfg, port, frag_path):
         eff_cap = cfg["max_configs"]
     groups = [configs[i:i + eff_cap]
               for i in range(0, len(configs), eff_cap)]
-    num_at = {(s, r, t): {} for s in score_names for r in ratios
-              for t in cycle_lens}
+    num_at = {c: {} for c in configs}
     # one counter dict per config group, stashed into shard 0's fragment
     # alongside the S0PROFILE print (env-gated: None when the env is absent)
     s0_profs = [] if _S0_PROFILE else None
@@ -1368,13 +1545,14 @@ def _worker(rank, world, cfg, port, frag_path):
         # mutates in place, so aliasing is safe)
         sel_dev_cache = {}
         _t0s = time.perf_counter() if _S0_PROFILE else 0.0
-        for (s, r, t) in group:
-            sel = sel0[(s, r, t)]
+        for c in group:
+            s, r, t, opt, _fold, _dl = c
+            sel = sel0[(s, r, opt)]
             stt = {}
             for e in sp.entries:
                 # _fresh_state: never alias the shard's w0/m0/v0 — every
                 # arm in the group must start from the pristine state
-                sel_key = (s, r, e["name"])
+                sel_key = (s, r, opt, e["name"])
                 if sel_key not in sel_dev_cache:
                     sel_dev_cache[sel_key] = \
                         sel[e["a"]:e["a"] + e["n"]].to(dev)
@@ -1386,7 +1564,7 @@ def _worker(rank, world, cfg, port, frag_path):
                                        device=dev),
                     "sel": sel_dev_cache[sel_key],
                 }
-            states[(s, r, t)] = stt
+            states[c] = stt
         _stp_s = (time.perf_counter() - _t0s) if _S0_PROFILE else 0.0
         chunk_dev = R._chunk_elems(cfg["chunk_mb"], itemsize)
         norm_fp32 = cfg["norm_fp32"]
@@ -1430,13 +1608,38 @@ def _worker(rank, world, cfg, port, frag_path):
             coef_dense, _flag = R.coef_dense_for(gmeta)
             clip_grad = float(gmeta.get("clip_grad", 0.0))
             count = t0 + si + 1
-            # per-config calendars: arm (s, r, t) full-syncs iff si % t == 0.
-            # Mixed-T runs reproduce solo-T arms bitwise because each arm's
-            # state machine consumes only its own calendar/states, the
-            # qn2/num2 exchanges are per-arm-indexed lists (elementwise
-            # reductions — the list length never enters a lane's value) and
-            # chunking / entry order are group-invariant
-            boundary_c = [si % t == 0 for (_s, _r, t) in group]
+            # per-config calendars: arm (s, r, t, opt, fold, dl) full-syncs
+            # iff si % t == 0. Mixed-T (and mixed-axis) runs reproduce
+            # solo-axis arms bitwise because each arm's state machine
+            # consumes only its own calendar/states, the qn2/num2 exchanges
+            # are per-arm-indexed lists (elementwise reductions — the list
+            # length never enters a lane's value) and chunking / entry order
+            # are group-invariant
+            boundary_c = [si % c[2] == 0 for c in group]
+            fold_c = [c[4] for c in group]
+            dl_scale = [dl_scale_of[c] for c in group]
+            # residual fold (fold=on arms): divide the accumulated residual
+            # by the cycle length T at the boundary, IN PLACE and BEFORE the
+            # pass-1 clip norm — the boundary norm (pass 1), the boundary
+            # re-selection score (pass 2) and the commit (pass 3) all read
+            # the folded value, exactly where the online residual_mean fold
+            # lands it (the grad buffer on the pre-boundary step, ahead of
+            # everything the boundary step computes; folding only the commit
+            # would re-clip against an unfolded norm — a semantics the
+            # online path never produces). The online kernel multiplies by
+            # the fp32 host reciprocal of the window; the oracle divides
+            # exactly in replay_dtype
+            if si > 0:
+                for ci, c in enumerate(group):
+                    if boundary_c[ci] and fold_c[ci]:
+                        for e in sp.entries:
+                            states[c][e["name"]]["res"].div_(float(c[2]))
+            # dual-lr boundary split: the outgoing window's mask (the mask
+            # the cycle's sparse steps used) gates the applied lr — pass 2
+            # replaces the masks, so the pre-replacement slices are stashed
+            # here for pass 3 (references only; the mask tensors are never
+            # mutated, reselection replaces them)
+            out_sel = {}
             if res_on:
                 # one H2D per entry per step, shared by every config and
                 # all three passes (the legacy path re-uploads per config
@@ -1476,7 +1679,8 @@ def _worker(rank, world, cfg, port, frag_path):
             # reach the host once per pass instead of per chunk
             qn2_dev = (torch.zeros(len(group), dtype=torch.float64,
                                    device=dev) if red_on else None)
-            for ci, (s, r, t) in enumerate(group):
+            for ci, c in enumerate(group):
+                s, r, t, opt, fold, dl = c
                 bnd = boundary_c[ci]
                 for e in sp.entries:
                     g = local.get(e["name"])
@@ -1485,7 +1689,7 @@ def _worker(rank, world, cfg, port, frag_path):
                     g_el = None if res_on else (
                         torch.zeros(e["n"], dtype=torch.float32)
                         if g is None else g)
-                    stt = states[(s, r, t)][e["name"]]
+                    stt = states[c][e["name"]]
                     for a in range(0, e["n"], chunk_dev):
                         b = min(e["n"], a + chunk_dev)
                         if res_on:
@@ -1545,11 +1749,15 @@ def _worker(rank, world, cfg, port, frag_path):
             # calendar reaches this step re-select, the others leave mask
             # and states untouched
             _t0p = time.perf_counter() if prof else 0.0
-            for ci, (s, r, t) in enumerate(group):
+            for ci, c in enumerate(group):
+                s, r, t, opt, fold, dl = c
                 if not (boundary_c[ci] and si > 0 and si + 1 < W):
                     continue
                 spec = specs[s]
-                _kf = K.formula(s) if k_on else None
+                # the replay-kernel formula arm hardcodes the AdamW v-basis;
+                # AdamS scores take the torch formula path with the v
+                # substitution (score_formula)
+                _kf = K.formula(s) if (k_on and opt == "adamw") else None
                 score_flat = torch.empty(sp.n, dtype=torch.float32,
                                          device=dev)
                 if prof:
@@ -1565,10 +1773,9 @@ def _worker(rank, world, cfg, port, frag_path):
                     g_el = None if res_on else (
                         torch.zeros(e["n"], dtype=torch.float32)
                         if g is None else g)
-                    stt = states[(s, r, t)][e["name"]]
+                    stt = states[c][e["name"]]
                     b1, b2, eps, wd = e["b1"], e["b2"], e["eps"], e["wd"]
-                    bc1c = 1.0 - b1 ** count
-                    bc2c = 1.0 - b2 ** count
+                    bc1c, bc2c = R._bc_pair(opt, count, b1, b2)
                     for a in range(0, e["n"], chunk_dev):
                         b = min(e["n"], a + chunk_dev)
                         if res_on:
@@ -1583,10 +1790,11 @@ def _worker(rank, world, cfg, port, frag_path):
                                   stt["vs"][a:b], q, b1, b2, eps, wd,
                                   bc1c, bc2c)
                               if _kf is not None else
-                              spec.formula(stt["ws"][a:b], stt["ms"][a:b],
-                                           stt["vs"][a:b], q, b1, b2, eps,
-                                           wd, bc1c, bc2c,
-                                           update_includes_wd=True))
+                              R.score_formula(spec, stt["ws"][a:b],
+                                              stt["ms"][a:b], stt["vs"][a:b],
+                                              q, b1, b2, eps, wd, bc1c, bc2c,
+                                              opt,
+                                              update_includes_wd=True))
                         score_flat[e["a"] + a:e["a"] + b] = sc.abs() \
                             .float()
                 if prof:
@@ -1594,14 +1802,25 @@ def _worker(rank, world, cfg, port, frag_path):
                         torch.cuda.synchronize()
                     prof["p2f"] += time.perf_counter() - _t0f
                     _t0f = time.perf_counter()
-                newsel, _th = shard_select(score_flat, ks[r], comms,
-                                           prof=prof)
+                if sel_semantics == BALANCED_HISTOGRAM:
+                    # no prof= here: the p2s bracket below is the single
+                    # accounting for both semantics
+                    newsel, _th = shard_select_balanced(
+                        score_flat, ks[r], comms, sp.entries)
+                else:
+                    newsel, _th = shard_select(score_flat, ks[r], comms,
+                                               prof=prof)
                 if prof:
                     if dev.startswith("cuda"):
                         torch.cuda.synchronize()
                     prof["p2s"] += time.perf_counter() - _t0f
                 for e in sp.entries:
-                    stt = states[(s, r, t)][e["name"]]
+                    stt = states[c][e["name"]]
+                    if dl_scale[ci] != 1.0:
+                        # stash the OUTGOING mask ahead of the replacement:
+                        # the boundary dual-lr split applies against it (the
+                        # online reselection runs after the commit)
+                        out_sel.setdefault(ci, {})[e["name"]] = stt["sel"]
                     stt["sel"] = newsel[e["a"]:e["a"] + e["n"]].to(dev)
                 del score_flat
             if prof:
@@ -1614,18 +1833,19 @@ def _worker(rank, world, cfg, port, frag_path):
             num2_dev = (torch.zeros(len(group), dtype=torch.float64,
                                     device=dev)
                         if (red_on and hz is not None) else None)
-            for ci, (s, r, t) in enumerate(group):
+            for ci, c in enumerate(group):
+                s, r, t, opt, fold, dl = c
                 bnd = boundary_c[ci]
                 for e in sp.entries:
                     g = local.get(e["name"])
                     g_el = None if res_on else (
                         torch.zeros(e["n"], dtype=torch.float32)
                         if g is None else g)
-                    stt = states[(s, r, t)][e["name"]]
+                    stt = states[c][e["name"]]
                     lr = R._lr_for_step(gmeta, e["group"])
                     b1, b2, eps, wd = e["b1"], e["b2"], e["eps"], e["wd"]
-                    bc1c = 1.0 - b1 ** count
-                    bc2c = 1.0 - b2 ** count
+                    bc1c, bc2c = R._bc_pair(opt, count, b1, b2)
+                    split = (bnd and dl_scale[ci] != 1.0)
                     for a in range(0, e["n"], chunk_dev):
                         b = min(e["n"], a + chunk_dev)
                         if res_on:
@@ -1643,19 +1863,34 @@ def _worker(rank, world, cfg, port, frag_path):
                             stt["res"][a:b] += gd * (~sel_c)
                         if replay_dtype != torch.float32:
                             q = q.to(replay_dtype)
-                        if k_on:
-                            K.adam_step_inplace(
-                                q, stt["ms"][a:b], stt["vs"][a:b],
-                                stt["ws"][a:b], None, lr, wd, b1, b2,
-                                bc1c, bc2c, eps)
+                        if split:
+                            # boundary dual-lr: the whole step displacement
+                            # (wd component included) applies at lr*scale on
+                            # the mask-inactive tail, at lr on the
+                            # communicated coords — against the OUTGOING
+                            # window's mask
+                            sel_out = (out_sel[ci][e["name"]] if ci in
+                                       out_sel else stt["sel"])
+                            inactive = ~sel_out[a:b]
+                            lr_i = lr * dl_scale[ci]
                         else:
-                            R._adam_step_inplace(
+                            inactive = lr_i = None
+                        if k_on:
+                            K.opt_step_inplace(
                                 q, stt["ms"][a:b], stt["vs"][a:b],
                                 stt["ws"][a:b], None, lr, wd, b1, b2,
-                                bc1c, bc2c, eps)
+                                bc1c, bc2c, eps, optimizer=opt,
+                                inactive=inactive, lr_inactive=lr_i)
+                        else:
+                            R._opt_step_inplace(
+                                q, stt["ms"][a:b], stt["vs"][a:b],
+                                stt["ws"][a:b], None, lr, wd, b1, b2,
+                                bc1c, bc2c, eps, optimizer=opt,
+                                inactive=inactive, lr_inactive=lr_i)
                         if hz is not None:
                             d = (stt["ws"][a:b]
-                                 - snap_loc[hz][e["name"]][a:b].to(dev)) \
+                                 - snap_loc[opt][hz][e["name"]][a:b]
+                                 .to(dev)) \
                                 .double()
                             if red_on:
                                 num2_dev[ci] += (d * d).sum()
@@ -1675,8 +1910,8 @@ def _worker(rank, world, cfg, port, frag_path):
                 if prof:
                     prof["hzar"] += time.perf_counter() - _t0z
                     prof["ar"] += 1
-                for ci, (s, r, t) in enumerate(group):
-                    num_at[(s, r, t)][hz] = math.sqrt(num2[ci])
+                for ci, c in enumerate(group):
+                    num_at[c][hz] = math.sqrt(num2[ci])
 
         _t0c = time.perf_counter() if prof else 0.0
         del states
@@ -1734,28 +1969,73 @@ def _worker(rank, world, cfg, port, frag_path):
     # IS the launcher's filesystem view)
     out = None
     if comms.global_rank == 0:
+        # key-suffix rules (the collision-avoidance precedent of the T set):
+        # an axis suffixes the bare score name only when that axis actually
+        # recurs in the run, so every default-singleton run (one T, adamw,
+        # fold off, dl 1) keeps the historical bare keys. Selection semantics
+        # are echoed separately by the CLI report assembler.
+        multi_t = len(cycle_lens) > 1
+        multi_opt = len(optimizers) > 1
+        multi_fold = len(folds) > 1
+        multi_dl = len(dual_lrs) > 1
+
+        def _arm_key(s, t, opt, fold, dl):
+            key = s
+            if multi_t:
+                key += f"@T{t}"
+            if multi_opt:
+                key += f"@{opt}"
+            if multi_fold and fold:
+                key += "@fold"
+            if multi_dl:
+                key += f"@dl{dl:g}"
+            return key
+
         per_ratio = {}
         for r in ratios:
             scores = {}
             for s in score_names:
-                # a single T uses the bare score key; with a T
-                # set the same score name recurs per T and would collide
                 for t in cycle_lens:
-                    key = s if len(cycle_lens) == 1 else f"{s}@T{t}"
-                    distortion = {}
-                    for h in cfg["horizons"]:
-                        hh = max(1, min(h, W))
-                        den = den_at.get(hh)
-                        num = num_at[(s, r, t)].get(hh)
-                        distortion[str(h)] = (
-                            num / den if (den is not None and num is not None
-                                          and den > 0) else None)
-                    scores[key] = {
-                        "threshold": thresh0[(s, r, t)],
-                        "distortion": distortion,
-                        **rankmet[(s, r, t)],
-                    }
+                    for opt in optimizers:
+                        for fold in folds:
+                            for dl in dual_lrs:
+                                key = _arm_key(s, t, opt, fold,
+                                               dl_scale_of[(s, r, t, opt,
+                                                            fold, dl)])
+                                distortion = {}
+                                for h in cfg["horizons"]:
+                                    hh = max(1, min(h, W))
+                                    den = den_at[opt].get(hh)
+                                    num = num_at[(s, r, t, opt, fold,
+                                                  dl)].get(hh)
+                                    distortion[str(h)] = (
+                                        num / den if (den is not None
+                                                      and num is not None
+                                                      and den > 0)
+                                        else None)
+                                scores[key] = {
+                                    "threshold": thresh0[(s, r, opt)],
+                                    "distortion": distortion,
+                                    **rankmet[(s, r, opt)],
+                                }
             per_ratio[str(r)] = {"k": ks[r], "scores": scores}
+        # one den/label view at one optimizer keeps the historical flat
+        # shape; with several optimizers the per-optimizer views nest under
+        # the optimizer name (each arm family's distortion above already
+        # divides by its own family's denominator)
+        if len(optimizers) == 1:
+            den_view = {str(h): den_at[optimizers[0]].get(h)
+                        for h in eff_horizons
+                        if den_at[optimizers[0]].get(h) is not None}
+            label_total_view = label_total[optimizers[0]]
+            label_stats_view = stats_label[optimizers[0]]
+        else:
+            den_view = {
+                opt: {str(h): den_at[opt].get(h) for h in eff_horizons
+                      if den_at[opt].get(h) is not None}
+                for opt in optimizers}
+            label_total_view = dict(label_total)
+            label_stats_view = dict(stats_label)
         out = {
             "t0": t0,
             "state_absent": bool(meta.get("state_absent", False)),
@@ -1780,14 +2060,13 @@ def _worker(rank, world, cfg, port, frag_path):
                 "g_residency": bool(cfg.get("g_residency")),
                 "dev_reduce": bool(cfg.get("dev_reduce")),
                 "per_step": recon_steps,
-                "den_norm_at_horizon": {
-                    str(h): den_at.get(h) for h in eff_horizons
-                    if den_at.get(h) is not None
-                },
-                "label_total": label_total,
-                "label_stats": stats_label,
+                "den_norm_at_horizon": den_view,
+                "label_total": label_total_view,
+                "label_stats": label_stats_view,
             },
-            "scores": stats,
+            "scores": {(s if not multi_opt else f"{s}@{opt}"):
+                       stats[(s, opt)]
+                       for s in score_names for opt in optimizers},
             "per_ratio": per_ratio,
         }
         # conditional echoes: the budget-off report shape is frozen — these
@@ -1833,9 +2112,11 @@ def _shard_stats(flat, comms):
 
 
 def _compute_dense_and_cache(cfg, R, t0, window_steps, eff_horizons,
-                             replay_dtype):
+                             replay_dtype, optimizer):
     """Cache-miss fallback: run the classic dense pass (full params) in the
-    parent process and save the standard dense cache — once per trace."""
+    parent process and save the standard dense cache — once per trace and
+    optimizer (the dense reference trajectory — label, den, snapshots —
+    depends on the step recursion, so each optimizer owns its cache file)."""
     catalog, names, offsets, N, state_files, g_files = R.discover_trace(
         cfg["trace_dir"])
     meta, params, *_ = R.build_branch_state(
@@ -1851,25 +2132,53 @@ def _compute_dense_and_cache(cfg, R, t0, window_steps, eff_horizons,
         label_total, den_at, recon_steps, snap_d = R.dense_replay(
             params, g_files, window_steps, meta, t0, eff_horizons,
             replay_dtype, cfg["chunk_mb"], "cpu",
-            upcast_bf16=cfg["upcast_bf16"])
+            upcast_bf16=cfg["upcast_bf16"], optimizer=optimizer)
     else:
         label_total, den_at, recon_steps, snap_d = R.dense_replay_dev(
             params, g_files, window_steps, meta, t0, eff_horizons,
             replay_dtype, cfg["chunk_mb"], "cuda:0",
-            upcast_bf16=cfg["upcast_bf16"])
+            upcast_bf16=cfg["upcast_bf16"], optimizer=optimizer)
     label_flat = torch.cat([p["label"].float() for p in params])
     R.save_dense_cache(cfg["dense_cache"], R._dense_cache_ident(
         cfg["trace_dir"], t0, window_steps, eff_horizons, replay_dtype,
         cfg["trace_dtype"],
-        "cpu" if cfg["device"] == "cpu" else "dev"), label_total, den_at,
-        recon_steps, snap_d, label_flat)
-    print(f"[fused t0={t0}] dense cache populated on miss "
+        "cpu" if cfg["device"] == "cpu" else "dev", optimizer), label_total,
+        den_at, recon_steps, snap_d, label_flat)
+    print(f"[fused t0={t0}] dense cache populated on miss for {optimizer} "
           f"({cfg['dense_cache']})", flush=True)
 
 
 # ----------------------------------------------------------------------------
 # entry points (called from sga.replay main with a plain config dict)
 # ----------------------------------------------------------------------------
+
+def _resolve_axes(args):
+    """Resolve the per-config cycle-engine axes (optimizer / fold /
+    dual-lr) for one args namespace, mirroring the CLI gate for programmatic
+    callers: getattr defaults keep Namespaces built before the axes existed
+    on the historical default singletons (adamw / off / 1), which reduce the
+    config space to the historical (score, ratio, T) tuples. Returns
+    (optimizers, folds, dual_lr_tokens)."""
+    import sga.replay as R
+    cycle_lens = getattr(args, "cycle_lens", None)
+    if cycle_lens is None:
+        cycle_lens = [args.cycle_len]
+    opts = getattr(args, "optimizer_set", None)
+    if opts is None:
+        raw = getattr(args, "optimizer", None)
+        opts = (R.parse_optimizer_set(raw) if raw is not None
+                else [R.DEFAULT_OPTIMIZER])
+    folds = getattr(args, "fold_set", None)
+    if folds is None:
+        raw = getattr(args, "fold", None)
+        folds = R.parse_fold_set(raw) if raw is not None else [False]
+    dl = getattr(args, "dual_lr_set", None)
+    if dl is None:
+        raw = getattr(args, "dual_lr", None)
+        dl = (R.parse_dual_lr_set(raw, cycle_lens) if raw is not None
+              else ["1"])
+    return opts, folds, dl
+
 
 def _common_gates(args):
     """Validation shared by the single-node and multi-node fused entries;
@@ -1881,6 +2190,7 @@ def _common_gates(args):
     if args.self_check is not None:
         raise ValueError("--replay-mode cycle cannot be combined with "
                          "--self-check")
+    R.require_scan_dtypes(args.replay_dtype, args.norm_dtype)
     if not args.dense_cache:
         raise ValueError(
             "--replay-mode cycle requires --dense-cache (the dense arm is "
@@ -1938,6 +2248,10 @@ def _common_gates(args):
             "cycle_lens must be a non-empty list of ints >= 1, "
             f"got {cycle_lens!r}")
     cycle_lens = sorted(set(cycle_lens))
+    # the per-config axes ride the same resolution as the CLI gate (unknown
+    # optimizer names, bad fold spellings and bad/ambiguous dual-lr tokens
+    # fail loudly here for direct programmatic callers too)
+    _resolve_axes(args)
     for r in args.ratios:
         if r <= 0.0 or r > 100.0:
             raise ValueError(f"ratio {r} out of (0,100]")
@@ -1975,6 +2289,7 @@ def _fused_cfg(args, ctx, t0, score_names):
     cycle_lens = getattr(args, "cycle_lens", None)
     if cycle_lens is None:
         cycle_lens = [args.cycle_len]
+    optimizers, folds, dual_lrs = _resolve_axes(args)
     return {
         "trace_dir": ctx["trace_dir"],
         "t0": t0,
@@ -1984,9 +2299,14 @@ def _fused_cfg(args, ctx, t0, score_names):
         "score_names": score_names,
         "cycle_lens": sorted(set(cycle_lens)),
         "cycle_mode": True,
+        "optimizers": optimizers,
+        "folds": folds,
+        "dual_lrs": dual_lrs,
         "replay_dtype": args.replay_dtype,
         "trace_dtype": args.trace_dtype,
         "upcast_bf16": args.trace_dtype == "bf16",
+        "selection_semantics": getattr(args, "selection_semantics",
+                                      "balanced-histogram"),
         "norm_fp32": args.norm_dtype == "fp32",
         "chunk_mb": args.chunk_mb,
         "device": ("cpu" if args.device == "cpu" else "cuda"),
@@ -2004,34 +2324,43 @@ def _fused_cfg(args, ctx, t0, score_names):
 
 
 def _populate_dense_cache(args, ctx, cfg, t0):
-    """Populate the dense cache parent-side, before any shard exists: on a
-    cold cache the dense pass can run for hours and must not happen inside
+    """Populate the dense cache(s) parent-side, before any shard exists: on
+    a cold cache the dense pass can run for hours and must not happen inside
     the process group (the waiting shards would hit the gloo timeout).
-    dense_cache_hit reports the parent-side LOAD outcome (False on the
-    populating run), matching the classic report field semantics. Returns
-    (window_steps, eff_horizons, ident)."""
+    One cache per optimizer of the run (the dense reference trajectory
+    depends on the step recursion; the ident carries the optimizer for
+    non-adamw values so existing adamw caches stay hits). dense_cache_hit
+    reports the parent-side LOAD outcome (False on the populating run),
+    matching the classic report field semantics — a bare bool for a
+    single-optimizer run (the historical shape), a per-optimizer dict
+    otherwise. Returns {optimizer: ident}."""
     import sga.replay as R
-    replay_dtype = (torch.float64 if args.replay_dtype == "fp64"
-                    else torch.float32)
+    R.require_scan_dtypes(args.replay_dtype, args.norm_dtype)
+    replay_dtype = R.resolve_replay_dtype(args.replay_dtype)
     window_steps, _W, eff_horizons = _window_and_horizons(
         ctx["g_files"], t0, args.window, args.horizons)
-    ident = R._dense_cache_ident(ctx["trace_dir"], t0, window_steps,
-                                 eff_horizons, replay_dtype,
-                                 args.trace_dtype,
-                                 "cpu" if args.device == "cpu" else "dev")
-    hit = R.load_dense_cache(args.dense_cache, ident) is not None
-    if not hit:
-        _compute_dense_and_cache(cfg, R, t0, window_steps, eff_horizons,
-                                 replay_dtype)
-        if args.device != "cpu":
-            # the populate pass ran on cuda:0 in THIS (parent) process and
-            # its peak stays cached in the allocator, invisible to per-process
-            # accounting but visible to the workers' sort guard, which reads
-            # device-wide free memory — hand the blocks back before any
-            # shard spawns (no device tensor is live at this point)
-            torch.cuda.empty_cache()
-    cfg["dense_cache_hit"] = hit
-    return window_steps, eff_horizons, ident
+    engine = "cpu" if args.device == "cpu" else "dev"
+    optimizers, _folds, _dl = _resolve_axes(args)
+    idents, hits = {}, {}
+    for opt in optimizers:
+        ident = R._dense_cache_ident(ctx["trace_dir"], t0, window_steps,
+                                     eff_horizons, replay_dtype,
+                                     args.trace_dtype, engine, opt)
+        idents[opt] = ident
+        hits[opt] = R.load_dense_cache(args.dense_cache, ident) is not None
+        if not hits[opt]:
+            _compute_dense_and_cache(cfg, R, t0, window_steps, eff_horizons,
+                                     replay_dtype, opt)
+    if args.device != "cpu":
+        # a populate pass ran on cuda:0 in THIS (parent) process and
+        # its peak stays cached in the allocator, invisible to per-process
+        # accounting but visible to the workers' sort guard, which reads
+        # device-wide free memory — hand the blocks back before any
+        # shard spawns (no device tensor is live at this point)
+        torch.cuda.empty_cache()
+    cfg["dense_cache_hit"] = (hits[optimizers[0]]
+                              if len(optimizers) == 1 else hits)
+    return idents
 
 
 def run_fused_branch(args, ctx, t0):
@@ -2047,6 +2376,17 @@ def run_fused_branch(args, ctx, t0):
             f"--fused-shards {world} exceeds the visible CUDA devices "
             f"({torch.cuda.device_count()})")
     cfg = _fused_cfg(args, ctx, t0, score_names)
+    if cfg.get("selection_semantics", "balanced-histogram") != "topk" and \
+            getattr(args, "nodes", None):
+        # mirror of the CLI gate in sga.replay.main for programmatic
+        # callers — fail before _populate_dense_cache (a cold-cache dense
+        # pass can run for hours) and before any shard spawns; any
+        # single-node shard count is fine (the sharded balanced select
+        # reconstructs the catalog histogram from the shard partials)
+        raise ValueError(
+            "--selection-semantics balanced-histogram requires a "
+            "single-node run (--nodes is not supported; single-node "
+            "runs may use any --fused-shards)")
     _populate_dense_cache(args, ctx, cfg, t0)
     fd, frag_path = tempfile.mkstemp(suffix=".pt",
                                      prefix="fused_branch_")

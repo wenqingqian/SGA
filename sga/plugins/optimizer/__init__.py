@@ -11,8 +11,9 @@ Score materialization is part of the same template: on full-sync steps the
 commit kernel writes the configured score (see the score registry) into the
 fp32 main-grad copy, where the engine's reselection reads it (the
 optimizer->score handoff). Which scores a template can emit is the
-template's own kernel-branch inventory (``_TRITON_SCORE_MAP`` in
-``adamw.py`` — a configured score outside it fails loud at construction).
+template's own kernel-branch inventory (``_TRITON_SCORE_MAP`` — one per
+kernel file, ``adamw.py`` and ``adams.py``, kept in lockstep; a configured
+score outside it fails loud at construction of that template).
 """
 
 from dataclasses import dataclass, field

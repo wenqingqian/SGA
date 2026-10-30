@@ -16,18 +16,22 @@ consumes the registry directly and defines no score set of its own:
     update       = |wd*w + U(g)|             (online full-sync selection score,
                                               upcoming-commit bias corrections)
     coi          = |U(g) - U(0)|             (counterfactual optimizer impact)
-(fp64 arithmetic, fp32 storage; the materialized form may be signed — the
-ranking selects store magnitudes.)
+(production scans use fp32 arithmetic and storage; self-check may use fp64.
+The materialized score may be signed — ranking stores magnitudes.)
 
 Replay modes:
 - ``zerofill``: frozen support, zero-filled q each step (original offline
-  semantics), replayed in-process;
+  semantics), replayed in-process; requires explicit
+  ``--selection-semantics topk`` under the balanced-default CLI;
 - ``cycle``: residual accumulation + boundary full-sync fold + mask
   re-selection every --cycle-len steps (offline twin of the online cyclic
   semantics), always served by the fused single-pass engine
   (sga/replay_fused.py) and therefore requiring --dense-cache (populated
   automatically on the first run). Boundary steps are dense, so d@1 is
   structurally 0 — the informative within-cycle horizons start at H=2.
+  Single-node cycle replay defaults to balanced-histogram; multi-node
+  requires explicit topk. Dense ``--self-check`` performs no selection and
+  therefore needs no selector override.
 
 Evaluation: distortion(H) = ||w_sparse - w_dense||/||w_dense - w0|| against
 the dense replay arm; NDCG@k / recall@k / missed_label_mass /
@@ -42,9 +46,10 @@ tests/test_replay_cycle.py):
   own norm;
 - the commit consuming g at global step t is commit number t+1 (bias
   correction exponent at the branch point is t0);
-- top-k selections break ties by index (catalog order, then row-major),
-  the threshold coming from the exact 32769-bin bit-pattern histogram select
-  (bit-identical to torch.kthvalue over the flat score vector).
+- balanced-histogram is the default trajectory selector: stride-8 sampling
+  per parameter view and whole-crossing-bin masks, with the bin lower edge
+  reported as threshold. Explicit topk instead breaks ties by global index
+  and reports the exact kth value. Ranking diagnostics remain exact-top-k.
 
 Hyperparameters: legacy traces carry GLOBAL adam_beta1/beta2/eps/weight_decay
 plus a per-group lr list (this tool replays every param with the global
@@ -86,7 +91,50 @@ from sga.plugins.scores import get_score_spec, score_names as all_score_names
 # Bump on ANY change to replay arithmetic or semantics (score formulas,
 # clip/norm handling, dtype rules, ...). Part of the dense-cache key: a stale
 # cache from an older semantics must fail loudly, never silently serve.
-REPLAY_SEMANTIC_VERSION = 2
+REPLAY_SEMANTIC_VERSION = 3
+
+REPLAY_DTYPES = {"fp32": torch.float32, "fp64": torch.float64}
+
+
+def resolve_replay_dtype(value):
+    """Resolve a declared replay dtype without silently accepting typos."""
+    try:
+        return REPLAY_DTYPES[value]
+    except (KeyError, TypeError):
+        raise ValueError(
+            f"--replay-dtype must be one of {sorted(REPLAY_DTYPES)}, "
+            f"got {value!r}") from None
+
+
+def require_scan_dtypes(replay_dtype, norm_dtype):
+    """Production scans are fp32-only; fp64 remains a self-check oracle."""
+    resolve_replay_dtype(replay_dtype)
+    if norm_dtype not in REPLAY_DTYPES:
+        raise ValueError(
+            f"--norm-dtype must be one of {sorted(REPLAY_DTYPES)}, "
+            f"got {norm_dtype!r}")
+    if replay_dtype != "fp32" or norm_dtype != "fp32":
+        raise ValueError(
+            "offline scans require --replay-dtype fp32 and "
+            "--norm-dtype fp32; fp64 is reserved for --self-check")
+
+# Replay optimizer vocabulary (the per-config state-machine axis of the
+# cycle engine; "adamw" is the historical semantics, the default everywhere).
+OPTIMIZERS = ("adamw", "adams")
+DEFAULT_OPTIMIZER = "adamw"
+
+# AdamS rebuilds v from the pre-commit m before m advances and never reads
+# stored v. Bias correction is absent, so every AdamS bc channel is one.
+ADAMS_V_BASIS = "v = beta2 * m_old**2 + (1 - beta2) * g**2 (m_old: pre-commit first moment; v computed before m updates)"
+ADAMS_BIAS_CORRECTION = 1.0
+
+
+def _bc_pair(optimizer, count, b1, b2):
+    """Bias-correction pair for one optimizer's commit number ``count``:
+    AdamW's (1 - beta^count) or AdamS's pinned no-correction pair."""
+    if optimizer == "adamw":
+        return 1.0 - b1 ** count, 1.0 - b2 ** count
+    return ADAMS_BIAS_CORRECTION, ADAMS_BIAS_CORRECTION
 
 _G_STEP_RE = re.compile(r"step_(\d+)_g\.pt$")
 _STAT_STEP_RE = re.compile(r"step_(\d+)_state\.pt$")
@@ -245,6 +293,117 @@ def _param_hp(meta, catalog_entry):
 
 
 # ----------------------------------------------------------------------------
+# per-config axes of the cycle engine: optimizer / fold / dual-lr
+# ----------------------------------------------------------------------------
+
+def resolve_dual_lr_token(tok, t):
+    """Resolve one --dual-lr token against a cycle length T.
+
+    Grammar: a plain float ("1", "0.5") or a T-relative multiple — "T" (the
+    cycle length itself) or "T/k" with k a plain float > 0 ("T/2" halves the
+    cycle length). The resolved value is the full-sync inactive-lr SCALE the
+    boundary apply multiplies lr by on the never-communicated tail (the
+    online ``full_sync_inactive_lr_scale``); expressing it in T units lets
+    one mixed-T run carry the same relative knob on every arm.
+    """
+    s = tok.strip()
+    if s in ("T", "t"):
+        return float(t)
+    if s.startswith(("T/", "t/")):
+        k = s[2:]
+        try:
+            kf = float(k)
+        except ValueError:
+            raise ValueError(
+                f"--dual-lr token {tok!r}: the divisor after 'T/' must be "
+                f"a number, got {k!r}") from None
+        if not (math.isfinite(kf) and kf > 0.0):
+            raise ValueError(
+                f"--dual-lr token {tok!r}: the divisor after 'T/' must be "
+                f"finite > 0, got {k!r}")
+        return float(t) / kf
+    try:
+        v = float(s)
+    except ValueError:
+        raise ValueError(
+            f"--dual-lr token {tok!r} is neither a number nor a T-relative "
+            "multiple ('T', 'T/2', ...)") from None
+    return v
+
+
+def _check_dual_lr_scale(tok, scale):
+    if not (math.isfinite(scale) and scale >= 0.0):
+        raise ValueError(
+            f"--dual-lr token {tok!r} resolves to {scale!r}; scales must be "
+            "finite >= 0 (0 freezes the inactive tail; the online "
+            "full-sync dual-lr domain rule)")
+
+
+def parse_dual_lr_set(spec, cycle_lens):
+    """--dual-lr comma set -> validated, deterministically ordered token
+    list. Distinct tokens must resolve to distinct scales for EVERY T in
+    ``cycle_lens`` (equal resolutions would enumerate one config twice and
+    collide the report key), and the scales must stay distinct under the
+    report key's %g rendering (6 significant digits): two different scales
+    that render alike (1000000 and 1000001 both -> "1e+06") would overwrite
+    each other silently in the scores dict. Ordering is by resolved scale at
+    the largest T so the config enumeration is deterministic."""
+    toks = [t for t in spec.replace(" ", "").split(",") if t]
+    if not toks:
+        raise ValueError(f"--dual-lr {spec!r} names no dual-lr value")
+    seen = {}
+    for tok in toks:
+        scale = resolve_dual_lr_token(tok, max(cycle_lens))
+        _check_dual_lr_scale(tok, scale)
+        seen[tok] = scale
+    if len(set(seen)) != len(seen):
+        raise ValueError(f"--dual-lr {spec!r} carries duplicate tokens")
+    for t in cycle_lens:
+        scales = [resolve_dual_lr_token(tok, t) for tok in toks]
+        if len(set(scales)) != len(scales):
+            raise ValueError(
+                f"--dual-lr {spec!r}: tokens collide at T={t} "
+                f"(resolved scales {scales}); every token must stay distinct "
+                "for every T in the run")
+        rendered = [f"{s:g}" for s in scales]
+        if len(set(rendered)) != len(rendered):
+            raise ValueError(
+                f"--dual-lr {spec!r}: tokens collide in the report key at "
+                f"T={t} (scales {scales} all render as {rendered} under the "
+                "key's %g form); distinct scales must stay distinct at 6 "
+                "significant digits")
+    return sorted(toks, key=lambda tok: seen[tok])
+
+
+def parse_optimizer_set(spec):
+    """--optimizer comma set -> validated, sorted optimizer list."""
+    toks = [t for t in spec.replace(" ", "").split(",") if t]
+    if not toks:
+        raise ValueError(f"--optimizer {spec!r} names no optimizer")
+    unknown = [t for t in toks if t not in OPTIMIZERS]
+    if unknown:
+        raise ValueError(
+            f"--optimizer {unknown} not a replay optimizer "
+            f"(allowed: {list(OPTIMIZERS)})")
+    return sorted(set(toks))
+
+
+def parse_fold_set(spec):
+    """--fold comma set ({off,on}) -> validated bool list (off first)."""
+    toks = [t for t in spec.replace(" ", "").split(",") if t]
+    if not toks:
+        raise ValueError(f"--fold {spec!r} names no fold value")
+    vals = []
+    for tok in toks:
+        if tok not in ("off", "on"):
+            raise ValueError(
+                f"--fold values must be 'off' or 'on', got {tok!r}")
+        vals.append(tok == "on")
+    out = [False, True]
+    return [v for v in out if v in vals]
+
+
+# ----------------------------------------------------------------------------
 # score computation (fp64 arithmetic, fp32 storage)
 # ----------------------------------------------------------------------------
 
@@ -322,6 +481,28 @@ def _score_stats(flat):
         "max": float(flat.max()) if total else 0.0,
         "fraction_zero": frac0,
     }
+
+
+def score_formula(spec, w, m, v, g, b1, b2, eps, wd, bc1, bc2, optimizer,
+                  update_includes_wd=False):
+    """One registry score under one replay optimizer.
+
+    adamw: the registry formula on the stored v with the upcoming commit's
+    bias corrections (the historical call). adams: the SAME registry formula
+    on the AdamS v-basis — the stored v is substituted by m*m of the
+    pre-commit first moment (ADAMS_V_BASIS) and both correction channels
+    carry ADAMS_BIAS_CORRECTION; the substitution turns the registry's
+    v_new = beta2*v + (1-beta2)*g^2 into AdamS's v_new = beta2*m^2 +
+    (1-beta2)*g^2 verbatim, so all four formulas carry over unchanged
+    (abs_g/abs_m do not read v; coi's U(0) picks up the AdamS v recursion —
+    provisional per the spec).
+    """
+    if optimizer == "adamw":
+        return spec.formula(w, m, v, g, b1, b2, eps, wd, bc1, bc2,
+                            update_includes_wd=update_includes_wd)
+    return spec.formula(w, m, m * m, g, b1, b2, eps, wd,
+                        ADAMS_BIAS_CORRECTION, ADAMS_BIAS_CORRECTION,
+                        update_includes_wd=update_includes_wd)
 
 
 # ----------------------------------------------------------------------------
@@ -465,15 +646,22 @@ def coef_dense_for(meta):
     return coef, flag
 
 
-def adam_update_chunk(q, m, v, w, lr, wd, b1, b2, bc1c, bc2c, eps, device):
-    """One AdamW commit on a chunk, returning the new (m, v, w) cpu tensors
-    plus the squared LR-scaled gradient-driven update (label term)."""
+def adam_update_chunk(q, m, v, w, lr, wd, b1, b2, bc1c, bc2c, eps, device,
+                      optimizer="adamw"):
+    """One commit on a chunk (AdamW's recursion, or AdamS's v basis), returning
+    the new (m, v, w) cpu tensors plus the squared LR-scaled gradient-driven
+    update (label term)."""
     qd = q.to(device)
     md = m.to(device)
     vd = v.to(device)
     wd_t = w.to(device)
     mn = b1 * md + (1.0 - b1) * qd
-    vn = b2 * vd + (1.0 - b2) * qd * qd
+    if optimizer == "adams":
+        # AdamS second moment: ADAMS_V_BASIS — v from the PRE-commit first
+        # moment (the stored v is never read), computed before m's update
+        vn = b2 * (md * md) + (1.0 - b2) * qd * qd
+    else:
+        vn = b2 * vd + (1.0 - b2) * qd * qd
     mh = mn / bc1c
     vh = vn / bc2c
     upd = mh / (torch.sqrt(vh) + eps)
@@ -484,18 +672,77 @@ def adam_update_chunk(q, m, v, w, lr, wd, b1, b2, bc1c, bc2c, eps, device):
     return mn.cpu(), vn.cpu(), wn.cpu(), upd2.cpu()
 
 
-def _adam_step_inplace(q, m, v, w, lab, lr, wd, b1, b2, bc1c, bc2c, eps):
+def _apply_lr_split(w, upd, lr, lr_inactive, inactive, wd):
+    """Boundary dual-lr apply: ``w -= where(inactive, lr_inactive, lr) *
+    (wd * w + upd)`` — the split multiplies the WHOLE step displacement, the
+    weight-decay component included (the online full-step kernel's LR_SPLIT
+    contract); the update vector itself stays mask-blind. ``inactive`` is
+    the bool mask of the never-communicated tail (True = inactive)."""
+    step = torch.full_like(w, lr)
+    step.masked_fill_(inactive, lr_inactive)
+    full = w * wd
+    full.add_(upd)
+    w.addcmul_(full, step, value=-1.0)
+
+
+def _adam_step_inplace(q, m, v, w, lab, lr, wd, b1, b2, bc1c, bc2c, eps,
+                       inactive=None, lr_inactive=None):
     """One AdamW commit on device-resident chunks, in place.
     q/m/v/w: same-shaped device tensors; lab: optional device tensor
-    accumulating (lr * gradient-driven update)^2."""
+    accumulating (lr * gradient-driven update)^2.
+    ``inactive``/``lr_inactive`` (boundary dual-lr): the tail applies the
+    step at lr_inactive while the rest keeps lr — see _apply_lr_split. Both
+    None keeps the historical single-lr statement sequence bit-for-bit."""
     m.mul_(b1).add_(q, alpha=1.0 - b1)
     v.mul_(b2).addcmul_(q, q, value=1.0 - b2)
     mh = m / bc1c
     vh = torch.sqrt(v / bc2c)
     upd = mh / (vh + eps)
-    w.mul_(1.0 - lr * wd).add_(upd, alpha=-lr)
+    if inactive is None:
+        w.mul_(1.0 - lr * wd).add_(upd, alpha=-lr)
+    else:
+        _apply_lr_split(w, upd, lr, lr_inactive, inactive, wd)
     if lab is not None:
         lab.addcmul_(upd, upd, value=lr * lr)
+
+
+def _adams_step_inplace(q, m, v, w, lab, lr, wd, b1, b2, bc1c, bc2c, eps,
+                        inactive=None, lr_inactive=None):
+    """One AdamS commit on device-resident chunks, in place (the _adamw twin
+    with the ADAMS_V_BASIS second moment). v never reads the stored v: it is
+    rebuilt from the PRE-commit m before m updates; the bc channels carry
+    ADAMS_BIAS_CORRECTION from the caller (1.0 — no correction term). The m
+    recursion, the decoupled wd apply and the optional boundary dual-lr
+    split (see _apply_lr_split) are the AdamW statement sequence."""
+    v.copy_(m)
+    v.mul_(m)
+    v.mul_(b2)
+    v.addcmul_(q, q, value=1.0 - b2)
+    m.mul_(b1).add_(q, alpha=1.0 - b1)
+    mh = m / bc1c
+    vh = torch.sqrt(v / bc2c)
+    upd = mh / (vh + eps)
+    if inactive is None:
+        w.mul_(1.0 - lr * wd).add_(upd, alpha=-lr)
+    else:
+        _apply_lr_split(w, upd, lr, lr_inactive, inactive, wd)
+    if lab is not None:
+        lab.addcmul_(upd, upd, value=lr * lr)
+
+
+def _opt_step_inplace(q, m, v, w, lab, lr, wd, b1, b2, bc1c, bc2c, eps,
+                      optimizer="adamw", inactive=None, lr_inactive=None):
+    """Dispatch one in-place commit of ``optimizer`` (the replay step
+    primitive the fused worker and the dense device replay call; the
+    keyword defaults keep the historical AdamW single-lr behavior)."""
+    if (inactive is None) != (lr_inactive is None):
+        raise ValueError(
+            "inactive and lr_inactive come as a pair (the boundary dual-lr "
+            f"split needs both; got inactive={inactive is not None}, "
+            f"lr_inactive={lr_inactive!r})")
+    fn = _adams_step_inplace if optimizer == "adams" else _adam_step_inplace
+    fn(q, m, v, w, lab, lr, wd, b1, b2, bc1c, bc2c, eps,
+       inactive=inactive, lr_inactive=lr_inactive)
 
 
 def _replay_meta(params, base_meta):
@@ -509,7 +756,8 @@ def _replay_meta(params, base_meta):
 
 
 def dense_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
-                 replay_dtype, chunk_mb, device, upcast_bf16=False):
+                 replay_dtype, chunk_mb, device, upcast_bf16=False,
+                 optimizer="adamw"):
     """Dense trajectory w_d / m_d / v_d from the logged (post-clip) g, the
     per-coordinate squared gradient-driven update label, the per-horizon
     denominator norms ||w_d(H)-w0||, pre-clip reconstruction diagnostics, and
@@ -540,8 +788,7 @@ def dense_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
             name, o, n = prm["name"], prm["off"], prm["n"]
             lr = _lr_for_step(gmeta, prm["group"])
             b1, b2, eps, wd = prm["b1"], prm["b2"], prm["eps"], prm["wd"]
-            bc1c = 1.0 - b1 ** count
-            bc2c = 1.0 - b2 ** count
+            bc1c, bc2c = _bc_pair(optimizer, count, b1, b2)
             gt = gp.get(name)
             if gt is None:
                 g = torch.zeros(n, dtype=torch.float32)
@@ -554,6 +801,7 @@ def dense_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
                 mn, vn, wn, upd2 = adam_update_chunk(
                     q, m[a:b], v[a:b], w[a:b],
                     lr, wd, b1, b2, bc1c, bc2c, eps, device,
+                    optimizer=optimizer,
                 )
                 m[a:b] = mn
                 v[a:b] = vn
@@ -598,8 +846,9 @@ def dense_replay(params, g_files, window_steps, base_meta, t0, eff_horizons,
     return label_total, den_at, recon_steps, snap_d
 
 
-def dense_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons,
-                     replay_dtype, chunk_mb, device, upcast_bf16=False):
+def dense_replay_dev(params, g_files, window_steps, base_meta, t0,
+                     eff_horizons, replay_dtype, chunk_mb, device,
+                     upcast_bf16=False, optimizer="adamw"):
     """Device-resident dense replay; same outputs as dense_replay but the
     dense m/v/w/label never leave ``device`` (horizon snapshots are cloned to
     cpu). Exists to avoid the 40-80 GB/step H2D/D2H round trips of the
@@ -625,8 +874,7 @@ def dense_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons,
             name, n = prm["name"], prm["n"]
             lr = _lr_for_step(gmeta, prm["group"])
             b1, b2, eps, wd = prm["b1"], prm["b2"], prm["eps"], prm["wd"]
-            bc1c = 1.0 - b1 ** count
-            bc2c = 1.0 - b2 ** count
+            bc1c, bc2c = _bc_pair(optimizer, count, b1, b2)
             gt = gp.get(name)
             g = torch.zeros(n, dtype=torch.float32) if gt is None else gt.reshape(-1)
             m, v, w, lab = prm["m"], prm["v"], prm["w"], prm["label"]
@@ -635,8 +883,9 @@ def dense_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons,
                 q = g[a:b].to(dev)
                 if replay_dtype != torch.float32:
                     q = q.to(replay_dtype)
-                _adam_step_inplace(q, m[a:b], v[a:b], w[a:b], lab[a:b],
-                                   lr, wd, b1, b2, bc1c, bc2c, eps)
+                _opt_step_inplace(q, m[a:b], v[a:b], w[a:b], lab[a:b],
+                                  lr, wd, b1, b2, bc1c, bc2c, eps,
+                                  optimizer=optimizer)
                 recon2 += float(((q.double() / coef_dense) ** 2.0).sum())
         recon_norm = math.sqrt(recon2)
         recon_steps.append({
@@ -847,14 +1096,20 @@ def sparse_replay_dev(params, g_files, window_steps, base_meta, t0, eff_horizons
 # ----------------------------------------------------------------------------
 
 def _dense_cache_ident(trace_dir, t0, window_steps, eff_horizons,
-                       replay_dtype, trace_dtype, dense_engine):
+                       replay_dtype, trace_dtype, dense_engine,
+                       optimizer=DEFAULT_OPTIMIZER):
     """Identity of one branch's dense replay artifacts. The trace path stands
     for the trace content (dumps are immutable); window/horizons/dtype change
     the saved artifacts; dense_engine fences the two dense engines apart
     (dense_replay quantizes horizon diffs to fp32 before squaring,
     dense_replay_dev does not — a shared ident would silently mix them);
-    REPLAY_SEMANTIC_VERSION fences caches across replay semantic edits."""
-    return "|".join([
+    REPLAY_SEMANTIC_VERSION fences caches across replay semantic edits. The
+    optimizer axis (the dense reference trajectory itself — label, den,
+    snapshots — depends on the step recursion) is appended only for
+    non-adamw values so every existing adamw cache keeps its exact ident and
+    stays a hit (the adamw arithmetic is unchanged); an adamw run and an
+    adams run therefore never share a cache file."""
+    parts = [
         f"semver={REPLAY_SEMANTIC_VERSION}",
         f"trace={trace_dir}",
         f"t0={t0}",
@@ -863,7 +1118,10 @@ def _dense_cache_ident(trace_dir, t0, window_steps, eff_horizons,
         f"dtype={replay_dtype}",
         f"trace_dtype={trace_dtype}",
         f"dense_engine={dense_engine}",
-    ])
+    ]
+    if optimizer != DEFAULT_OPTIMIZER:
+        parts.append(f"optimizer={optimizer}")
+    return "|".join(parts)
 
 
 def _dense_cache_path(cache_dir, ident):
@@ -980,7 +1238,8 @@ def process_branch(t0, ctx, args):
         ctx["trace_dir"], ctx["names"], ctx["offsets"], ctx["N"],
         ctx["state_files"], ctx["g_files"],
     )
-    replay_dtype = torch.float64 if args.replay_dtype == "fp64" else torch.float32
+    require_scan_dtypes(args.replay_dtype, args.norm_dtype)
+    replay_dtype = resolve_replay_dtype(args.replay_dtype)
     state_file = state_files[t0]
     meta, params, w_parts, m_parts, v_parts, g_parts = build_branch_state(
         state_file, names, replay_dtype, catalog=ctx.get("catalog"),
@@ -1188,7 +1447,7 @@ def run_self_check(ctx, from_step, to_step, args):
         raise ValueError(
             f"--self-check {from_step} {to_step}: missing g dump(s) at steps {missing}")
 
-    replay_dtype = torch.float64 if args.replay_dtype == "fp64" else torch.float32
+    replay_dtype = resolve_replay_dtype(args.replay_dtype)
     meta, params, w_parts, m_parts, v_parts, g_parts = build_branch_state(
         state_files[from_step], names, replay_dtype, catalog=ctx.get("catalog"))
     for prm in params:
@@ -1367,14 +1626,13 @@ def main(argv=None):
     ap.add_argument("--device", default="cpu", help="cpu | cuda:N")
     ap.add_argument("--chunk-mb", type=int, default=256,
                     help="per-chunk working-set budget for large params, MB")
-    ap.add_argument("--replay-dtype", default="fp64", choices=["fp64", "fp32"],
-                    help="dtype for the AdamW replay arithmetic")
-    ap.add_argument("--norm-dtype", default="fp64", choices=["fp64", "fp32"],
-                    help="accumulation dtype of the per-step clip-norm pass "
-                         "(the sparse pass-1 reductions): fp64 (default, "
-                         "oracle semantics) or fp32 (per-chunk fp32 "
-                         "reduction, chunk sums promoted to fp64; the "
-                         "deviation is gated by the frozen fp32-norm band)")
+    ap.add_argument("--replay-dtype", default="fp32", choices=["fp32", "fp64"],
+                    help="dtype for replay arithmetic: fp32 for scans; fp64 "
+                         "is reserved for --self-check")
+    ap.add_argument("--norm-dtype", default="fp32", choices=["fp32", "fp64"],
+                    help="accumulation dtype of the per-step clip-norm pass: "
+                         "production scans require fp32; fp64 is reserved for "
+                         "--self-check")
     ap.add_argument("--trace-dtype", default="fp32", choices=["fp32", "bf16"],
                     help="g payload dtype in the trace: fp32 (original "
                          "dumps) or bf16 (screening copies built by "
@@ -1407,6 +1665,32 @@ def main(argv=None):
                          "becomes a replay config and mixed-T groups share "
                          "one window pass; mutually exclusive with "
                          "--cycle-len (default: 20, as a one-element set)")
+    ap.add_argument("--optimizer", default=None, metavar="SET",
+                    help="comma set of replay optimizers for --replay-mode "
+                         "cycle (adamw | adams; default adamw): every "
+                         "(score, ratio, T, optimizer, fold, dual-lr) "
+                         "combination becomes a replay config. adamw is the "
+                         "historical recursion; adams rebuilds the second "
+                         "moment from the pre-commit first moment "
+                         "(" + ADAMS_V_BASIS + ") with bias correction "
+                         "dropped (bc channels pinned to 1.0)")
+    ap.add_argument("--fold", default=None, metavar="SET",
+                    help="comma set of residual-fold arms for --replay-mode "
+                         "cycle (off | on; default off): on divides the "
+                         "accumulated residual by the cycle length T at the "
+                         "boundary commit (the online residual_mean fold; "
+                         "the divisor feeds the boundary clip norm, the "
+                         "boundary re-selection score and the commit alike)")
+    ap.add_argument("--dual-lr", default=None, metavar="SET",
+                    help="comma set of full-sync inactive-lr scales for "
+                         "--replay-mode cycle (plain floats or T-relative "
+                         "tokens: T, T/2; default 1): at cycle boundaries the "
+                         "never-communicated tail applies the whole step "
+                         "(weight-decay component included) at lr * scale "
+                         "while the communicated coords keep lr — the online "
+                         "full_sync_inactive_lr_scale knob, expressed in T "
+                         "units so one mixed-T run carries the same relative "
+                         "knob on every arm")
     ap.add_argument("--fused", action="store_true",
                     help="(deprecated no-op: --replay-mode cycle now always "
                          "runs the fused engine; kept so existing command "
@@ -1414,8 +1698,21 @@ def main(argv=None):
     ap.add_argument("--fused-shards", type=int, default=8,
                     help="shard process count for --replay-mode cycle "
                          "(fused engine; shard r uses cuda:r; the window "
-                         "read, the streaming AdamW state and the top-k "
-                         "select are split across shards)")
+                         "read, streaming optimizer state and configured "
+                         "trajectory selection are split across shards)")
+    ap.add_argument("--selection-semantics", default="balanced-histogram",
+                    choices=("topk", "balanced-histogram"),
+                    help="selection semantics applied at the branch point "
+                         "and every boundary re-selection: "
+                         "balanced-histogram (default; bit-faithful replay "
+                         "of the online engine's stride-8, whole-crossing-"
+                         "bin histogram mode) or topk (legacy exact global "
+                         "top-k with global-index tie-fill). Balanced "
+                         "requires single-node cycle replay; any "
+                         "--fused-shards count is supported there, while "
+                         "zerofill and --nodes require explicit topk. "
+                         "Online configs with block size > 1 or "
+                         "sga_always_sync_layers are not reproduced)")
     ap.add_argument("--fused-max-configs", type=int, default=12,
                     help="arms (score x ratio) advanced per fused window "
                          "pass in --replay-mode cycle (config group size; "
@@ -1537,6 +1834,23 @@ def main(argv=None):
             # the gate covers both modes
             raise ValueError(f"--cycle-len must be >= 1, got {args.cycle_len}")
         args.cycle_lens = [args.cycle_len]
+    # per-config cycle-engine axes (optimizer / fold / dual-lr), resolved
+    # here like cycle_lens: the default singletons (adamw / off / 1) reduce
+    # the config space to the historical (score, ratio, T) tuples. Axis keys
+    # stay conditional; selection_semantics has its own echo policy below.
+    if (args.optimizer is not None or args.fold is not None
+            or args.dual_lr is not None) and args.replay_mode != "cycle":
+        raise ValueError(
+            "--optimizer/--fold/--dual-lr are only supported with "
+            "--replay-mode cycle (they parameterize the cycle engine's "
+            "per-config state machine)")
+    args.optimizer_set = (parse_optimizer_set(args.optimizer)
+                          if args.optimizer is not None
+                          else [DEFAULT_OPTIMIZER])
+    args.fold_set = (parse_fold_set(args.fold) if args.fold is not None
+                     else [False])
+    args.dual_lr_set = (parse_dual_lr_set(args.dual_lr, args.cycle_lens)
+                        if args.dual_lr is not None else ["1"])
     if args.replay_mode == "cycle" and args.self_check is not None:
         # cycle dispatches to run_fused_branch, which the self-check path
         # never reaches — reject the combination by name instead of
@@ -1557,6 +1871,15 @@ def main(argv=None):
         raise ValueError(
             "--nodes is only supported with --replay-mode cycle (the "
             "multi-node launcher serves the fused engine only)")
+    if args.self_check is None and getattr(
+            args, "selection_semantics", "balanced-histogram") != "topk" and (
+            args.replay_mode != "cycle" or args.nodes):
+        raise ValueError(
+            "--selection-semantics balanced-histogram requires "
+            "--replay-mode cycle on a single node (--nodes is not "
+            "supported: only the single-node engine implements the "
+            "sharded balanced select; any --fused-shards count is fine "
+            "on one node)")
     if args.nodes is not None:
         args.nodes = [x.strip() for x in args.nodes.split(",") if x.strip()]
         if not args.nodes:
@@ -1620,6 +1943,9 @@ def main(argv=None):
         raise ValueError(
             "--dense-cache cannot be combined with --self-check "
             "(the self-check must actually replay the window)")
+    resolve_replay_dtype(args.replay_dtype)
+    if args.self_check is None:
+        require_scan_dtypes(args.replay_dtype, args.norm_dtype)
 
     trace_dir = os.path.abspath(args.trace_dir)
     catalog, names, offsets, N, state_files, g_files = discover_trace(trace_dir)
@@ -1722,6 +2048,19 @@ def main(argv=None):
     if args.fused_state_budget_mb > 0:
         report["config"]["fused_state_budget_mb"] = \
             args.fused_state_budget_mb
+    # same conditional-echo contract for the per-config axes: default
+    # singletons (adamw / off / 1) add no axis keys, so explicit legacy-topk
+    # runs retain the pre-axis report shape.
+    if args.optimizer_set != [DEFAULT_OPTIMIZER]:
+        report["config"]["optimizer"] = args.optimizer_set
+    if args.fold_set != [False]:
+        report["config"]["fold"] = ["on" if f else "off" for f in args.fold_set]
+    if args.dual_lr_set != ["1"]:
+        report["config"]["dual_lr"] = args.dual_lr_set
+    # Balanced changes trajectory masks and reports a crossing-bin lower edge
+    # as threshold; explicit topk retains the legacy report shape.
+    if getattr(args, "selection_semantics", "balanced-histogram") != "topk":
+        report["config"]["selection_semantics"] = args.selection_semantics
     report = sanitize(report, nd=8)
 
     if args.out:

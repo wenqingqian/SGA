@@ -21,8 +21,9 @@ Contract under test:
    and the branch report inside the world=2 pure-reordering band against a
    world=1 run (wrong slicing or a wrong global-rank mapping would blow
    the band, not pass silently) — plus the composition case (world=4 over
-   two nodes: node_rank>0 AND local_shards>1) and the single-node
-   degenerate case.
+   two nodes: node_rank>0 AND local_shards>1), the single-node degenerate
+   case, and the two-optimizer cache leg (one populated-and-confirmed
+   dense cache per optimizer, per-optimizer report views).
 4. Launch gates: shard/world divisibility by the node count, empty and
    duplicated and ill-formed node lists, shard count >= 1, timeout bounds,
    the --device cuda:N rejection, and the launcher-side CUDA capacity
@@ -70,17 +71,22 @@ def _ctx(trace_dir):
 
 
 def _multinode_args(td, cache, t0, shards, device="cpu",
-                    preflight_timeout=600.0, run_deadline=0.0):
+                    preflight_timeout=600.0, run_deadline=0.0,
+                    optimizer=None, selection="topk"):
     """The args namespace run_fused_branch_multinode consumes (the same
     fields sga.replay's argparse produces after its own gates)."""
-    return argparse.Namespace(
+    ns = argparse.Namespace(
         replay_mode="cycle", self_check=None, dense_cache=cache,
         score_names=["abs_g", "update"], fused_shards=shards,
         fused_max_configs=2, ratios=[20.0, 30.0], horizons=[1, 3, 6],
-        window=6, cycle_len=2, replay_dtype="fp64", trace_dtype="fp32",
-        norm_dtype="fp64", chunk_mb=1, device=device, seed=1234,
+        window=6, cycle_len=2, replay_dtype="fp32", trace_dtype="fp32",
+        norm_dtype="fp32", chunk_mb=1, device=device, seed=1234,
         verbose=False, preflight_timeout=preflight_timeout,
-        run_deadline=run_deadline, launch_log_dir=None)
+        run_deadline=run_deadline, launch_log_dir=None,
+        selection_semantics=selection)
+    if optimizer is not None:
+        ns.optimizer = optimizer
+    return ns
 
 
 def _sleep_argv(seconds=120):
@@ -126,8 +132,8 @@ def test_cfg_b64_roundtrip():
     cfg = {"trace_dir": "/w/trace", "t0": 900, "window": 6,
            "horizons": [1, 3, 6], "ratios": [20.0, 30.0],
            "score_names": ["abs_g", "update"], "cycle_len": 2,
-           "cycle_mode": True, "replay_dtype": "fp64",
-           "trace_dtype": "bf16", "upcast_bf16": True, "norm_fp32": False,
+           "cycle_mode": True, "replay_dtype": "fp32",
+           "trace_dtype": "bf16", "upcast_bf16": True, "norm_fp32": True,
            "chunk_mb": 1, "device": "cpu", "dense_cache": "/w/cache",
            "max_configs": 2, "seed": 1234, "verbose": False,
            "dense_cache_hit": False}
@@ -284,6 +290,61 @@ def test_multinode_single_node_degenerate():
     print("PASS test_multinode_single_node_degenerate")
 
 
+def test_multinode_multi_optimizer_cache_confirm():
+    """The per-optimizer publish loop: a two-optimizer run (adamw+adams)
+    populates TWO dense caches parent-side and confirms EVERY one of them
+    on every remote node before any shard starts — one distinct existing
+    cache file per optimizer (the dense reference trajectory depends on
+    the step recursion), each confirmed against the same remote node, and
+    the report carries the per-optimizer views (dense_cache_hit as a
+    per-optimizer dict on the cold populate, the nested den view, the
+    @{opt}-suffixed score stats)."""
+    with tempfile.TemporaryDirectory() as td:
+        t0 = _build_fixture(td)[0]
+        fresh_cache = os.path.join(td, "dense_cache_2opt")
+        seen = []
+        real_confirm = replay_launch._confirm_cache_visible
+
+        def spy_confirm(node, cache_path, expected_bytes, **kw):
+            seen.append((node, cache_path))
+            return real_confirm(node, cache_path, expected_bytes, **kw)
+
+        replay_launch._confirm_cache_visible = spy_confirm
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                out = replay_launch.run_fused_branch_multinode(
+                    _multinode_args(td, fresh_cache, t0, 2,
+                                    optimizer="adamw,adams"),
+                    _ctx(td), t0, ["127.0.0.1", "127.0.0.1"],
+                    executor="local")
+        finally:
+            replay_launch._confirm_cache_visible = real_confirm
+        # one confirm per optimizer on the one remote node (node 0 is the
+        # parent itself), each a distinct existing cache file
+        assert len(seen) == 2, seen
+        paths = {p for _n, p in seen}
+        assert len(paths) == 2, seen
+        assert all(n == "127.0.0.1" for n, _p in seen), seen
+        for p in paths:
+            assert os.path.isfile(p) and os.path.getsize(p) > 0, p
+            assert os.path.dirname(p) == fresh_cache, p
+        # both optimizer names appear in the parent's confirm banners
+        console = buf.getvalue()
+        assert "(adamw) confirmed on 1 remote node(s)" in console, console
+        assert "(adams) confirmed on 1 remote node(s)" in console, console
+        # per-optimizer report views (multi-optimizer shapes)
+        assert out["replay"]["dense_cache_hit"] == {"adamw": False,
+                                                    "adams": False}
+        assert set(out["replay"]["den_norm_at_horizon"]) == \
+            {"adamw", "adams"}, out["replay"]["den_norm_at_horizon"]
+        assert set(out["replay"]["label_total"]) == {"adamw", "adams"}
+        assert set(out["scores"]) == {f"{s}@{o}" for s in ("abs_g", "update")
+                                      for o in ("adamw", "adams")}, \
+            sorted(out["scores"])
+    print("PASS test_multinode_multi_optimizer_cache_confirm")
+
+
 def test_multinode_gates():
     """Every invalid launch shape is rejected with its option named, before
     any node is contacted (the duplicate-node gate guards the real ssh
@@ -310,6 +371,10 @@ def test_multinode_gates():
              "local"),
             (_multinode_args(td, cache, t0, 2, device="cuda:1"),
              ["127.0.0.1", "127.0.0.1"], "CUDA_VISIBLE_DEVICES", "local"),
+            (_multinode_args(td, cache, t0, 2,
+                             selection="balanced-histogram"),
+             ["127.0.0.1", "127.0.0.1"],
+             "--selection-semantics balanced-histogram requires", "local"),
         ]
         for ns, nodes, msg, executor in cases:
             try:
@@ -320,6 +385,8 @@ def test_multinode_gates():
             else:
                 raise AssertionError(f"gate accepted: shards={ns.fused_shards}"
                                      f" device={ns.device} nodes={nodes}")
+        assert not os.path.exists(cache), \
+            "a launch gate ran dense-cache population or node workers"
     print("PASS test_multinode_gates")
 
 
@@ -699,7 +766,7 @@ def test_cli_forwards_ssh_key_and_nodes():
         # minimal branch dict that survives sanitize + print_summary
         return {"t0": t0, "window_len": 6, "state_absent": [],
                 "scores": {}, "per_ratio": {},
-                "replay": {"dense_cache_hit": True, "dtype": "fp64"}}
+                "replay": {"dense_cache_hit": True, "dtype": "fp32"}}
 
     with tempfile.TemporaryDirectory() as td:
         t0 = _build_fixture(td)[0]
@@ -776,6 +843,7 @@ def main():
     test_multinode_local_world2_band()
     test_multinode_local_world4_band()
     test_multinode_single_node_degenerate()
+    test_multinode_multi_optimizer_cache_confirm()
     test_multinode_gates()
     test_multinode_preflight_failure_loud()
     test_multinode_run_phase_early_kill()

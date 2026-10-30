@@ -94,6 +94,12 @@ auto-routes here):
    The per-kernel adversarial conformance matrix (per-score, adam,
    select passes, stack canaries, dispatch gates) lives in
    tests/test_replay_kernels.py.
+14. --selection-semantics balanced-histogram: allowed end to end on a
+   single node at world=2 (the sharded balanced select reconstructs the
+   catalog histogram from the shard partials), report inside the
+   standard world=2 comparator, threshold distinct from the exact-topk
+   arm's (the semantics actually routed the select sites); --nodes and
+   zerofill stay rejected by name.
 """
 import io
 import json
@@ -225,15 +231,51 @@ def _run(argv):
         return soa.main(argv)
 
 
-def _base_args(td, cache, t0, extra=(), cycle=("--cycle-len", "2")):
+def _base_args(td, cache, t0, extra=(), cycle=("--cycle-len", "2"),
+               selection="topk"):
     # ``cycle`` is swappable because the two T spellings are mutually
-    # exclusive on the CLI — a --cycle-lens run cannot just append the flag
+    # exclusive on the CLI — a --cycle-lens run cannot just append the flag.
+    # Legacy exact-oracle tests pin topk centrally; selection=None exercises
+    # the CLI's balanced default, and an appended explicit flag also wins.
+    selection_args = (() if selection is None else
+                      ("--selection-semantics", selection))
     return ["--trace-dir", td, "--branch-point", str(t0), "--window", "6",
             "--horizons", "1,3,6", "--ratios", "20,30",
             "--score-names", "abs_g,update", "--replay-mode", "cycle",
             *cycle, "--dense-cache", cache, "--device", "cpu",
-            "--chunk-mb", "1", *extra]
+            "--chunk-mb", "1", *selection_args, *extra]
 
+
+
+def test_scan_dtype_guards():
+    """Fused entries and serialized workers reject fp64 before replay work."""
+    with tempfile.TemporaryDirectory() as td:
+        t0, *_ = _build_fixture(td)
+        cache = os.path.join(td, "dense_cache")
+        for extra in (["--replay-dtype", "fp64"],
+                      ["--norm-dtype", "fp64"]):
+            try:
+                _run(_base_args(td, cache, t0, extra))
+            except ValueError as e:
+                assert "fp64 is reserved for --self-check" in str(e), e
+            else:
+                raise AssertionError(f"fp64 scan accepted: {extra}")
+
+        worker_cases = [
+            {"replay_dtype": "fp64", "norm_fp32": True},
+            {"replay_dtype": "fp32", "norm_fp32": False},
+        ]
+        for case in worker_cases:
+            cfg = {"seed": 1234, "device": "cpu", **case}
+            try:
+                replay_fused._worker(
+                    0, 1, cfg, 0, os.path.join(td, "frag.pt"))
+            except ValueError as e:
+                assert "fp64 is reserved for --self-check" in str(e), e
+            else:
+                raise AssertionError(
+                    f"serialized worker accepted invalid scan cfg: {case}")
+    print("PASS test_scan_dtype_guards")
 
 def _close(a, b, rel):
     if a == b:
@@ -283,10 +325,10 @@ def _ref_distortion(pre, lrs, clip, t0, absent, w0s, m0s, v0s, g0s, score,
     input. ``payload_dtype`` mirrors the stored g dtype: the reference
     quantizes the logged gradients exactly as the fixture writer did
     (bf16 payloads reach the engine upcast to fp32)."""
-    w0 = torch.cat([w0s[n] for n in NAMES]).double()
-    m0 = torch.cat([m0s[n] for n in NAMES]).double()
-    v0 = torch.cat([v0s[n] for n in NAMES]).double()
-    branch_grad = torch.cat([g0s[n] for n in NAMES]).double()
+    w0 = torch.cat([w0s[n] for n in NAMES]).float()
+    m0 = torch.cat([m0s[n] for n in NAMES]).float()
+    v0 = torch.cat([v0s[n] for n in NAMES]).float()
+    branch_grad = torch.cat([g0s[n] for n in NAMES]).float()
     logged_flat, norms = [], []
     for si, g in enumerate(pre):
         norm = 0.0
@@ -295,7 +337,7 @@ def _ref_distortion(pre, lrs, clip, t0, absent, w0s, m0s, v0s, g0s, score,
         norm = norm ** 0.5
         coef = min(1.0, clip / (norm + 1.0e-6)) if clip > 0.0 else 1.0
         parts = [torch.zeros(SIZES[i]) if absent.get(si) == n
-                 else (g[n] * coef).to(payload_dtype).float().double()
+                 else (g[n] * coef).to(payload_dtype).float()
                  for i, n in enumerate(NAMES)]
         logged_flat.append(torch.cat(parts))
         norms.append(norm)
@@ -314,8 +356,7 @@ def _ref_distortion(pre, lrs, clip, t0, absent, w0s, m0s, v0s, g0s, score,
 def _assert_ref_anchor(report, t0, ref_args, horizons):
     """Every score x ratio distortion in the report matches the from-spec
     reference. The report is sanitized to 8 decimals, so the band is the
-    rounding step plus a relative slack for the engine's chunked fp64
-    summation order."""
+    rounding step plus a relative slack for chunked fp32 replay arithmetic."""
     for r in ref_args["ratios"]:
         for s in ref_args["scores"]:
             got = report["branch_results"][str(t0)]["per_ratio"][str(r)] \
@@ -328,7 +369,9 @@ def _assert_ref_anchor(report, t0, ref_args, horizons):
                 g, w = got[str(h)], want[str(h)]
                 assert (g is None) == (w is None), (s, r, h, g, w)
                 if g is not None:
-                    assert abs(g - w) <= 5e-8 + 1e-6 * abs(w), \
+                    # fp32 state updates have an absolute quantization floor
+                    # when dense and sparse trajectories nearly coincide.
+                    assert abs(g - w) <= 5e-6 + 1e-3 * abs(w), \
                         (s, r, h, g, w)
 
 
@@ -477,6 +520,38 @@ def test_fused_cold_cache_world2():
     print("PASS test_fused_cold_cache_world2")
 
 
+def test_fused_world2_balanced_histogram():
+    """Omitting --selection-semantics selects balanced-histogram end to end
+    at world=2 on one node: the sharded balanced select reconstructs the online engine's
+    full-catalog histogram from the shard partials (per-param subsample
+    phase, catalog-wide n_total/n_sampled, int64 histogram all_reduce, no
+    world factor), so the whole-crossing-bin threshold is exact across
+    shardings and the report stays inside the standard world=2 comparator
+    (fp64 scalar sums reorder exactly as in the topk band). The balanced
+    threshold (crossing-bin lower edge) must differ from the exact-topk
+    threshold on at least one arm — proof the semantics actually routed
+    the select sites instead of silently running topk."""
+    with tempfile.TemporaryDirectory() as td:
+        t0, _W = _build_fixture(td)[0:2]
+        cache = os.path.join(td, "dense_cache")
+        top = _run(_base_args(td, cache, t0, ["--fused-shards", "1"]))
+        b1 = _run(_base_args(td, cache, t0, ["--fused-shards", "1"],
+                             selection=None))
+        b2 = _run(_base_args(td, cache, t0,
+                             ["--fused-shards", "2",
+                              "--fused-max-configs", "2"], selection=None))
+        assert b1["config"]["selection_semantics"] == "balanced-histogram"
+        assert b2["config"]["selection_semantics"] == "balanced-histogram"
+        _compare_world2(b1, b2, "balanced")
+        tbr = top["branch_results"][str(t0)]["per_ratio"]
+        bbr = b1["branch_results"][str(t0)]["per_ratio"]
+        assert any(tbr[r]["scores"][s]["threshold"]
+                   != bbr[r]["scores"][s]["threshold"]
+                   for r in tbr for s in tbr[r]["scores"]), \
+            "balanced-histogram arm reproduced exact-topk thresholds"
+    print("PASS test_fused_world2_balanced_histogram")
+
+
 def test_fused_cli_gates():
     """Each invalid combination is rejected with the option named, before
     any replay work."""
@@ -484,8 +559,18 @@ def test_fused_cli_gates():
         t0, _W = _build_fixture(td)[0:2]
         cache = os.path.join(td, "dense_cache")
         base = ["--trace-dir", td, "--branch-point", str(t0),
-                "--ratios", "20", "--horizons", "3", "--device", "cpu"]
+                "--ratios", "20", "--horizons", "3", "--device", "cpu",
+                "--selection-semantics", "topk"]
+        default_balanced = base[:-2]
         cases = [
+            # The unconditional balanced default rejects unsupported modes
+            # when the caller omits an explicit legacy topk selection.
+            (default_balanced,
+             "--selection-semantics balanced-histogram requires"),
+            (default_balanced + ["--replay-mode", "cycle",
+                                 "--dense-cache", cache,
+                                 "--nodes", "nodeA.example"],
+             "--selection-semantics balanced-histogram requires"),
             # zerofill (the default) has no fused form; --fused is a
             # deprecated no-op only where it ever made sense
             (base + ["--fused"], "--fused is deprecated"),
@@ -537,6 +622,17 @@ def test_fused_cli_gates():
             (base + ["--replay-mode", "cycle", "--dense-cache", cache,
                      "--cycle-lens", "2,x"],
              "must be integers >= 1"),
+            # balanced-histogram semantics: zerofill has no fused select
+            (base + ["--selection-semantics", "balanced-histogram"],
+             "--selection-semantics balanced-histogram requires"),
+            # ... and --nodes stays rejected under cycle: the sharded
+            # balanced select is single-node only (any shard count is fine
+            # on ONE node — exercised end to end by
+            # test_fused_world2_balanced_histogram)
+            (base + ["--replay-mode", "cycle", "--dense-cache", cache,
+                     "--selection-semantics", "balanced-histogram",
+                     "--nodes", "nodeA.example"],
+             "--selection-semantics balanced-histogram requires"),
         ]
         if torch.cuda.is_available():
             # --device cpu: shards are plain processes with no CUDA bound,
@@ -1361,28 +1457,25 @@ def test_dev_reduce_bitwise():
     horizon numerators in per-config fp64 device scalars fetched once per
     pass. The addends and their order are unchanged, so the whole report
     must be bit-identical to the per-chunk host-sync path (world 1 and 2,
-    warm cache, both norm dtypes; on CUDA also combined with residency)."""
+    warm cache, fp32 norm; on CUDA also combined with residency)."""
     with tempfile.TemporaryDirectory() as td:
         t0, *_ = _build_fixture(td)
         cache = os.path.join(td, "dense_cache")
         _run(_base_args(td, cache, t0, ["--fused-shards", "1"]))
         for shards in ("1", "2"):
-            for nd in ("fp64", "fp32"):
-                base = _run(_base_args(td, cache, t0,
-                                       ["--fused-shards", shards,
-                                        "--norm-dtype", nd]))
-                red = _run(_base_args(td, cache, t0,
-                                      ["--fused-shards", shards,
-                                       "--norm-dtype", nd,
-                                       "--fused-dev-reduce"]))
-                assert base["config"]["fused_dev_reduce"] is False
-                assert red["config"]["fused_dev_reduce"] is True
-                for rep in (base, red):
-                    rep["config"].pop("fused_dev_reduce")
-                    frag = rep["branch_results"][str(t0)]
-                    frag["replay"].pop("dev_reduce")
-                assert _deep_eq_nan(base, red), \
-                    f"dev_reduce moved a bit (shards={shards} nd={nd})"
+            base = _run(_base_args(td, cache, t0,
+                                   ["--fused-shards", shards]))
+            red = _run(_base_args(td, cache, t0,
+                                  ["--fused-shards", shards,
+                                   "--fused-dev-reduce"]))
+            assert base["config"]["fused_dev_reduce"] is False
+            assert red["config"]["fused_dev_reduce"] is True
+            for rep in (base, red):
+                rep["config"].pop("fused_dev_reduce")
+                frag = rep["branch_results"][str(t0)]
+                frag["replay"].pop("dev_reduce")
+            assert _deep_eq_nan(base, red), \
+                f"dev_reduce moved a bit (shards={shards})"
     print("PASS test_dev_reduce_bitwise")
 
 
@@ -1857,13 +1950,14 @@ def test_front_rank_bg_world2():
 def test_front_rank_bg_worker_unit():
     """_FrontRankWorker applies the ranking chain in FIFO order as the
     single writer of idcg/rankmet: tiny-tensor results match the
-    synchronous calls exactly across two ratios (the cross-ratio FIFO
-    through the shared idcg map is pinned in the unit, not just one
-    ratio's); a task exception re-raises at finish() (never a silent
-    drain); a submit behind a dead worker raises fast through the entry
-    check, and a submit backpressured on a full queue raises fast through
-    the queue.Full health check once the only consumer dies mid-backlog —
-    neither leg may deadlock the bounded queue."""
+    synchronous calls exactly across two ratios x two optimizer families
+    (the cross-ratio FIFO through the shared idcg map AND the
+    (score, optimizer) stats / per-optimizer label-total plumbing are
+    pinned in the unit); a task exception re-raises at finish() (never a
+    silent drain); a submit behind a dead worker raises fast through the
+    entry check, and a submit backpressured on a full queue raises fast
+    through the queue.Full health check once the only consumer dies
+    mid-backlog — neither leg may deadlock the bounded queue."""
     gen = torch.Generator().manual_seed(7)
     ks_map = {20: 5, 30: 3}
     idcg_parts = {20: [torch.rand(3, generator=gen),
@@ -1881,29 +1975,43 @@ def test_front_rank_bg_worker_unit():
                      torch.ones(2, dtype=torch.bool)],
                 30: [torch.ones(2, dtype=torch.bool),
                      torch.zeros(1, dtype=torch.bool)]}
-    stats = {"abs_g": {"sum": 100.0}}
-    worker = replay_fused._FrontRankWorker(None, [2], ks_map, stats, 50.0)
+    # per-(score, optimizer) stats and per-optimizer label totals — the
+    # axis-aware plumbing the worker must keep apart
+    stats = {("abs_g", "adamw"): {"sum": 100.0},
+             ("abs_g", "adams"): {"sum": 40.0}}
+    label_total = {"adamw": 50.0, "adams": 8.0}
+    worker = replay_fused._FrontRankWorker(None, ks_map, stats, label_total)
     worker.start()
-    for r in (20, 30):
-        worker.submit(("idcg", r, idcg_parts[r]))
-        worker.submit(("rank", "abs_g", r, sc_parts[r], lb_parts[r],
-                       ls_parts[r]))
+    for opt in ("adamw", "adams"):
+        for r in (20, 30):
+            worker.submit(("idcg", opt, r, idcg_parts[r]))
+            worker.submit(("rank", "abs_g", opt, r, sc_parts[r],
+                           lb_parts[r], ls_parts[r]))
     rankmet = worker.finish()
     exp_met = {}
-    for r in (20, 30):
-        exp_idcg = replay_fused._idcg_of_parts(idcg_parts[r])
-        exp_met[("abs_g", r, 2)] = replay_fused._fused_ranking(
-            torch.cat(sc_parts[r]), torch.cat(lb_parts[r]), ls_parts[r],
-            ks_map[r], 100.0, 50.0, exp_idcg)
+    for opt in ("adamw", "adams"):
+        for r in (20, 30):
+            exp_idcg = replay_fused._idcg_of_parts(idcg_parts[r])
+            exp_met[("abs_g", r, opt)] = replay_fused._fused_ranking(
+                torch.cat(sc_parts[r]), torch.cat(lb_parts[r]), ls_parts[r],
+                ks_map[r], stats[("abs_g", opt)]["sum"], label_total[opt],
+                exp_idcg)
     assert set(rankmet) == set(exp_met), rankmet.keys()
     for key, want in exp_met.items():
         got = rankmet[key]
         assert all(got[f] == want[f] for f in want), (key, got, want)
+    # two optimizer families on one score must land distinct metrics (the
+    # sums/label totals differ) — a keyed-by-score regression would fold
+    # them onto one entry
+    for r in (20, 30):
+        assert rankmet[("abs_g", r, "adamw")] != rankmet[("abs_g", r,
+                                                          "adams")]
 
-    bad = replay_fused._FrontRankWorker(None, [2], {20: ks_map[20]}, stats,
-                                        50.0)
+    bad = replay_fused._FrontRankWorker(None, {20: ks_map[20]},
+                                        {("abs_g", "adamw"):
+                                         {"sum": 100.0}}, {"adamw": 50.0})
     bad.start()
-    bad.submit(("rank", "abs_g", 20, [torch.rand(2), "junk"],
+    bad.submit(("rank", "abs_g", "adamw", 20, [torch.rand(2), "junk"],
                 [torch.rand(2)], [torch.ones(2, dtype=torch.bool)]))
     try:
         bad.finish()
@@ -1913,7 +2021,7 @@ def test_front_rank_bg_worker_unit():
         raise AssertionError("worker failure did not re-raise at finish")
     _tq = time.perf_counter()
     try:
-        bad.submit(("idcg", 20, idcg_parts[20]))
+        bad.submit(("idcg", "adamw", 20, idcg_parts[20]))
     except RuntimeError:
         pass
     else:
@@ -1934,15 +2042,16 @@ def test_front_rank_bg_worker_unit():
 
     replay_fused._fused_ranking = slow_poison
     try:
-        full = replay_fused._FrontRankWorker(None, [2], ks_map, stats, 50.0)
+        full = replay_fused._FrontRankWorker(None, ks_map, stats,
+                                             label_total)
         full.start()
         for _i in range(5):
-            full.submit(("rank", "abs_g", 20, sc_parts[20], lb_parts[20],
-                         ls_parts[20]))
+            full.submit(("rank", "abs_g", "adamw", 20, sc_parts[20],
+                         lb_parts[20], ls_parts[20]))
         _tq = time.perf_counter()
         try:
-            full.submit(("rank", "abs_g", 20, sc_parts[20], lb_parts[20],
-                         ls_parts[20]))
+            full.submit(("rank", "abs_g", "adamw", 20, sc_parts[20],
+                         lb_parts[20], ls_parts[20]))
         except RuntimeError as e:
             assert "front rank worker failed" in str(e), str(e)
         else:
@@ -2212,7 +2321,7 @@ def test_select_nccl_world2():
     print("PASS test_select_nccl_world2")
 
 
-def _budget_mb(shards, cap, replay_dtype="fp64"):
+def _budget_mb(shards, cap, replay_dtype="fp32"):
     """The --fused-state-budget-mb value that derives group size == cap,
     recomputed from the fixture spec constants (sum(SIZES)) via the
     engine's public accounting: {w,m,v,res} x itemsize over the widest
@@ -2513,6 +2622,7 @@ def main():
     test_fused_world2_band()
     test_fused_world2_norm_fp32()
     test_fused_cold_cache_world2()
+    test_fused_world2_balanced_histogram()
     test_fused_cli_gates()
     test_cycle_lens_mixed_equivalence()
     test_cycle_lens_single_compat()
@@ -2547,6 +2657,7 @@ def main():
     test_fused_select_device_bitwise()
     test_select_env_killswitch()
     test_select_nccl_world2()
+    test_scan_dtype_guards()
     test_state_budget_bitwise()
     test_state_budget_cap_semantics()
     test_state_budget_cuda()

@@ -59,6 +59,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sga import replay as soa
+from sga import replay_fused
 from sga import trace_convert as tc
 
 
@@ -75,26 +76,50 @@ def _bc(count, b1=B1, b2=B2):
     return 1.0 - b1 ** count, 1.0 - b2 ** count
 
 
-def _adamw(w, m, v, q, lr, count):
-    bc1, bc2 = _bc(count)
-    m = B1 * m + (1.0 - B1) * q
-    v = B2 * v + (1.0 - B2) * q * q
+def _adamw(w, m, v, q, lr, count, optimizer="adamw", inactive=None,
+           lr_inactive=None):
+    """One optimizer step. ``optimizer`` selects the AdamW/AdamS families;
+    with ``inactive`` the boundary full step applies the split lr over the
+    WHOLE step (wd term included) against the outgoing mask — the online
+    full_sync_inactive_lr_scale contract."""
+    if (inactive is None) != (lr_inactive is None):
+        raise ValueError("inactive and lr_inactive must be passed together")
+    if optimizer == "adamw":
+        bc1, bc2 = _bc(count)
+        m = B1 * m + (1.0 - B1) * q
+        v = B2 * v + (1.0 - B2) * q * q
+    else:
+        # sga.replay.ADAMS_V_BASIS: v from the PRE-commit first moment,
+        # computed before m updates; bias correction replaced by 1
+        bc1 = bc2 = 1.0
+        v = B2 * (m * m) + (1.0 - B2) * q * q
+        m = B1 * m + (1.0 - B1) * q
     upd = (m / bc1) / (torch.sqrt(v / bc2) + EPS)
-    return w * (1.0 - lr * WD) - lr * upd, m, v
+    if inactive is None:
+        return w * (1.0 - lr * WD) - lr * upd, m, v
+    step = torch.full_like(w, lr)
+    step.masked_fill_(inactive, lr_inactive)
+    return w - step * (WD * w + upd), m, v
 
 
-def _ref_score(name, w, m, v, g, count, b1=B1, b2=B2):
-    bc1, bc2 = _bc(count, b1, b2)
+def _ref_score(name, w, m, v, g, count, b1=B1, b2=B2, optimizer="adamw"):
+    if optimizer == "adamw":
+        bc1, bc2 = _bc(count, b1, b2)
+        vv = v
+    else:
+        # AdamS: v := m*m and no bias correction (sga.replay.ADAMS_*)
+        bc1 = bc2 = 1.0
+        vv = m * m
     if name == "abs_g":
         return g.abs()
     if name == "abs_m":
         return m.abs()
     mg = (b1 * m + (1.0 - b1) * g) / bc1
-    vg = (b2 * v + (1.0 - b2) * g * g) / bc2
+    vg = (b2 * vv + (1.0 - b2) * g * g) / bc2
     ug = mg / (torch.sqrt(vg) + EPS)
     if name == "update":
         return (WD * w + ug).abs()
-    u0 = (b1 * m / bc1) / (torch.sqrt(b2 * v / bc2) + EPS)
+    u0 = (b1 * m / bc1) / (torch.sqrt(b2 * vv / bc2) + EPS)
     return (ug - u0).abs()
 
 
@@ -114,7 +139,8 @@ def _topk_mask(sc, k):
 
 
 def reference_cycle(w0, m0, v0, logged_grads, grad_norms, lrs, clip, t0,
-                    score_name, k, T, reselect=True, branch_grad=None):
+                    score_name, k, T, reselect=True, branch_grad=None,
+                    optimizer="adamw", fold=False, dual_lr=1.0):
     """From-spec reference: returns (dense_w_at_each_step, sparse_w_at_each_step).
 
     ``logged_grads`` are the POST-CLIP gradients as logged in the trace
@@ -127,13 +153,23 @@ def reference_cycle(w0, m0, v0, logged_grads, grad_norms, lrs, clip, t0,
     counterfactual used to prove that boundary re-selection is
     load-bearing (test_boundary_reselect_changes_mask).
     ``branch_grad`` is the gradient the branch STATE dump carries (what
-    the engine's branch-point selection consumes)."""
+    the engine's branch-point selection consumes).
+    ``optimizer`` selects the AdamW/AdamS step family for BOTH arms;
+    ``fold`` divides the residual by T on the pre-boundary step, so the
+    boundary's clip norm, re-selection score and commit all read the
+    folded buffer (the online fold window contract — all three landing
+    points move together);
+    ``dual_lr`` (!= 1) scales the whole boundary full step (wd term
+    included) on the OUTGOING window's mask — re-selection happens after
+    the commit, so the split-lr step consumes the mask that is about to
+    be replaced."""
     # dense trajectory: the logged (already clipped) gradient as committed
     md, vd, wdt = m0.clone(), v0.clone(), w0.clone()
     dense_ws = []
     for si, g in enumerate(logged_grads):
         count = t0 + si + 1
-        wdt, md, vd = _adamw(wdt, md, vd, g, lrs[si], count)
+        wdt, md, vd = _adamw(wdt, md, vd, g, lrs[si], count,
+                             optimizer=optimizer)
         dense_ws.append(wdt.clone())
     # sparse cycle trajectory
     ms, vs, ws = m0.clone(), v0.clone(), w0.clone()
@@ -142,7 +178,8 @@ def reference_cycle(w0, m0, v0, logged_grads, grad_norms, lrs, clip, t0,
     # the branch-point selection consumes the state dump's g as-is (it is
     # already post-clip); fp64 math / fp32 storage per the registry
     # contract, index-ordered tie-fill per the select contract
-    sel = _topk_mask(_ref_score(score_name, ws, ms, vs, q0, t0 + 1)
+    sel = _topk_mask(_ref_score(score_name, ws, ms, vs, q0, t0 + 1,
+                                optimizer=optimizer)
                      .float(), k)
     sparse_ws = []
     for si, g_logged in enumerate(logged_grads):
@@ -150,14 +187,22 @@ def reference_cycle(w0, m0, v0, logged_grads, grad_norms, lrs, clip, t0,
         coef_dense = min(1.0, clip / (grad_norms[si] + 1.0e-6)) \
             if clip > 0.0 else 1.0
         g = g_logged / coef_dense
-        if si % T == 0:
+        boundary = si % T == 0
+        out_sel = None
+        if boundary:
+            if fold and si > 0:
+                # pre-boundary fold: everything downstream this step (clip
+                # norm, score, commit) reads the folded buffer
+                res = res / T
             q_pre = g + res
             coef = 1.0
             if clip > 0.0:
                 coef = min(1.0, clip / (float(q_pre.norm()) + 1.0e-6))
             q = q_pre * coef
+            out_sel = sel
             if reselect and si > 0 and si + 1 < len(logged_grads):
-                sc = _ref_score(score_name, ws, ms, vs, q, count)
+                sc = _ref_score(score_name, ws, ms, vs, q, count,
+                                optimizer=optimizer)
                 sel = _topk_mask(sc.float(), k)
             res = torch.zeros_like(res)
         else:
@@ -166,7 +211,14 @@ def reference_cycle(w0, m0, v0, logged_grads, grad_norms, lrs, clip, t0,
                 coef = min(1.0, clip / (float((g * sel).norm()) + 1.0e-6))
             q = g * sel * coef
             res = res + g * (~sel)
-        ws, ms, vs = _adamw(ws, ms, vs, q, lrs[si], count)
+        if dual_lr != 1.0 and boundary:
+            ws, ms, vs = _adamw(ws, ms, vs, q, lrs[si], count,
+                                optimizer=optimizer,
+                                inactive=~out_sel,
+                                lr_inactive=lrs[si] * dual_lr)
+        else:
+            ws, ms, vs = _adamw(ws, ms, vs, q, lrs[si], count,
+                                optimizer=optimizer)
         sparse_ws.append(ws.clone())
     return dense_ws, sparse_ws
 
@@ -214,12 +266,14 @@ def _make_trace(tmpdir, pre_grads, lrs, clip, t0, n):
 
 
 def _run_module(tmpdir, name, w0, m0, v0, t0, W, score_name, ratio_pct, T,
-                replay_dtype=torch.float64, upcast_bf16=False,
-                norm_fp32=False):
+                replay_dtype=torch.float32, upcast_bf16=False,
+                norm_fp32=True, optimizer="adamw", fold=False,
+                dual_lr=None):
     """Run the fused engine (single shard, inline, cpu) for one score x
     ratio arm via run_fused_branch — the direct call returns the RAW branch
     dict (no 8-decimal sanitize), so num_at keeps full fp64 precision — and
-    return num_at {h: num} as distortion[h] * den[h]."""
+    return num_at {h: num} as distortion[h] * den[h]. Single-value axis
+    sets keep the bare score key (suffix rules only fire on real sets)."""
     from sga import replay_fused
 
     catalog, names, offsets, N, state_files, g_files = soa.discover_trace(
@@ -237,6 +291,9 @@ def _run_module(tmpdir, name, w0, m0, v0, t0, W, score_name, ratio_pct, T,
         trace_dtype=("bf16" if upcast_bf16 else "fp32"),
         norm_dtype=("fp32" if norm_fp32 else "fp64"),
         chunk_mb=1, device="cpu", seed=1234, verbose=False,
+        optimizer_set=[optimizer], fold_set=[fold],
+        dual_lr_set=[dual_lr if dual_lr is not None else "1"],
+        selection_semantics="topk",
     )
     br = replay_fused.run_fused_branch(args, ctx, t0)
     den = br["replay"]["den_norm_at_horizon"]
@@ -247,12 +304,13 @@ def _run_module(tmpdir, name, w0, m0, v0, t0, W, score_name, ratio_pct, T,
 
 
 def _ref_num_at(w0, m0, v0, logged, norms, lrs, clip, t0, score_name,
-                ratio_pct, T):
+                ratio_pct, T, optimizer="adamw", fold=False, dual_lr=1.0):
     k = max(1, int(round(ratio_pct / 100.0 * w0.numel())))
     dense_ws, sparse_ws = reference_cycle(
         w0.double(), m0.double(), v0.double(),
         [g.double() for g in logged], norms, lrs, clip, t0, score_name, k, T,
-        branch_grad=logged[0].double())
+        branch_grad=logged[0].double(), optimizer=optimizer, fold=fold,
+        dual_lr=dual_lr)
     return {h: float((sparse_ws[h - 1] - dense_ws[h - 1]).norm())
             for h in range(1, len(logged) + 1)}
 
@@ -295,7 +353,7 @@ def test_no_fold_within_window():
             ref = _ref_num_at(w0, m0, v0, logged, norms, lrs, 0.0, t0, score, 25.0,
                               T=W + 1)
             for h in range(1, W + 1):
-                assert _close(num_at[h], ref[h], 1e-9), (
+                assert _close(num_at[h], ref[h], 1e-3), (
                     f"{score} d@{h}: module {num_at[h]} vs ref {ref[h]}")
     print("PASS test_no_fold_within_window")
 
@@ -314,9 +372,188 @@ def test_multicycle_with_clipping():
             num_at = _run_module(td, name, w0, m0, v0, t0, W, score, 50.0, 2)
             ref = _ref_num_at(w0, m0, v0, logged, norms, lrs, clip, t0, score, 50.0, 2)
             for h in range(1, W + 1):
-                assert _close(num_at[h], ref[h], 1e-9), (
+                assert _close(num_at[h], ref[h], 1e-3), (
                     f"{score} d@{h}: module {num_at[h]} vs ref {ref[h]}")
     print("PASS test_multicycle_with_clipping")
+
+
+def test_param_axes_vs_reference():
+    """The (optimizer, fold, dual_lr) axes against the extended from-spec
+    reference on a clip-active multi-boundary fixture — full axis product,
+    every score; plus the fixture-sanity side that each axis actually moves
+    the numbers (a no-op axis would silently measure nothing)."""
+    torch.manual_seed(22)
+    t0, W, T, n = 3100, 6, 3, 30
+    pre = [torch.randn(n) * 0.5 for _ in range(W)]  # norms >> clip -> active
+    lrs = [5e-5, 4.8e-5, 4.6e-5, 4.4e-5, 4.2e-5, 4e-5]
+    clip = 0.3
+    dl_tokens = (None, "T/2", "0.5")  # default, T-relative, plain float
+    with tempfile.TemporaryDirectory() as td:
+        name, w0, m0, v0, logged, norms = _make_trace(td, pre, lrs, clip,
+                                                      t0, n)
+        # warm the dense cache with the default arm; each optimizer family
+        # keeps its own cache entry afterwards
+        _run_module(td, name, w0, m0, v0, t0, W, "abs_m", 25.0, T)
+        combos = {}
+        for opt in ("adamw", "adams"):
+            for fold in (False, True):
+                for dl in dl_tokens:
+                    dl_scale = (1.0 if dl is None else
+                                (float(T) / 2.0 if dl == "T/2" else 0.5))
+                    for score in soa.all_score_names():
+                        num_at = _run_module(td, name, w0, m0, v0, t0, W,
+                                             score, 25.0, T, optimizer=opt,
+                                             fold=fold, dual_lr=dl)
+                        ref = _ref_num_at(w0, m0, v0, logged, norms, lrs,
+                                          clip, t0, score, 25.0, T,
+                                          optimizer=opt, fold=fold,
+                                          dual_lr=dl_scale)
+                        for h in range(1, W + 1):
+                            assert _close(num_at[h], ref[h], 1e-3), (
+                                f"{score} ({opt},fold={fold},dl={dl}) d@{h}: "
+                                f"module {num_at[h]} vs ref {ref[h]}")
+                    combos[(opt, fold, dl)] = num_at
+        base = combos[("adamw", False, None)]
+        for opt in ("adamw", "adams"):
+            for fold in (False, True):
+                for dl in dl_tokens:
+                    if (opt, fold, dl) == ("adamw", False, None):
+                        continue
+                    got = combos[(opt, fold, dl)]
+                    assert any(got[h] != base[h] for h in base), (
+                        f"axis combo ({opt},fold={fold},dl={dl}) is a no-op "
+                        "on this fixture")
+        # the two optimizer families genuinely differ (v basis + bc)
+        assert any(combos[("adams", False, None)][h]
+                   != combos[("adamw", False, None)][h]
+                   for h in base), "AdamS arm did not move vs AdamW"
+    print("PASS test_param_axes_vs_reference")
+
+
+def test_param_axes_mixed_equivalence():
+    """One engine run carrying the full axis sets must reproduce the solo
+    runs arm-for-arm exactly (the per-config state machines are
+    independent), with the collision-suffix key rules placing every arm:
+    default-singleton arms keep the bare score key, each recurring axis
+    suffixes its own tag (@opt, @fold on fold-on arms, @dl{scale:g})."""
+    torch.manual_seed(23)
+    t0, W, T, n = 3200, 6, 3, 30
+    pre = [torch.randn(n) * 0.5 for _ in range(W)]
+    lrs = [4e-3] * W
+    clip = 0.3
+    score, ratio_pct = "update", 25.0
+    with tempfile.TemporaryDirectory() as td:
+        name, w0, m0, v0, logged, norms = _make_trace(td, pre, lrs, clip,
+                                                      t0, n)
+        solo = {}
+        for opt in ("adamw", "adams"):
+            for fold in (False, True):
+                for dl in (None, "0.5"):
+                    solo[(opt, fold, dl)] = _run_module(
+                        td, name, w0, m0, v0, t0, W, score, ratio_pct, T,
+                        optimizer=opt, fold=fold, dual_lr=dl)
+        # the mixed run: two optimizers x two folds x two dl tokens in one
+        # engine pass
+        from sga import replay_fused
+        catalog, names, offsets, N, state_files, g_files = \
+            soa.discover_trace(td)
+        ctx = {"trace_dir": os.path.abspath(td), "names": names,
+               "offsets": offsets, "N": N, "state_files": state_files,
+               "g_files": g_files, "catalog": catalog}
+        args = argparse.Namespace(
+            replay_mode="cycle", self_check=None,
+            dense_cache=os.path.join(td, "dense_cache"),
+            score_names=[score], fused_shards=1, fused_max_configs=12,
+            ratios=[ratio_pct], horizons=list(range(1, W + 1)), window=W,
+            cycle_len=T, replay_dtype="fp32", trace_dtype="fp32",
+            norm_dtype="fp32", chunk_mb=1, device="cpu", seed=1234,
+            verbose=False, optimizer_set=["adamw", "adams"],
+            fold_set=[False, True], dual_lr_set=["1", "0.5"],
+            selection_semantics="topk",
+        )
+        br = replay_fused.run_fused_branch(args, ctx, t0)
+        scores = br["per_ratio"][str(ratio_pct)]["scores"]
+        den = br["replay"]["den_norm_at_horizon"]
+        assert set(den) == {"adamw", "adams"}, "per-optimizer denominators"
+        assert br["replay"]["dense_cache_hit"] == {
+            "adamw": True, "adams": True}, \
+            "both optimizer families hit their own cache entries"
+        keys = {}
+        for opt in ("adamw", "adams"):
+            for fold in (False, True):
+                for dl in (None, "0.5"):
+                    # key-suffix rule: every axis that recurs in the run
+                    # tags every arm it owns (@T{t} precedent) — an
+                    # optimizer set tags even its adamw arm, a dl set even
+                    # its scale-1.0 arm (@dl1)
+                    key = score + f"@{opt}"
+                    if fold:
+                        key += "@fold"
+                    key += "@dl1" if dl is None else "@dl0.5"
+                    keys[(opt, fold, dl)] = key
+                    assert key in scores, (key, sorted(scores))
+                    dist = scores[key]["distortion"]
+                    got = {int(h): (None if dist[str(h)] is None
+                                    else dist[str(h)] * den[opt][str(h)])
+                           for h in range(1, W + 1)}
+                    for h in range(1, W + 1):
+                        assert got[h] == solo[(opt, fold, dl)][h], (
+                            f"mixed run arm {key} d@{h} diverged from the "
+                            f"solo run: {got[h]} vs {solo[(opt, fold, dl)][h]}")
+        # exactly the 8 collision-suffixed keys, nothing else
+        assert set(scores) == set(keys.values()), sorted(scores)
+        # per-optimizer score stats nest under the family name
+        assert set(br["scores"]) == {f"{score}@adamw", f"{score}@adams"}
+    print("PASS test_param_axes_mixed_equivalence")
+
+
+def test_dual_lr_token_grammar():
+    """Token resolution: T/t/T-k forms resolve against the run's T; the
+    plain-float form is absolute; gates reject non-numbers, bad divisors,
+    negative/nan scales, colliding resolutions, and resolutions that stay
+    distinct as floats but collide under the report key's %g rendering."""
+    R = soa
+    assert R.resolve_dual_lr_token("T", 3) == 3.0
+    assert R.resolve_dual_lr_token("t", 3) == 3.0
+    assert R.resolve_dual_lr_token("T/2", 3) == 1.5
+    assert R.resolve_dual_lr_token("t/4", 3) == 0.75
+    assert R.resolve_dual_lr_token("0.5", 3) == 0.5
+    assert R.parse_dual_lr_set("T,0.5", [3]) == ["0.5", "T"]  # scale order
+    for bad in ("abc", "T/", "T/0", "T/-2", "T/nan"):
+        try:
+            R.resolve_dual_lr_token(bad, 3)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"token {bad!r} accepted")
+    for spec in ("-1", "nan", "inf", "T,-1"):
+        try:
+            R.parse_dual_lr_set(spec, [3])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"dual-lr set {spec!r} accepted")
+    # duplicate tokens and colliding resolutions at some T in the run
+    for spec, lens in (("1,1", [3]), ("1,T", [1]), ("T/2,1", [2])):
+        try:
+            R.parse_dual_lr_set(spec, lens)
+        except ValueError as e:
+            assert "collide" in str(e) or "duplicate" in str(e), str(e)
+        else:
+            raise AssertionError(f"dual-lr set {spec!r} at {lens} accepted")
+    # distinct scales that RENDER alike under the report key's %g form
+    # (6 significant digits) would silently overwrite each other in the
+    # scores dict — the parse gate refuses them by name
+    for spec in ("1000000,1000001", "0.123456789,0.1234567889"):
+        try:
+            R.parse_dual_lr_set(spec, [3])
+        except ValueError as e:
+            assert "report key" in str(e) and "%g" in str(e), str(e)
+        else:
+            raise AssertionError(f"dual-lr set {spec!r} accepted")
+    # near neighbours that DO stay distinct at 6 significant digits pass
+    assert R.parse_dual_lr_set("0.5,0.6", [3]) == ["0.5", "0.6"]
+    print("PASS test_dual_lr_token_grammar")
 
 
 def test_boundary_reselect_changes_mask():
@@ -354,7 +591,7 @@ def test_boundary_reselect_changes_mask():
         num_at = _run_module(td, name, w0, m0, v0, t0, W, score, ratio_pct, T)
         ref = _ref_num_at(w0, m0, v0, logged, norms, lrs, 0.0, t0, score, ratio_pct, T)
         for h in range(1, W + 1):
-            assert _close(num_at[h], ref[h], 1e-9), (
+            assert _close(num_at[h], ref[h], 1e-3), (
                 f"d@{h}: module {num_at[h]} vs re-selecting ref {ref[h]}")
     print("PASS test_boundary_reselect_changes_mask")
 
@@ -572,7 +809,8 @@ def test_cli_rejects_invalid_options():
     """The CLI gate rejects each invalid option value with the option named,
     before any trace access (deep ZeroDivisionErrors and silently empty
     reports are not acceptable diagnostics)."""
-    base = ["--trace-dir", "/nonexistent-sga-trace-dir"]
+    base = ["--trace-dir", "/nonexistent-sga-trace-dir",
+            "--selection-semantics", "topk"]
     cases = [
         (["--replay-mode", "cycle", "--cycle-len", "0"], "--cycle-len"),
         # the loud gate: cycle always routes to the fused engine, which
@@ -587,6 +825,27 @@ def test_cli_rejects_invalid_options():
         (["--branch-point", ","], "--branch-point"),
         (["--dense-cache", "/tmp/x", "--self-check", "1", "2"],
          "--dense-cache"),
+        (["--branch-point", "1", "--replay-dtype", "fp64"],
+         "fp64 is reserved for --self-check"),
+        (["--branch-point", "1", "--norm-dtype", "fp64"],
+         "fp64 is reserved for --self-check"),
+        # per-config axis flags: parse gates name the flag; the axis flags
+        # outside cycle mode name the mode gate
+        (["--replay-mode", "cycle", "--optimizer", "sgd"],
+         "not a replay optimizer"),
+        (["--replay-mode", "cycle", "--fold", "maybe"],
+         "'off' or 'on'"),
+        (["--replay-mode", "cycle", "--dual-lr", "T/0"],
+         "divisor after 'T/'"),
+        (["--replay-mode", "cycle", "--dual-lr", "abc"],
+         "neither a number nor"),
+        (["--replay-mode", "cycle", "--dual-lr", "-1"],
+         "finite >= 0"),
+        (["--replay-mode", "cycle", "--cycle-len", "1", "--dual-lr", "1,T"],
+         "collide at T=1"),
+        (["--optimizer", "adams"], "only supported with"),
+        (["--fold", "on"], "only supported with"),
+        (["--dual-lr", "0.5"], "only supported with"),
     ]
     for extra, opt in cases:
         try:
@@ -612,7 +871,8 @@ def test_print_summary_zero_distortion():
         with redirect_stdout(buf):
             report = soa.main(["--trace-dir", td, "--branch-point", str(t0),
                                "--window", str(W), "--ratios", "50",
-                               "--horizons", "2"])
+                               "--horizons", "2",
+                               "--selection-semantics", "topk"])
     met = report["branch_results"][str(t0)]["per_ratio"]["50.0"]["scores"]
     for m in met.values():
         assert m["distortion"] == {"2": None}
@@ -620,6 +880,8 @@ def test_print_summary_zero_distortion():
     # effective-engine flag (only cycle routes to the fused engine)
     assert report["config"]["fused"] is False
     assert report["config"]["fused_effective"] is False
+    assert report["config"]["replay_dtype"] == "fp32"
+    assert report["config"]["norm_dtype"] == "fp32"
     assert "N/A" in buf.getvalue(), "printer must render the None cell"
     print("PASS test_print_summary_zero_distortion")
 
@@ -675,13 +937,21 @@ def test_dense_cache_ident_engine_fence():
     """cpu and dev dense engines must never share a cache file: dense_replay
     quantizes horizon diffs to fp32 before squaring, dense_replay_dev does
     not — a shared ident would silently serve wrong denominators across
-    device migrations of the same trace."""
+    device migrations of the same trace. The optimizer axis fences the same
+    way (AdamW/AdamS dense trajectories differ), while the default adamw
+    ident must stay exactly its historical string (existing caches stay
+    hits)."""
     base = ("trace", 0, [1, 2], [1, 2], torch.float32, "fp32")
     i_cpu = soa._dense_cache_ident(*base, "cpu")
     i_dev = soa._dense_cache_ident(*base, "dev")
     assert i_cpu != i_dev
     assert (soa._dense_cache_path("cache", i_cpu)
             != soa._dense_cache_path("cache", i_dev))
+    i_adams = soa._dense_cache_ident(*base, "cpu", optimizer="adams")
+    assert i_adams != i_cpu
+    assert "|optimizer=adams" in i_adams
+    assert "|optimizer=" not in i_cpu, \
+        "default adamw ident must stay byte-identical (old caches hit)"
     print("PASS test_dense_cache_ident_engine_fence")
 
 
@@ -824,7 +1094,9 @@ def test_self_check_trace_dtype():
     identical with and without the flag — only the echoed field differs);
     on a bf16 copy the self-check without the flag fails loudly (the bf16
     gate) instead of silently ignoring it, and with the flag it reports
-    trace_dtype "bf16"."""
+    trace_dtype "bf16". These calls deliberately omit --selection-semantics:
+    the default balanced selector is irrelevant to dense self-check and is
+    exempt from the zerofill compatibility gate."""
     torch.manual_seed(13)
     t0, W, n = 900, 5, 16
     pre = [torch.randn(n) * 0.02 for _ in range(W)]
@@ -836,11 +1108,14 @@ def test_self_check_trace_dtype():
                                 "v": {name: v0}, "g": {name: torch.randn(n)}},
                     "meta": {**BASE_META, "step": t0 + W}},
                    os.path.join(td, f"step_{t0 + W:06d}_state.pt"))
-        argv = ["--trace-dir", td, "--self-check", str(t0), str(t0 + W)]
+        argv = ["--trace-dir", td, "--self-check", str(t0), str(t0 + W),
+                "--replay-dtype", "fp64"]
         buf = io.StringIO()
         with redirect_stdout(buf):
             r_fp = soa.main(list(argv))
             r_up = soa.main(argv + ["--trace-dtype", "bf16"])
+        assert r_fp["config"]["replay_dtype"] == "fp64"
+        assert r_up["config"]["replay_dtype"] == "fp64"
         sc_fp, sc_up = r_fp["self_check"], r_up["self_check"]
         assert sc_fp.pop("trace_dtype") == "fp32"
         assert sc_up.pop("trace_dtype") == "bf16"
@@ -864,7 +1139,8 @@ def test_self_check_trace_dtype():
                             for k, v in d["payload"].items()}
             torch.save(d, os.path.join(bf, f"step_{t0 + si:06d}_g.pt"))
 
-        argv_bf = ["--trace-dir", bf, "--self-check", str(t0), str(t0 + W)]
+        argv_bf = ["--trace-dir", bf, "--self-check", str(t0), str(t0 + W),
+                   "--replay-dtype", "fp64"]
         try:
             with redirect_stdout(buf):
                 soa.main(list(argv_bf))
@@ -878,85 +1154,54 @@ def test_self_check_trace_dtype():
     print("PASS test_self_check_trace_dtype")
 
 
-def test_norm_dtype_fp32():
-    """--norm-dtype fp32: with clipping inactive the norm is unused and the
-    replay is bitwise identical; with active clipping the fp32-quantized
-    pass-1 norms perturb the trajectory only at the band scale."""
-    torch.manual_seed(13)
-    t0, W, n = 900, 6, 24
-    lrs = [5e-5] * W
-    # clip inactive (clip=0): coef is structurally 1, the norm is never
-    # consumed
-    pre = [torch.randn(n) * 0.02 for _ in range(W)]
-    with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0, _logged, _norms = _make_trace(td, pre, lrs, 0.0, t0, n)
-        a = _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 25.0, 2,
-                        norm_fp32=False)
-        b = _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 25.0, 2,
-                        norm_fp32=True)
-        assert a == b, "clip-inactive replay must not depend on norm dtype"
-    # clip active (norms >> clip): fp32 quantization of the pass-1 norms
-    # perturbs coef at ~1e-7 relative; the trajectory stays within the band
-    pre = [torch.randn(n) * 0.5 for _ in range(W)]
-    with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0, _logged, _norms = _make_trace(td, pre, lrs, 0.3, t0, n)
-        a = _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 25.0, 2,
-                        norm_fp32=False)
-        b = _run_module(td, name, w0, m0, v0, t0, W, "abs_g", 25.0, 2,
-                        norm_fp32=True)
-        # the flag must actually fire on the clip-active arm: a no-op
-        # norm_fp32 would produce b == a, trivially inside the band
-        assert any(b[h] != a[h] for h in a), \
-            "fp32-norm quantization must perturb the clipped trajectory"
-        for h in a:
-            assert (a[h] == 0.0) == (b[h] == 0.0), f"d@{h}: {a[h]} vs {b[h]}"
-            if a[h] != 0.0:
-                assert _close(b[h], a[h], 1e-4), (
-                    f"fp32-norm d@{h} outside band: {b[h]} vs {a[h]}")
-    print("PASS test_norm_dtype_fp32")
-
-
-def test_replay_dtype_fp32():
-    """--replay-dtype fp32 anchors the fused worker's fp32 branch: state,
-    residual and q stay fp32 (no fp64 cast at the commit), so the
-    trajectory matches the from-spec fp64 reference only to the fp32 band,
-    and the flag visibly fires (the fp32 numbers differ from the fp64
-    run's)."""
+def test_fp32_scan_policy():
+    """Production scans are fp32-only; fp64 remains available to self-check."""
     torch.manual_seed(14)
     t0, W, n = 1100, 6, 24
-    pre = [torch.randn(n) * 0.5 for _ in range(W)]  # norms >> clip -> active
+    pre = [torch.randn(n) * 0.5 for _ in range(W)]
     lrs = [5e-5] * W
     clip = 0.3
     with tempfile.TemporaryDirectory() as td:
-        name, w0, m0, v0, logged, norms = _make_trace(td, pre, lrs, clip, t0, n)
-        f64 = _run_module(td, name, w0, m0, v0, t0, W, "coi", 50.0, 2)
-        f32 = _run_module(td, name, w0, m0, v0, t0, W, "coi", 50.0, 2,
-                          replay_dtype=torch.float32)
-        ref = _ref_num_at(w0, m0, v0, logged, norms, lrs, clip, t0, "coi",
-                          50.0, 2)
-        # the branch must actually fire: fp32 state/q/res move the numbers
-        assert any(f32[h] != f64[h] for h in f64), \
-            "--replay-dtype fp32 must not be a silent no-op"
-        # sub-ulp distortions collapse to exact 0.0 in fp32 (h=1 here:
-        # ref ~4e-13 -> 0.0); above that noise floor the fp32 trajectory
-        # tracks the from-spec fp64 reference to ~5e-4 relative -> band 1e-3
+        name, w0, m0, v0, logged, norms = _make_trace(
+            td, pre, lrs, clip, t0, n)
+        got = _run_module(td, name, w0, m0, v0, t0, W, "coi", 50.0, 2)
+        ref = _ref_num_at(w0, m0, v0, logged, norms, lrs, clip, t0,
+                          "coi", 50.0, 2)
         floor = 1.0e-8
-        for h in f32:
+        for h in got:
             if ref[h] < floor:
-                assert f32[h] < floor, \
-                    f"d@{h}: {f32[h]} above the fp32 noise floor " \
-                    f"(ref {ref[h]})"
+                assert got[h] < floor, (h, got[h], ref[h])
             else:
-                rel = abs(f32[h] - ref[h]) / abs(ref[h])
-                assert rel < 1e-3, (
-                    f"fp32 d@{h} outside band: {f32[h]} vs ref {ref[h]}")
-    print("PASS test_replay_dtype_fp32")
+                assert _close(got[h], ref[h], 1e-3), (h, got[h], ref[h])
+
+        catalog, names, offsets, N, state_files, g_files = soa.discover_trace(td)
+        ctx = {"trace_dir": os.path.abspath(td), "names": names,
+               "offsets": offsets, "N": N, "state_files": state_files,
+               "g_files": g_files, "catalog": catalog}
+        args = argparse.Namespace(
+            replay_mode="cycle", self_check=None,
+            dense_cache=os.path.join(td, "bad-cache"), score_names=["coi"],
+            fused_shards=1, fused_max_configs=1, ratios=[50.0],
+            horizons=[W], window=W, cycle_len=2, replay_dtype="fp64",
+            trace_dtype="fp32", norm_dtype="fp32", chunk_mb=1,
+            device="cpu", seed=1234, verbose=False,
+        )
+        try:
+            replay_fused.run_fused_branch(args, ctx, t0)
+        except ValueError as e:
+            assert "fp64 is reserved for --self-check" in str(e), e
+        else:
+            raise AssertionError("fp64 production scan accepted")
+    print("PASS test_fp32_scan_policy")
 
 
 def main():
     test_T1_is_dense()
     test_no_fold_within_window()
     test_multicycle_with_clipping()
+    test_param_axes_vs_reference()
+    test_param_axes_mixed_equivalence()
+    test_dual_lr_token_grammar()
     test_boundary_reselect_changes_mask()
     test_branch_score_formulas()
     test_determinism()
@@ -970,8 +1215,7 @@ def main():
     test_trace_dtype_bf16()
     test_trace_convert_module()
     test_self_check_trace_dtype()
-    test_norm_dtype_fp32()
-    test_replay_dtype_fp32()
+    test_fp32_scan_policy()
     print("\nall replay-cycle tests passed")
 
 
