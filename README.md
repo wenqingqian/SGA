@@ -39,7 +39,7 @@ cd SGA && source env.sh
 - `sga/train_gpt.py` — the torchrun entrypoint; it reuses megatron's
   stock pretraining implementations and GPT build chain unchanged.
 - `sga/launcher/` — multi-node ssh launcher (the training path only:
-  ssh + torchrun + megatron; run/stop/query via `run.py` + hydra).
+  ssh + torchrun + megatron; job control via `run.py` + hydra).
 - `sga/replay.py`, `sga/replay_fused.py` — offline replay. Record one
   training window, then evaluate any score × ratio × cycle-length
   configuration offline. The fused engine advances a whole config group
@@ -56,6 +56,52 @@ cd SGA && source env.sh
   pip-installed megatron would shadow the source tree. `setup.sh`
   prints an environment and sibling-repo report against
   `manifest.yaml`.
+
+## Running a training job
+
+`run.py` is a hydra shim over the launcher. Given a config it wires
+MegatronBackend + SshLauncher: ssh to each node named in the hostfile,
+run the config's `cmds.before_start` hook there (activate the training
+environment and `source env.sh`, which puts the Megatron-LM source on
+`PYTHONPATH`), then start torchrun with the entrypoint
+`sga/train_gpt.py` — which drives megatron's stock pretraining loop
+unchanged.
+
+A config is one flat yaml with three sections:
+
+- `experiment:` — launch and outputs: `exp_name`, `exp_dir`, `runner`
+  (`nnodes`, `nproc_per_node`, `hostfile`, `ssh_port`, `master_port`),
+  the `cmds.before_start` hook, and `envs`.
+- `train:` — megatron's own arguments; leaf keys are megatron CLI arg
+  names, and node-count-dependent values (e.g. `global_batch_size`)
+  are set per launch.
+- `sga:` — the plugin axes, validated before launch and handed to the
+  entrypoint as flat `--sga-*` flags. `sga_enabled: false` (the dense
+  presets) leaves the job a plain megatron run.
+
+The top-level `action` key selects what the launcher does:
+
+| action | effect |
+| --- | --- |
+| `run` | background launch (remote nohup); the console tails node 0's log during startup, then the launcher returns while the job runs on |
+| `test` | foreground launch: stream the job output and return when it exits |
+| `dryrun` | print the per-node launch plan without touching the nodes |
+| `query` | report the status of a running job |
+| `stop` | stop a running job |
+
+```bash
+python run.py --config-path examples/llama3 --config-name train_1b_dense \
+    action=run experiment.exp_name=dense-1b experiment.exp_dir=./dense-1b \
+    experiment.runner.nnodes=2 experiment.runner.hostfile=hostfile.txt \
+    train.model.global_batch_size=16
+```
+
+The hostfile (not committed; the example configs default to
+`examples/<model>/hostfile.txt`) carries one `<ip> slots=8` line per
+node — a missing hostfile only WARNs and the job runs local-only. For
+a sparse run, point `--config-name` at an SGA preset or override the
+`sga:` keys; `experiments/example/` walks the whole
+trace → replay → sparse-run workflow end to end.
 
 ## Offline replay (fused)
 
