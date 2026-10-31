@@ -31,15 +31,16 @@ cd SGA && source env.sh
   AdamW optimizer.
 - `sga/backends/` — gradient-sync backends: `torch_pipelined_index` and
   `torch_pipelined_mask` (active), and `nccl_pipelined_index`
-  (deprecated for now; code and tests are kept). `dense` is not a
+  (deprecated for now, but code and tests are kept). `dense` is not a
   backend class — it is the SGA-off value of `sga_backend`.
 - `sga/config/` — single-layer yaml validation. Keys under the `sga:`
-  section reach the training entry as flat `--sga-*` flags and are
-  validated there; they never mix into megatron's `train.*` arguments.
-- `sga/train_gpt.py` — the torchrun entrypoint; it reuses megatron's
+  section reach the training entry as flat `--sga-*` flags, are
+  validated there, and never mix into megatron's `train.*` arguments.
+- `sga/train_gpt.py` — the torchrun entrypoint. It reuses megatron's
   stock pretraining implementations and GPT build chain unchanged.
-- `sga/launcher/` — multi-node ssh launcher (the training path only:
-  ssh + torchrun + megatron; job control via `run.py` + hydra).
+- `sga/launcher/` — multi-node ssh launcher for the training path
+  (ssh + torchrun + megatron). Job control goes through
+  `run.py` + hydra.
 - `sga/replay.py`, `sga/replay_fused.py` — offline replay. Record one
   training window, then evaluate any score × ratio × cycle-length
   configuration offline. The fused engine advances a whole config group
@@ -72,7 +73,7 @@ A config is one flat yaml with three sections:
 - `experiment:` — launch and outputs: `exp_name`, `exp_dir`, `runner`
   (`nnodes`, `nproc_per_node`, `hostfile`, `ssh_port`, `master_port`),
   the `cmds.before_start` hook, and `envs`.
-- `train:` — megatron's own arguments; leaf keys are megatron CLI arg
+- `train:` — megatron's own arguments. Leaf keys are megatron CLI arg
   names, and node-count-dependent values (e.g. `global_batch_size`)
   are set per launch.
 - `sga:` — the plugin axes, validated before launch and handed to the
@@ -83,7 +84,7 @@ The top-level `action` key selects what the launcher does:
 
 | action | effect |
 | --- | --- |
-| `run` | background launch (remote nohup); the console tails node 0's log during startup, then the launcher returns while the job runs on |
+| `run` | background launch (remote nohup). The console tails node 0's log during startup, then the launcher returns while the job runs on |
 | `test` | foreground launch: stream the job output and return when it exits |
 | `dryrun` | print the per-node launch plan without touching the nodes |
 | `query` | report the status of a running job |
@@ -96,11 +97,13 @@ python run.py --config-path examples/llama3 --config-name train_1b_dense \
     train.model.global_batch_size=16
 ```
 
-The hostfile (not committed; the example configs default to
-`examples/<model>/hostfile.txt`) carries one `<ip> slots=8` line per
-node — a missing hostfile only WARNs and the job runs local-only. For
-a sparse run, point `--config-name` at an SGA preset or override the
-`sga:` keys; `experiments/example/` walks the whole
+The hostfile is not committed. The example configs default to
+`examples/<model>/hostfile.txt`: create it there with one
+`<ip> slots=8` line per node. A missing hostfile only WARNs, and the
+job runs local-only.
+
+For a sparse run, point `--config-name` at an SGA preset or override
+the `sga:` keys. `experiments/example/` walks the whole
 trace → replay → sparse-run workflow end to end.
 
 ## Offline replay (fused)
@@ -118,7 +121,7 @@ window (mixed cycle lengths via `--cycle-lens`, group size derived
 from a state-byte budget via `--fused-state-budget-mb`), sharded
 across GPUs, and spans nodes with `--nodes` (ssh-launched shards over
 a shared filesystem). A single-shard run reproduces per-config replay
-bitwise; a multi-shard run stays within a small pure reordering band.
+bitwise. A multi-shard run stays within a small pure reordering band.
 The branch point is a global training step number (train iteration):
 `--branch-point 40` replays from the optimizer-state snapshot saved at
 the 40th train iteration and consumes the `--window` recorded gradient
