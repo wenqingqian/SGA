@@ -1261,7 +1261,6 @@ def test_async_multiworker_failure_cleanup():
             assert sorted(released) == [0, 1, 2, 3], released
             assert len(released) == len(set(released))
             assert writer._reserved == 0 and writer._inflight == 0
-            assert writer._active_workers == 0
             assert not any(t.is_alive() for t in writer._threads)
             assert not _tmp_files(td)
             assert writer.stats["error"] is not None
@@ -1558,6 +1557,46 @@ def test_pinned_cuda_backend_guards_and_optional_parity():
     print("PASS test_pinned_cuda_backend_guards_and_optional_parity")
 
 
+def test_pinned_cuda_resume_skip_and_refuse():
+    """pinned_cuda re-runs skip bitwise-equal published targets on the
+    caller thread (the writer never loads published files) and refuse a
+    differing one — same resume contract as cpu_snapshot."""
+    if not torch.cuda.is_available():
+        print("SKIP pinned CUDA resume skip (CUDA unavailable)")
+        return
+
+    def _dump(td, offset=0.0):
+        grad = torch.linspace(-3, 3, 257, device="cuda") + offset
+        col = TraceCollector(
+            dir=td, branch_points=[], window=1,
+            async_enabled=True, async_backend="pinned_cuda",
+            async_queue_depth=2, async_worker_count=1,
+            async_max_workset_gib=0.05)
+        col._entries = [("g", SimpleNamespace(
+            main_param=SimpleNamespace(grad=grad)), 0)]
+        col._dump_grad(0, {"step": 0})
+        return col.close()
+
+    with tempfile.TemporaryDirectory() as td:
+        target = os.path.join(td, "step_000000_g.pt")
+        stats = _dump(td)
+        assert stats["written"] == 1 and stats["error"] is None, stats
+        mtime = os.stat(target).st_mtime_ns
+        stats = _dump(td)                    # identical payload -> skip
+        assert stats["skipped_existing"] == 1, stats
+        assert stats["written"] == 0 and stats["enqueued"] == 0, stats
+        assert os.stat(target).st_mtime_ns == mtime
+        bad = torch.load(target, weights_only=False)
+        bad["payload"] = {k: v + 1.0 for k, v in bad["payload"].items()}
+        torch.save(bad, target)
+        try:
+            _dump(td)
+            raise AssertionError("overwrite of a differing target accepted")
+        except ValueError as e:
+            assert "different values" in str(e), e
+    print("PASS test_pinned_cuda_resume_skip_and_refuse")
+
+
 def test_async_constructor_guards():
     """Direct-construction backstops for the async knobs (the engine-test
     route seeds config without validation; same discipline as dump_dtype)."""
@@ -1617,6 +1656,7 @@ def main():
     test_async_phase_timer_keys_and_accounting()
     test_async_close_bounded_and_values_match_helper()
     test_pinned_cuda_backend_guards_and_optional_parity()
+    test_pinned_cuda_resume_skip_and_refuse()
     test_async_constructor_guards()
     print("\nall trace tests passed")
 

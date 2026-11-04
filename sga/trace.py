@@ -10,12 +10,15 @@ collector never mutates any tensor consumed by training (world-rank-0
 only). The default is fully synchronous — the dump runs at most once per
 step inside a configured window and ``sga_trace_async`` (opt-in,
 default false) selects a background writer. Its default ``cpu_snapshot``
-backend preserves the current blocking independent CPU snapshot semantics.
+backend keeps the blocking independent CPU snapshot semantics.
 The separate explicit ``pinned_cuda`` backend submits nonblocking D2H directly
 from immutable dump-slot gradients into bounded reusable pinned buffers on a
 dedicated CUDA stream, synchronizes that stream before optimizer mutation, and
-then overlaps one or more atomic file writers with subsequent training. Catalog
-and branch-point state files always stay synchronous.
+then overlaps one or more atomic file writers with subsequent training. The
+pinned_cuda pool is sized at the first traced step (a cap too small for one
+slot per writer fails loudly there, not at startup), and the gradient layout
+and single CUDA device are frozen from that first dump. Catalog and
+branch-point state files always stay synchronous.
 The writer preserves state-before-gradient publication, bounds queued
 snapshots independently of synchronous state saves, and records native
 per-phase timers.
@@ -182,9 +185,9 @@ def _process_alive(pid: int) -> bool:
 
 def _record_phase(stats: dict, phase: str, elapsed: float) -> None:
     """Fold one phase measurement into its {n, s, max_s} triple. The keys
-    are pre-initialized in the stats dict (a stable diagnostics shape);
-    callers mutate only their own phase's keys, so no lock is needed
-    beyond the GIL (same contract as the rest of stats)."""
+    are pre-initialized in the stats dict (a stable diagnostics shape).
+    Best-effort: a concurrent writer may lose a race on a counter —
+    diagnostics only, never control flow."""
     stats[f"{phase}_n"] += 1
     stats[f"{phase}_s"] += float(elapsed)
     if elapsed > stats[f"{phase}_max_s"]:
@@ -195,17 +198,16 @@ class _PendingWrite:
     """One accepted g item on its way to disk."""
 
     __slots__ = ("step", "meta", "payload", "reservation", "seq",
-                 "release_slot", "cast_dtype")
+                 "release_slot")
 
     def __init__(self, step, meta, payload, reservation, seq,
-                 release_slot=None, cast_dtype=None):
+                 release_slot=None):
         self.step = step
         self.meta = meta
         self.payload = payload
         self.reservation = reservation
         self.seq = seq
         self.release_slot = release_slot
-        self.cast_dtype = cast_dtype
 
 
 class _PinnedCudaSlot:
@@ -239,9 +241,10 @@ class _AsyncGradWriter:
 
     ``_cv`` guards: ``_queue``, ``_reserved`` (bytes), ``_inflight``
     (accepted-but-unfinished items — the depth budget counts queue + the
-    item under the writer's pen), ``_error``, ``_closed``. ``stats`` is
-    mutated by both threads on disjoint keys (GIL-sufficient); a snapshot
-    for reporting is taken under the lock.
+    item under a writer's pen), ``_error``, ``_closed``. ``stats``
+    diagnostics are updated by the caller and every worker (best-effort
+    counters; a concurrent update may be lost); a snapshot for reporting
+    is taken under the lock.
 
     ``stats`` phase timers are async-only and expose ``<name>_n``,
     ``<name>_s`` and ``<name>_max_s`` for ``snapshot``, ``d2h_submit``,
@@ -251,6 +254,11 @@ class _AsyncGradWriter:
 
     def __init__(self, dir: str, queue_depth: int, max_workset_bytes: int,
                  worker_count: int = 1):
+        if (not isinstance(worker_count, int)
+                or isinstance(worker_count, bool) or worker_count < 1):
+            raise ValueError(
+                f"trace async writer worker_count must be an int >= 1 "
+                f"(got {worker_count!r})")
         self._dir = dir
         self._max_depth = int(queue_depth)
         self._cap = int(max_workset_bytes)
@@ -263,7 +271,6 @@ class _AsyncGradWriter:
         self._error_raised = False      # close raises it exactly once
         self._closed = False
         self._threads = []
-        self._active_workers = 0
         self._seq = 0
         self.stats = {
             "enqueued": 0, "written": 0, "written_bytes": 0,
@@ -292,7 +299,6 @@ class _AsyncGradWriter:
             target=self._writer_loop,
             name=f"sga-trace-async-writer-{i}", daemon=True)
             for i in range(self._worker_count)]
-        self._active_workers = len(self._threads)
         for thread in self._threads:
             thread.start()
         # Best-effort close for training-side early exceptions: the success
@@ -380,8 +386,7 @@ class _AsyncGradWriter:
             self._cv.notify_all()
 
     def submit(self, step: int, meta: dict, payload: dict,
-               reservation_bytes: int, *, release_slot=None,
-               cast_dtype=None) -> None:
+               reservation_bytes: int, *, release_slot=None) -> None:
         """Hand a completed independent CPU snapshot to the writer."""
         with self._cv:
             if self._error is not None:
@@ -393,12 +398,13 @@ class _AsyncGradWriter:
             self._seq += 1
             self._queue.append(_PendingWrite(
                 step, meta, payload, int(reservation_bytes), self._seq,
-                release_slot=release_slot, cast_dtype=cast_dtype))
+                release_slot=release_slot))
             self.stats["enqueued"] += 1
             self._cv.notify_all()
 
     def existing_matches(self, step: int, meta: dict, payload: dict) -> bool:
-        """Resume-safe publication check (main thread, reservation held):
+        """Resume-safe publication check (caller thread, before submit —
+        synchronous, outside the writer's async budget):
         an existing target with bitwise-equal payload and matching meta is
         skipped; anything else (unreadable, different content) refuses the
         overwrite — a rerun must name an empty directory."""
@@ -450,11 +456,9 @@ class _AsyncGradWriter:
                     if self._queue:
                         while self._queue:
                             self._release_item_locked(self._queue.popleft())
-                    self._active_workers -= 1
                     self._cv.notify_all()
                     return
                 if not self._queue:
-                    self._active_workers -= 1
                     self._cv.notify_all()
                     return
                 item = self._queue.popleft()
@@ -465,17 +469,8 @@ class _AsyncGradWriter:
         tmp = f"{path}.tmp.{os.getpid()}.{item.seq}"
         t0 = time.perf_counter()
         try:
-            payload = item.payload
-            if item.cast_dtype is not None:
-                cast0 = time.perf_counter()
-                payload = {name: tensor.to(item.cast_dtype)
-                           for name, tensor in payload.items()}
-                _record_phase(self.stats, "cast",
-                              time.perf_counter() - cast0)
-            skipped = self.existing_matches(item.step, item.meta, payload)
-            if not skipped:
-                torch.save({"meta": item.meta, "payload": payload}, tmp)
-                os.replace(tmp, path)
+            torch.save({"meta": item.meta, "payload": item.payload}, tmp)
+            os.replace(tmp, path)
         except BaseException as e:
             # a failed write still accounts its elapsed time, then latches
             _record_phase(self.stats, "write", time.perf_counter() - t0)
@@ -488,7 +483,8 @@ class _AsyncGradWriter:
                     self._error = e  # latch the ORIGINAL exception object
                     self.stats["error"] = repr(e)
                     self.stats["error_step"] = item.step
-                    # fail-closed: the backlog is not written either
+                    # fail-closed: the queued backlog is dropped (an item
+                    # already under a writer's pen may still publish)
                     while self._queue:
                         self._release_item_locked(self._queue.popleft())
                 self._release_item_locked(item)
@@ -496,17 +492,15 @@ class _AsyncGradWriter:
             return
         _record_phase(self.stats, "write", time.perf_counter() - t0)
         try:
-            written = (os.path.getsize(path)
-                       if not skipped and os.path.exists(path) else 0)
+            written = os.path.getsize(path)
         except OSError:
-            written = item.reservation // 2
+            written = item.reservation
         if item.release_slot is not None:
             item.release_slot()
             item.release_slot = None
         with self._cv:
-            if written:
-                self.stats["written"] += 1
-                self.stats["written_bytes"] += written
+            self.stats["written"] += 1
+            self.stats["written_bytes"] += written
             self._release_item_locked(item)
             self._cv.notify_all()
 
@@ -605,7 +599,7 @@ class TraceCollector:
 
     The engine passes the canonical values of ``sga_trace_dir`` /
     ``sga_trace_branch_points`` / ``sga_trace_window`` /
-    ``sga_trace_dump_dtype`` and the three async knobs straight through
+    ``sga_trace_dump_dtype`` and the async knobs straight through
     (already typed and validated; ``parse_branch_points`` below is the
     idempotent guard for direct construction)."""
 
@@ -665,7 +659,7 @@ class TraceCollector:
         self._catalog_written = False          # per process (resume-safe)
         self._writer = None                    # lazy, async mode, rank 0
         self._drained = False                  # final drain happened
-        self._copy_stream = None               # pinned_cuda, lazy per device
+        self._copy_stream = None  # pinned_cuda; one stream, single-device dumps
         self._slot_cv = threading.Condition(threading.Lock())
         self._pinned_slots = []                # bounded reusable host buffers
         self._free_pinned_slots = deque()
@@ -873,7 +867,7 @@ class TraceCollector:
         """Async g dump: reserve BEFORE any allocation, take the blocking
         independent CPU snapshot on the main thread (timed into the
         ``snapshot`` phase, its bf16 cast into ``cast``), then hand
-        serialization+write to the single writer. Nothing the queue holds
+        serialization+write to the background writer(s). Nothing the queue holds
         aliases training memory, and the payload value semantics are
         identical to the sync path above."""
         entries = [(name, rec) for name, rec, _gi in self._entries
@@ -938,11 +932,11 @@ class TraceCollector:
                         "trace pinned_cuda workset cannot hold one pinned "
                         "slot per writer plus bounded queue serialization "
                         "transients within sga_trace_async_max_workset_gib")
-                self._slot_signature = signature
                 self._pinned_slots = [
                     _PinnedCudaSlot(entries, output_dtype=self._g_dtype)
                     for _ in range(slot_count)]
                 self._free_pinned_slots.extend(self._pinned_slots)
+                self._slot_signature = signature
             elif signature != self._slot_signature:
                 raise RuntimeError(
                     "trace pinned_cuda gradient layout changed after the "
@@ -993,9 +987,9 @@ class TraceCollector:
         slot = self._acquire_pinned_slot(entries, writer)
         output_bytes = sum(t.numel() * t.element_size()
                            for t in slot.payload.values())
-        # Pinned slots are persistent pool storage. Per-item reservation covers
-        # the bounded serialization transient only; pool capacity was checked
-        # at construction against the same global cap.
+        # Pinned slots are persistent pool storage. Per-item reservation
+        # covers the bounded serialization transient only; the pool itself
+        # was sized against the same global cap at first-slot acquisition.
         transient_bytes = min(output_bytes,
                               _SERIALIZATION_TRANSIENT_CAP_BYTES)
         submitted = False
@@ -1020,10 +1014,11 @@ class TraceCollector:
             self._copy_stream.synchronize()
             _record_phase(writer.stats, "d2h_sync",
                           time.perf_counter() - sync0)
-            writer.submit(
-                step, dict(meta), slot.payload, transient_bytes,
-                release_slot=lambda s=slot: self._release_pinned_slot(s))
-            submitted = True
+            if not writer.existing_matches(step, dict(meta), slot.payload):
+                writer.submit(
+                    step, dict(meta), slot.payload, transient_bytes,
+                    release_slot=lambda s=slot: self._release_pinned_slot(s))
+                submitted = True
         finally:
             if not submitted:
                 self._release_pinned_slot(slot)
@@ -1031,7 +1026,7 @@ class TraceCollector:
                     writer.release(transient_bytes)
 
     def _ensure_writer(self) -> _AsyncGradWriter:
-        """Lazy single-writer construction (rank 0, async mode, first g
+        """Lazy writer construction (rank 0, async mode, first g
         dump only — a traced run with no window never spawns it)."""
         if self._writer is None:
             self._writer = _AsyncGradWriter(

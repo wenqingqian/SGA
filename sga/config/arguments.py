@@ -245,14 +245,12 @@ def _add_sga_trace_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--sga-trace-async-backend", type=str, default="cpu_snapshot",
         choices=("cpu_snapshot", "pinned_cuda"),
-        help="sga_trace_async only: cpu_snapshot preserves the existing "
-             "blocking independent CPU-copy semantics; pinned_cuda is an "
-             "explicit experimental backend that copies immutable dump-slot "
-             "gradients directly into bounded reusable output-dtype pinned "
-             "buffers with nonblocking D2H on a dedicated CUDA stream, "
-             "synchronizes that stream before optimizer mutation, and then "
-             "overlaps file writing with later training. BF16 is cast on GPU "
-             "before D2H. Default cpu_snapshot.")
+        help="sga_trace_async only: cpu_snapshot takes a blocking "
+             "independent CPU copy; pinned_cuda does nonblocking D2H into "
+             "bounded reusable output-dtype pinned buffers on a dedicated "
+             "CUDA stream (bf16 cast on the GPU first), synchronized "
+             "before optimizer mutation — only the file write overlaps "
+             "training. Default cpu_snapshot.")
     group.add_argument(
         "--sga-trace-async-queue-depth", type=int, default=2,
         help="sga_trace_async only: max in-flight g items (queued + being "
@@ -261,10 +259,8 @@ def _add_sga_trace_args(parser: argparse.ArgumentParser):
              "steady-state writer bottleneck.")
     group.add_argument(
         "--sga-trace-async-worker-count", type=int, default=1,
-        help="sga_trace_async only: number of independent atomic file writer "
-             "threads. Default 1 preserves existing behavior; pinned_cuda "
-             "may use 2 when the storage system benefits from concurrent "
-             "streams. Must be <= queue depth.")
+        help="sga_trace_async only: number of independent atomic file "
+             "writer threads; must be <= queue depth. Default 1.")
     group.add_argument(
         "--sga-trace-async-max-workset-gib", type=float, default=16.0,
         help="sga_trace_async only: hard cap in GiB on async host RAM: "
