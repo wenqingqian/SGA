@@ -916,7 +916,7 @@ def test_async_drains_at_last_target_step():
                 "step_000000_g.pt", "step_000001_g.pt",
                 "step_000002_g.pt"} <= files, files
         assert not _tmp_files(td)
-        assert not eng._trace._writer._thread.is_alive()
+        assert not any(t.is_alive() for t in eng._trace._writer._threads)
         diag = eng._trace.diagnostics()
         assert diag["enqueued"] == 3 and diag["written"] == 3
         assert diag["error"] is None
@@ -975,7 +975,7 @@ def test_async_drain_fence_covers_found_inf_gap():
         assert "step_000001_g.pt" in set(os.listdir(td))
         assert "step_000002_g.pt" not in set(os.listdir(td))  # the skip
         assert not _tmp_files(td)
-        assert not eng._trace._writer._thread.is_alive()
+        assert not any(t.is_alive() for t in eng._trace._writer._threads)
     print("PASS test_async_drain_fence_covers_found_inf_gap")
 
 
@@ -1099,12 +1099,12 @@ def test_async_byte_budget_writer_level():
         cap = 512
         w = _AsyncGradWriter(td, queue_depth=8, max_workset_bytes=cap)
         w.start()
-        w.reserve(nbytes)                        # reserved == cap exactly
-        blocked = threading.Thread(target=lambda: w.reserve(nbytes))
+        w.reserve(cap)                           # reserved == cap exactly
+        blocked = threading.Thread(target=lambda: w.reserve(cap))
         blocked.start()
         time.sleep(0.2)
         assert blocked.is_alive(), "byte budget did not block the second item"
-        w.submit(0, {"step": 0}, payload, nbytes)
+        w.submit(0, {"step": 0}, payload, cap)
         blocked.join(timeout=10)                 # write frees -> reserve runs
         assert not blocked.is_alive()
         stats = w.close()
@@ -1116,7 +1116,7 @@ def test_async_byte_budget_writer_level():
         w2 = _AsyncGradWriter(td, queue_depth=8, max_workset_bytes=cap)
         w2.start()
         try:
-            w2.reserve(nbytes + 8)               # reservation 528 > 512
+            w2.reserve(cap + 16)                 # reservation > 512
             raise AssertionError("oversized item accepted")
         except ValueError as e:
             assert "exceeds" in str(e) and "no oversized bypass" in str(e), e
@@ -1209,6 +1209,81 @@ def test_async_writer_exception_latch_fail_closed():
         eng._trace.close()
         eng._trace.close()
     print("PASS test_async_writer_exception_latch_fail_closed")
+
+
+def test_async_multiworker_failure_cleanup():
+    """With two active writers, one failure discards queued backlog while an
+    already-active peer may finish; simultaneous failures still preserve the
+    first-error latch. Every accepted item's slot callback runs exactly once,
+    reservations drain to zero, and no partial temporary file survives."""
+    real_save = torch.save
+
+    def run_case(both_fail):
+        with tempfile.TemporaryDirectory() as td:
+            writer = _AsyncGradWriter(
+                td, queue_depth=4, max_workset_bytes=1024,
+                worker_count=2)
+            released = []
+            release_lock = threading.Lock()
+
+            def release(step):
+                with release_lock:
+                    released.append(step)
+
+            for step in range(4):
+                writer.reserve(1)
+                writer.submit(
+                    step, {"step": step}, {"g": torch.tensor([float(step)])},
+                    1, release_slot=lambda step=step: release(step))
+
+            rendezvous = threading.Barrier(2)
+
+            def racing_save(obj, path, **kw):
+                step = obj["meta"]["step"]
+                if step in (0, 1):
+                    rendezvous.wait(timeout=5)
+                    if step == 0 or both_fail:
+                        raise _WriterBoom(f"disk exploded at {step}")
+                return real_save(obj, path, **kw)
+
+            with patch("torch.save", side_effect=racing_save):
+                writer.start()
+                try:
+                    writer.close()
+                except _WriterBoom as e:
+                    assert "disk exploded" in str(e)
+                else:
+                    raise AssertionError("multi-worker failure was not raised")
+
+            # The exception is raised once; all later closes are idempotent.
+            writer.close()
+            writer.close()
+            assert sorted(released) == [0, 1, 2, 3], released
+            assert len(released) == len(set(released))
+            assert writer._reserved == 0 and writer._inflight == 0
+            assert writer._active_workers == 0
+            assert not any(t.is_alive() for t in writer._threads)
+            assert not _tmp_files(td)
+            assert writer.stats["error"] is not None
+            assert writer.stats["error_step"] in (0, 1)
+            targets = sorted(f for f in os.listdir(td)
+                             if f.endswith("_g.pt"))
+            assert writer.stats["written"] == len(targets)
+            assert "step_000000_g.pt" not in targets
+            if both_fail:
+                assert targets == []
+            else:
+                # The peer may already own and finish additional items before
+                # the first failure acquires the latch. Unclaimed backlog is
+                # discarded; already-active work is allowed to publish.
+                assert "step_000001_g.pt" in targets
+                assert set(targets) <= {
+                    "step_000001_g.pt", "step_000002_g.pt",
+                    "step_000003_g.pt"}
+
+    run_case(both_fail=False)
+    run_case(both_fail=True)
+    print("PASS test_async_multiworker_failure_cleanup")
 
 
 def test_async_resume_skip_and_refuse_overwrite():
@@ -1417,16 +1492,86 @@ def test_async_close_bounded_and_values_match_helper():
     print("PASS test_async_close_bounded_and_values_match_helper")
 
 
+def test_pinned_cuda_backend_guards_and_optional_parity():
+    """pinned_cuda is explicit, CUDA-only, and preserves sync payloads.
+
+    CPU always exercises the fail-loud device guard.  A CUDA host also runs a
+    focused collector-level parity and pool-reuse check using real pinned
+    memory and a dedicated copy stream synchronized before return.
+    """
+    col = TraceCollector(
+        dir="/tmp/sga-trace-never", branch_points=[], window=1,
+        async_enabled=True, async_backend="pinned_cuda")
+    assert col.async_backend == "pinned_cuda"
+    try:
+        TraceCollector(dir="/tmp/sga-trace-never", branch_points=[], window=1,
+                       async_backend="pinned_cuda")
+        raise AssertionError("pinned backend accepted with async disabled")
+    except ValueError as e:
+        assert "requires" in str(e), e
+    col._entries = [("g", SimpleNamespace(
+        main_param=SimpleNamespace(grad=torch.arange(8.0))), 0)]
+    try:
+        col._dump_grad_pinned_cuda(0, {"step": 0})
+        raise AssertionError("pinned backend accepted CPU gradients")
+    except RuntimeError as e:
+        assert "requires CUDA gradients" in str(e), e
+    finally:
+        col.close()
+
+    if not torch.cuda.is_available():
+        print("SKIP pinned CUDA parity (CUDA unavailable)")
+        return
+    for dump_dtype in ("fp32", "bf16"):
+        with tempfile.TemporaryDirectory() as td:
+            grad = torch.linspace(-3, 3, 257, device="cuda")
+            rec = SimpleNamespace(main_param=SimpleNamespace(grad=grad))
+            col = TraceCollector(
+                dir=td, branch_points=[], window=1, dump_dtype=dump_dtype,
+                async_enabled=True, async_backend="pinned_cuda",
+                async_queue_depth=3, async_worker_count=2,
+                async_max_workset_gib=0.01)
+            col._entries = [("g", rec, 0)]
+            before = grad.detach().cpu()
+            expected = []
+            for step in range(7):  # > slot_count proves blocking reuse
+                grad.copy_(torch.linspace(-3, 3, 257, device="cuda") + step)
+                expected.append(grad.detach().cpu())
+                col._dump_grad(step, {"step": step})
+                grad.add_(1000)  # optimizer-like mutation after D2H completes
+            stats = col.close()
+            for step, before in enumerate(expected):
+                got = torch.load(
+                    os.path.join(td, f"step_{step:06d}_g.pt"),
+                    weights_only=False)["payload"]["g"]
+                want = (before if dump_dtype == "fp32"
+                        else before.to(torch.bfloat16))
+                assert torch.equal(got, want)
+            assert len(col._pinned_slots) == 3
+            assert len(col._free_pinned_slots) == 3
+            assert all(t.is_pinned() for slot in col._pinned_slots
+                       for t in slot.payload.values())
+            assert stats["written"] == 7
+            assert stats["d2h_submit_n"] == 7
+            assert stats["d2h_sync_n"] == 7
+            assert stats["error"] is None
+    print("PASS test_pinned_cuda_backend_guards_and_optional_parity")
+
+
 def test_async_constructor_guards():
     """Direct-construction backstops for the async knobs (the engine-test
     route seeds config without validation; same discipline as dump_dtype)."""
     ok = TraceCollector(dir="/tmp/sga-trace-never", branch_points=[],
-                        window=1, async_enabled=True, async_queue_depth=1,
+                        window=1, async_enabled=True,
+                        async_backend="cpu_snapshot", async_queue_depth=1,
                         async_max_workset_gib=0.5)
-    assert ok.async_enabled and ok.async_queue_depth == 1
+    assert ok.async_enabled and ok.async_backend == "cpu_snapshot"
+    assert ok.async_queue_depth == 1
     assert ok.async_max_workset_gib == 0.5
     for bad in ({"async_queue_depth": 0}, {"async_queue_depth": True},
                 {"async_queue_depth": 1.5},
+                {"async_worker_count": 0}, {"async_worker_count": True},
+                {"async_queue_depth": 1, "async_worker_count": 2},
                 {"async_max_workset_gib": 0.0},
                 {"async_max_workset_gib": -1.0},
                 {"async_max_workset_gib": float("nan")},
@@ -1436,7 +1581,8 @@ def test_async_constructor_guards():
                            window=1, **bad)
             raise AssertionError(f"accepted {bad}")
         except ValueError as e:
-            assert ("queue_depth" in str(e)) or ("workset_gib" in str(e)), e
+            assert ("queue_depth" in str(e) or "worker_count" in str(e)
+                    or "workset_gib" in str(e)), e
     print("PASS test_async_constructor_guards")
 
 
@@ -1464,11 +1610,13 @@ def main():
     test_async_byte_budget_writer_level()
     test_async_oversized_item_fails_before_snapshot()
     test_async_writer_exception_latch_fail_closed()
+    test_async_multiworker_failure_cleanup()
     test_async_resume_skip_and_refuse_overwrite()
     test_async_stale_tmp_cleanup_scoped()
     test_async_rank_gate_no_writer()
     test_async_phase_timer_keys_and_accounting()
     test_async_close_bounded_and_values_match_helper()
+    test_pinned_cuda_backend_guards_and_optional_parity()
     test_async_constructor_guards()
     print("\nall trace tests passed")
 

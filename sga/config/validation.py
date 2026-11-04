@@ -234,8 +234,12 @@ def validate_sga_args(args=None) -> None:
         != sga_defaults()["sga_trace_dump_dtype"]
         or args.sga_trace_async
         != sga_defaults()["sga_trace_async"]
+        or args.sga_trace_async_backend
+        != sga_defaults()["sga_trace_async_backend"]
         or args.sga_trace_async_queue_depth
         != sga_defaults()["sga_trace_async_queue_depth"]
+        or args.sga_trace_async_worker_count
+        != sga_defaults()["sga_trace_async_worker_count"]
         or args.sga_trace_async_max_workset_gib
         != sga_defaults()["sga_trace_async_max_workset_gib"])
     if trace_present:
@@ -252,6 +256,15 @@ def validate_sga_args(args=None) -> None:
         if dd not in ("fp32", "bf16"):
             raise ValueError(
                 f"sga_trace_dump_dtype must be 'fp32' or 'bf16' (got {dd!r})")
+        async_backend = args.sga_trace_async_backend
+        if async_backend not in ("cpu_snapshot", "pinned_cuda"):
+            raise ValueError(
+                "sga_trace_async_backend must be 'cpu_snapshot' or "
+                f"'pinned_cuda' (got {async_backend!r})")
+        if async_backend != "cpu_snapshot" and not args.sga_trace_async:
+            raise ValueError(
+                "sga_trace_async_backend='pinned_cuda' requires "
+                "sga_trace_async=true")
         # Lazy import: sga.trace pulls in torch, so import it only when a
         # trace config is actually present.
         from sga.trace import parse_branch_points
@@ -271,6 +284,16 @@ def validate_sga_args(args=None) -> None:
             raise ValueError(
                 f"sga_trace_async_queue_depth must be an int >= 1 "
                 f"(got {depth!r})")
+        workers = args.sga_trace_async_worker_count
+        if (not isinstance(workers, int) or isinstance(workers, bool)
+                or workers < 1):
+            raise ValueError(
+                f"sga_trace_async_worker_count must be an int >= 1 "
+                f"(got {workers!r})")
+        if workers > depth:
+            raise ValueError(
+                "sga_trace_async_worker_count must be <= "
+                f"sga_trace_async_queue_depth ({workers} > {depth})")
         gib = args.sga_trace_async_max_workset_gib
         if (not isinstance(gib, (int, float)) or isinstance(gib, bool)
                 or not math.isfinite(gib) or gib <= 0.0):

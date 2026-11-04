@@ -257,17 +257,28 @@ def test_trace_validation():
     cfg4.sga.sga_trace_async = True
     ns = _ns_of(cfg4)
     assert ns.sga_trace_async is True
+    assert ns.sga_trace_async_backend == "cpu_snapshot"
     assert ns.sga_trace_async_queue_depth == 2
+    assert ns.sga_trace_async_worker_count == 1
     assert ns.sga_trace_async_max_workset_gib == 16.0
 
     cfg4.sga.sga_trace_async_queue_depth = 0
     expect_error(lambda: _prevalidate_sga(cfg4), "queue_depth")
     cfg4.sga.sga_trace_async_queue_depth = 2
+    cfg4.sga.sga_trace_async_worker_count = 3
+    expect_error(lambda: _prevalidate_sga(cfg4), "worker_count")
+    cfg4.sga.sga_trace_async_worker_count = 1
     cfg4.sga.sga_trace_async_max_workset_gib = 0.0
     expect_error(lambda: _prevalidate_sga(cfg4), "max_workset_gib")
     cfg4.sga.sga_trace_async_max_workset_gib = float("nan")
     expect_error(lambda: _prevalidate_sga(cfg4), "max_workset_gib")
     cfg4.sga.sga_trace_async_max_workset_gib = 16.0
+    cfg4.sga.sga_trace_async_backend = "pinned_cuda"
+    ns = _ns_of(cfg4)
+    assert ns.sga_trace_async_backend == "pinned_cuda"
+    cfg4.sga.sga_trace_async = False
+    expect_error(lambda: _prevalidate_sga(cfg4), "requires")
+    cfg4.sga.sga_trace_async = True
     _prevalidate_sga(cfg4)  # legal posture again
 
     cfg5, _ = make_base()

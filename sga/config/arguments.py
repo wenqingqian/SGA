@@ -240,12 +240,19 @@ def _add_sga_trace_args(parser: argparse.ArgumentParser):
              "way. Default fp32 (zero-drift).")
     group.add_argument(
         "--sga-trace-async", type=sga_bool, default=False,
-        help="offload each step's g-file serialization+write to a single "
-             "background writer after the main thread takes an independent "
-             "blocking CPU snapshot. The queue never holds training/CUDA "
-             "tensors; catalog and branch-point state files stay synchronous. "
-             "Writer failures re-raise fail-closed and the queue drains after "
-             "the last target gradient step. Default false (synchronous).")
+        help="offload each step's g-file serialization+write to a "
+             "background writer. Default false (synchronous).")
+    group.add_argument(
+        "--sga-trace-async-backend", type=str, default="cpu_snapshot",
+        choices=("cpu_snapshot", "pinned_cuda"),
+        help="sga_trace_async only: cpu_snapshot preserves the existing "
+             "blocking independent CPU-copy semantics; pinned_cuda is an "
+             "explicit experimental backend that copies immutable dump-slot "
+             "gradients directly into bounded reusable output-dtype pinned "
+             "buffers with nonblocking D2H on a dedicated CUDA stream, "
+             "synchronizes that stream before optimizer mutation, and then "
+             "overlaps file writing with later training. BF16 is cast on GPU "
+             "before D2H. Default cpu_snapshot.")
     group.add_argument(
         "--sga-trace-async-queue-depth", type=int, default=2,
         help="sga_trace_async only: max in-flight g items (queued + being "
@@ -253,15 +260,19 @@ def _add_sga_trace_args(parser: argparse.ArgumentParser):
              "Default 2 — the queue hides latency spikes, not a "
              "steady-state writer bottleneck.")
     group.add_argument(
+        "--sga-trace-async-worker-count", type=int, default=1,
+        help="sga_trace_async only: number of independent atomic file writer "
+             "threads. Default 1 preserves existing behavior; pinned_cuda "
+             "may use 2 when the storage system benefits from concurrent "
+             "streams. Must be <= queue depth.")
+    group.add_argument(
         "--sga-trace-async-max-workset-gib", type=float, default=16.0,
-        help="sga_trace_async only: hard cap in GiB on the writer's "
-             "host-RAM workset (queued snapshots + the item being "
-             "written + one conservative serialization copy). Each item "
-             "reserves 2x its fp32 snapshot bytes BEFORE the snapshot is "
-             "allocated; a single item whose reservation alone exceeds "
-             "the cap fails before any allocation (no oversized bypass). "
-             "Synchronous state saves are NOT part of this budget. "
-             "Default 16.0.")
+        help="sga_trace_async only: hard cap in GiB on async host RAM: "
+             "persistent queued snapshots plus a bounded per-writer "
+             "serialization transient. The cpu_snapshot backend reserves "
+             "2x payload per item before copying; pinned_cuda sizes its "
+             "reusable output-dtype pool within the cap. Synchronous state "
+             "saves are NOT part of this budget. Default 16.0.")
 
 
 def _add_sga_score_args(parser: argparse.ArgumentParser):
