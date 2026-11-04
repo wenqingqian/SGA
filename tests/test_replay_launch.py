@@ -78,7 +78,7 @@ def _multinode_args(td, cache, t0, shards, device="cpu",
     ns = argparse.Namespace(
         replay_mode="cycle", self_check=None, dense_cache=cache,
         score_names=["abs_g", "update"], fused_shards=shards,
-        fused_max_configs=2, ratios=[20.0, 30.0], horizons=[1, 3, 6],
+        fused_max_configs=2, ratios=[20.0, 30.0], horizons=[6],
         window=6, cycle_len=2, replay_dtype="fp32", trace_dtype="fp32",
         norm_dtype="fp32", chunk_mb=1, device=device, seed=1234,
         verbose=False, preflight_timeout=preflight_timeout,
@@ -130,7 +130,7 @@ def test_cfg_b64_roundtrip():
     scalars/lists only — a tensor here would mean the launcher started
     shipping state that cannot cross an argv)."""
     cfg = {"trace_dir": "/w/trace", "t0": 900, "window": 6,
-           "horizons": [1, 3, 6], "ratios": [20.0, 30.0],
+           "horizons": [6], "ratios": [20.0, 30.0],
            "score_names": ["abs_g", "update"], "cycle_len": 2,
            "cycle_mode": True, "replay_dtype": "fp32",
            "trace_dtype": "bf16", "upcast_bf16": True, "norm_fp32": True,

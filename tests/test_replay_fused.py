@@ -402,7 +402,7 @@ def test_fused_world1_bitwise():
         a = json.dumps(hit["branch_results"], sort_keys=True)
         b = json.dumps(noop["branch_results"], sort_keys=True)
         assert a == b, "--fused (deprecated no-op) changed the report"
-        _assert_ref_anchor(hit, t0, ref_args, ("1", "3", "6"))
+        _assert_ref_anchor(hit, t0, ref_args, (str(W),))
     print("PASS test_fused_world1_bitwise")
 
 
@@ -612,6 +612,10 @@ def test_fused_cli_gates():
             # balanced-histogram semantics: zerofill has no fused select
             (base + ["--selection-semantics", "balanced-histogram"],
              "--selection-semantics balanced-histogram requires"),
+            (base + ["--horizons", "1,3"],
+             "--horizons must equal the window"),
+            (base + ["--horizons", ""],
+             "--horizons must equal the window"),
             # ... and --nodes stays rejected under cycle: the sharded
             # balanced select is single-node only (any shard count is fine
             # on ONE node — exercised end to end by
@@ -829,7 +833,7 @@ def test_fused_cuda_world1():
             "ratios": (20.0, 30.0), "scores": ("abs_g", "update"),
             "T": 2, "W": W,
         }
-        _assert_ref_anchor(report, t0, ref_args, ("1", "3", "6"))
+        _assert_ref_anchor(report, t0, ref_args, (str(W),))
     print("PASS test_fused_cuda_world1")
 
 
@@ -866,7 +870,7 @@ def test_fused_bf16_trace_world1():
             "ratios": (20.0, 30.0), "scores": ("abs_g", "update"),
             "T": 2, "W": W, "payload_dtype": torch.bfloat16,
         }
-        _assert_ref_anchor(report, t0, ref_args, ("1", "3", "6"))
+        _assert_ref_anchor(report, t0, ref_args, (str(W),))
         # fp32 twin: identical payloads pre-upcast at rest — every replay
         # path must consume exactly the same fp32 inputs either way, so
         # the two fused runs are bit-identical (the dense caches populate
